@@ -1,0 +1,63 @@
+# Line endings.
+#
+# Without this file, normalization depends on each machine's core.autocrlf —
+# which differs between a Windows workstation and a Mac, so the same edit can
+# produce a whole-file diff depending on who made it. These rules move that
+# decision into the repository, where it is the same for everyone.
+#
+# Default: normalize to LF in the repository, check out whatever the platform
+# prefers. Windows working copies stay CRLF; the stored blobs never do.
+* text=auto
+
+# Files below must be LF in the *working tree* too, not just in the repository,
+# because something other than an editor reads them.
+
+# Shell scripts. A CRLF shebang becomes `#!/usr/bin/env bash\r`, and the loader
+# looks for an interpreter literally named "bash\r" — which fails with a
+# "no such file or directory" that names a file that plainly exists.
+# setup-host.sh runs on the Linux GPU host, so this one is load-bearing.
+*.sh            text eol=lf
+*.bash          text eol=lf
+
+# Docker. A trailing \r survives into RUN commands and breaks line
+# continuations; ENV values silently gain an invisible character.
+Dockerfile      text eol=lf
+Dockerfile.*    text eol=lf
+*.dockerfile    text eol=lf
+.dockerignore   text eol=lf
+
+# Compose and env files are read by the Linux-side tooling, and a \r on the end
+# of a value (TS_IP, ports) is the kind of bug that costs an afternoon.
+docker-compose*.yml  text eol=lf
+.env.example         text eol=lf
+
+# Batch files are the mirror image: cmd.exe wants CRLF.
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+
+# Text that benefits from explicit marking so `text=auto` never has to guess.
+*.py            text
+*.md            text
+*.json          text
+*.toml          text
+*.yml           text
+*.yaml          text
+*.html          text
+*.css           text
+*.js            text
+*.txt           text
+
+# Binary: never normalize, never diff as text.
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.pdf           binary
+*.zip           binary
+*.gz            binary
+*.db            binary
+*.sqlite        binary
+*.sqlite3       binary
+*.gguf          binary
+*.bin           binary

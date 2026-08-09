@@ -16,3 +16,8 @@ palace/
 
 # Local env — holds the host bind address
 .env
+
+# Run state: a mutable log, not a reviewable artifact.
+.hybridforge/run.db
+.hybridforge/run.db-wal
+.hybridforge/run.db-shm

@@ -1,22 +1,29 @@
 {
   "name": "hybrid-forge",
   "displayName": "Hybrid Forge",
-  "version": "0.1.0",
-  "description": "Plan-and-execute coding pipeline: Claude plans and reviews, a local Qwen3.6 model executes, MemPalace persists project decisions.",
+  "version": "0.2.0",
+  "description": "Autonomous plan-and-execute coding loop. A daemon owns the state machine and drives whichever models you bring; Claude plans and reviews, a cheaper model builds.",
   "author": {
     "name": "NMS App Works LLC"
   },
   "keywords": [
     "local-llm",
     "plan-and-execute",
-    "mempalace",
+    "autonomous",
+    "agent-loop",
+    "bring-your-own-model",
     "ollama",
-    "qwen"
+    "vllm"
   ],
   "userConfig": {
+    "executorKind": {
+      "type": "string",
+      "description": "Adapter for the interactive delegation tool: openai (covers Ollama, vLLM, LM Studio, LiteLLM, OpenRouter, OpenAI), anthropic, gemini, command, or claude-cli. Per-project roles live in .hybridforge/config.json and take precedence over this.",
+      "default": "openai"
+    },
     "executorBaseUrl": {
       "type": "string",
-      "description": "OpenAI-compatible base URL for the local executor model (e.g. http://forge-host:11434/v1)",
+      "description": "Base URL for the executor model when executorKind is an HTTP adapter (e.g. http://forge-host:11434/v1)",
       "default": "http://localhost:11434/v1"
     },
     "executorModel": {
