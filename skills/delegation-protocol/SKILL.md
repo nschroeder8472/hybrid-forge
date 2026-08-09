@@ -1,14 +1,26 @@
 ---
 name: delegation-protocol
-description: Use when working in a repository containing a .hybridforge directory, or whenever the user asks to delegate implementation work to the local executor model. Governs how work is split between Claude (planning, triage, review) and the local Qwen executor (implementation, test authoring), what a valid ticket must contain, and which categories of work must never be delegated.
+description: Use when working in a repository containing a .hybridforge directory, or whenever the user asks to delegate implementation work to an executor model, plan a feature for the autonomous loop, or start/monitor a forge run. Governs how work is split between the planning/review roles and the executor role, what a valid ticket must contain, which categories of work must never be delegated, and what the human is responsible for once the loop is running.
 ---
 
 # Delegation protocol
 
-Claude is the planner and reviewer. The local executor model writes code against
-specs Claude has already fully resolved. The executor is capable but does not
-reliably know when it is out of its depth, so **triage is Claude's job and is
-never delegated.**
+The planner and reviewer roles resolve the design; the executor role writes code
+against specs that are already fully resolved. The executor is capable but does
+not reliably know when it is out of its depth, so **triage is never delegated.**
+
+## Two ways work reaches the executor
+
+**Interactively** — you call `delegate_implementation` yourself, one ticket at a
+time, and read each result. Good for a single risky change you want to watch.
+
+**Autonomously** — the daemon (`forge go`) runs the whole backlog: build, apply,
+test, verify, review, repeat, until it is done or blocked. This is the normal
+path, and it changes what your attention is for. You are not approving each
+step; you are getting the plan right beforehand, because the loop will act on it
+for hours without asking.
+
+Everything below applies to both. It matters more in the second.
 
 ## Triage: decide before writing a ticket
 
@@ -72,6 +84,34 @@ Review the diff **against the spec**, not against "the tests pass." Specifically
 
 If the executor returned a `BLOCKED:` response, treat that as a signal the spec
 was underspecified. Fix the spec — do not paper over it in the ticket text.
+
+## Running the loop unattended
+
+**Get the plan right before saying go.** Once the loop starts it will work
+through the backlog for hours without asking permission. The moment before that
+is the cheapest possible time to catch a ticket routed `delegate` that should
+have been `claude-only` — afterwards you are reviewing something that was
+already built.
+
+**Never assign the same model to `executor` and `reviewer`.** A model reviewing
+its own diff against a spec it just implemented will accept it. The review step
+is what keeps a cheap executor honest, and it only works if something else does
+the reviewing.
+
+**A `BLOCKED:` ticket is a spec defect, not a transient failure.** The loop does
+not retry it, and neither should you. Fix the ticket in
+`.hybridforge/tickets/`, then re-ingest.
+
+**`waiting_budget` is not a fault.** It means a usage window is exhausted and
+the run is parked until it reopens. It resumes itself. Do not restart it, and
+do not switch it to a different model to get around the wait unless you
+actually want that model doing the work.
+
+**Read the rejections.** "rejected out-of-scope edits" in the log means the
+executor tried to write a file its ticket did not authorize. That is the check
+working, but it is also a signal: either the spec was missing a file the work
+genuinely needs, or the executor is wandering. Widen `allowed_files` only when
+it is the first.
 
 ## After merge
 

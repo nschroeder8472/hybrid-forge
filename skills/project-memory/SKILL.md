@@ -28,17 +28,38 @@ no context at all because it reads as authoritative.
 `neverDelegate` is a project-specific extension of the categories in the
 `delegation-protocol` skill, not a replacement for them.
 
-## Before writing a ticket
+## Who retrieves, and when
 
-Query memory for anything that constrains the work — established conventions,
-prior decisions on the same subsystem, and past review corrections. Pass what
-you find into the ticket's `context` field.
+**The daemon retrieves on its own.** When `memory.url` is set, the loop queries
+MemPalace before each ticket and passes the result to both the executor and the
+reviewer. You do not need to hand-populate context for an autonomous run, and
+`forge doctor` will tell you whether retrieval is actually working.
 
-Retrieve narrowly. A ticket about the export pipeline does not need the whole
-project history; irrelevant context spends executor attention and invites
-inconsistency.
+**You still retrieve when planning.** A ticket's own `context` field is for
+constraints you found while deciding *what* the ticket should be — the daemon's
+per-ticket query is topical and will not necessarily surface them. Both reach
+the executor; ticket context comes first.
+
+Retrieve narrowly either way. A ticket about the export pipeline does not need
+the whole project history; irrelevant context spends executor attention and
+invites inconsistency.
+
+If retrieval is unavailable the run continues without it, logging one warning
+and giving up after three consecutive failures. That is deliberate — losing an
+overnight run to a memory outage would be worse than building without history —
+but it does mean a silent `memory: FAIL` in `forge doctor` costs you every
+convention the executor would otherwise have followed. Check it after changing
+hosts.
 
 ## After a ticket merges
+
+**The daemon can record for you.** With `memory.write` on, the loop asks after
+each reviewed ticket whether anything durable emerged and writes it. It is
+told that the right answer is usually nothing — and it is, for most tickets.
+Turn it on with `dryRun` first and read a few runs' worth of proposals before
+letting it write for real.
+
+Whether you record by hand or the loop does it, the filter is the same.
 
 Record only what is durable:
 

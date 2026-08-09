@@ -2,8 +2,11 @@
   "mcpServers": {
     "forge-executor": {
       "command": "python3",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/executor_server.py"],
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/mcp_servers/executor_server.py"
+      ],
       "env": {
+        "FORGE_EXECUTOR_KIND": "${executorKind}",
         "FORGE_EXECUTOR_BASE_URL": "${executorBaseUrl}",
         "FORGE_EXECUTOR_MODEL": "${executorModel}"
       }

@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hybrid Forge</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-2: #1e222b;
+  --line: #2a2f3a;
+  --text: #e6e8ee;
+  --muted: #949cad;
+  --accent: #6ea8fe;
+  --ok: #58d68d;
+  --warn: #f5b041;
+  --err: #ec7063;
+  --wait: #bb8fce;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+  position: sticky; top: 0; z-index: 10;
+}
+h1 { font-size: 15px; margin: 0; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.status {
+  font-family: var(--mono); font-size: 13px; padding: 3px 10px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--panel-2);
+}
+.status.running { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.status.waiting_budget { color: var(--wait); border-color: color-mix(in srgb, var(--wait) 40%, transparent); }
+.status.paused { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+.status.blocked, .status.failed { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, transparent); }
+.status.done { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+.spacer { flex: 1; }
+button {
+  font: inherit; color: var(--text); background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 14px; cursor: pointer;
+}
+button:hover { border-color: var(--accent); }
+button.stop:hover { border-color: var(--err); color: var(--err); }
+main { display: grid; grid-template-columns: minmax(320px, 1fr) minmax(360px, 1.2fr); gap: 16px; padding: 16px; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+section > h2 {
+  margin: 0; padding: 10px 14px; font-size: 12px; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--line);
+}
+.body { padding: 12px 14px; }
+.goal { color: var(--muted); font-size: 13px; margin: 0 0 10px; }
+.bar { height: 6px; border-radius: 3px; background: var(--panel-2); overflow: hidden; margin-bottom: 12px; }
+.bar > i { display: block; height: 100%; background: var(--ok); transition: width .3s; }
+.notice {
+  margin: 0 0 12px; padding: 8px 12px; border-radius: 6px; font-size: 13px;
+  background: color-mix(in srgb, var(--wait) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--wait) 35%, transparent);
+}
+ul { list-style: none; margin: 0; padding: 0; }
+.ticket { display: flex; gap: 10px; align-items: baseline; padding: 7px 0; border-top: 1px solid var(--line); }
+.ticket:first-child { border-top: 0; }
+.ticket .id { font-family: var(--mono); font-size: 12px; color: var(--accent); min-width: 74px; }
+.ticket .title { flex: 1; }
+.ticket .note { display: block; color: var(--warn); font-size: 12px; }
+.pill { font-size: 11px; font-family: var(--mono); padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.pill.done { color: var(--ok); } .pill.running { color: var(--accent); }
+.pill.blocked, .pill.failed { color: var(--err); } .pill.skipped { color: var(--wait); }
+#log { max-height: 46vh; overflow-y: auto; font-family: var(--mono); font-size: 12.5px; }
+#log div { padding: 3px 0; border-top: 1px solid var(--line); display: flex; gap: 10px; }
+#log div:first-child { border-top: 0; }
+#log time { color: var(--muted); flex-shrink: 0; }
+#log .warn { color: var(--warn); } #log .error { color: var(--err); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px; padding-bottom: 6px; }
+td { padding: 4px 0; border-top: 1px solid var(--line); font-family: var(--mono); font-size: 12.5px; }
+td:last-child, th:last-child { text-align: right; }
+.empty { color: var(--muted); font-style: italic; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Hybrid Forge</h1>
+  <span class="status" id="status">connecting</span>
+  <span id="progress" class="goal" style="margin:0"></span>
+  <span class="spacer"></span>
+  <button id="pause">Pause</button>
+  <button id="resume">Resume</button>
+  <button id="stop" class="stop">Stop</button>
+</header>
+
+<main>
+  <section>
+    <h2>Backlog</h2>
+    <div class="body">
+      <p class="goal" id="goal"></p>
+      <div class="bar"><i id="barfill" style="width:0"></i></div>
+      <div id="notice"></div>
+      <ul id="tickets"><li class="empty">No run yet.</li></ul>
+    </div>
+  </section>
+
+  <section>
+    <h2>Activity</h2>
+    <div class="body" id="log"></div>
+  </section>
+
+  <section>
+    <h2>Steps</h2>
+    <div class="body"><ul id="steps"><li class="empty">Nothing yet.</li></ul></div>
+  </section>
+
+  <section>
+    <h2>Token usage</h2>
+    <div class="body">
+      <table>
+        <thead><tr><th>Model</th><th>Calls</th><th>Tokens</th></tr></thead>
+        <tbody id="usage"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+const clock = (ts) => new Date(ts * 1000).toLocaleTimeString();
+
+async function control(command) {
+  await fetch("/api/control", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ command }),
+  });
+  refresh();
+}
+$("pause").onclick = () => control("pause");
+$("resume").onclick = () => control("resume");
+$("stop").onclick = () => {
+  // Stopping ends the run; the daemon will not restart it on its own.
+  if (confirm("Stop the run? It will finish the current step, then exit.")) control("stop");
+};
+
+function renderTickets(tickets) {
+  if (!tickets.length) return '<li class="empty">No tickets.</li>';
+  return tickets.map(t => `
+    <li class="ticket">
+      <span class="id">${esc(t.id)}</span>
+      <span class="title">${esc(t.title)}${t.note ? `<span class="note">${esc(t.note)}</span>` : ""}</span>
+      <span class="pill ${esc(t.status)}">${esc(t.status)}${t.attempts > 1 ? ` ×${t.attempts}` : ""}</span>
+    </li>`).join("");
+}
+
+function renderSteps(steps) {
+  if (!steps.length) return '<li class="empty">Nothing yet.</li>';
+  return steps.map(s => `
+    <li class="ticket">
+      <span class="id">${esc(s.ticket || "—")}</span>
+      <span class="title">${esc(s.name)}</span>
+      <span class="pill ${esc(s.status)}">${esc(s.status)}</span>
+    </li>`).join("");
+}
+
+async function refresh() {
+  let state;
+  try { state = await (await fetch("/api/state")).json(); }
+  catch { $("status").textContent = "disconnected"; $("status").className = "status failed"; return; }
+
+  const run = state.run;
+  const status = run ? run.status : "idle";
+  $("status").textContent = status.replace("_", " ");
+  $("status").className = "status " + status;
+
+  $("goal").textContent = run ? (run.goal || "(no goal recorded)") : "No run yet.";
+
+  const done = state.progress ? state.progress.done : 0;
+  const total = state.progress ? state.progress.total : 0;
+  $("progress").textContent = total ? `${done}/${total} tickets` : "";
+  $("barfill").style.width = total ? `${(done / total) * 100}%` : "0";
+
+  // WAITING_BUDGET is the state worth explaining rather than just colouring:
+  // it means the loop is alive and will resume on its own.
+  $("notice").innerHTML = (status === "waiting_budget" || (run && run.note && status !== "running"))
+    ? `<p class="notice">${esc(run.note || "Waiting for a usage window to reopen.")}</p>` : "";
+
+  $("tickets").innerHTML = renderTickets(state.tickets || []);
+  $("steps").innerHTML = renderSteps(state.steps || []);
+  $("usage").innerHTML = (state.usage || [])
+    .map(u => `<tr><td>${esc(u.model)}</td><td>${u.calls}</td><td>${esc(u.display)}</td></tr>`)
+    .join("") || '<tr><td colspan="3" class="empty">No calls yet.</td></tr>';
+}
+
+let lastEventId = 0;
+function connectEvents() {
+  const source = new EventSource(`/api/events?after=${lastEventId}`);
+  source.onmessage = (message) => {
+    const event = JSON.parse(message.data);
+    lastEventId = Math.max(lastEventId, event.id);
+    const line = document.createElement("div");
+    line.className = event.level;
+    line.innerHTML = `<time>${clock(event.ts)}</time><span>${esc(event.message)}</span>`;
+    $("log").prepend(line);
+    while ($("log").childElementCount > 300) $("log").lastElementChild.remove();
+    refresh();
+  };
+  // Reconnect from the last id seen, so the gap replays instead of vanishing.
+  source.onerror = () => { source.close(); setTimeout(connectEvents, 3000); };
+}
+
+refresh();
+connectEvents();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
