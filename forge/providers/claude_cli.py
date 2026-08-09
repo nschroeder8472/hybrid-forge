@@ -143,6 +143,14 @@ class ClaudeCLIProvider(Provider):
                 input=prompt,
                 capture_output=True,
                 text=True,
+                # Pinned rather than left to the locale. Every prompt in this
+                # project contains an em dash, and on a Windows host — where
+                # the preferred encoding is cp1252 — writing one to the child's
+                # stdin raises UnicodeEncodeError before the CLI sees anything.
+                # The failure then surfaces as "no stdin data received", which
+                # points nowhere near the actual cause.
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 cwd=self.cwd,
                 check=False,

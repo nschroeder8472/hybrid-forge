@@ -383,6 +383,12 @@ class Orchestrator:
                 cwd=self.config.root,
                 capture_output=True,
                 text=True,
+                # A test suite that prints a non-ASCII character must not crash
+                # the daemon decoding its own verify step. `replace` keeps the
+                # output readable enough to feed back to the executor, which is
+                # all this text is for.
+                encoding="utf-8",
+                errors="replace",
                 timeout=1800,
                 check=False,
             )
@@ -701,6 +707,11 @@ class Orchestrator:
                 cwd=self.config.root,
                 capture_output=True,
                 text=True,
+                # A diff of source code routinely carries non-ASCII. Decoding it
+                # with the host locale would fail on exactly the tickets that
+                # touch user-facing strings.
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
             return result.stdout
@@ -715,6 +726,8 @@ class Orchestrator:
             cwd=self.config.root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
         ok = result.returncode == 0
