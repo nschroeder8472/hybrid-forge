@@ -90,6 +90,11 @@ class SubprocessProvider(Provider):
                 input=stdin_data,
                 capture_output=True,
                 text=True,
+                # UTF-8 both ways regardless of the host locale — a prompt
+                # containing an em dash must not fail to reach the binary, and
+                # a completion containing one must not fail to come back.
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 check=False,
             )
