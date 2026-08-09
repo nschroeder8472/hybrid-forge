@@ -3,13 +3,14 @@ services:
     image: ollama/ollama:latest
     container_name: forge-ollama
     restart: unless-stopped
-    # Host networking so the container binds directly to tailscale0.
+    # Host networking so the container can bind directly to a host interface.
     # With this mode `ports:` is ignored — OLLAMA_HOST controls the bind address.
     network_mode: host
     environment:
-      # Bind to the Tailscale interface only. Ollama has no authentication;
-      # 0.0.0.0 would publish an open inference endpoint to the whole LAN.
-      OLLAMA_HOST: "${TS_IP}:11434"
+      # Bind to one specific interface. Ollama has no authentication; 0.0.0.0
+      # would publish an open inference endpoint to every network this host is
+      # attached to.
+      OLLAMA_HOST: "${BIND_ADDR}:11434"
       # Keep weights resident between tickets. Without this every delegation
       # after an idle gap pays a cold load of ~20GB from disk.
       OLLAMA_KEEP_ALIVE: "${OLLAMA_KEEP_ALIVE:-30m}"
@@ -39,7 +40,7 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      MEMPALACE_HOST: "${TS_IP}"
+      MEMPALACE_HOST: "${BIND_ADDR}"
       MEMPALACE_PORT: "${PALACE_PORT:-8787}"
     volumes:
       # The palace database. One authoritative copy, on the host, forever.

@@ -6,15 +6,17 @@ resume, stop — through the same control table the loop already polls. The
 dashboard never reaches into the loop's internals, so a crashed UI cannot take
 a run with it, and a restarted UI reattaches with no handshake.
 
-Bound to loopback by default. There is no authentication: the control endpoint
-can stop a running job, so widening the bind address puts that button on your
-network. Reach it over Tailscale rather than binding to 0.0.0.0, matching the
-posture of the executor host.
+Bound to loopback by default, and there is no authentication of any kind. The
+control endpoint can stop a running job, so widening the bind address hands
+that button to anyone who can reach the port. Keep it on 127.0.0.1 and tunnel
+in if you need it from elsewhere; if you do widen it, put something in front
+that authenticates, because this server will not.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -217,8 +219,39 @@ class Handler(BaseHTTPRequestHandler):
             return
 
 
+LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+
+
+def is_exposed(host: str) -> bool:
+    """True when this bind address reaches beyond the local machine."""
+    return host.strip() not in LOOPBACK_HOSTS
+
+
+def exposure_warning(config: Config) -> str:
+    """Warning text for a non-loopback bind, or "" when bound to loopback.
+
+    Worth saying out loud every time rather than only in the docs: the control
+    endpoint can stop a running job and there is nothing here to stop anyone
+    who can reach the port from pressing it.
+    """
+    if not is_exposed(config.ui.host):
+        return ""
+    where = "every network this machine is on" if config.ui.host in ("0.0.0.0", "::", "") \
+        else f"anything that can reach {config.ui.host}"
+    return (
+        f"WARNING: the dashboard is bound to {config.ui.host}:{config.ui.port}, not loopback. "
+        f"It has NO authentication and its stop button ends the run, so {where} can "
+        "control this daemon. Set ui.host to 127.0.0.1 and tunnel in, or put an "
+        "authenticating proxy in front of it."
+    )
+
+
 def serve(config: Config, store: Store) -> ThreadingHTTPServer:
     """Start the dashboard on a background thread and return the server."""
+    warning = exposure_warning(config)
+    if warning:
+        print(warning, file=sys.stderr)
+
     handler = type("BoundHandler", (Handler,), {"store": store, "config": config})
     server = ThreadingHTTPServer((config.ui.host, config.ui.port), handler)
     server.daemon_threads = True

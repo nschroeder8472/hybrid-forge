@@ -122,11 +122,14 @@ all.
 ```bash
 # Ollama — the inference server
 curl -fsSL https://ollama.com/install.sh | sh
-
-# Tailscale, if not already on this machine
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up
 ```
+
+You also need a network path from your workstation to this host. Anything that
+gives the two machines a stable address for each other works — a LAN, a VPN, an
+overlay network, an SSH tunnel. Pick one now and note the address, because
+§1.3 binds the services to it. What matters is not which you choose but that
+the resulting address is reachable by your workstation and *not* by anything
+else: neither service below has authentication.
 
 Confirm the GPU is visible to Ollama:
 
@@ -153,18 +156,26 @@ ollama run qwen3.6:35b-a3b "Reply with exactly: OK"
 nvidia-smi   # confirm VRAM occupancy looks sane
 ```
 
-### 1.3 Bind the inference server to Tailscale only
+### 1.3 Bind the inference server to one interface
 
 **Ollama ships with no authentication.** Binding it to `0.0.0.0` publishes an
-unauthenticated endpoint that will happily execute inference for anything on your
-LAN. Bind it to the Tailscale interface instead.
+endpoint that will happily execute inference for anything that can reach the
+port — every network this host is attached to, including whatever your router
+is doing. Bind it to a single address instead, and make it the narrowest one
+that your workstation can still reach.
+
+List the candidates and pick one:
 
 ```bash
-TS_IP=$(tailscale ip -4 | head -n1)
+ip -4 -o addr show scope global      # interface name and address, one per line
+```
+
+```bash
+BIND_ADDR=<the address you picked>
 sudo mkdir -p /etc/systemd/system/ollama.service.d
 sudo tee /etc/systemd/system/ollama.service.d/override.conf <<EOF
 [Service]
-Environment="OLLAMA_HOST=${TS_IP}:11434"
+Environment="OLLAMA_HOST=${BIND_ADDR}:11434"
 Environment="OLLAMA_KEEP_ALIVE=30m"
 EOF
 sudo systemctl daemon-reload && sudo systemctl restart ollama
@@ -174,15 +185,22 @@ sudo systemctl daemon-reload && sudo systemctl restart ollama
 pay a cold load on every delegation, which is the single biggest source of
 "why is this so slow" in this setup.
 
-Verify from the host, then from your Mac:
+Verify from the host, then from your workstation:
 
 ```bash
-curl http://$(tailscale ip -4 | head -n1):11434/v1/models          # on host
-curl http://<host-tailscale-name>:11434/v1/models                  # on Mac
+curl http://${BIND_ADDR}:11434/v1/models       # on host
+curl http://<host-address>:11434/v1/models     # on the workstation
 ```
 
-If the second fails, the problem is Tailscale ACLs or the bind address — fix it
-here before going further. Everything downstream assumes this works.
+Both checks matter, and the second is the one that counts — an endpoint
+answering on the machine it runs on proves nothing about reachability. If it
+fails, the problem is the bind address, a firewall rule, or your VPN's access
+controls. Fix it here before going further; everything downstream assumes this
+works.
+
+If your network gives the host a stable name, prefer the name over the literal
+address in client config — a machine that changes address then costs you one
+DNS record instead of an edit in every repo's `config.json`.
 
 ### 1.4 MemPalace
 
@@ -197,7 +215,10 @@ Two things to establish before wiring clients to it:
    will only work for a client on the same machine. This pipeline needs it
    reachable from your Mac, so you need either a network transport (HTTP/SSE) or
    an MCP proxy fronting the stdio server. Confirm which your version supports.
-2. **Bind address.** Same reasoning as Ollama — Tailscale interface only.
+2. **Bind address.** Same reasoning and same address as Ollama — one interface,
+   not `0.0.0.0`. A memory store is if anything the more sensitive of the two:
+   it holds your project's decisions, and nothing in front of it asks who is
+   reading them.
 
 The palace database stays here, on the host, permanently. One authoritative copy.
 Do not sync it, do not check it into a repo, do not keep a second copy on the Mac.
@@ -239,7 +260,7 @@ docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
 
 ```bash
 cp .env.example .env
-tailscale ip -4 | head -n1        # put this in TS_IP
+ip -4 -o addr show scope global   # pick one; put it in BIND_ADDR
 docker compose up -d
 docker compose exec ollama ollama pull qwen3.6:35b-a3b
 ```
@@ -258,11 +279,13 @@ The compute layer is disposable; the state is not. `-v` is the footgun.
 ### Two things that behave differently under containers
 
 **Host networking is doing real work here.** A container on the default bridge
-network cannot see the host's `tailscale0` interface, so `OLLAMA_HOST` pointed at
-a Tailscale IP would fail to bind. `network_mode: host` makes the container's
-bind address the host's bind address, which is why the security posture from 1.3
-carries over unchanged. Note that `ports:` is ignored in this mode — the
-environment variable is what controls exposure.
+network has its own network namespace and cannot see the host's interfaces, so
+`OLLAMA_HOST` pointed at a host address would fail to bind — this bites hardest
+with VPN and overlay interfaces, which exist only on the host.
+`network_mode: host` makes the container's bind address the host's bind
+address, which is why the security posture from 1.3 carries over unchanged.
+Note that `ports:` is ignored in this mode — `BIND_ADDR` is what controls
+exposure, so a wrong value there is not contained by Docker.
 
 **Restarts evict VRAM.** `OLLAMA_KEEP_ALIVE` only helps within a container's
 lifetime. If your habit is spinning the stack up and down around each coding
@@ -306,7 +329,7 @@ claude --plugin-dir /path/to/hybrid-forge
 The plugin declares its endpoints in `userConfig`, so Claude Code prompts for
 them at enable time rather than making you hand-edit settings. Supply:
 
-- `executorBaseUrl` — `http://<host-tailscale-name>:11434/v1`
+- `executorBaseUrl` — `http://<host-address-or-name>:11434/v1`
 - `executorModel` — `qwen3.6:35b-a3b`
 - `memPalaceUrl` — your MemPalace endpoint from step 1.4
 
@@ -362,6 +385,44 @@ cd ~/code/image-marquee
 forge init          # or, inside Claude Code: /forge-init
 ```
 
+`forge init` asks five short questions — executor endpoint, who plans and
+reviews, memory URL, this repo's room and verify commands, then a review of what
+it will write. **Every endpoint is probed as you answer it**, with one real
+completion rather than a socket check: an endpoint that is up but 401s, or that
+serves a model name with a typo in it, both look fine to anything cheaper and
+fail on the first ticket.
+
+For the verify commands it asks a model rather than guessing from file names.
+With your permission it collects the repo's CI workflow, Makefile or Justfile,
+build manifest, and contributing guide, and asks the **planner** model what this
+project actually runs. It reports which files it read and where each command
+came from.
+
+The difference is not cosmetic. A `Cargo.toml` does not mean `cargo test` — the
+project may run `cargo nextest run`, need `--workspace`, gate tests behind a
+feature, or drive everything through `just`. CI already states the real answer.
+
+What it will not do is invent one. A repo with no CI, no Makefile, and nothing
+in its docs gets empty fields, because an empty command is skipped by the loop
+and a plausible wrong one parks the backlog. Detection can be declined, and
+every failure — no planner yet, endpoint down, unreadable reply — leaves the
+fields blank for you to fill in rather than substituting a guess.
+
+Commands are also sanity-checked before being offered: unexpanded CI
+interpolation (`${{ matrix.flags }}`), a bare `cd`, an invented `<placeholder>`,
+or a two-line procedure are all discarded rather than pre-filled.
+
+Nothing is written until the last question. Ctrl-C anywhere leaves the repo
+exactly as it was.
+
+```bash
+forge init --defaults   # skip the questions, write a config to edit by hand
+```
+
+With no terminal attached — piped, redirected, run from a script or from Claude
+Code — it takes every default, prints what it chose, and exits. It never blocks
+waiting on input nobody is there to give.
+
 This creates:
 
 ```
@@ -376,7 +437,39 @@ tickets in particular benefit from being reviewable — they are what a human
 reads to decide whether the plan is right *before* the loop spends hours acting
 on it.
 
+### 3.0 The machine profile — why the second repo is faster
+
+Your endpoints do not change per repo, so `forge init` saves them once:
+
+| Platform | Path |
+|---|---|
+| Linux / BSD | `$XDG_CONFIG_HOME/hybrid-forge/profile.json`, else `~/.config/hybrid-forge/profile.json` |
+| macOS | `~/.config/hybrid-forge/profile.json` |
+| Windows | `%APPDATA%\hybrid-forge\profile.json` |
+| Any | `$FORGE_PROFILE`, which overrides all of the above |
+
+It holds `models`, `roles`, `memory`, and the UI port. Every one of those
+questions arrives pre-filled on the next repo, so setup #2 is Enter-through
+until it asks about that repo specifically.
+
+It deliberately does **not** hold `commands`, `room`, or `neverDelegate`. Those
+differ per repo, and a `cargo test` carried into a Python project does not fail
+loudly — it fails `maxAttempts` times per ticket and parks the entire backlog,
+which looks like a model problem and is not.
+
+**No credentials are stored there, ever.** Providers resolve keys through
+`apiKeyEnv` — the *name* of an environment variable — so the name is what gets
+saved. An inline `apiKey` typed into a config by hand is stripped on the way in
+rather than quietly copied into a second file you did not know existed.
+
+The file is plain JSON with a comment field at the top. Edit it, or delete it to
+start fresh; a corrupt one is treated as absent, because re-asking four questions
+beats refusing to initialize a repo.
+
 ### 3.1 Declaring models and roles
+
+`forge init` writes this block for you; this section is what the questions were
+actually asking, and what to edit if you skipped them with `--defaults`.
 
 The config's two important blocks are `models` (what you have) and `roles` (who
 does what). Any declared model can play any role:
@@ -448,7 +541,7 @@ discovery and name the tool yourself), `limit` (results, default 6),
 
 The daemon speaks MCP directly rather than going through Claude Code, so
 MemPalace must be reachable over HTTP from **whichever machine runs the
-daemon** — the same Tailscale address Claude Code already uses.
+daemon** — the same address Claude Code already uses.
 
 **Tool discovery is automatic**, because MemPalace's tool surface changes
 across versions. The client lists the server's tools, picks the one that looks
@@ -458,7 +551,7 @@ prints what it found:
 
 ```
 memory: ok memory url=http://forge-host:8787/mcp room=image-marquee
-        tool=palace_recall available=palace_write_entry, palace_recall
+        read=palace_recall write=off available=palace_write_entry, palace_recall
 ```
 
 If it picks the wrong tool, or finds none, set `memory.searchTool` explicitly —
@@ -512,7 +605,7 @@ the diff against the spec).
 `forge doctor` shows the write state and which tool was chosen:
 
 ```
-memory: ok url=… room=image-marquee read=palace_recall
+memory: ok memory url=… room=image-marquee read=palace_recall
         write=ON(palace_remember) available=palace_delete_entry, palace_recall, palace_remember
 ```
 
@@ -633,9 +726,15 @@ getting routed to the executor because "it's mostly mechanical," tighten
 **Cold-start latency is the usual complaint.** If delegation feels slow, check
 `OLLAMA_KEEP_ALIVE` and whether another process evicted the weights from VRAM.
 
-**Keep the security posture.** Both services are unauthenticated and bound to
-Tailscale. If you later want them reachable more broadly, put them behind
-Authentik like your other services rather than widening the bind address.
+**Keep the security posture.** Three unauthenticated surfaces exist here and
+none of them will ever ask who is calling: Ollama executes inference for
+anyone who can reach it, MemPalace serves your project's decisions to anyone
+who can reach it, and the dashboard's stop button ends a run for anyone who can
+reach it. All three are bound narrowly for that reason — the dashboard to
+loopback, the other two to one interface. If you later want any of them
+reachable more broadly, put an authenticating proxy in front rather than
+widening the bind address. The daemon prints a warning at startup when the
+dashboard is bound off loopback; treat it as a reminder, not a permission slip.
 
 ---
 
@@ -643,7 +742,7 @@ Authentik like your other services rather than widening the bind address.
 
 | Symptom | Where to look |
 |---|---|
-| `EXECUTOR_UNREACHABLE` | Tailscale connectivity, then `OLLAMA_HOST` bind address |
+| `EXECUTOR_UNREACHABLE` | Network path from the daemon's machine to the host, then `OLLAMA_HOST` bind address, then firewall rules |
 | `forge doctor` reports FAIL | The error names the kind — auth, unreachable, or bad response |
 | MCP server missing from `/mcp` | `claude --debug`; restart Claude Code after config changes |
 | MemPalace connects on host but not Mac | Transport is stdio — needs HTTP or a proxy (see 1.4) |
@@ -652,6 +751,11 @@ Authentik like your other services rather than widening the bind address.
 | "rejected out-of-scope edits" in the log | Working as intended. Widen `allowed_files` only if the ticket genuinely needs that file |
 | Run sits in `waiting_budget` | Not a fault. The reason and reopen time are on the dashboard |
 | Loop won't start: "no run to work on" | Nothing ingested yet — `forge ingest <spec>` |
+| `forge init` asked nothing | No TTY (piped, redirected, or run by an agent). It took the defaults and printed them; edit the config, or re-run it in a terminal |
+| `forge init` filled in the wrong endpoints | A stale machine profile. Overwrite the answers, or delete the profile — see §3.0 for its path |
+| `forge init` found no verify commands | Nothing in the repo states them — no CI, no Makefile, no contributing guide. Fill them in yourself; §3.1 explains why this field matters most |
+| Detected commands are wrong | It reports which file each came from. If CI is stale, fix `config.json` directly — the loop uses that, not CI |
+| "could not build the planner model" during detection | Detection runs on the planner role, which is configured one question earlier. A failed probe there leaves nothing to ask |
 | `memory: FAIL` in doctor | Wrong URL, or MemPalace not reachable from the daemon's machine |
 | Memory connects but retrieves nothing | Wrong tool auto-selected, or wrong `room`. Doctor prints the chosen tool and every available name; set `memory.searchTool` |
 | Every ticket blocks on context overflow | The model's window is too small for these tickets. Split them, or raise `contextWindow` if it was set too low by hand |

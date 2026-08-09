@@ -37,7 +37,6 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-from .providers.base import Message
 from .secrets import find_secrets
 from .tokens import estimate_text
 
@@ -577,16 +576,6 @@ def ticket_query(title: str, spec: str, allowed_files: list[str]) -> str:
     if allowed_files:
         parts.append("Files: " + ", ".join(allowed_files[:8]))
     return "\n".join(p for p in parts if p).strip()
-
-
-def as_context_message(text: str) -> Message:
-    """Wrap retrieved memory in the droppable context envelope.
-
-    The `## Established project context` prefix is what the budget gate uses to
-    identify what it may discard when a prompt does not fit — memory yields to
-    the spec, never the other way around.
-    """
-    return Message(role="user", content=f"## Established project context\n{text}")
 
 
 # ----------------------------------------------------------------------
