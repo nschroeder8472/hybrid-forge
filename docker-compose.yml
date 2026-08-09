@@ -1,0 +1,52 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: forge-ollama
+    restart: unless-stopped
+    # Host networking so the container binds directly to tailscale0.
+    # With this mode `ports:` is ignored — OLLAMA_HOST controls the bind address.
+    network_mode: host
+    environment:
+      # Bind to the Tailscale interface only. Ollama has no authentication;
+      # 0.0.0.0 would publish an open inference endpoint to the whole LAN.
+      OLLAMA_HOST: "${TS_IP}:11434"
+      # Keep weights resident between tickets. Without this every delegation
+      # after an idle gap pays a cold load of ~20GB from disk.
+      OLLAMA_KEEP_ALIVE: "${OLLAMA_KEEP_ALIVE:-30m}"
+    volumes:
+      # Weights live on the host filesystem, not in an image layer. Read
+      # directly off NVMe, survive every teardown, and keep the image small.
+      - ollama-models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  mempalace:
+    build:
+      context: ./mempalace
+      dockerfile: Dockerfile
+    container_name: forge-mempalace
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      MEMPALACE_HOST: "${TS_IP}"
+      MEMPALACE_PORT: "${PALACE_PORT:-8787}"
+    volumes:
+      # The palace database. One authoritative copy, on the host, forever.
+      - mempalace-data:/data
+
+volumes:
+  ollama-models:
+    driver: local
+  mempalace-data:
+    driver: local

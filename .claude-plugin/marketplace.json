@@ -1,0 +1,14 @@
+{
+  "name": "nms-forge",
+  "owner": {
+    "name": "NMS App Works LLC"
+  },
+  "plugins": [
+    {
+      "name": "hybrid-forge",
+      "displayName": "Hybrid Forge",
+      "source": "./",
+      "description": "Plan-and-execute coding pipeline pairing Claude with a locally hosted executor model."
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "forge-executor": {
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/executor_server.py"],
+      "env": {
+        "FORGE_EXECUTOR_BASE_URL": "${executorBaseUrl}",
+        "FORGE_EXECUTOR_MODEL": "${executorModel}"
+      }
+    },
+    "mempalace": {
+      "type": "http",
+      "url": "${memPalaceUrl}"
+    }
+  }
+}
