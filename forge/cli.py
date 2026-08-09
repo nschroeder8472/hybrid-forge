@@ -1,9 +1,9 @@
 """`forge` — the command line around the daemon.
 
-    forge init                     scaffold .hybridforge/ for this repo
+    forge init [--defaults]        set up .hybridforge/ for this repo
     forge doctor                   probe every configured model
     forge ingest <file|->          turn a spec or plan into a backlog
-    forge go [--detach]            run the loop until done or stopped
+    forge go [--plan f] [--open]   run the loop until done or stopped
     forge status                   one-shot summary
     forge pause | resume | stop    control a running loop
     forge ui                       serve the dashboard on its own
@@ -23,11 +23,13 @@ import time
 import webbrowser
 from pathlib import Path
 
+from . import wizard
 from .config import Config, ConfigError, default_config
 from .ingest import ingest as ingest_document
 from .ingest import write_tickets
 from .loop import CONTROL_KEY, CONTROL_PAUSE, CONTROL_RUN, CONTROL_STOP, Orchestrator
 from .memory import MemoryClient
+from .profile import Profile
 from .providers import ProviderError
 from .state import Store
 from .tokens import format_tokens
@@ -57,7 +59,26 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"{config_path} already exists. Re-run with --force to overwrite.")
         return 1
 
-    config = default_config(root)
+    profile = Profile.load()
+
+    if args.defaults:
+        config = default_config(root)
+        saved_profile = None
+    else:
+        # No TTY disables the questions rather than the wizard: the flow still
+        # runs, prints what it chose, and takes every default. A setup command
+        # that blocks on stdin nobody is watching is worse than one that guesses.
+        prompter = wizard.Prompter(enabled=wizard.interactive())
+        try:
+            result = wizard.run(root, profile, prompter)
+        except wizard.Aborted:
+            print("\nAborted. Nothing was written.")
+            return 1
+        if result is None:
+            print("\nDeclined. Nothing was written.")
+            return 1
+        config, saved_profile = result
+
     written = config.write()
     config.tickets_dir.mkdir(parents=True, exist_ok=True)
 
@@ -66,11 +87,27 @@ def cmd_init(args: argparse.Namespace) -> int:
     # and config are what belong in version control.
     gitignore.write_text("run.db\nrun.db-wal\nrun.db-shm\n", encoding="utf-8")
 
-    print(f"Wrote {written}")
+    print(f"\nWrote {written}")
+
+    if saved_profile is not None:
+        try:
+            profile_path = saved_profile.save()
+            print(f"Saved these endpoints to {profile_path}")
+            print("  The next repo on this machine starts from them.")
+        except OSError as exc:
+            # A read-only or missing home directory is not a reason to fail an
+            # init that already succeeded — the repo config is the deliverable.
+            print(f"(could not save machine profile: {exc})")
+
     print("\nNext:")
-    print("  1. Edit `models` and `roles` to point at the models you want.")
-    print("  2. Fill in `commands.lint` / `.typecheck` / `.test` for this repo.")
-    print("  3. Run `forge doctor` to check every model answers.")
+    if args.defaults:
+        print("  1. Edit `models` and `roles` to point at the models you want.")
+        print("  2. Fill in `commands.lint` / `.typecheck` / `.test` for this repo.")
+        print("  3. Run `forge doctor` to check every model answers.")
+    else:
+        print("  1. `forge doctor` — re-checks every endpoint.")
+        print("  2. `forge ingest <spec>` — turn a plan into a reviewable backlog.")
+        print("  3. `forge go` — run it.")
     return 0
 
 
@@ -275,8 +312,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", default=".", help="project directory (default: cwd)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("init", help="scaffold .hybridforge/ for this repo")
+    p = sub.add_parser("init", help="set up .hybridforge/ for this repo, with prompts")
     p.add_argument("--force", action="store_true", help="overwrite an existing config")
+    p.add_argument(
+        "--defaults",
+        action="store_true",
+        help="skip the questions and write a default config to edit by hand",
+    )
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("doctor", help="probe every configured model")

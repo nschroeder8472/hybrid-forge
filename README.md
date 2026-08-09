@@ -32,6 +32,9 @@ forged (daemon)
 loop until DONE | BLOCKED | stopped
 ```
 
+Diagrams of the loop, the two ways work enters it, and what differs between a
+greenfield repo and an existing one: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## Bring your own models
 
 Four roles — `planner`, `executor`, `tester`, `reviewer` — and any model can play
@@ -95,8 +98,11 @@ So the split is by weight, not by role:
 | GPU host | Ollama serving the executor model; MemPalace |
 | Your workstation | the repo, the daemon, Claude Code, the toolchain |
 
-Model calls and memory reads cross the network (Tailscale); files, git, and
-builds stay local. This is also the only workable shape for a macOS-only
+Model calls and memory reads cross the network; files, git, and builds stay
+local. Any network the two machines share will do — the only requirement is
+that the daemon can reach the model and memory endpoints, and that those
+endpoints are not reachable by anything else, since neither has authentication
+of its own. This is also the only workable shape for a macOS-only
 toolchain — `xcodebuild` and the simulators cannot run in a Linux container, so
 verification has to happen on the Mac.
 
@@ -154,13 +160,15 @@ pause/resume/stop. It reads the same SQLite the loop writes, so a crashed
 dashboard cannot take a run with it and a restarted one reattaches with no
 handshake.
 
-It has no authentication and its stop button ends a run — reach it over
-Tailscale rather than binding it to `0.0.0.0`.
+It has no authentication and its stop button ends a run, so it binds to
+loopback and warns on startup if you point `ui.host` anywhere else. Tunnel in
+rather than widening the bind address, or put something that authenticates in
+front of it.
 
 ## Commands
 
 ```bash
-forge init                  # scaffold .hybridforge/ for this repo
+forge init [--defaults]     # set up .hybridforge/ for this repo, with prompts
 forge doctor                # probe every configured model
 forge ingest <file|->       # spec or plan -> reviewable backlog
 forge go [--plan f] [--open]# run until done or stopped
@@ -172,11 +180,39 @@ forge ui                    # dashboard without running the loop
 In Claude Code: `/forge-init`, `/forge-plan`, `/forge-ingest`, `/forge-go`,
 `/forge-status`.
 
-## Setup
+## Setup asks once
 
-See [docs/SETUP.md](docs/SETUP.md). The daemon is stdlib-only Python 3.10+ — a
-failed `pip install` is a bad way to discover that an overnight run never
-started.
+`forge init` prompts for the endpoints, **probes each one while you are still
+sitting there**, and writes what it learned to a machine-level profile
+(`~/.config/hybrid-forge/profile.json`, `%APPDATA%\hybrid-forge\` on Windows).
+The next repo starts from those answers, so the second setup is Enter-through
+except for the things that repo actually decides.
+
+A wrong endpoint found now costs one retyped line. The same wrong endpoint found
+by `forge go` costs the run.
+
+For the verify commands it does not guess at all. It collects the repo's own CI
+workflow, Makefile, and contributing guide, hands them to the planner model, and
+asks what this project actually runs — so you get `cargo nextest run --workspace`
+because that is what CI runs, not `cargo test` because a `Cargo.toml` exists.
+Nothing found means an empty field, which the loop skips. A wrong `test` command
+does not fail once; it fails `maxAttempts` times per ticket and parks the whole
+backlog, looking exactly like a bad executor model.
+
+Credentials are never stored. Providers resolve keys through `apiKeyEnv`, the
+*name* of an environment variable, and that name is what the profile keeps.
+
+```bash
+forge init              # prompts, probes, remembers
+forge init --defaults   # no questions; writes a config to edit by hand
+```
+
+With no terminal attached — piped, redirected, or run from a script — it takes
+every default and says so rather than blocking on stdin nobody is watching.
+
+See [docs/SETUP.md](docs/SETUP.md) for the host side. The daemon is stdlib-only
+Python 3.10+ — a failed `pip install` is a bad way to discover that an overnight
+run never started.
 
 ## Layout
 
@@ -190,6 +226,9 @@ forge/secrets.py          credential detection for anything about to be persiste
 forge/ingest.py           outside spec/plan -> backlog
 forge/patch.py            model output -> file writes, with scope enforcement
 forge/prompts.py          per-role prompts (a contract the parsers depend on)
+forge/wizard.py           interactive `forge init` — asks, probes, never hangs
+forge/toolchain.py        reads the repo's CI/docs to find its verify commands
+forge/profile.py          machine-level endpoints, reused by the next repo
 forge/ui/                 dashboard
 mcp_servers/              MCP shim for interactive (non-daemon) delegation
 skills/                   triage rules and memory discipline

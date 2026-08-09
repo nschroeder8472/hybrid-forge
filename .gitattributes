@@ -27,7 +27,7 @@ Dockerfile.*    text eol=lf
 .dockerignore   text eol=lf
 
 # Compose and env files are read by the Linux-side tooling, and a \r on the end
-# of a value (TS_IP, ports) is the kind of bug that costs an afternoon.
+# of a value (BIND_ADDR, ports) is the kind of bug that costs an afternoon.
 docker-compose*.yml  text eol=lf
 .env.example         text eol=lf
 

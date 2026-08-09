@@ -15,10 +15,12 @@ import unittest
 from pathlib import Path
 
 from forge.budget import BudgetGate, RateLimitPolicy
+from forge.config import Config, UISettings
 from forge.ingest import looks_like_plan, parse_plan, tickets_from_json
 from forge.patch import enforce_scope, is_safe_path, matches_any, parse_output
 from forge.providers.claude_cli import parse_reset_time
 from forge.state import Store, Ticket
+from forge.ui.server import exposure_warning, is_exposed
 
 
 class TestPatchParsing(unittest.TestCase):
@@ -196,6 +198,31 @@ class TestStoreResume(unittest.TestCase):
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [Ticket("T-1", status="running", position=0)])
         self.assertEqual(store.next_ticket(run_id).ticket_id, "T-1")
+
+
+class TestDashboardExposure(unittest.TestCase):
+    """The dashboard has no auth and its stop button ends a run, so a bind
+    address that reaches beyond this machine must say so out loud."""
+
+    def _config(self, host: str) -> Config:
+        config = Config(root=Path("."))
+        config.ui = UISettings(host=host, port=8799)
+        return config
+
+    def test_loopback_binds_are_silent(self):
+        for host in ("127.0.0.1", "::1", "localhost"):
+            self.assertFalse(is_exposed(host), host)
+            self.assertEqual(exposure_warning(self._config(host)), "")
+
+    def test_wildcard_bind_warns_about_every_network(self):
+        warning = exposure_warning(self._config("0.0.0.0"))
+        self.assertIn("NO authentication", warning)
+        self.assertIn("every network this machine is on", warning)
+
+    def test_specific_non_loopback_bind_names_the_address(self):
+        warning = exposure_warning(self._config("192.168.1.10"))
+        self.assertIn("192.168.1.10:8799", warning)
+        self.assertIn("NO authentication", warning)
 
 
 if __name__ == "__main__":
