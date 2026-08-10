@@ -151,6 +151,73 @@ class TestArgumentBuilding(unittest.TestCase):
         )
 
 
+# MemPalace scopes on two axes and requires both to write, which no amount of
+# parameter-name guessing can supply. These cover the configured-argument
+# escape hatch against that shape.
+ADD_DRAWER = {
+    "name": "mempalace_add_drawer",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "wing": {"type": "string"},
+            "room": {"type": "string"},
+            "content": {"type": "string"},
+            "added_by": {"type": "string"},
+        },
+        "required": ["wing", "room", "content"],
+    },
+}
+
+
+class TestConfiguredArguments(unittest.TestCase):
+    def test_search_carries_a_param_no_guess_would_find(self):
+        args = _build_arguments(
+            ADD_DRAWER, query="x", room="", limit=3, extra={"wing": "hybrid-forge"}
+        )
+        self.assertEqual(args["wing"], "hybrid-forge")
+
+    def test_undeclared_keys_are_dropped(self):
+        # One block serves both tools, so it names params only one of them has.
+        args = _build_arguments(
+            STUB_TOOLS[1], query="x", room="", limit=3, extra={"wing": "hf", "space": "s"}
+        )
+        self.assertNotIn("wing", args)
+        self.assertEqual(args["space"], "s")
+
+    def test_configured_value_overrides_the_guessed_room(self):
+        args = _build_arguments(
+            ADD_DRAWER, query="x", room="guessed", limit=3, extra={"room": "decisions"}
+        )
+        self.assertEqual(args["room"], "decisions")
+
+    def test_never_overwrites_the_query_text(self):
+        args = _build_arguments(
+            STUB_TOOLS[1], query="png export", room="", limit=3, extra={"q": "clobbered"}
+        )
+        self.assertEqual(args["q"], "png export")
+
+    def test_never_overwrites_the_entry_text(self):
+        from forge.memory import _build_write_arguments
+
+        args = _build_write_arguments(
+            ADD_DRAWER, entry="Chose tiny-skia.", room="", title="",
+            extra={"content": "clobbered", "wing": "hybrid-forge"},
+        )
+        self.assertEqual(args["content"], "Chose tiny-skia.")
+        self.assertEqual(args["wing"], "hybrid-forge")
+
+    def test_write_arguments_layer_over_the_shared_ones(self):
+        settings = MemorySettings.from_config(
+            {
+                "url": "http://x/mcp",
+                "arguments": {"wing": "hybrid-forge"},
+                "writeArguments": {"room": "decisions"},
+            }
+        )
+        self.assertEqual(settings.arguments, {"wing": "hybrid-forge"})
+        self.assertEqual(settings.write_arguments, {"room": "decisions"})
+
+
 class TestLiveRetrieval(unittest.TestCase):
     def _client(self, url, **kwargs):
         return MemoryClient(MemorySettings(url=url, room="marquee", **kwargs))
@@ -326,6 +393,22 @@ class TestWriteToolSelection(unittest.TestCase):
         from forge.memory import _pick_write_tool
 
         self.assertIsNone(_pick_write_tool([{"name": "palace_recall"}]))
+
+    def test_prefers_the_store_over_a_diary(self):
+        from forge.memory import _pick_write_tool
+
+        # `diary_write` matches an earlier hint than `add_drawer`; picking it
+        # would file every decision where search does not look.
+        tools = [{"name": "mempalace_diary_write"}, {"name": "mempalace_add_drawer"}]
+        self.assertEqual(_pick_write_tool(tools)["name"], "mempalace_add_drawer")
+
+    def test_a_diary_is_still_better_than_nothing(self):
+        from forge.memory import _pick_write_tool
+
+        self.assertEqual(
+            _pick_write_tool([{"name": "mempalace_diary_write"}])["name"],
+            "mempalace_diary_write",
+        )
 
 
 class TestWriteGuards(unittest.TestCase):

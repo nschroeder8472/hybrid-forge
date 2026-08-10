@@ -506,6 +506,13 @@ def _ask_repo(answers: Answers, root: Path, prompter: Prompter) -> None:
     answers.room = prompter.ask(
         "Memory room — scopes retrieval to this project", root.name
     )
+    if answers.memory.get("url") or answers.memory.get("command"):
+        # A palace that scopes by project under a different parameter name gets
+        # the same answer. MemPalace calls it a wing and refuses to write
+        # without one; a server with no such parameter drops it, so sending it
+        # unconditionally costs nothing and saves a silent write failure on the
+        # first ticket that produces a decision.
+        answers.memory.setdefault("arguments", {})["wing"] = answers.room
 
     say("\nVerify commands. These run before any model reviews, and an empty one")
     say("is skipped — which is better than a command that does not work, because")

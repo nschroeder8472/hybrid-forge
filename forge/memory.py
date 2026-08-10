@@ -78,6 +78,11 @@ _WRITE_HINTS_FORBIDDEN = (
     "delete", "remove", "drop", "purge", "clear", "destroy", "reset", "wipe",
     "prune", "forget",
 )
+# Safe to write to, but a side channel rather than the store retrieval reads.
+# MemPalace's `diary_write` matches "write" and would otherwise be picked ahead
+# of `add_drawer`, filing every decision somewhere search does not look. Chosen
+# only when nothing else is on offer.
+_WRITE_HINTS_LAST = ("diary", "journal", "log")
 
 # Candidate parameter names, by role. Only ones present in the tool's declared
 # schema are sent.
@@ -529,6 +534,12 @@ class MemorySettings:
     token_env: str = ""
     headers: dict[str, str] = field(default_factory=dict)
     room: str = ""
+    # Extra tool arguments this server needs that `room` cannot express. A
+    # palace may scope on two axes — MemPalace files under a *wing* (the
+    # project) and a *room* (the aspect) and requires both to write — and the
+    # generic parameter guesses above only know about one. Keys not declared by
+    # the tool being called are dropped, so one block can serve both tools.
+    arguments: dict[str, Any] = field(default_factory=dict)
     enabled: bool = True
     # Name the search tool explicitly to skip discovery, for a server whose
     # naming does not match the hints above.
@@ -545,6 +556,10 @@ class MemorySettings:
     # future session reads, with no undo. That deserves its own yes.
     write: bool = False
     write_tool: str = ""
+    # Extra arguments for the write call only, layered over `arguments`. Reads
+    # and writes want different scopes: a search should span the whole project,
+    # while a recorded decision belongs in one aspect of it.
+    write_arguments: dict[str, Any] = field(default_factory=dict)
     # Log what would be written without sending it. The honest way to find out
     # what the recorder considers durable before letting it near the palace.
     dry_run: bool = False
@@ -561,6 +576,7 @@ class MemorySettings:
             token_env=str(data.get("tokenEnv", "")),
             headers={str(k): str(v) for k, v in (data.get("headers") or {}).items()},
             room=str(data.get("room", "") or room),
+            arguments=dict(data.get("arguments") or {}),
             enabled=bool(data.get("enabled", True)),
             search_tool=str(data.get("searchTool", "")),
             limit=int(data.get("limit", 6)),
@@ -568,6 +584,7 @@ class MemorySettings:
             timeout=int(data.get("timeout", 30)),
             write=bool(data.get("write", False)),
             write_tool=str(data.get("writeTool", "")),
+            write_arguments=dict(data.get("writeArguments") or {}),
             dry_run=bool(data.get("dryRun", False)),
             max_write_chars=int(data.get("maxWriteChars", 2000)),
         )
@@ -670,10 +687,18 @@ class MemoryClient:
         else:
             write_state = f"write=ON({self._write_tool.get('name')})"
 
+        scope = ", ".join(
+            f"{k}={v}" for k, v in self.settings.arguments.items()
+        )
+        write_scope = ", ".join(
+            f"{k}={v}" for k, v in self.settings.write_arguments.items()
+        )
         return (
             f"ok memory transport={self.settings.transport} target={self.settings.target} "
             f"room={self.settings.room or '(unscoped)'} "
-            f"read={self._tool.get('name')} {write_state} "
+            + (f"scope=[{scope}] " if scope else "")
+            + (f"writeScope=[{write_scope}] " if write_scope else "")
+            + f"read={self._tool.get('name')} {write_state} "
             f"available={', '.join(self._available_tools)}"
         )
 
@@ -697,6 +722,7 @@ class MemoryClient:
             query=query,
             room=self.settings.room,
             limit=self.settings.limit,
+            extra=self.settings.arguments,
         )
         text = self._client.call_tool(str(self._tool["name"]), arguments)
         return _truncate(text, self.settings.max_tokens)
@@ -744,7 +770,11 @@ class MemoryClient:
             )
 
         arguments = _build_write_arguments(
-            self._write_tool, entry=entry, room=self.settings.room, title=title
+            self._write_tool,
+            entry=entry,
+            room=self.settings.room,
+            title=title,
+            extra={**self.settings.arguments, **self.settings.write_arguments},
         )
 
         if self.settings.dry_run:
@@ -784,8 +814,35 @@ def _schema_properties(tool: dict[str, Any]) -> dict[str, Any]:
     return properties if isinstance(properties, dict) else {}
 
 
+def _apply_extra_arguments(
+    arguments: dict[str, Any],
+    extra: dict[str, Any],
+    properties: dict[str, Any],
+    *,
+    protected: str,
+) -> None:
+    """Layer configured arguments over the guessed ones, in place.
+
+    Explicit configuration beats a guess, so an extra overrides a parameter the
+    name-matching above already filled — that is the point of writing it down.
+    The one exception is the parameter carrying the query or entry text:
+    overwriting that would silently send an empty search, or file the config
+    block itself as a memory. Keys the tool does not declare are dropped, so a
+    single block can serve tools with different schemas.
+    """
+    for name, value in extra.items():
+        if name == protected or (properties and name not in properties):
+            continue
+        arguments[name] = value
+
+
 def _build_arguments(
-    tool: dict[str, Any], *, query: str, room: str, limit: int
+    tool: dict[str, Any],
+    *,
+    query: str,
+    room: str,
+    limit: int,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fill only the parameters this tool actually declares.
 
@@ -794,11 +851,13 @@ def _build_arguments(
     """
     properties = _schema_properties(tool)
     arguments: dict[str, Any] = {}
+    query_param = ""
 
     if properties:
         for name in _QUERY_PARAMS:
             if name in properties:
                 arguments[name] = query
+                query_param = name
                 break
         else:
             # Schema present but no recognizable query field: use the single
@@ -810,6 +869,7 @@ def _build_arguments(
             ]
             if len(required) == 1:
                 arguments[required[0]] = query
+                query_param = required[0]
 
         if room:
             for name in _ROOM_PARAMS:
@@ -823,9 +883,11 @@ def _build_arguments(
     else:
         # No schema advertised — send the most common shape and hope.
         arguments["query"] = query
+        query_param = "query"
         if room:
             arguments["room"] = room
 
+    _apply_extra_arguments(arguments, extra or {}, properties, protected=query_param)
     return arguments
 
 
@@ -896,15 +958,28 @@ def _pick_write_tool(
             bad in str(tool.get("name", "")).lower() for bad in _WRITE_HINTS_FORBIDDEN
         )
     ]
-    for hint in _WRITE_HINTS_POSITIVE:
-        for tool in safe:
-            if hint in str(tool.get("name", "")).lower():
-                return tool
+    # Two passes rather than one, so a side-channel name never beats a primary
+    # store just by matching an earlier hint.
+    primary = [
+        tool
+        for tool in safe
+        if not any(late in str(tool.get("name", "")).lower() for late in _WRITE_HINTS_LAST)
+    ]
+    for candidates in (primary, safe):
+        for hint in _WRITE_HINTS_POSITIVE:
+            for tool in candidates:
+                if hint in str(tool.get("name", "")).lower():
+                    return tool
     return None
 
 
 def _build_write_arguments(
-    tool: dict[str, Any], *, entry: str, room: str, title: str
+    tool: dict[str, Any],
+    *,
+    entry: str,
+    room: str,
+    title: str,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fill only the parameters the write tool declares.
 
@@ -921,11 +996,14 @@ def _build_write_arguments(
             arguments["room"] = room
         if title:
             arguments["title"] = title
+        _apply_extra_arguments(arguments, extra or {}, properties, protected="content")
         return arguments
 
+    entry_param = ""
     for name in _ENTRY_PARAMS:
         if name in properties:
             arguments[name] = entry
+            entry_param = name
             break
     else:
         required = [
@@ -935,6 +1013,7 @@ def _build_write_arguments(
         ]
         if len(required) == 1:
             arguments[required[0]] = entry
+            entry_param = required[0]
         else:
             raise MemoryRefused(
                 f"cannot tell which parameter of {tool.get('name')!r} takes the "
@@ -953,4 +1032,5 @@ def _build_write_arguments(
                 arguments[name] = room
                 break
 
+    _apply_extra_arguments(arguments, extra or {}, properties, protected=entry_param)
     return arguments

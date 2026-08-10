@@ -47,6 +47,11 @@
       "mcp", "--palace", "/data/palace"
     ],
     "room": "",
+    "arguments": { "wing": "hybrid-forge" },
+    "writeTool": "mempalace_add_drawer",
+    "writeArguments": { "room": "decisions", "added_by": "hybrid-forge-daemon" },
+    "write": true,
+    "dryRun": true,
     "timeout": 120
   },
   "loop": {
