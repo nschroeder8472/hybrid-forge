@@ -281,10 +281,37 @@ class TestWizardFlow(unittest.TestCase):
         # Write-back declined stays off — it mutates a store with no undo.
         self.assertNotIn("write", config.memory)
 
+        # The room answer also scopes a palace that names the project axis
+        # something else; a server without that parameter drops it.
+        self.assertEqual(config.memory["arguments"]["wing"], "myroom")
+
         # The profile keeps endpoints, and nothing the next repo would decide.
         self.assertIn("local", profile.models)
         self.assertIn("claude", profile.models)
         self.assertEqual(profile.memory["url"], "http://gpu:8787/mcp")
+
+    def test_project_scope_never_reaches_the_next_repo(self):
+        root = temp_repo("pyproject.toml")
+        path = Path(tempfile.mkdtemp()) / "profile.json"
+        _, profile = self._run(root, [
+            "http://gpu:11434/v1", "qwen3.6:35b-a3b", "",
+            "1", "opus",
+            "http://gpu:8787/mcp", "n",
+            "myroom",
+            "y", "", "", "",
+            "",
+            "y",
+        ], profile=Profile(path=path))
+
+        # In memory it is still there — it configured *this* repo.
+        self.assertEqual(profile.memory["arguments"]["wing"], "myroom")
+
+        # On disk it is gone, or the next repo would read this one's decisions
+        # and present them as its own.
+        reloaded = Profile.load(profile.save(path))
+        self.assertNotIn("arguments", reloaded.memory)
+        self.assertNotIn("room", reloaded.memory)
+        self.assertEqual(reloaded.memory["url"], "http://gpu:8787/mcp")
 
     def test_declining_the_final_confirmation_writes_nothing(self):
         root = temp_repo("Cargo.toml")

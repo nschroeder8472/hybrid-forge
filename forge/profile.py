@@ -41,6 +41,12 @@ APP_DIR = "hybrid-forge"
 # survives; this is the literal-secret field it exists to replace.
 _SECRET_KEYS = ("apiKey", "api_key", "token", "password", "secret")
 
+# Memory keys that name *this* repository rather than the machine's palace.
+# Carried forward they would scope the next repo's reads and writes to the
+# previous one — which does not fail, it silently answers every question with
+# another project's decisions.
+_PER_REPO_MEMORY_KEYS = ("room", "arguments")
+
 
 def profile_path() -> Path:
     """Where this machine's profile lives. Never creates anything."""
@@ -71,6 +77,16 @@ def strip_secrets(block: Any) -> Any:
     if isinstance(block, list):
         return [strip_secrets(item) for item in block]
     return block
+
+
+def strip_repo_scope(memory: dict[str, Any]) -> dict[str, Any]:
+    """Drop the keys that name one repository, keeping the transport.
+
+    Same rule the docstring states for `commands` and `neverDelegate`, applied
+    to the memory block: what is worth reusing is *where the palace is*, never
+    *which project's shelf to read*.
+    """
+    return {key: value for key, value in memory.items() if key not in _PER_REPO_MEMORY_KEYS}
 
 
 @dataclass
@@ -130,7 +146,7 @@ class Profile:
             ),
             "models": strip_secrets(self.models),
             "roles": self.roles,
-            "memory": strip_secrets(self.memory),
+            "memory": strip_repo_scope(strip_secrets(self.memory)),
             "ui": {"port": self.ui_port},
         }
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

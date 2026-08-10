@@ -26,5 +26,9 @@ palace/
 mempalace.yaml
 entities.json
 
-# Editable-install build metadata
+# Build metadata. `pip install .` leaves both behind; the artifacts under
+# build/ are a stale copy of the source and would confuse a reviewer reading
+# a diff that appears to change the same file twice.
 *.egg-info/
+build/
+dist/

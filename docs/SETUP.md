@@ -623,6 +623,25 @@ discovery and name the tool yourself), `limit` (results, default 6),
 `maxTokens` (cap on retrieved context, default 1200), `timeout`, and
 `enabled: false` to turn it off without deleting the block.
 
+**When one `room` is not enough**, name the parameters yourself in
+`arguments`. MemPalace scopes on two axes — a *wing* (the project) and a *room*
+(the aspect: `decisions`, `backend`, `meetings`) — and no amount of guessing at
+parameter names can invent the second one:
+
+```json
+"memory": {
+  "command": ["mempalace-mcp"],
+  "arguments": { "wing": "image-marquee" }
+}
+```
+
+Every key is passed straight through to the tool being called, and keys that
+tool does not declare are dropped — so one block can serve a search tool and a
+write tool with different schemas. A configured value wins over the one `room`
+would have supplied; the only parameter it cannot touch is the one carrying the
+query or entry text, since overwriting that would send an empty search or file
+the config block itself as a memory.
+
 The daemon speaks MCP directly rather than going through Claude Code, so
 MemPalace has to be startable — or reachable — from **whichever machine runs
 the daemon**.
@@ -688,6 +707,28 @@ Guardrails, all verified by the test suite:
 Other keys: `writeTool` (skip discovery), `maxWriteChars`, and `recordRole`
 (which role judges durability — defaults to `reviewer`, since it has just read
 the diff against the spec).
+
+`writeArguments` layers over `arguments` for the write call only, because reads
+and writes want different scopes: a search should span the whole project, while
+a recorded decision belongs in one aspect of it. Against MemPalace that is:
+
+```json
+"memory": {
+  "command": ["mempalace-mcp"],
+  "arguments":      { "wing": "image-marquee" },
+  "writeTool":      "mempalace_add_drawer",
+  "writeArguments": { "room": "decisions", "added_by": "hybrid-forge-daemon" },
+  "write": true,
+  "dryRun": true
+}
+```
+
+`writeTool` is belt and braces here: discovery already prefers a primary store
+over a side channel, so it picks `add_drawer` rather than `diary_write` — but a
+tool this far from being undoable is worth naming rather than inferring.
+
+`forge init` fills `arguments.wing` from the room you give it, so a new repo is
+scoped correctly without touching this block by hand.
 
 `forge doctor` shows the write state and which tool was chosen:
 
