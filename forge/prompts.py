@@ -35,6 +35,11 @@ Rules:
 - Output the COMPLETE contents of every file you change. For each one, put the
   file path on its own line, then a fenced code block containing the whole
   file. No partial files, no diffs, no ellipses.
+- Because you emit whole files, every line you were not asked to change is one
+  you must reproduce character for character — docstrings, blank lines,
+  formatting, and functions the ticket never mentions included. Rewriting a
+  line that already worked is a change the spec did not ask for, and it will be
+  rejected at review even when the behavior is identical. Copy first, then add.
 """
 
 TESTER_SYSTEM = """You write tests that encode criteria decided upstream.
@@ -160,7 +165,27 @@ Fix the cause. Do not work around the check.
     return messages
 
 
-def tests_prompt(ticket: Ticket, changed_files: list[str]) -> list[Message]:
+def tests_prompt(
+    ticket: Ticket,
+    changed_files: list[str],
+    *,
+    test_command: str = "",
+    example_test: tuple[str, str] | None = None,
+    failure_context: str = "",
+) -> list[Message]:
+    """Ask the tester for assertions, with the evidence to match the repo.
+
+    Telling a model to "follow the conventions of this repository" is only an
+    instruction if it can see the repository, and the tester cannot — it gets a
+    ticket, not a checkout. Left to guess it writes whichever framework is most
+    common in its training data, which on a `unittest` project means a file the
+    runner collects nothing from: zero tests, a non-zero exit, and a ticket
+    that fails three times with a correct implementation on disk.
+
+    So the two things that actually determine the answer are passed in: the
+    command that will judge the tests, and a real test file from this repo to
+    imitate. Both are already known to the daemon.
+    """
     files = "\n".join(f"- {p}" for p in changed_files) or "- (none)"
     body = f"""Ticket: {ticket.ticket_id} — {ticket.title}
 
@@ -169,9 +194,53 @@ def tests_prompt(ticket: Ticket, changed_files: list[str]) -> list[Message]:
 
 ## Criteria to encode as assertions
 {_criteria_block(ticket)}
-
-Follow the test framework and conventions already used in this repository.
 """
+
+    if test_command:
+        body += f"""
+## The command that will run your tests
+```
+{test_command}
+```
+Your tests must be collected and executed by that command. A file it does not
+collect is worse than no file: it reports zero tests and fails the ticket.
+"""
+
+    if example_test is not None:
+        path, content = example_test
+        body += f"""
+## An existing test in this repository — match this framework and style
+`{path}`:
+```
+{content}
+```
+"""
+    else:
+        body += "\nFollow the test framework and conventions already used in this repository.\n"
+
+    if failure_context:
+        body += f"""
+## The previous attempt did not pass verification
+
+```
+{failure_context}
+```
+
+Read this before writing anything, and decide which kind of failure it is.
+
+A failure caused by **your own assertion being wrong** — asserting on something
+the criterion never claimed, comparing a return value against source text,
+importing a name that does not exist, a typo in an expected value — is yours to
+correct. Write the assertion the criterion actually describes.
+
+A failure caused by **the implementation being wrong** is not yours to correct.
+Write the same assertion again, unchanged. Deleting it, loosening it, or
+wrapping it in a skip would hide a real defect and end the ticket with a green
+suite over broken code — a worse outcome than any failing test.
+
+If you cannot tell which it is, keep the assertion as written.
+"""
+
     return [
         Message(role="system", content=TESTER_SYSTEM),
         Message(role="user", content=body),
@@ -202,6 +271,42 @@ def review_prompt(ticket: Ticket, diff: str, retrieved: str = "") -> list[Messag
 """
     messages.append(Message(role="user", content=body))
     return messages
+
+
+def parse_verdict(text: str) -> tuple[bool, str]:
+    """Read a reviewer's reply as (approved, reason).
+
+    Deliberately fail-closed. The obvious implementation — approve unless the
+    reply starts with REJECT — treats every unreadable answer as a pass, and
+    the ways a reply can be unreadable are not exotic. The one observed in
+    practice: a model that echoes its own instruction, `ACCEPT or REJECT:`, on
+    the first line. That does not start with REJECT, so a rejection sailed
+    through and the ticket was marked done over work the reviewer refused.
+
+    So a verdict line must say one word and not the other, approval must be
+    stated rather than inferred, and anything else is a rejection carrying the
+    reply for a human to read. A wrongly-rejected ticket costs an attempt; a
+    wrongly-approved one is what the review step exists to prevent.
+    """
+    for raw in text.splitlines():
+        # Tolerate `**ACCEPT**`, `# REJECT`, `ACCEPT.` — models decorate.
+        line = raw.strip().strip("*#`_ \t.:—-").upper()
+        if not line:
+            continue
+        has_accept, has_reject = "ACCEPT" in line, "REJECT" in line
+        # Both words on one line is the instruction being repeated, not a
+        # decision. Skipping it is what lets the real verdict below be found.
+        if has_accept and has_reject:
+            continue
+        if has_reject:
+            return False, text.strip()
+        if has_accept:
+            return True, text.strip()
+
+    return False, (
+        "reviewer gave no readable ACCEPT or REJECT verdict; treating as a "
+        f"rejection.\n\n{text.strip()}"
+    )
 
 
 NOTHING_SENTINEL = "NOTHING"

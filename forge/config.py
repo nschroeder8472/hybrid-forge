@@ -20,7 +20,7 @@ second-guessing an OpenAI executor — with no code change.
   },
   "commands": {"lint": "...", "typecheck": "...", "test": "..."},
   "neverDelegate": ["src/auth/**"],
-  "memory": {"url": "http://forge-host:8787/mcp", "room": "image-marquee"},
+  "memory": {"command": ["mempalace-mcp"], "room": "image-marquee"},
   "loop": {"maxAttempts": 3, "autoCommit": false},
   "ui": {"host": "127.0.0.1", "port": 8799}
 }
@@ -164,6 +164,24 @@ class Config:
 
     # ------------------------------------------------------------------
 
+    def model_block(self, name: str) -> dict[str, Any]:
+        """A model's config with project-scoped defaults filled in.
+
+        `cwd` is the load-bearing one. Adapters that shell out — `claude-cli`
+        and `command` — otherwise inherit the daemon's process directory, and
+        the daemon is routinely started from somewhere else: `forge --root
+        <path>`, a scheduled task, an editor's terminal. A planner run in the
+        wrong directory does not fail. It reads whatever repository it landed
+        in and writes confident, well-formed tickets about that one, naming
+        files and conventions the target project has never had.
+
+        An explicit `cwd` in the block still wins, so a deliberate override —
+        pointing the planner at a sibling checkout, say — survives.
+        """
+        block = dict(self.models[name])
+        block.setdefault("cwd", str(self.root))
+        return block
+
     def provider_for(self, role: str) -> Provider:
         """Build the provider playing a role.
 
@@ -174,7 +192,7 @@ class Config:
         if role not in ROLES:
             raise ConfigError(f"unknown role {role!r}; expected one of {', '.join(ROLES)}")
         name = self.roles[role]
-        return build_provider(name, self.models[name])
+        return build_provider(name, self.model_block(name))
 
     def model_name_for(self, role: str) -> str:
         return self.roles[role]

@@ -22,12 +22,14 @@ spec does not improve by being asked again.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
+from .artifacts import Artifacts
 from .budget import BudgetGate, Wait
 from .config import Config
 from .memory import MemoryClient, MemoryRefused, MemoryUnavailable, ticket_query
@@ -44,6 +46,7 @@ from .prompts import (
     CONTEXT_HEADING,
     build_prompt,
     parse_record,
+    parse_verdict,
     record_prompt,
     review_prompt,
     tests_prompt,
@@ -92,6 +95,9 @@ class Orchestrator:
         self.gate = BudgetGate(store, config.rate_limit_policies())
         self.memory = MemoryClient.from_config(config.memory, room=config.room)
         self.started_at = time.time()
+        # Bound to a run id in run(); until then nothing is recorded, which is
+        # what a bare Orchestrator in a test should do.
+        self.artifacts = Artifacts(config.config_dir, 0, enabled=False)
         # Set once a memory failure has been reported, so a server that is down
         # for a twenty-ticket run logs once rather than twenty times.
         self._memory_warned = False
@@ -411,6 +417,16 @@ class Orchestrator:
         self.store.set_run_status(run_id, RUN_RUNNING)
         self.store.log(run_id, "Loop started.", kind="lifecycle")
 
+        self.artifacts = Artifacts(self.config.config_dir, run_id)
+        if self.artifacts.failure:
+            # Reported, not raised: losing the record is not losing the work.
+            self.store.log(
+                run_id,
+                f"Step artifacts disabled — {self.artifacts.failure}",
+                level="warn",
+                kind="lifecycle",
+            )
+
         try:
             while True:
                 self._honor_control(run_id)
@@ -490,11 +506,18 @@ class Orchestrator:
         retrieved = self._retrieve_context(run_id, ticket)
         failure_context = ""
 
+        # The tree before this ticket touched anything, so review sees this
+        # ticket's changes and not the uncommitted work of every ticket before
+        # it. Taken per ticket rather than per attempt on purpose: a retry is
+        # judged on everything the ticket has accumulated, which is what will
+        # actually be committed.
+        baseline = self._snapshot()
+
         while ticket.attempts < self.config.loop.max_attempts:
             ticket.attempts += 1
             self.store.update_ticket(run_id, ticket)
 
-            outcome = self._attempt(run_id, ticket, failure_context, retrieved)
+            outcome = self._attempt(run_id, ticket, failure_context, retrieved, baseline)
 
             if outcome.blocked:
                 ticket.status = TICKET_BLOCKED
@@ -541,7 +564,12 @@ class Orchestrator:
             raise Stopped()
 
     def _attempt(
-        self, run_id: int, ticket: Ticket, failure_context: str, retrieved: str = ""
+        self,
+        run_id: int,
+        ticket: Ticket,
+        failure_context: str,
+        retrieved: str = "",
+        baseline: str = "",
     ) -> StepResult:
         # --- BUILD ---------------------------------------------------
         step_id = self.store.start_step(run_id, ticket.ticket_id, "build")
@@ -557,7 +585,27 @@ class Orchestrator:
             return StepResult(ok=False, blocked=True, detail=str(exc))
         except ProviderError as exc:
             self.store.end_step(step_id, "failed", str(exc))
+            self._record_step(ticket, "build", "failed", {"error": str(exc)})
             return StepResult(ok=False, detail=f"executor unavailable: {exc}")
+
+        self._record_call(ticket, "build", "executor", completion)
+
+        # A response cut off at the output limit parses cleanly — the fence the
+        # model opened is simply never closed, or closes around half a
+        # function. Applying it writes a file that is syntactically wrong for a
+        # reason no reviewer would guess from the diff, so nothing is written
+        # and the attempt is spent instead.
+        if completion.truncated:
+            detail = (
+                "Your previous response was cut off at the output limit, so no "
+                "files were written. Emit the same implementation in fewer "
+                "output tokens — fewer files per response, no restated context "
+                "— or reply BLOCKED: if the ticket cannot be implemented "
+                "within that budget."
+            )
+            self.store.end_step(step_id, "failed", completion.text[:20000])
+            return StepResult(ok=False, detail=detail)
+
         self.store.end_step(step_id, "ok", completion.text[:20000])
 
         parsed = parse_output(completion.text)
@@ -590,6 +638,12 @@ class Orchestrator:
             self.store.end_step(step_id, "failed", str(exc))
             return StepResult(ok=False, blocked=True, detail=str(exc))
         self.store.end_step(step_id, "ok", "\n".join(written))
+        self._record_step(
+            ticket,
+            "apply",
+            "ok",
+            {"written": written, "rejected": scoped.rejected},
+        )
 
         # --- TESTS ---------------------------------------------------
         # The criteria come from the ticket, never from the executor's own
@@ -601,10 +655,28 @@ class Orchestrator:
                 completion = self._call(
                     run_id,
                     "tester",
-                    tests_prompt(ticket, written),
+                    tests_prompt(
+                        ticket,
+                        written,
+                        test_command=self.config.commands.get("test", ""),
+                        example_test=self._example_test(written),
+                        # The executor already gets this. Without it here, a
+                        # tester that wrote one wrong assertion rewrites the
+                        # same one every attempt, and the ticket burns its
+                        # retries asking the executor to fix code that was
+                        # never broken — and that it cannot fix anyway, since
+                        # the test file is outside its allowed scope.
+                        failure_context=failure_context,
+                    ),
                     max_tokens=self._output_budget("tester"),
                     temperature=0.1,
                 )
+                # Half a test file is worse than no test file: it fails verify
+                # on a syntax error, which reads as the implementation being
+                # broken. Discard it and let review check the criteria instead
+                # — the same trade the handler below already makes.
+                if completion.truncated:
+                    raise ValueError("tester hit its output limit; partial tests discarded")
                 test_parsed = enforce_scope(
                     parse_output(completion.text),
                     ticket.allowed_files + ["**/test_*.py", "**/*_test.*", "**/*.test.*", "tests/**"],
@@ -615,10 +687,21 @@ class Orchestrator:
                 self.store.end_step(
                     step_id, "ok", "\n".join(e.path for e in test_parsed.edits)
                 )
+                self._record_call(
+                    ticket,
+                    "tests",
+                    "tester",
+                    completion,
+                    extra={
+                        "written": [e.path for e in test_parsed.edits],
+                        "rejected": test_parsed.rejected,
+                    },
+                )
             except (ProviderError, ValueError) as exc:
                 # A missing test is a weaker result, not a failed ticket — the
                 # criteria are still checked by review.
                 self.store.end_step(step_id, "failed", str(exc))
+                self._record_step(ticket, "tests", "failed", {"error": str(exc)})
                 self.store.log(
                     run_id,
                     f"{ticket.ticket_id}: test authoring failed ({exc}); continuing to verify.",
@@ -628,7 +711,15 @@ class Orchestrator:
 
         # --- VERIFY --------------------------------------------------
         for name in ("lint", "typecheck", "test"):
-            result = self._shell(run_id, name, self.config.commands.get(name, ""))
+            command = self.config.commands.get(name, "")
+            result = self._shell(run_id, name, command)
+            self._record_step(
+                ticket,
+                f"verify-{name}",
+                "ok" if result.ok else "failed",
+                {"command": command},
+                raw=result.detail,
+            )
             if not result.ok:
                 return StepResult(
                     ok=False,
@@ -636,7 +727,7 @@ class Orchestrator:
                 )
 
         # --- REVIEW --------------------------------------------------
-        diff = self._diff()
+        diff = self._diff(baseline)
         step_id = self.store.start_step(run_id, ticket.ticket_id, "review")
         try:
             completion = self._call(
@@ -650,10 +741,29 @@ class Orchestrator:
             self.store.end_step(step_id, "failed", str(exc))
             return StepResult(ok=False, detail=f"reviewer unavailable: {exc}")
 
-        verdict = completion.text.strip()
-        self.store.end_step(step_id, "ok", verdict[:20000])
+        # An approval is inferred from the absence of REJECT, so a verdict that
+        # stops mid-sentence passes the ticket by default. Truncation must not
+        # be the cheapest route to approval.
+        if completion.truncated:
+            self.store.end_step(step_id, "failed", completion.text[:20000])
+            return StepResult(
+                ok=False,
+                detail="reviewer hit its output limit; the verdict was incomplete "
+                "and was not treated as approval",
+            )
 
-        if verdict.upper().startswith("REJECT"):
+        approved, verdict = parse_verdict(completion.text)
+        self.store.end_step(step_id, "ok" if approved else "failed", verdict[:20000])
+        self._record_call(
+            ticket,
+            "review",
+            "reviewer",
+            completion,
+            status="ok" if approved else "failed",
+            extra={"approved": approved},
+        )
+
+        if not approved:
             return StepResult(ok=False, detail=f"review rejected the diff:\n{verdict}")
 
         self.store.log(
@@ -683,38 +793,170 @@ class Orchestrator:
 
     # ------------------------------------------------------------------
 
+    def _record_step(
+        self,
+        ticket: Ticket,
+        name: str,
+        status: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        raw: str = "",
+    ) -> None:
+        self.artifacts.record(
+            ticket.ticket_id,
+            ticket.attempts,
+            name,
+            {"status": status, **(payload or {})},
+            raw=raw,
+        )
+
+    def _record_call(
+        self,
+        ticket: Ticket,
+        name: str,
+        role: str,
+        completion: Completion,
+        *,
+        status: str = "ok",
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Record a model call — cost, how it ended, and what it said.
+
+        `finish_reason` and `truncated` are here rather than only in the log
+        because "the model ran out of output budget" and "the model chose to
+        stop" produce identical-looking files on disk, and telling them apart
+        after the fact is most of diagnosing a bad ticket.
+        """
+        self._record_step(
+            ticket,
+            name,
+            status,
+            {
+                "role": role,
+                "model": completion.model or self.config.model_name_for(role),
+                "finish_reason": completion.finish_reason,
+                "truncated": completion.truncated,
+                "usage": {
+                    "prompt_tokens": completion.usage.prompt_tokens,
+                    "completion_tokens": completion.usage.completion_tokens,
+                    "estimated": completion.usage.estimated,
+                },
+                **(extra or {}),
+            },
+            raw=completion.text,
+        )
+
+    # Where tests live, in rough order of how conventional the location is.
+    _TEST_GLOBS = ("tests/**/*", "test/**/*", "**/test_*.*", "**/*_test.*", "**/*.test.*")
+    # Enough to establish framework, imports, and assertion style; not so much
+    # that a large suite crowds the criteria out of the tester's window.
+    _EXAMPLE_TEST_CHARS = 2000
+
+    def _example_test(self, exclude: list[str]) -> tuple[str, str] | None:
+        """An existing test file for the tester to imitate, if the repo has one.
+
+        Framework is not a preference here, it is a hard constraint: a pytest
+        file under `unittest discover` collects zero tests. One real example
+        settles it more reliably than any instruction.
+
+        Files this ticket just wrote are excluded — handing back the tester's
+        own previous attempt would launder a wrong guess into a convention.
+        """
+        written = {p.replace("\\", "/") for p in exclude}
+        for pattern in self._TEST_GLOBS:
+            for path in sorted(self.config.root.glob(pattern)):
+                if not path.is_file() or path.suffix in ("", ".pyc"):
+                    continue
+                relative = path.relative_to(self.config.root).as_posix()
+                if relative in written:
+                    continue
+                try:
+                    content = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if not content.strip():
+                    continue
+                return relative, content[: self._EXAMPLE_TEST_CHARS]
+        return None
+
     def _output_budget(self, role: str) -> int:
         provider = self.config.provider_for(role)
         return provider.capabilities().max_output_tokens
 
-    def _diff(self) -> str:
-        """Working-tree diff, including untracked files.
+    # A scratch index, so snapshotting never disturbs whatever the user has
+    # staged. Inside .git/ so it is invisible to the working tree and to any
+    # diff computed from it.
+    _SNAPSHOT_INDEX = "forge-snapshot-index"
 
-        `git add -N` registers new files with the index without staging their
-        contents, so a ticket that creates a file still shows up in the diff the
-        reviewer reads. Without it, brand-new code would be reviewed as if it
-        did not exist.
+    def _git(self, *args: str, index: str = "") -> subprocess.CompletedProcess[str]:
+        env = None
+        if index:
+            env = {**os.environ, "GIT_INDEX_FILE": index}
+        return subprocess.run(
+            ["git", *args],
+            cwd=self.config.root,
+            capture_output=True,
+            text=True,
+            # A diff of source code routinely carries non-ASCII. Decoding it
+            # with the host locale would fail on exactly the tickets that touch
+            # user-facing strings.
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            env=env,
+        )
+
+    def _snapshot(self) -> str:
+        """Content hash of the working tree right now, as a git tree object.
+
+        Written through a throwaway index so the user's staged changes are
+        never touched, and recorded as a tree rather than a commit so nothing
+        lands in history or on a ref. `git add -A` brings in untracked files —
+        a ticket that creates a file must show up in the diff — and honours
+        `.gitignore`, which is what keeps build output and this project's own
+        artifacts out of what the reviewer reads.
+
+        Returns "" when git is unavailable or the snapshot fails; callers fall
+        back to the whole-tree diff rather than reviewing nothing.
+        """
+        index = str(self.config.root / ".git" / self._SNAPSHOT_INDEX)
+        try:
+            Path(index).unlink(missing_ok=True)
+            if self._git("add", "-A", index=index).returncode != 0:
+                return ""
+            result = self._git("write-tree", index=index)
+            return result.stdout.strip() if result.returncode == 0 else ""
+        except (FileNotFoundError, OSError):
+            return ""
+
+    def _diff(self, since: str = "") -> str:
+        """The changeset a reviewer should judge.
+
+        Scoped to one ticket when `since` is a tree captured before it started.
+        That distinction is load-bearing: `autoCommit` is off by default, so a
+        verified ticket's work stays in the working tree, and a whole-tree diff
+        shows every earlier ticket's changes to the reviewer of the current
+        one. It then correctly rejects them as outside this ticket's allowed
+        files — the executor is blamed for work it did not do, and a backlog
+        fails from its second ticket onward.
+
+        Anything the ticket did not touch appears in both trees and cancels
+        out, which also keeps stale build output and leftovers from a failed
+        earlier attempt out of the reviewer's view.
         """
         try:
-            subprocess.run(
-                ["git", "add", "-N", "."],
-                cwd=self.config.root,
-                capture_output=True,
-                check=False,
-            )
-            result = subprocess.run(
-                ["git", "diff"],
-                cwd=self.config.root,
-                capture_output=True,
-                text=True,
-                # A diff of source code routinely carries non-ASCII. Decoding it
-                # with the host locale would fail on exactly the tickets that
-                # touch user-facing strings.
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
-            return result.stdout
+            if since:
+                current = self._snapshot()
+                if current:
+                    result = self._git("diff-tree", "-p", since, current)
+                    if result.returncode == 0:
+                        return result.stdout
+
+            # No baseline, or git refused one: fall back to the whole tree.
+            # `git add -N` registers new files with the index without staging
+            # their contents, so a ticket that creates a file still appears.
+            self._git("add", "-N", ".")
+            return self._git("diff").stdout
         except FileNotFoundError:
             return "(git not available; diff unavailable)"
 

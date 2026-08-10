@@ -121,7 +121,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         from .providers import build_provider
 
         try:
-            provider = build_provider(name, config.models[name])
+            # Same block the loop will use, cwd included — doctor that probes a
+            # differently-configured provider than the run is not a check.
+            provider = build_provider(name, config.model_block(name))
         except Exception as exc:  # noqa: BLE001 - report, don't abort the sweep
             print(f"  {name}: FAIL (config) {exc}")
             failures += 1

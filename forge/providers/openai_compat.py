@@ -53,7 +53,7 @@ class OpenAICompatProvider(Provider):
             **self.extra_body,
         }
         if self.capabilities().supports_temperature:
-            payload["temperature"] = temperature
+            payload["temperature"] = self.temperature(temperature)
 
         data = post_json(
             f"{self.base_url}/chat/completions",

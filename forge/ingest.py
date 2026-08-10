@@ -58,6 +58,13 @@ Rules:
 - Acceptance criteria are assertions that would FAIL if the behavior were
   wrong. "Returns Err(ParseError) for input missing a closing brace" is a
   criterion. "Handles malformed input gracefully" is not.
+- Write every instruction as the behavior you want, not the behavior you
+  forbid. A local executor follows "reproduce the existing `shout` function
+  exactly as it appears in the file, character for character" far more
+  reliably than "do not modify `shout`" — a negative constraint describes
+  everything except what to do, and the model has to infer the target from its
+  absence. Reserve prohibitions for scope, where the allowed-files list
+  enforces them mechanically rather than by persuasion.
 - Mark a ticket "claude-only" when it touches authentication, authorization,
   secrets, concurrency, shared mutable state, migrations, public API surface,
   cryptography, or payment flows — or when the right approach is still an open

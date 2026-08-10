@@ -8,8 +8,14 @@ Two constraints shaped it:
 
 **Stdlib only.** The daemon's no-dependency promise is load-bearing — an
 overnight run must not fail to start because a package is missing. So this is a
-minimal JSON-RPC client over MCP's Streamable HTTP transport rather than the
-MCP SDK.
+minimal JSON-RPC client over MCP rather than the MCP SDK.
+
+**Two transports, because one server is reached two ways.** `memory.url` speaks
+Streamable HTTP to a palace already listening somewhere; `memory.command` runs
+one as a child process and speaks newline-delimited JSON-RPC over its stdin.
+MemPalace serves both — `mempalace-mcp` for stdio, `mempalace serve` for HTTP —
+and which you want follows from where the palace sits. Sharing a machine with
+the daemon, `command` is the direct route: no port, no listener, no token.
 
 **MemPalace's tool surface moves between versions**, as this project's own
 setup docs warn. So nothing here hardcodes a tool name. The client asks the
@@ -30,11 +36,18 @@ records anything.
 
 from __future__ import annotations
 
+import atexit
 import json
+import os
+import queue
 import re
+import subprocess
+import threading
+import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Any
 
 from .secrets import find_secrets
@@ -104,92 +117,58 @@ class MemoryUnreachable(MemoryUnavailable):
 
 
 # ----------------------------------------------------------------------
-# Minimal MCP client (Streamable HTTP transport)
+# Minimal MCP client — transport-agnostic half
 # ----------------------------------------------------------------------
 
 
-class MCPClient:
-    """Just enough MCP to initialize, list tools, and call one."""
+class _MCPSession:
+    """The MCP conversation, with the transport left abstract.
 
-    def __init__(self, url: str, *, timeout: int = 30, headers: dict[str, str] | None = None):
-        self.url = url.rstrip("/")
+    Streamable HTTP reaches a server already listening somewhere; stdio reaches
+    one the daemon starts itself. MemPalace offers both, so the choice is about
+    placement rather than capability: stdio for the ordinary case where memory
+    and the daemon share a machine, HTTP for a palace running `mempalace serve`
+    on another.
+
+    Everything above the wire — the version handshake, tool discovery, tool
+    calls — is identical either way, so it lives here and each transport
+    supplies only `_rpc` and `_notify`.
+    """
+
+    def __init__(self, *, timeout: int = 30):
         self.timeout = timeout
-        self.extra_headers = headers or {}
-        self.session_id: str | None = None
         self.protocol_version: str | None = None
         self._next_id = 0
 
-    # ------------------------------------------------------------------
-
-    def _headers(self) -> dict[str, str]:
-        headers = {
-            "Content-Type": "application/json",
-            # Streamable HTTP may answer with either shape; accept both.
-            "Accept": "application/json, text/event-stream",
-            **self.extra_headers,
-        }
-        if self.session_id:
-            headers["Mcp-Session-Id"] = self.session_id
-        if self.protocol_version:
-            headers["MCP-Protocol-Version"] = self.protocol_version
-        return headers
-
     def _rpc(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        self._next_id += 1
-        request_id = self._next_id
-        payload = {"jsonrpc": "2.0", "id": request_id, "method": method}
-        if params is not None:
-            payload["params"] = params
-
-        request = urllib.request.Request(
-            self.url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=self._headers(),
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                # The server assigns a session on initialize; echo it thereafter.
-                session = response.headers.get("Mcp-Session-Id")
-                if session:
-                    self.session_id = session
-                body = response.read().decode("utf-8")
-                content_type = response.headers.get("Content-Type", "")
-        except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read().decode("utf-8")[:400]
-            except Exception:  # noqa: BLE001 - error body is best-effort
-                pass
-            if exc.code >= 500:
-                raise MemoryUnreachable(f"{self.url} returned {exc.code}: {detail}") from exc
-            raise MemoryUnavailable(f"{self.url} returned {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise MemoryUnreachable(f"could not reach {self.url}: {exc.reason}") from exc
-        except TimeoutError as exc:
-            raise MemoryUnreachable(
-                f"timed out after {self.timeout}s reaching {self.url}"
-            ) from exc
-
-        message = _parse_response(body, content_type, request_id)
-        if "error" in message:
-            error = message["error"]
-            raise MemoryUnavailable(f"{method} failed: {error.get('message')} ({error.get('code')})")
-        return message.get("result") or {}
+        raise NotImplementedError
 
     def _notify(self, method: str) -> None:
-        """Fire-and-forget notification (no id, no response expected)."""
-        request = urllib.request.Request(
-            self.url,
-            data=json.dumps({"jsonrpc": "2.0", "method": method}).encode("utf-8"),
-            headers=self._headers(),
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout):
-                pass
-        except Exception:  # noqa: BLE001 - a dropped notification is not fatal
-            pass
+        raise NotImplementedError
+
+    def close(self) -> None:
+        """Release whatever the transport holds. Safe to call twice."""
+
+    @property
+    def endpoint(self) -> str:
+        """How this connection is named in errors and `forge doctor`."""
+        raise NotImplementedError
+
+    def _payload(self, method: str, params: dict[str, Any] | None) -> tuple[dict[str, Any], int]:
+        self._next_id += 1
+        payload: dict[str, Any] = {"jsonrpc": "2.0", "id": self._next_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        return payload, self._next_id
+
+    @staticmethod
+    def _result_or_raise(message: dict[str, Any], method: str) -> dict[str, Any]:
+        if "error" in message:
+            error = message["error"]
+            raise MemoryUnavailable(
+                f"{method} failed: {error.get('message')} ({error.get('code')})"
+            )
+        return message.get("result") or {}
 
     # ------------------------------------------------------------------
 
@@ -228,6 +207,235 @@ class MCPClient:
         if result.get("isError"):
             raise MemoryUnavailable(f"tool {name!r} reported an error: {_content_text(result)[:300]}")
         return _content_text(result)
+
+
+# ----------------------------------------------------------------------
+# Streamable HTTP transport
+# ----------------------------------------------------------------------
+
+
+class MCPClient(_MCPSession):
+    """MCP over Streamable HTTP — a palace reachable across a network."""
+
+    def __init__(self, url: str, *, timeout: int = 30, headers: dict[str, str] | None = None):
+        super().__init__(timeout=timeout)
+        self.url = url.rstrip("/")
+        self.extra_headers = headers or {}
+        self.session_id: str | None = None
+
+    @property
+    def endpoint(self) -> str:
+        return self.url
+
+    # ------------------------------------------------------------------
+
+    def _headers(self) -> dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            # Streamable HTTP may answer with either shape; accept both.
+            "Accept": "application/json, text/event-stream",
+            **self.extra_headers,
+        }
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        if self.protocol_version:
+            headers["MCP-Protocol-Version"] = self.protocol_version
+        return headers
+
+    def _rpc(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload, request_id = self._payload(method, params)
+
+        request = urllib.request.Request(
+            self.url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=self._headers(),
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                # The server assigns a session on initialize; echo it thereafter.
+                session = response.headers.get("Mcp-Session-Id")
+                if session:
+                    self.session_id = session
+                body = response.read().decode("utf-8")
+                content_type = response.headers.get("Content-Type", "")
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8")[:400]
+            except Exception:  # noqa: BLE001 - error body is best-effort
+                pass
+            if exc.code >= 500:
+                raise MemoryUnreachable(f"{self.url} returned {exc.code}: {detail}") from exc
+            raise MemoryUnavailable(f"{self.url} returned {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise MemoryUnreachable(f"could not reach {self.url}: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise MemoryUnreachable(
+                f"timed out after {self.timeout}s reaching {self.url}"
+            ) from exc
+
+        return self._result_or_raise(_parse_response(body, content_type, request_id), method)
+
+    def _notify(self, method: str) -> None:
+        """Fire-and-forget notification (no id, no response expected)."""
+        request = urllib.request.Request(
+            self.url,
+            data=json.dumps({"jsonrpc": "2.0", "method": method}).encode("utf-8"),
+            headers=self._headers(),
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout):
+                pass
+        except Exception:  # noqa: BLE001 - a dropped notification is not fatal
+            pass
+
+# ----------------------------------------------------------------------
+# stdio transport
+# ----------------------------------------------------------------------
+
+
+class StdioMCPClient(_MCPSession):
+    """MCP over a child process's stdin/stdout.
+
+    The transport most MCP servers actually ship, MemPalace included: newline-
+    delimited JSON-RPC, one message per line, no framing beyond that.
+
+    Reading needs a thread rather than `select`, because `select` does not work
+    on pipes on Windows and the daemon runs there. stderr gets a thread of its
+    own for a duller reason: an undrained stderr pipe fills its OS buffer and
+    the child blocks forever, which would look exactly like a hung palace. The
+    tail it keeps is what turns "the server exited" into a message naming why.
+    """
+
+    def __init__(
+        self,
+        command: list[str],
+        *,
+        timeout: int = 30,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+    ):
+        super().__init__(timeout=timeout)
+        self.command = list(command)
+        self.cwd = cwd
+        self.env = env
+        self._proc: subprocess.Popen[str] | None = None
+        self._lines: queue.Queue[str | None] = queue.Queue()
+        self._errors: deque[str] = deque(maxlen=20)
+
+    @property
+    def endpoint(self) -> str:
+        return " ".join(self.command)
+
+    # ------------------------------------------------------------------
+
+    def _ensure_process(self) -> subprocess.Popen[str]:
+        if self._proc is not None and self._proc.poll() is None:
+            return self._proc
+        try:
+            proc = subprocess.Popen(  # noqa: S603 - argv list, never shell=True
+                self.command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                # Pinned rather than inherited: a palace entry containing an em
+                # dash must not die on a cp1252 console, same as the providers.
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                cwd=self.cwd,
+                env=self.env,
+            )
+        except (OSError, ValueError) as exc:
+            raise MemoryUnreachable(f"could not start {self.endpoint!r}: {exc}") from exc
+
+        self._proc = proc
+        threading.Thread(target=self._pump_stdout, args=(proc,), daemon=True).start()
+        threading.Thread(target=self._pump_stderr, args=(proc,), daemon=True).start()
+        atexit.register(self.close)
+        return proc
+
+    def _pump_stdout(self, proc: subprocess.Popen[str]) -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            self._lines.put(line)
+        # Sentinel: readers waiting on a reply must learn the server is gone
+        # rather than sit until their timeout expires.
+        self._lines.put(None)
+
+    def _pump_stderr(self, proc: subprocess.Popen[str]) -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            self._errors.append(line.rstrip())
+
+    def _stderr_tail(self) -> str:
+        tail = " / ".join(self._errors)
+        return f" stderr: {tail[-400:]}" if tail else ""
+
+    def _send(self, payload: dict[str, Any]) -> None:
+        proc = self._ensure_process()
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(json.dumps(payload) + "\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise MemoryUnreachable(
+                f"{self.endpoint} closed its input: {exc}{self._stderr_tail()}"
+            ) from exc
+
+    def _rpc(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload, request_id = self._payload(method, params)
+        self._send(payload)
+
+        deadline = time.monotonic() + self.timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MemoryUnreachable(
+                    f"timed out after {self.timeout}s waiting for {method} "
+                    f"from {self.endpoint}{self._stderr_tail()}"
+                )
+            try:
+                line = self._lines.get(timeout=remaining)
+            except queue.Empty:
+                continue
+            if line is None:
+                code = self._proc.poll() if self._proc else None
+                raise MemoryUnreachable(
+                    f"{self.endpoint} exited (code {code}) before answering "
+                    f"{method}{self._stderr_tail()}"
+                )
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                # Servers that log to stdout are out of spec but common. A line
+                # that is not JSON cannot be a reply, so it is not our problem.
+                continue
+            # Notifications and server-initiated requests share the stream;
+            # anything not carrying our id belongs to someone else.
+            if isinstance(message, dict) and message.get("id") == request_id:
+                return self._result_or_raise(message, method)
+
+    def _notify(self, method: str) -> None:
+        try:
+            self._send({"jsonrpc": "2.0", "method": method})
+        except MemoryUnavailable:
+            pass  # a dropped notification is not fatal
+
+    def close(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+            proc.terminate()
+            proc.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            proc.kill()
 
 
 def _parse_response(body: str, content_type: str, request_id: int) -> dict[str, Any]:
@@ -280,6 +488,24 @@ def _content_text(result: dict[str, Any]) -> str:
     return "\n".join(parts).strip()
 
 
+def _as_argv(value: Any) -> list[str]:
+    """Read `memory.command` as an argv list.
+
+    A list is canonical and the only form that survives a Windows path with
+    spaces intact. A bare string is accepted because it is what people type,
+    but it is split on whitespace only — no shell quoting, because nothing here
+    ever reaches a shell and pretending otherwise would invite a config that
+    looks quoted and is not.
+    """
+    if not value:
+        return []
+    if isinstance(value, str):
+        return value.split()
+    if isinstance(value, (list, tuple)):
+        return [str(part) for part in value]
+    raise MemoryUnavailable(f"memory.command must be a list or a string, got {type(value).__name__}")
+
+
 # ----------------------------------------------------------------------
 # MemPalace-facing wrapper
 # ----------------------------------------------------------------------
@@ -288,6 +514,20 @@ def _content_text(result: dict[str, Any]) -> str:
 @dataclass
 class MemorySettings:
     url: str = ""
+    # argv for a stdio MCP server, run as a child process. The alternative to
+    # `url`, not an addition to it: a stdio server has no address, and an HTTP
+    # one is already running. When both are set `command` wins, and `describe`
+    # says which transport is live so the ignored key is visible rather than
+    # silently dropped.
+    command: list[str] = field(default_factory=list)
+    # Bearer token for an HTTP palace. `mempalace serve` requires one on any
+    # non-loopback bind, so without this the remote case cannot connect at all.
+    # `tokenEnv` names an environment variable and is the form to prefer:
+    # config.json is a file this project tells you to commit, and a token in it
+    # is a credential in your history. Same reasoning as `apiKeyEnv` on models.
+    token: str = ""
+    token_env: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
     room: str = ""
     enabled: bool = True
     # Name the search tool explicitly to skip discovery, for a server whose
@@ -316,6 +556,10 @@ class MemorySettings:
         data = data or {}
         return cls(
             url=str(data.get("url", "")),
+            command=_as_argv(data.get("command")),
+            token=str(data.get("token", "")),
+            token_env=str(data.get("tokenEnv", "")),
+            headers={str(k): str(v) for k, v in (data.get("headers") or {}).items()},
             room=str(data.get("room", "") or room),
             enabled=bool(data.get("enabled", True)),
             search_tool=str(data.get("searchTool", "")),
@@ -330,7 +574,28 @@ class MemorySettings:
 
     @property
     def configured(self) -> bool:
-        return bool(self.url) and self.enabled
+        return bool(self.url or self.command) and self.enabled
+
+    @property
+    def transport(self) -> str:
+        return "stdio" if self.command else "http"
+
+    def request_headers(self) -> dict[str, str]:
+        """Headers for an HTTP palace, with the bearer token resolved.
+
+        An explicitly configured Authorization header wins over the token
+        fields: someone who wrote the header by hand meant it.
+        """
+        headers = dict(self.headers)
+        token = os.environ.get(self.token_env, "") if self.token_env else self.token
+        if token and not any(k.lower() == "authorization" for k in headers):
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    @property
+    def target(self) -> str:
+        """What this memory points at, for logs and `forge doctor`."""
+        return " ".join(self.command) if self.command else self.url
 
     @property
     def writes_enabled(self) -> bool:
@@ -342,7 +607,7 @@ class MemoryClient:
 
     def __init__(self, settings: MemorySettings):
         self.settings = settings
-        self._client: MCPClient | None = None
+        self._client: _MCPSession | None = None
         self._tool: dict[str, Any] | None = None
         self._write_tool: dict[str, Any] | None = None
         self._available_tools: list[str] = []
@@ -357,12 +622,24 @@ class MemoryClient:
     def _ensure_connected(self) -> None:
         if self._client is not None:
             return
-        client = MCPClient(self.settings.url, timeout=self.settings.timeout)
+        client: _MCPSession
+        if self.settings.command:
+            client = StdioMCPClient(self.settings.command, timeout=self.settings.timeout)
+        else:
+            client = MCPClient(
+                self.settings.url,
+                timeout=self.settings.timeout,
+                headers=self.settings.request_headers(),
+            )
         client.connect()
         tools = client.list_tools()
         self._available_tools = [str(t.get("name", "")) for t in tools]
         self._tool = _pick_search_tool(tools, self.settings.search_tool)
         if self._tool is None:
+            # Under stdio this connection is a live child process, so giving up
+            # has to reap it. Leaking one per attempt would leave a run trailing
+            # orphaned palaces for as long as it kept retrying.
+            client.close()
             raise MemoryUnavailable(
                 "no search-like tool found on the memory server. "
                 f"It exposes: {', '.join(self._available_tools) or '(none)'}. "
@@ -379,7 +656,10 @@ class MemoryClient:
         try:
             self._ensure_connected()
         except MemoryUnavailable as exc:
-            return f"FAIL memory url={self.settings.url} error={exc}"
+            return (
+                f"FAIL memory transport={self.settings.transport} "
+                f"target={self.settings.target} error={exc}"
+            )
 
         if not self.settings.write:
             write_state = "write=off"
@@ -391,10 +671,17 @@ class MemoryClient:
             write_state = f"write=ON({self._write_tool.get('name')})"
 
         return (
-            f"ok memory url={self.settings.url} room={self.settings.room or '(unscoped)'} "
+            f"ok memory transport={self.settings.transport} target={self.settings.target} "
+            f"room={self.settings.room or '(unscoped)'} "
             f"read={self._tool.get('name')} {write_state} "
             f"available={', '.join(self._available_tools)}"
         )
+
+    def close(self) -> None:
+        """Shut down the transport. A no-op over HTTP; reaps the child on stdio."""
+        client, self._client = self._client, None
+        if client is not None:
+            client.close()
 
     def search(self, query: str) -> str:
         """Return relevant memory as text, or "" when there is none.

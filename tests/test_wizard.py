@@ -131,6 +131,22 @@ class TestProbesNeverRaise(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("kaboom", detail)
 
+    def test_one_answer_routes_to_the_right_transport(self):
+        # MemPalace is stdio-only, so a bare command is the common answer and
+        # must not be mistaken for a malformed URL.
+        self.assertEqual(
+            wizard.memory_block("mempalace-mcp"), {"command": ["mempalace-mcp"], "room": ""}
+        )
+        self.assertEqual(
+            wizard.memory_block("http://h:8787/mcp"), {"url": "http://h:8787/mcp", "room": ""}
+        )
+
+    def test_a_command_is_not_rejected_by_url_validation(self):
+        with mock.patch("forge.wizard.MemoryClient") as client:
+            client.from_config.return_value.describe.return_value = "ok memory transport=stdio"
+            ok, _ = wizard.probe_memory("mempalace-mcp", room="")
+        self.assertTrue(ok)
+
 
 class TestEvidenceGathering(unittest.TestCase):
     def test_a_repo_with_nothing_to_read_yields_no_evidence(self):

@@ -63,12 +63,18 @@ exactly right. On the Mac, everything is local except two URLs:
   "commands": {
     "test": "xcodebuild test -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 16'"
   },
-  "memory": { "url": "http://forge-host:8787/mcp" }
+  "memory": { "url": "http://forge-host:8765/mcp" }
 }
 ```
 
 `claude-cli` shells out to the `claude` you are already signed into on that Mac,
 so planning and review run on your existing subscription with no API key.
+
+The memory entry uses `url` here because this is the split case: the palace is
+on the GPU host, so it runs `mempalace serve` and the Mac connects over HTTP.
+That listener wants a bearer token — see §1.4. Running the palace on the Mac
+instead replaces the whole entry with `"command": ["mempalace-mcp"]`: no
+listener, no port, no token.
 
 **A sleeping laptop pauses the run.** For an overnight run use
 `caffeinate -i forge go --no-ui`, or run the daemon on the GPU host against a
@@ -204,24 +210,91 @@ DNS record instead of an edit in every repo's `config.json`.
 
 ### 1.4 MemPalace
 
-Install MemPalace on the host and ingest whatever project history you already
-have. **Verify the current install and transport instructions against the
-MemPalace docs** — this project moved fast through 2026 and its MCP surface has
-changed across versions.
+MemPalace speaks MCP two ways, and which one you want follows from where the
+palace sits relative to the daemon. Verified against MemPalace 3.6.0.
 
-Two things to establish before wiring clients to it:
+| | transport | when |
+|---|---|---|
+| `mempalace-mcp` | stdio (what the image's `mcp` CMD runs) | palace and daemon on one machine |
+| `mempalace serve` | Streamable HTTP, bearer token, optional TLS | palace on another machine |
 
-1. **Transport.** MemPalace exposes an MCP server, but if it defaults to stdio it
-   will only work for a client on the same machine. This pipeline needs it
-   reachable from your Mac, so you need either a network transport (HTTP/SSE) or
-   an MCP proxy fronting the stdio server. Confirm which your version supports.
-2. **Bind address.** Same reasoning and same address as Ollama — one interface,
-   not `0.0.0.0`. A memory store is if anything the more sensitive of the two:
-   it holds your project's decisions, and nothing in front of it asks who is
-   reading them.
+Its published image is `ghcr.io/mempalace/mempalace:latest`, so there is
+nothing to build.
 
-The palace database stays here, on the host, permanently. One authoritative copy.
-Do not sync it, do not check it into a repo, do not keep a second copy on the Mac.
+#### Same machine as the daemon — the simple case
+
+A stdio server is spoken to through its stdin, so if the palace and the repo
+share a machine there is no server to stand up and no endpoint to secure. Point
+`memory.command` at it and the daemon runs it as a child process:
+
+```json
+"memory": {
+  "command": ["mempalace-mcp", "--palace", "/path/to/palace"],
+  "room": "your-project"
+}
+```
+
+Or against the published image, with the palace in a named volume:
+
+```json
+"memory": {
+  "command": ["docker", "run", "--rm", "-i",
+              "-v", "mempalace-data:/data",
+              "ghcr.io/mempalace/mempalace:latest"],
+  "room": "your-project"
+}
+```
+
+`-i` is load-bearing — JSON-RPC needs stdin held open, and without it the
+server exits before the handshake completes.
+
+`forge doctor` confirms it: it starts the process, reports the tools it found,
+or fails with the server's own stderr.
+
+#### Different machines — `mempalace serve`
+
+MemPalace serves MCP over Streamable HTTP itself. No proxy:
+
+```bash
+mempalace serve --host <bind-addr> --port 8765
+```
+
+The endpoint is `/mcp`, which is the transport the daemon speaks:
+
+```json
+"memory": { "url": "http://forge-host:8765/mcp" }
+```
+
+Unlike Ollama, this listener authenticates. A non-loopback bind auto-generates
+a bearer token and stores it `0600` under `~/.mempalace/server/`; `--token`
+sets one explicitly. Give it to the daemon by naming the environment variable
+that holds it — never by pasting it into `config.json`, which this project
+tells you to commit:
+
+```json
+"memory": {
+  "url": "http://forge-host:8765/mcp",
+  "tokenEnv": "MEMPALACE_TOKEN"
+}
+```
+
+`memory.headers` takes arbitrary headers if you need something else. Two flags
+worth knowing:
+
+- `--read-only` hides and refuses every mutating tool. If the daemon is only
+  retrieving — the default, since write-back is opt-in — this is the right way
+  to serve it, and it removes `mempalace_delete_drawer` from the surface
+  entirely rather than trusting tool selection to avoid it.
+- `--allow-insecure` permits a non-loopback bind with no token. Only behind a
+  proxy that terminates auth. Traffic is plaintext without `--tls-cert` /
+  `--tls-key`.
+
+Same bind rule as Ollama: the narrowest interface that your daemon still
+reaches, never `0.0.0.0` out of convenience.
+
+The palace database stays on one machine, permanently. One authoritative copy.
+Do not sync it, do not check it into a repo, do not keep a second copy on the
+client.
 
 ### 1.5 Verify the host as a whole
 
@@ -530,8 +603,19 @@ that gap.
 
 ```json
 "room": "image-marquee",
-"memory": { "url": "http://forge-host:8787/mcp" }
+"memory": { "command": ["mempalace-mcp"] }
 ```
+
+Two transports, and you pick by where the palace lives:
+
+| key | when | what it does |
+|---|---|---|
+| `command` | palace on the daemon's machine | runs MemPalace as a child process, JSON-RPC over its stdin |
+| `url` | palace on another machine | Streamable HTTP to an MCP proxy fronting it (§1.4) |
+
+`command` takes an argv list — a bare string is split on whitespace, with no
+shell quoting, so a path with spaces belongs in list form. Setting both keys is
+not an error but `command` wins; `forge doctor` prints which transport is live.
 
 `room` scopes retrieval and is inherited from the top-level `room` field unless
 you override it inside the block. Other optional keys: `searchTool` (skip
@@ -540,8 +624,8 @@ discovery and name the tool yourself), `limit` (results, default 6),
 `enabled: false` to turn it off without deleting the block.
 
 The daemon speaks MCP directly rather than going through Claude Code, so
-MemPalace must be reachable over HTTP from **whichever machine runs the
-daemon** — the same address Claude Code already uses.
+MemPalace has to be startable — or reachable — from **whichever machine runs
+the daemon**.
 
 **Tool discovery is automatic**, because MemPalace's tool surface changes
 across versions. The client lists the server's tools, picks the one that looks
@@ -550,9 +634,12 @@ will never auto-select a tool whose name suggests it writes. `forge doctor`
 prints what it found:
 
 ```
-memory: ok memory url=http://forge-host:8787/mcp room=image-marquee
+memory: ok memory transport=stdio target=mempalace-mcp room=image-marquee
         read=palace_recall write=off available=palace_write_entry, palace_recall
 ```
+
+A failure names the transport and, under stdio, carries the server's own stderr
+— so a palace that dies on a bad path says so instead of timing out silently.
 
 If it picks the wrong tool, or finds none, set `memory.searchTool` explicitly —
 the doctor output lists every name the server exposes.
@@ -570,7 +657,7 @@ a review correction — and write that to memory.
 
 ```json
 "memory": {
-  "url": "http://forge-host:8787/mcp",
+  "command": ["mempalace-mcp", "--palace", "/path/to/palace"],
   "write": true,
   "dryRun": true
 }
@@ -745,7 +832,7 @@ dashboard is bound off loopback; treat it as a reminder, not a permission slip.
 | `EXECUTOR_UNREACHABLE` | Network path from the daemon's machine to the host, then `OLLAMA_HOST` bind address, then firewall rules |
 | `forge doctor` reports FAIL | The error names the kind — auth, unreachable, or bad response |
 | MCP server missing from `/mcp` | `claude --debug`; restart Claude Code after config changes |
-| MemPalace connects on host but not Mac | Transport is stdio — needs HTTP or a proxy (see 1.4) |
+| MemPalace connects on host but not Mac | Stdio has no address. Either run it on the daemon's machine with `memory.command`, or put an MCP proxy in front (§1.4) |
 | Executor returns `BLOCKED:` | The spec is underspecified. Fix the ticket, do not re-run |
 | Ticket failed after N attempts | Read the `test` step detail — usually a wrong `commands` entry, not a model problem |
 | "rejected out-of-scope edits" in the log | Working as intended. Widen `allowed_files` only if the ticket genuinely needs that file |
@@ -756,7 +843,7 @@ dashboard is bound off loopback; treat it as a reminder, not a permission slip.
 | `forge init` found no verify commands | Nothing in the repo states them — no CI, no Makefile, no contributing guide. Fill them in yourself; §3.1 explains why this field matters most |
 | Detected commands are wrong | It reports which file each came from. If CI is stale, fix `config.json` directly — the loop uses that, not CI |
 | "could not build the planner model" during detection | Detection runs on the planner role, which is configured one question earlier. A failed probe there leaves nothing to ask |
-| `memory: FAIL` in doctor | Wrong URL, or MemPalace not reachable from the daemon's machine |
+| `memory: FAIL` in doctor | Under `command`, the report carries the server's own stderr — read that first; a wrong subcommand shows up as an immediate exit. Under `url`, wrong address or no proxy running |
 | Memory connects but retrieves nothing | Wrong tool auto-selected, or wrong `room`. Doctor prints the chosen tool and every available name; set `memory.searchTool` |
 | Every ticket blocks on context overflow | The model's window is too small for these tickets. Split them, or raise `contextWindow` if it was set too low by hand |
 | Slow first token every ticket | `OLLAMA_KEEP_ALIVE`, VRAM eviction by another process |

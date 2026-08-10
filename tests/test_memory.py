@@ -12,9 +12,14 @@ not called `query`/`room`/`limit`.
 from __future__ import annotations
 
 import json
+import os
+import sys
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from unittest import mock
 
 from forge.memory import (
     MemoryClient,
@@ -410,3 +415,124 @@ class TestRecordParsing(unittest.TestCase):
         from forge.prompts import parse_record
 
         self.assertEqual(parse_record("TITLE: bare"), ("", ""))
+
+
+# A stdio MCP server, in the shape MemPalace ships: newline-delimited JSON-RPC
+# on stdin/stdout. It deliberately prints a non-JSON banner first, because real
+# servers log to stdout and a client that cannot skip that line is broken.
+STDIO_SERVER = '''
+import json, sys
+
+print("MemPalace stub starting", flush=True)
+TOOLS = [{"name": "palace_recall",
+          "description": "Recall prior decisions",
+          "inputSchema": {"type": "object",
+                          "properties": {"query": {"type": "string"},
+                                         "limit": {"type": "integer"}}}}]
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    method, request_id = message["method"], message["id"]
+    if method == "initialize":
+        result = {"protocolVersion": "2025-06-18", "serverInfo": {"name": "stub"}}
+    elif method == "tools/list":
+        result = {"tools": TOOLS}
+    elif method == "tools/call":
+        query = message["params"]["arguments"].get("query", "")
+        result = {"content": [{"type": "text", "text": "recalled: " + query}]}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+'''
+
+# Writes a diagnostic and dies without ever answering — the shape of a palace
+# with a bad path or a missing model.
+STDIO_CRASHER = '''
+import sys
+sys.stderr.write("palace not found at /data/palace\\n")
+raise SystemExit(3)
+'''
+
+
+class TestStdioTransport(unittest.TestCase):
+    """The transport MemPalace actually ships. Exercised against a real child
+    process rather than a mock, because the failure modes worth catching —
+    blocking reads, an undrained stderr, a server that exits — only exist once
+    a process does."""
+
+    def _script(self, body: str) -> str:
+        path = Path(tempfile.mkdtemp()) / "server.py"
+        path.write_text(body, encoding="utf-8")
+        return str(path)
+
+    def _settings(self, body: str, **kwargs) -> MemorySettings:
+        return MemorySettings(
+            command=[sys.executable, self._script(body)], timeout=30, **kwargs
+        )
+
+    def test_round_trip_over_a_child_process(self):
+        client = MemoryClient(self._settings(STDIO_SERVER, room="hybrid-forge"))
+        self.addCleanup(client.close)
+
+        report = client.describe()
+
+        self.assertTrue(report.startswith("ok memory"), report)
+        self.assertIn("transport=stdio", report)
+        self.assertIn("read=palace_recall", report)
+        self.assertIn("recalled:", client.search("how are slugs named"))
+
+    def test_bearer_token_comes_from_the_environment(self):
+        # `mempalace serve` requires a token on any non-loopback bind, and the
+        # env form is the one that keeps it out of a committed config.json.
+        settings = MemorySettings.from_config(
+            {"url": "http://h:8765/mcp", "tokenEnv": "MEMPALACE_TOKEN_TEST"}
+        )
+        with mock.patch.dict(os.environ, {"MEMPALACE_TOKEN_TEST": "s3cret"}):
+            self.assertEqual(settings.request_headers(), {"Authorization": "Bearer s3cret"})
+
+    def test_an_explicit_authorization_header_is_not_overwritten(self):
+        settings = MemorySettings.from_config(
+            {"url": "http://h/mcp", "token": "t", "headers": {"Authorization": "Custom keep-me"}}
+        )
+        self.assertEqual(settings.request_headers()["Authorization"], "Custom keep-me")
+
+    def test_no_token_sends_no_authorization(self):
+        settings = MemorySettings.from_config({"url": "http://h/mcp"})
+        self.assertEqual(settings.request_headers(), {})
+
+    def test_config_accepts_a_command(self):
+        settings = MemorySettings.from_config({"command": ["mempalace-mcp"]})
+        self.assertTrue(settings.configured)
+        self.assertEqual(settings.transport, "stdio")
+        self.assertEqual(settings.command, ["mempalace-mcp"])
+
+    def test_a_server_that_exits_reports_its_stderr(self):
+        client = MemoryClient(self._settings(STDIO_CRASHER))
+        self.addCleanup(client.close)
+
+        report = client.describe()
+
+        # The point of draining stderr: the reason is in the report, not just
+        # "the server exited".
+        self.assertTrue(report.startswith("FAIL memory"), report)
+        self.assertIn("palace not found", report)
+
+    def test_a_command_that_does_not_exist_is_unreachable_not_a_crash(self):
+        client = MemoryClient(MemorySettings(command=["definitely-not-a-real-binary-xyz"]))
+        self.addCleanup(client.close)
+
+        self.assertIn("could not start", client.describe())
+
+    def test_closing_reaps_the_child(self):
+        client = MemoryClient(self._settings(STDIO_SERVER))
+        client.describe()
+        proc = client._client._proc
+
+        client.close()
+
+        self.assertIsNotNone(proc.poll(), "child process outlived close()")
