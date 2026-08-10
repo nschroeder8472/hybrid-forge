@@ -74,7 +74,7 @@ class GeminiProvider(Provider):
             ],
             "generationConfig": {
                 "maxOutputTokens": max_tokens,
-                "temperature": temperature,
+                "temperature": self.temperature(temperature),
             },
         }
         if system:

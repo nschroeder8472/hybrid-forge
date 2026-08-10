@@ -1,0 +1,64 @@
+{
+  "room": "",
+  "models": {
+    "local": {
+      "kind": "openai",
+      "baseUrl": "http://127.0.0.1:11434/v1",
+      "model": "forge-exec",
+      "contextWindow": 32768,
+      "maxOutputTokens": 24576
+    },
+    "localAlt": {
+      "kind": "openai",
+      "baseUrl": "http://127.0.0.1:11434/v1",
+      "model": "forge-alt",
+      "contextWindow": 32768,
+      "maxOutputTokens": 24576
+    },
+    "localTest": {
+      "kind": "openai",
+      "baseUrl": "http://127.0.0.1:11434/v1",
+      "model": "forge-test",
+      "contextWindow": 32768,
+      "maxOutputTokens": 8192
+    },
+    "claude": {
+      "kind": "claude-cli",
+      "model": "opus"
+    }
+  },
+  "roles": {
+    "planner": "claude",
+    "executor": "local",
+    "tester": "local",
+    "reviewer": "claude"
+  },
+  "commands": {
+    "lint": "",
+    "typecheck": "",
+    "test": "python -m unittest discover tests"
+  },
+  "neverDelegate": [],
+  "memory": {
+    "command": [
+      "docker", "run", "--rm", "-i",
+      "-v", "mempalace-data:/data",
+      "ghcr.io/mempalace/mempalace:latest",
+      "mcp", "--palace", "/data/palace"
+    ],
+    "room": "",
+    "timeout": 120
+  },
+  "loop": {
+    "maxAttempts": 3,
+    "autoCommit": false,
+    "stopOnBlocked": false,
+    "pollSeconds": 2.0,
+    "maxRuntimeSeconds": 0
+  },
+  "ui": {
+    "host": "127.0.0.1",
+    "port": 8799,
+    "enabled": true
+  }
+}

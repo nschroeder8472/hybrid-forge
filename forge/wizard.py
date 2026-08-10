@@ -136,7 +136,7 @@ def heading(step: int, total: int, title: str) -> None:
 def check_url(url: str) -> str:
     """Complaint about an obviously malformed URL, or "" when it looks usable.
 
-    Catches the mistake everyone makes — pasting `forge-host:8787/mcp` without
+    Catches the mistake everyone makes — pasting `forge-host:8765/mcp` without
     a scheme — before it reaches urllib, whose `unknown url type` is true but
     unhelpful.
     """
@@ -192,16 +192,31 @@ def probe_model(name: str, block: dict[str, Any]) -> tuple[bool, str]:
         return True, "answered"
 
 
-def probe_memory(url: str, room: str) -> tuple[bool, str]:
+def memory_block(answer: str, room: str = "") -> dict[str, Any]:
+    """Read one answer as either transport.
+
+    A URL is the only thing that can start with a scheme, so the two are
+    distinguishable without asking a second question. Anything else is argv for
+    a stdio server — which is what MemPalace ships, and the more common answer.
+    """
+    answer = answer.strip()
+    if answer.startswith(("http://", "https://")) or "://" in answer:
+        return {"url": answer, "room": room}
+    return {"command": answer.split(), "room": room}
+
+
+def probe_memory(answer: str, room: str) -> tuple[bool, str]:
     """Connect and list tools. Never raises, for the same reason as above."""
-    complaint = check_url(url)
-    if complaint:
-        return False, complaint
+    block = memory_block(answer, room)
+    if block.get("url"):
+        complaint = check_url(block["url"])
+        if complaint:
+            return False, complaint
 
     try:
-        client = MemoryClient.from_config({"url": url, "room": room}, room=room)
+        client = MemoryClient.from_config(block, room=room)
         if client is None:
-            return False, "no url"
+            return False, "no url or command"
         report = client.describe()
     except Exception as exc:  # noqa: BLE001 - describe() normalizes its own errors only
         return False, f"{type(exc).__name__}: {exc}"
@@ -441,29 +456,34 @@ def _ask_memory(answers: Answers, profile: Profile, prompter: Prompter) -> None:
     heading(3, TOTAL_STEPS, "Project memory (optional)")
     say("An MCP server holding decisions from past sessions. Without it the")
     say("executor sees only what each ticket carries. Blank to skip.")
+    say("")
+    say("A command runs the server here, as a child process — MemPalace speaks")
+    say("stdio, so this is the usual answer:  mempalace-mcp")
+    say("A URL reaches one already running elsewhere:  http://host:8765/mcp")
 
-    default_url = (profile.memory or {}).get("url", "")
+    previous = profile.memory or {}
+    default_answer = previous.get("url", "") or " ".join(previous.get("command", []) or [])
 
     for attempt in range(MAX_RETRIES):
-        url = prompter.ask("\nMCP URL", default_url)
-        if not url:
+        answer = prompter.ask("\nMCP command or URL", default_answer)
+        if not answer:
             answers.memory = {"url": "", "room": ""}
             say("  skipped — the loop will run without project context.")
             return
 
-        answers.memory = {"url": url}
+        answers.memory = memory_block(answer)
 
         say("\nprobing…")
-        ok, detail = probe_memory(url, room="")
+        ok, detail = probe_memory(answer, room="")
         _report(ok, detail)
         if ok or not prompter.enabled:
             break
 
-        default_url = url
+        default_answer = answer
         if attempt == MAX_RETRIES - 1:
             say("\nContinuing — memory failures never end a run, they only remove context.")
             break
-        if not prompter.confirm("Try a different URL", default=True):
+        if not prompter.confirm("Try a different command or URL", default=True):
             say("Continuing — memory failures never end a run, they only remove context.")
             break
 

@@ -92,7 +92,7 @@ class AnthropicProvider(Provider):
         if system:
             payload["system"] = system
         if self._accepts_temperature():
-            payload["temperature"] = temperature
+            payload["temperature"] = self.temperature(temperature)
 
         effort = self.config.get("effort")
         if effort:

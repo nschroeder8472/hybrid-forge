@@ -32,16 +32,38 @@ services:
       retries: 3
       start_period: 60s
 
+  # MemPalace's default CMD is `mcp` — the MCP server over stdio, which is what
+  # the daemon drives. That makes it a child process, not a service: a stdio
+  # server exits when its stdin closes, so `restart: unless-stopped` here would
+  # be a crash loop rather than availability.
+  #
+  # (MemPalace 3.6 does have `serve`, a real HTTP listener with bearer-token
+  # auth, for a palace on a different machine than the daemon. That case wants
+  # its own long-running service — see docs/SETUP.md §1.4.)
+  #
+  # For the same-machine case the daemon starts the palace itself. Set in
+  # .hybridforge/config.json:
+  #
+  #   "memory": {
+  #     "command": ["docker", "run", "--rm", "-i",
+  #                 "-v", "mempalace-data:/data",
+  #                 "ghcr.io/mempalace/mempalace:latest"],
+  #     "room": "your-project"
+  #   }
+  #
+  # `-i` is load-bearing: JSON-RPC needs stdin held open. Drop `docker run`
+  # entirely if MemPalace is installed on the host — ["mempalace", ...] is the
+  # same thing without a container between the daemon and the palace.
+  #
+  # This entry exists so `docker compose run mempalace` works for maintenance
+  # (`mine`, `sweep`) against the same volume the daemon uses. It is deliberately
+  # not started by `docker compose up`.
   mempalace:
-    build:
-      context: ./mempalace
-      dockerfile: Dockerfile
+    profiles: ["tools"]
+    image: ghcr.io/mempalace/mempalace:latest
     container_name: forge-mempalace
-    restart: unless-stopped
-    network_mode: host
-    environment:
-      MEMPALACE_HOST: "${BIND_ADDR}"
-      MEMPALACE_PORT: "${PALACE_PORT:-8787}"
+    stdin_open: true
+    tty: false
     volumes:
       # The palace database. One authoritative copy, on the host, forever.
       - mempalace-data:/data
@@ -50,4 +72,10 @@ volumes:
   ollama-models:
     driver: local
   mempalace-data:
+    # Named explicitly, against Compose's default of prefixing the project
+    # directory. Two reasons, both about the palace outliving this checkout:
+    # the daemon reaches it through `memory.command`, which is a plain
+    # `docker run` with no project prefix to inherit; and a durable store keyed
+    # off a folder name vanishes the day the folder is renamed.
+    name: mempalace-data
     driver: local

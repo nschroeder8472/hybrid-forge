@@ -59,6 +59,10 @@ class SubprocessProvider(Provider):
             raise ValueError(f"provider {name!r} of kind 'command' needs a non-empty `command`")
         self.prompt_on = config.get("promptOn", "stdin")
         self.model = config.get("model") or self.command[0]
+        # Where the binary runs. Config supplies the project root by default,
+        # because a CLI that inspects the repo it was started in reads the
+        # wrong one when the daemon was launched from elsewhere.
+        self.cwd = config.get("cwd")
 
     def complete(
         self,
@@ -97,6 +101,7 @@ class SubprocessProvider(Provider):
                 errors="replace",
                 timeout=timeout,
                 check=False,
+                cwd=self.cwd,
             )
         except FileNotFoundError as exc:
             raise ProviderUnreachable(f"command not found: {argv[0]}") from exc

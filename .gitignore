@@ -21,3 +21,10 @@ palace/
 .hybridforge/run.db
 .hybridforge/run.db-wal
 .hybridforge/run.db-shm
+
+# MemPalace per-project files (issue #185)
+mempalace.yaml
+entities.json
+
+# Editable-install build metadata
+*.egg-info/

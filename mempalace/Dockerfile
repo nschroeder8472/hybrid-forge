@@ -1,29 +1,23 @@
 # MemPalace container.
 #
-# VERIFY BEFORE USE: MemPalace ships no official image as far as this project
-# knows, and its MCP transport surface has changed across versions. The install
-# command and the serve invocation below are the two lines most likely to be
-# wrong for your installed version — check the current MemPalace docs and adjust.
+# MemPalace publishes its own image, so there is nothing to build from source:
 #
-# Specifically confirm: does your version expose an HTTP/SSE MCP transport, or
-# only stdio? If stdio only, this container needs an MCP proxy in front of it
-# (add it as a second service in docker-compose.yml) — a stdio server in a
-# container is not reachable from your Mac.
+#   docker pull ghcr.io/mempalace/mempalace:latest
+#
+# This file exists only to pin that image and declare the data volume. Verified
+# against MemPalace 3.6.0.
+#
+# The image's default CMD is `mcp` — the MCP server over **stdio**, which is
+# what the daemon drives through `memory.command`. There is no CMD or EXPOSE
+# here because that default is already right for the common case: a palace on
+# the same machine as the daemon needs no port and no listener.
+#
+# For a palace on a different machine, MemPalace serves MCP over Streamable
+# HTTP itself — `mempalace serve --host <addr> --port 8765`, with bearer-token
+# auth and optional TLS. No MCP proxy is involved. See docs/SETUP.md §1.4.
 
-FROM python:3.12-slim
+FROM ghcr.io/mempalace/mempalace:latest
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# VERIFY: package name and install method.
-RUN pip install --no-cache-dir mempalace
-
-ENV MEMPALACE_PALACE_PATH=/data/palace \
-    MEMPALACE_HOST=127.0.0.1 \
-    MEMPALACE_PORT=8787
-
+# The palace, its config, and the cached embedding model. HOME is /data in this
+# image, so a named volume here keeps all three across `docker compose down`.
 VOLUME ["/data"]
-
-# VERIFY: subcommand and flags for serving MCP over the network.
-CMD ["sh", "-c", "mempalace serve --host ${MEMPALACE_HOST} --port ${MEMPALACE_PORT} --palace ${MEMPALACE_PALACE_PATH}"]

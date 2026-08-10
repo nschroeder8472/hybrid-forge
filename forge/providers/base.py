@@ -192,6 +192,20 @@ class Provider(ABC):
     ) -> Completion:
         """Send a completion request. Raises a ProviderError subclass on failure."""
 
+    def temperature(self, requested: float) -> float:
+        """The sampling temperature to actually send.
+
+        The loop asks for a temperature per role — low, because determinism is
+        usually what a pipeline wants. Model families disagree with that: some
+        reasoning models degenerate into repetition well above zero, and ship
+        an official sampling recipe you are meant to follow rather than
+        override. Config wins, so `"temperature": 0.6` on a model block lets a
+        model be run the way its authors intended without the loop having to
+        know which family it belongs to.
+        """
+        configured = self.config.get("temperature")
+        return requested if configured is None else float(configured)
+
     @abstractmethod
     def capabilities(self) -> Capabilities:
         """Report context window and output limits for the configured model."""
