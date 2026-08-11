@@ -5,6 +5,8 @@
     forge ingest <file|->          turn a spec or plan into a backlog
     forge go [--plan f] [--open]   run the loop until done or stopped
     forge status                   one-shot summary
+    forge retry [--respec]         put failed tickets back on the backlog
+    forge prune [--keep N]         delete the artifact trees of old runs
     forge pause | resume | stop    control a running loop
     forge ui                       serve the dashboard on its own
 
@@ -18,20 +20,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 import time
 import webbrowser
 from pathlib import Path
 
 from . import wizard
+from .artifacts import ARTIFACTS_DIR
 from .config import Config, ConfigError, default_config
 from .ingest import ingest as ingest_document
 from .ingest import write_tickets
 from .loop import CONTROL_KEY, CONTROL_PAUSE, CONTROL_RUN, CONTROL_STOP, Orchestrator
 from .memory import MemoryClient
 from .profile import Profile
+from .prompts import parse_respec, respec_prompt
 from .providers import ProviderError
-from .state import Store
+from .state import (
+    RUN_IDLE,
+    TICKET_BLOCKED,
+    TICKET_DONE,
+    TICKET_FAILED,
+    TICKET_SKIPPED,
+    Store,
+)
 from .tokens import format_tokens
 from .ui import server as ui_server
 
@@ -134,8 +146,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"  {name}: {report}")
         print(
             f"      context={format_tokens(caps.context_window)} "
-            f"max_output={format_tokens(caps.max_output_tokens)}"
+            f"max_output={format_tokens(caps.max_output_tokens)} "
+            f"prompt_budget={format_tokens(caps.input_budget(caps.max_output_tokens))}"
         )
+        # Not counted as failures: every one of these answers a health probe
+        # perfectly well and then costs a run. Reported so they are fixed before
+        # the run rather than diagnosed after it.
+        try:
+            notes = provider.diagnostics()
+        except Exception as exc:  # noqa: BLE001 - a broken check must not fail doctor
+            notes = [f"could not run configuration checks: {exc}"]
+        for note in notes:
+            print(f"      ! {note}")
         if report.startswith("FAIL"):
             failures += 1
 
@@ -242,8 +264,16 @@ def cmd_go(args: argparse.Namespace) -> int:
     print(f"\nFinished: {final}")
     print(f"  tickets: {json.dumps(counts)}")
     for row in store.usage_summary():
-        total = row["prompt_tokens"] + row["completion_tokens"]
-        print(f"  {row['model']}: {row['calls']} calls, {format_tokens(total)} tokens")
+        line = (
+            f"  {row['model']}: {row['calls']} calls, "
+            f"{format_tokens(row['total_tokens'])} tokens"
+        )
+        cached = row["cache_creation_tokens"] + row["cache_read_tokens"]
+        if cached:
+            line += f" ({format_tokens(cached)} cached)"
+        if row["cost_usd"]:
+            line += f", ${row['cost_usd']:.2f}"
+        print(line)
 
     return 0 if final in ("done",) else 1
 
@@ -278,6 +308,241 @@ def cmd_status(args: argparse.Namespace) -> int:
         print()
         for row in state["usage"]:
             print(f"  {row['model']}: {row['calls']} calls, {row['display']} tokens")
+
+    # A run with nothing pending looks finished but may just be stuck. Say how
+    # to reopen it here, where the failed tickets are already on screen.
+    stuck = sum(state["counts"].get(s, 0) for s in ("failed", "blocked", "skipped"))
+    if stuck and not state["counts"].get("pending", 0):
+        print(f"\n{stuck} ticket(s) need another pass. Requeue them with: forge retry")
+    return 0
+
+
+def _respec(
+    config: Config,
+    store: Store,
+    run_id: int,
+    tickets: list,
+    notes: dict[str, str],
+) -> None:
+    """Rewrite requeued tickets from the evidence of why they failed.
+
+    Best-effort per ticket. The requeue is already committed by the time this
+    runs, so a planner that is unreachable or returns nonsense must cost the
+    user a revision, never the retry itself.
+    """
+    try:
+        provider = config.provider_for("planner")
+    except ConfigError as exc:
+        print(f"\nwarning: cannot respec — {exc}")
+        return
+
+    print("\nRe-speccing from the recorded failures…")
+    for ticket in tickets:
+        failures = store.ticket_failures(run_id, ticket.ticket_id)
+        note = (notes.get(ticket.ticket_id) or "").strip()
+        if note:
+            failures = failures + [{"name": "gave up", "detail": note}]
+        if not failures:
+            print(f"  {ticket.ticket_id:<10} skipped — nothing recorded to learn from")
+            continue
+
+        try:
+            completion = provider.complete(
+                respec_prompt(ticket, failures), max_tokens=4096, temperature=0.0
+            )
+            revision = parse_respec(completion.text)
+        except (ProviderError, ValueError) as exc:
+            print(f"  {ticket.ticket_id:<10} unchanged — {exc}")
+            continue
+
+        rationale = revision.pop("rationale", "")
+        changed = [
+            field
+            for field, value in revision.items()
+            if value != getattr(ticket, field)
+        ]
+        if not changed:
+            print(f"  {ticket.ticket_id:<10} unchanged — planner kept the ticket as written")
+            continue
+
+        for field, value in revision.items():
+            setattr(ticket, field, value)
+        store.update_ticket(run_id, ticket)
+        store.log(
+            run_id,
+            f"{ticket.ticket_id}: respec revised {', '.join(changed)}. {rationale}".strip(),
+            kind="ticket",
+        )
+
+        print(f"  {ticket.ticket_id:<10} revised {', '.join(changed)}")
+        if rationale:
+            print(f"      {rationale}")
+
+    # Tickets are the artifact a human reviews before the loop acts on them,
+    # so the files on disk have to carry the revision too.
+    paths = write_tickets(config.tickets_dir, store.list_tickets(run_id))
+    print(f"\nRewrote {len(paths)} ticket file(s) in {config.tickets_dir}.")
+    print("Read the revised specs before starting — respec is a suggestion, not a fix.")
+
+
+def cmd_prune(args: argparse.Namespace) -> int:
+    """Drop the artifact trees of old runs.
+
+    Artifacts are the record of what every step actually did, and they are the
+    reason a ticket that failed at 2am can be diagnosed at 9. But nothing ever
+    removed them: one small project reached 979 files across eight runs, and a
+    daemon left running against a real backlog does not level off.
+
+    Only whole runs are removed, newest kept, and only the artifact tree — the
+    database keeps every run's history either way, so `forge status` still
+    accounts for work this deletes the transcripts of.
+    """
+    config = _load(args.root)
+    store = _store(config)
+
+    base = config.config_dir / ARTIFACTS_DIR
+    if not base.is_dir():
+        print(f"Nothing to prune: {base} does not exist.")
+        return 0
+
+    runs = sorted(
+        (path for path in base.iterdir() if path.is_dir() and path.name.startswith("run-")),
+        key=lambda path: _run_number(path.name),
+    )
+    latest = store.latest_run()
+    current = int(latest["id"]) if latest is not None else 0
+
+    doomed = runs[: max(0, len(runs) - args.keep)]
+    # Never the run in progress, however low `--keep` goes: deleting the
+    # transcripts of a live run as it writes them is the one case where this
+    # command could destroy something nobody has read yet.
+    doomed = [path for path in doomed if _run_number(path.name) != current]
+
+    if not doomed:
+        print(
+            f"Nothing to prune: {len(runs)} run(s) on disk, keeping {args.keep}."
+        )
+        return 0
+
+    total = sum(
+        entry.stat().st_size for path in doomed for entry in path.rglob("*") if entry.is_file()
+    )
+    if args.dry_run:
+        print(f"Would remove {len(doomed)} run(s), {_megabytes(total)}:")
+        for path in doomed:
+            print(f"  {path.name}")
+        print("\nRe-run without --dry-run to delete.")
+        return 0
+
+    removed = 0
+    for path in doomed:
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            print(f"  {path.name}: could not remove — {exc}")
+            continue
+        removed += 1
+
+    print(f"Removed {removed} run(s) of artifacts, {_megabytes(total)} freed.")
+    print(f"Kept the {args.keep} newest. Run history stays in {config.db_path.name}.")
+    return 0
+
+
+def _run_number(name: str) -> int:
+    try:
+        return int(name.split("-", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def _megabytes(size: int) -> str:
+    return f"{size / 1_048_576:.1f} MB" if size >= 1_048_576 else f"{size / 1024:.0f} KB"
+
+
+def cmd_retry(args: argparse.Namespace) -> int:
+    """Put failed work back on the backlog so the loop can pick it up again.
+
+    Without this a run that ends `blocked` is a dead end: `forge go` finds the
+    run but no ticket is `pending`, so it re-declares the backlog exhausted and
+    the only way forward is re-ingesting the whole plan and redoing the work
+    that already succeeded.
+    """
+    config = _load(args.root)
+    store = _store(config)
+
+    if args.run:
+        run = store.get_run(args.run)
+        if run is None:
+            sys.exit(f"error: no run {args.run}. List them with `forge status`.")
+    else:
+        run = store.latest_run()
+        if run is None:
+            sys.exit("error: no runs yet. Ingest a spec first:\n  forge ingest plan.md")
+    run_id = int(run["id"])
+
+    wanted = list(args.ticket) if args.ticket else None
+    if wanted:
+        known = {t.ticket_id for t in store.list_tickets(run_id)}
+        missing = [t for t in wanted if t not in known]
+        if missing:
+            sys.exit(
+                f"error: run {run_id} has no ticket {', '.join(missing)}. "
+                "Check the ids with `forge status`."
+            )
+
+    statuses = None
+    if args.all and not wanted:
+        # Everything except work still queued — re-running a pending ticket is
+        # a no-op, and resetting it would discard attempts already spent.
+        statuses = (TICKET_DONE, TICKET_FAILED, TICKET_BLOCKED, TICKET_SKIPPED)
+
+    # Captured before the reset clears it — for a ticket the executor gave up
+    # on with `BLOCKED:`, this note is the only record of what it could not
+    # decide, and no step was logged as failed.
+    notes = {t.ticket_id: t.blocked_note for t in store.list_tickets(run_id)}
+
+    reset = store.reset_tickets(run_id, ticket_ids=wanted, statuses=statuses)
+    if not reset:
+        counts = store.ticket_counts(run_id)
+        print(
+            f"Nothing to retry in run {run_id} (tickets: {json.dumps(counts)}).\n"
+            "Name a ticket with --ticket ID, or --all to redo completed work too."
+        )
+        return 0
+
+    store.set_run_status(run_id, RUN_IDLE, note=f"retrying {len(reset)} ticket(s)")
+    store.log(run_id, f"Retry queued {len(reset)} ticket(s).", kind="control")
+
+    print(f"Run {run_id}: queued {len(reset)} ticket(s) for retry.")
+    for ticket in reset:
+        prior = f"{ticket.attempt_base} prior attempt(s)" if ticket.attempt_base else "fresh"
+        print(f"  {ticket.ticket_id:<10} {ticket.title} ({prior})")
+
+    if args.respec:
+        _respec(config, store, run_id, reset, notes)
+
+    # A newer run would shadow this one, since the loop always takes the
+    # highest run id. Say so rather than letting `forge go` look broken.
+    latest = store.latest_run()
+    if latest is not None and int(latest["id"]) != run_id:
+        print(
+            f"\nwarning: run {latest['id']} is newer and `forge go` will pick it "
+            f"up instead of run {run_id}."
+        )
+        return 0
+
+    if args.go:
+        return cmd_go(
+            argparse.Namespace(
+                root=args.root,
+                plan="",
+                goal="",
+                no_ui=args.no_ui,
+                open=False,
+            )
+        )
+
+    print("\nStart it with: forge go")
     return 0
 
 
@@ -345,6 +610,38 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("status", help="one-shot summary of the current run")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("prune", help="delete the artifact trees of old runs")
+    p.add_argument(
+        "--keep", type=int, default=5, help="runs to keep, newest first (default: 5)"
+    )
+    p.add_argument(
+        "--dry-run", action="store_true", help="list what would be removed and stop"
+    )
+    p.set_defaults(func=cmd_prune)
+
+    p = sub.add_parser("retry", help="put failed tickets back on the backlog")
+    p.add_argument("--run", type=int, default=0, help="run id (default: the latest)")
+    p.add_argument(
+        "--ticket",
+        action="append",
+        default=[],
+        metavar="ID",
+        help="retry this ticket whatever its status; repeatable",
+    )
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help="also reset tickets that succeeded, to redo the whole run",
+    )
+    p.add_argument(
+        "--respec",
+        action="store_true",
+        help="have the planner revise each ticket from why it failed",
+    )
+    p.add_argument("--go", action="store_true", help="start the loop straight after")
+    p.add_argument("--no-ui", action="store_true", help="with --go, skip the dashboard")
+    p.set_defaults(func=cmd_retry)
 
     for name, help_text in (
         ("pause", "pause after the current step"),

@@ -120,9 +120,14 @@ class AnthropicProvider(Provider):
             text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
 
         raw_usage = data.get("usage") or {}
+        # `input_tokens` is the uncached remainder only; with a cached prefix
+        # the cache counters hold nearly all of the real input. Counting them
+        # separately keeps the ledger honest about what the call consumed.
         usage = Usage(
             prompt_tokens=int(raw_usage.get("input_tokens", 0)),
             completion_tokens=int(raw_usage.get("output_tokens", 0)),
+            cache_creation_tokens=int(raw_usage.get("cache_creation_input_tokens", 0)),
+            cache_read_tokens=int(raw_usage.get("cache_read_input_tokens", 0)),
             estimated=not raw_usage,
         )
 

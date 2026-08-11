@@ -12,7 +12,8 @@ second-guessing an OpenAI executor — with no code change.
     "local":  {"kind": "openai",     "baseUrl": "http://forge:11434/v1",
                "model": "qwen3.6:35b-a3b", "contextWindow": 32768},
     "claude": {"kind": "claude-cli", "model": "opus",
-               "rateLimit": {"tokensPerWindow": 0, "windowSeconds": 18000}}
+               "rateLimit": {"tokensPerWindow": 0, "costPerWindow": 0,
+                             "windowSeconds": 18000}}
   },
   "roles": {
     "planner": "claude", "executor": "local",
@@ -67,6 +68,12 @@ class LoopSettings:
     poll_seconds: float = 2.0
     # Cap on unattended wall-clock time. 0 disables.
     max_runtime_seconds: int = 0
+    # Run the verify commands once before each ticket, so a failure that was
+    # already there is not blamed on the ticket that happened to run next.
+    # Worth its cost on any project where the verify step is incremental; turn
+    # it off when a full suite is slow enough that paying it per ticket costs
+    # more than the attempts it saves.
+    baseline_verify: bool = True
 
 
 @dataclass
@@ -137,6 +144,7 @@ class Config:
             stop_on_blocked=bool(loop.get("stopOnBlocked", False)),
             poll_seconds=float(loop.get("pollSeconds", 2.0)),
             max_runtime_seconds=int(loop.get("maxRuntimeSeconds", 0)),
+            baseline_verify=bool(loop.get("baselineVerify", True)),
         )
 
         ui = data.get("ui", {}) or {}
@@ -236,6 +244,7 @@ class Config:
                 "stopOnBlocked": self.loop.stop_on_blocked,
                 "pollSeconds": self.loop.poll_seconds,
                 "maxRuntimeSeconds": self.loop.max_runtime_seconds,
+                "baselineVerify": self.loop.baseline_verify,
             },
             "ui": {"host": self.ui.host, "port": self.ui.port, "enabled": self.ui.enabled},
         }

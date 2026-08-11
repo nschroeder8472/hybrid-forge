@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
+from .failures import distill
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,8 +43,10 @@ CREATE TABLE IF NOT EXISTS tickets (
     status        TEXT NOT NULL DEFAULT 'pending',
     position      INTEGER NOT NULL DEFAULT 0,
     attempts      INTEGER NOT NULL DEFAULT 0,
+    attempt_base  INTEGER NOT NULL DEFAULT 0,
     spec          TEXT NOT NULL DEFAULT '',
     allowed_files TEXT NOT NULL DEFAULT '[]',
+    reference_files TEXT NOT NULL DEFAULT '[]',
     criteria      TEXT NOT NULL DEFAULT '[]',
     context       TEXT NOT NULL DEFAULT '',
     blocked_note  TEXT NOT NULL DEFAULT '',
@@ -72,11 +76,14 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE TABLE IF NOT EXISTS usage (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    model             TEXT NOT NULL,
-    ts                REAL NOT NULL,
-    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
-    completion_tokens INTEGER NOT NULL DEFAULT 0
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    model                 TEXT NOT NULL,
+    ts                    REAL NOT NULL,
+    prompt_tokens         INTEGER NOT NULL DEFAULT 0,
+    completion_tokens     INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+    cost_usd              REAL NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS control (
@@ -118,11 +125,26 @@ class Ticket:
     status: str = TICKET_PENDING
     position: int = 0
     attempts: int = 0
+    # Attempts spent on this ticket by *earlier* retry cycles. `attempts` is
+    # reset per cycle so the loop's max-attempts budget starts fresh, but the
+    # artifact directory is named from the sum — otherwise a retry would write
+    # over the very evidence that explains why the first cycle failed.
+    attempt_base: int = 0
     spec: str = ""
     allowed_files: list[str] = field(default_factory=list)
+    # Files the executor may read but must not write. Without these it works
+    # entirely blind: it is asked to produce whole files against an existing
+    # codebase it has never seen, so it guesses at export names and signatures
+    # and the reviewer rejects the guess.
+    reference_files: list[str] = field(default_factory=list)
     criteria: list[str] = field(default_factory=list)
     context: str = ""
     blocked_note: str = ""
+
+    @property
+    def attempt_number(self) -> int:
+        """Globally increasing attempt index, used to name artifacts."""
+        return self.attempt_base + self.attempts
 
     def as_row(self) -> dict[str, Any]:
         return {
@@ -132,8 +154,10 @@ class Ticket:
             "status": self.status,
             "position": self.position,
             "attempts": self.attempts,
+            "attempt_base": self.attempt_base,
             "spec": self.spec,
             "allowed_files": json.dumps(self.allowed_files),
+            "reference_files": json.dumps(self.reference_files),
             "criteria": json.dumps(self.criteria),
             "context": self.context,
             "blocked_note": self.blocked_note,
@@ -148,8 +172,10 @@ class Ticket:
             status=row["status"],
             position=row["position"],
             attempts=row["attempts"],
+            attempt_base=row["attempt_base"],
             spec=row["spec"],
             allowed_files=json.loads(row["allowed_files"]),
+            reference_files=json.loads(row["reference_files"]),
             criteria=json.loads(row["criteria"]),
             context=row["context"],
             blocked_note=row["blocked_note"],
@@ -167,7 +193,30 @@ class Store:
         # WAL so the dashboard can read while the loop writes.
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.executescript(SCHEMA)
+        self._migrate()
         self._connection.commit()
+
+    # Columns added after the first release. `CREATE TABLE IF NOT EXISTS` will
+    # not add them to a database that already exists, so widen it here instead
+    # of leaving older runs unable to open at all.
+    _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+        ("usage", "cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("usage", "cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("usage", "cost_usd", "REAL NOT NULL DEFAULT 0"),
+        ("tickets", "attempt_base", "INTEGER NOT NULL DEFAULT 0"),
+        ("tickets", "reference_files", "TEXT NOT NULL DEFAULT '[]'"),
+    )
+
+    def _migrate(self) -> None:
+        for table, column, decl in self._ADDED_COLUMNS:
+            existing = {
+                row["name"]
+                for row in self._connection.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in existing:
+                self._connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {decl}"
+                )
 
     def close(self) -> None:
         self._connection.close()
@@ -262,10 +311,14 @@ class Store:
                 row["position"] = position if not ticket.position else ticket.position
                 connection.execute(
                     "INSERT OR REPLACE INTO tickets "
-                    "(run_id, ticket_id, title, route, status, position, attempts, spec, "
-                    " allowed_files, criteria, context, blocked_note, updated_at) "
+                    "(run_id, ticket_id, title, route, status, position, attempts, "
+                    " attempt_base, spec, allowed_files, reference_files, criteria, context, "
+                    " blocked_note, "
+                    " updated_at) "
                     "VALUES (:run_id, :ticket_id, :title, :route, :status, :position, "
-                    ":attempts, :spec, :allowed_files, :criteria, :context, :blocked_note, :now)",
+                    ":attempts, :attempt_base, :spec, :allowed_files, :reference_files, "
+                    ":criteria, :context, "
+                    ":blocked_note, :now)",
                     {**row, "run_id": run_id, "now": now},
                 )
 
@@ -291,12 +344,84 @@ class Store:
     def update_ticket(self, run_id: int, ticket: Ticket) -> None:
         with self._write() as connection:
             connection.execute(
-                "UPDATE tickets SET status = :status, attempts = :attempts, spec = :spec, "
-                "allowed_files = :allowed_files, criteria = :criteria, context = :context, "
+                "UPDATE tickets SET status = :status, attempts = :attempts, "
+                "attempt_base = :attempt_base, spec = :spec, "
+                "allowed_files = :allowed_files, reference_files = :reference_files, "
+                "criteria = :criteria, context = :context, "
                 "blocked_note = :blocked_note, updated_at = :now "
                 "WHERE run_id = :run_id AND ticket_id = :ticket_id",
                 {**ticket.as_row(), "run_id": run_id, "now": time.time()},
             )
+
+    def ticket_failures(
+        self, run_id: int, ticket_id: str, limit: int = 6
+    ) -> list[dict[str, str]]:
+        """What actually went wrong on a ticket, oldest first.
+
+        The step log outlives the attempt loop's in-memory failure context, so
+        this is the only durable record of the reviewer's reasoning once a
+        ticket has been given up on. Ordered oldest-first because a repeated
+        rejection across attempts is the strongest signal that the spec, not
+        the implementation, is what needs changing.
+        """
+        rows = self._connection.execute(
+            "SELECT name, detail FROM steps "
+            "WHERE run_id = ? AND ticket_id = ? AND status = 'failed' AND detail != '' "
+            "ORDER BY id DESC LIMIT ?",
+            (run_id, ticket_id, limit * 4),
+        ).fetchall()
+
+        # Steps keep the raw output — it is the durable record. Distil here,
+        # where it becomes prompt input, so a reader still gets everything and
+        # the planner gets the diagnosis instead of 20k characters of warnings.
+        failures: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for row in reversed(rows):
+            detail = distill(row["detail"], limit=2500)
+            if not detail:
+                continue
+            # The same lint error on all three attempts is one fact, not three.
+            # Repeating it crowds out the other failures inside the budget.
+            key = f"{row['name']}::{detail}"
+            if key in seen:
+                continue
+            seen.add(key)
+            failures.append({"name": row["name"], "detail": detail})
+        return failures[-limit:]
+
+    # Statuses a retry reopens by default: work that stopped without landing.
+    RETRYABLE = (TICKET_FAILED, TICKET_BLOCKED, TICKET_SKIPPED)
+
+    def reset_tickets(
+        self,
+        run_id: int,
+        ticket_ids: list[str] | None = None,
+        statuses: tuple[str, ...] | None = None,
+    ) -> list[Ticket]:
+        """Return exhausted tickets to the backlog and report what moved.
+
+        Each reset rolls the spent attempts into `attempt_base` before zeroing
+        `attempts`, so the next cycle gets a full budget while its artifacts
+        land in fresh directories rather than on top of the failed ones.
+
+        `ticket_ids` selects explicitly and ignores `statuses` — retrying a
+        named ticket that happens to be `done` is a legitimate thing to ask
+        for, and silently skipping it would be worse than doing it.
+        """
+        reset: list[Ticket] = []
+        for ticket in self.list_tickets(run_id):
+            if ticket_ids is not None:
+                if ticket.ticket_id not in ticket_ids:
+                    continue
+            elif ticket.status not in (statuses or self.RETRYABLE):
+                continue
+            ticket.attempt_base += ticket.attempts
+            ticket.attempts = 0
+            ticket.status = TICKET_PENDING
+            ticket.blocked_note = ""
+            self.update_ticket(run_id, ticket)
+            reset.append(ticket)
+        return reset
 
     def ticket_counts(self, run_id: int) -> dict[str, int]:
         rows = self._connection.execute(
@@ -369,21 +494,50 @@ class Store:
     # Usage ledger (satisfies budget.UsageLedger)
     # ------------------------------------------------------------------
 
-    def record_usage(self, model: str, prompt_tokens: int, completion_tokens: int) -> None:
+    def record_usage(
+        self,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cache_creation_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cost_usd: float = 0.0,
+    ) -> None:
         with self._write() as connection:
             connection.execute(
-                "INSERT INTO usage (model, ts, prompt_tokens, completion_tokens) "
-                "VALUES (?, ?, ?, ?)",
-                (model, time.time(), prompt_tokens, completion_tokens),
+                "INSERT INTO usage (model, ts, prompt_tokens, completion_tokens, "
+                "cache_creation_tokens, cache_read_tokens, cost_usd) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    model,
+                    time.time(),
+                    prompt_tokens,
+                    completion_tokens,
+                    cache_creation_tokens,
+                    cache_read_tokens,
+                    cost_usd,
+                ),
             )
 
     def tokens_since(self, model: str, since: float) -> int:
+        # Cache reads and writes count against the window the same as fresh
+        # input does. Summing only prompt + completion here would let a
+        # cache-heavy run sail past a tokens_per_window limit unnoticed.
         row = self._connection.execute(
-            "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS total "
+            "SELECT COALESCE(SUM(prompt_tokens + completion_tokens "
+            "+ cache_creation_tokens + cache_read_tokens), 0) AS total "
             "FROM usage WHERE model = ? AND ts >= ?",
             (model, since),
         ).fetchone()
         return int(row["total"])
+
+    def cost_since(self, model: str, since: float) -> float:
+        row = self._connection.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS total "
+            "FROM usage WHERE model = ? AND ts >= ?",
+            (model, since),
+        ).fetchone()
+        return float(row["total"])
 
     def requests_since(self, model: str, since: float) -> int:
         row = self._connection.execute(
@@ -395,8 +549,13 @@ class Store:
         rows = self._connection.execute(
             "SELECT model, COUNT(*) AS calls, "
             "COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, "
-            "COALESCE(SUM(completion_tokens), 0) AS completion_tokens "
-            "FROM usage GROUP BY model ORDER BY prompt_tokens DESC"
+            "COALESCE(SUM(completion_tokens), 0) AS completion_tokens, "
+            "COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens, "
+            "COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, "
+            "COALESCE(SUM(cost_usd), 0) AS cost_usd, "
+            "COALESCE(SUM(prompt_tokens + completion_tokens "
+            "+ cache_creation_tokens + cache_read_tokens), 0) AS total_tokens "
+            "FROM usage GROUP BY model ORDER BY total_tokens DESC"
         ).fetchall()
         return [dict(row) for row in rows]
 

@@ -43,15 +43,32 @@ class Usage:
     Providers that do not report usage leave these at 0 and set `estimated`;
     the budget gate then falls back to its own estimate rather than silently
     treating the call as free.
+
+    `prompt_tokens` is fresh (uncached) input only, matching the provider field
+    of the same name. On a cached prefix that number is tiny and says nothing
+    about what the call actually consumed, so the cache counters are tracked
+    separately and folded into `total_tokens` — reading `prompt_tokens` alone
+    undercounts a cache-heavy call by orders of magnitude.
     """
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
+    # Provider-reported cost for this call, when it reports one. Authoritative
+    # where present: it already accounts for the model, tier, and cache rates,
+    # none of which we can reconstruct from token counts alone.
+    cost_usd: float = 0.0
     estimated: bool = False
 
     @property
+    def input_tokens(self) -> int:
+        """Everything the model read: fresh input plus both cache paths."""
+        return self.prompt_tokens + self.cache_creation_tokens + self.cache_read_tokens
+
+    @property
     def total_tokens(self) -> int:
-        return self.prompt_tokens + self.completion_tokens
+        return self.input_tokens + self.completion_tokens
 
 
 @dataclass
@@ -221,18 +238,51 @@ class Provider(ABC):
 
         return estimate_messages(messages)
 
+    # Enough for a reasoning model to think before it answers. The probe used
+    # to ask for 16, which a reasoning model spends entirely on its preamble:
+    # it returned an empty string with finish_reason "length" and the endpoint
+    # was reported `ok ... reply=''` — a pass recorded for a model that had not
+    # said anything. gpt-oss:20b needs 51 tokens to reply "OK".
+    _HEALTH_OUTPUT_TOKENS = 512
+
     def health(self) -> str:
         """One-line liveness probe used by `forge doctor` and the dashboard."""
         try:
             reply = self.complete(
                 [Message(role="user", content="Reply with exactly: OK")],
-                max_tokens=16,
+                max_tokens=min(self._HEALTH_OUTPUT_TOKENS, self.capabilities().max_output_tokens),
                 temperature=0.0,
                 timeout=60,
             )
-            return f"ok name={self.name} kind={self.kind} model={self.model} reply={reply.text.strip()[:40]!r}"
         except ProviderError as exc:
             return f"FAIL name={self.name} kind={self.kind} model={self.model} error={type(exc).__name__}: {exc}"
+
+        text = reply.text.strip()
+        if not text:
+            # Answering with nothing is not answering. Reported as a failure so
+            # it is fixed before a run rather than diagnosed as a bad executor.
+            why = (
+                "hit its output limit before emitting anything"
+                if reply.truncated
+                else "returned an empty response"
+            )
+            return f"FAIL name={self.name} kind={self.kind} model={self.model} error={why}"
+        return f"ok name={self.name} kind={self.kind} model={self.model} reply={text[:40]!r}"
+
+    def diagnostics(self) -> list[str]:
+        """Configuration problems that will not fail a probe but will cost a run.
+
+        `health()` answers "does this endpoint reply". These are the things that
+        answer yes and are still wrong: a context window larger than the server
+        is serving, an output reserve that leaves nowhere to put the prompt, a
+        model half-resident in VRAM. None of them raise, none of them show up
+        until a ticket behaves strangely at 2am, and all of them are visible for
+        the price of a request `forge doctor` is already making.
+
+        Best-effort and provider-specific; the default is that there is nothing
+        to say.
+        """
+        return []
 
 
 def split_system(messages: list[Message]) -> tuple[str, list[Message]]:

@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
-from .providers import ContextOverflow, Message, Provider
+from .providers import ContextOverflow, Message, Provider, Usage
 from .tokens import format_tokens
 
 
@@ -35,9 +35,19 @@ class UsageLedger(Protocol):
     change shape without touching this file.
     """
 
-    def record_usage(self, model: str, prompt_tokens: int, completion_tokens: int) -> None: ...
+    def record_usage(
+        self,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cache_creation_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cost_usd: float = 0.0,
+    ) -> None: ...
 
     def tokens_since(self, model: str, since: float) -> int: ...
+
+    def cost_since(self, model: str, since: float) -> float: ...
 
     def requests_since(self, model: str, since: float) -> int: ...
 
@@ -56,6 +66,11 @@ class RateLimitPolicy:
     tokens_per_minute: int = 0
     tokens_per_window: int = 0
     window_seconds: int = 0
+    # A spend cap is denominated in dollars, not tokens, and providers that
+    # price their own calls report that figure directly. Capping on it is the
+    # only proactive defence against a billing limit — the reactive path only
+    # learns about one after the provider has already refused a call.
+    cost_per_window: float = 0.0
 
     @classmethod
     def from_config(cls, config: dict[str, Any] | None) -> "RateLimitPolicy":
@@ -65,6 +80,7 @@ class RateLimitPolicy:
             tokens_per_minute=int(config.get("tokensPerMinute", 0) or 0),
             tokens_per_window=int(config.get("tokensPerWindow", 0) or 0),
             window_seconds=int(config.get("windowSeconds", 0) or 0),
+            cost_per_window=float(config.get("costPerWindow", 0) or 0),
         )
 
     @property
@@ -73,6 +89,7 @@ class RateLimitPolicy:
             self.requests_per_minute
             or self.tokens_per_minute
             or (self.tokens_per_window and self.window_seconds)
+            or (self.cost_per_window and self.window_seconds)
         )
 
 
@@ -103,7 +120,7 @@ class BudgetGate:
     # Rate limits
     # ------------------------------------------------------------------
 
-    def park(self, model: str, until: float, reason: str = "") -> None:
+    def park(self, model: str, until: float) -> None:
         """Record that a model is unavailable until a given time."""
         self._parked_until[model] = max(self._parked_until.get(model, 0.0), until)
 
@@ -155,10 +172,28 @@ class BudgetGate:
                     ),
                 )
 
+        if policy.cost_per_window and policy.window_seconds:
+            spent = self.ledger.cost_since(model, now - policy.window_seconds)
+            if spent >= policy.cost_per_window:
+                return Wait(
+                    seconds=policy.window_seconds / 4,
+                    reason=(
+                        f"{model} at ${spent:.2f}/${policy.cost_per_window:.2f} "
+                        f"for the {policy.window_seconds // 3600}h window"
+                    ),
+                )
+
         return None
 
-    def record(self, model: str, prompt_tokens: int, completion_tokens: int) -> None:
-        self.ledger.record_usage(model, prompt_tokens, completion_tokens)
+    def record(self, model: str, usage: Usage) -> None:
+        self.ledger.record_usage(
+            model,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cache_creation_tokens,
+            usage.cache_read_tokens,
+            usage.cost_usd,
+        )
         # A successful call means the window is open again.
         self._parked_until.pop(model, None)
 

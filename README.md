@@ -173,6 +173,7 @@ forge doctor                # probe every configured model
 forge ingest <file|->       # spec or plan -> reviewable backlog
 forge go [--plan f] [--open]# run until done or stopped
 forge status                # one-shot summary
+forge retry [--respec]      # requeue failed tickets, optionally re-specced
 forge pause | resume | stop # applied after the current step, never mid-patch
 forge ui                    # dashboard without running the loop
 ```
@@ -210,9 +211,15 @@ forge init --defaults   # no questions; writes a config to edit by hand
 With no terminal attached — piped, redirected, or run from a script — it takes
 every default and says so rather than blocking on stdin nobody is watching.
 
-See [docs/SETUP.md](docs/SETUP.md) for the host side. The daemon is stdlib-only
-Python 3.10+ — a failed `pip install` is a bad way to discover that an overnight
-run never started.
+First time through, [docs/QUICKSTART.md](docs/QUICKSTART.md) walks the whole
+setup — Ollama and which model to run, MemPalace, the daemon, and a narrated
+first `forge init`. [docs/SETUP.md](docs/SETUP.md) is the reference behind it:
+every option, every alternative, and the full security discussion. The daemon is
+stdlib-only Python 3.10+ — a failed `pip install` is a bad way to discover that
+an overnight run never started.
+
+[docs/ROADMAP.md](docs/ROADMAP.md) holds what is not built yet and why — the
+bug-report loop first among it.
 
 ## Layout
 

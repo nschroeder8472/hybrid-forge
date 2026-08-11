@@ -4,6 +4,11 @@ End-to-end setup for the plan-and-execute pipeline: Claude plans and reviews,
 a locally hosted Qwen3.6-35B-A3B executes, MemPalace carries project decisions
 across sessions.
 
+If this is your first time, [QUICKSTART.md](QUICKSTART.md) walks the same
+ground in order — one recommended path, a narrated first `forge init`, and
+pointers back into this document at each decision point. This one is the
+reference; that one is the tour.
+
 There are three distinct installs, and conflating them is the most common way
 this goes wrong:
 
@@ -69,6 +74,34 @@ exactly right. On the Mac, everything is local except two URLs:
 
 `claude-cli` shells out to the `claude` you are already signed into on that Mac,
 so planning and review run on your existing subscription with no API key.
+
+**It runs without tools by default.** `claude -p` is an agent, not a completion
+endpoint: left with its tools it runs a multi-turn session, reads files, and
+bills for every turn. One measured reviewer call spent 208k cache-read tokens
+and $0.34 judging a diff that was already in its prompt; disabling tools cut a
+comparable call from $0.106 to $0.046.
+
+It also matters for what the adapter guarantees. The loop decides what each
+role may see and what it may write; a role holding tools reads and writes
+whatever it likes, so the same `roles` block means different things depending
+on which adapter is behind it. Without tools this adapter behaves the way the
+loop already assumes — one call, one completion.
+
+Set `"tools"` to get the agent back, either wholesale or by name:
+
+```json
+"claude": { "kind": "claude-cli", "model": "opus", "tools": "default" }
+"claude": { "kind": "claude-cli", "model": "opus", "tools": "Read,Grep" }
+```
+
+A role that benefits from exploring the repo — a planner writing tickets
+against a codebase it has not seen — is worth the tokens. A reviewer handed the
+diff usually is not.
+
+**Your `CLAUDE.md` reaches these roles.** The CLI loads `~/.claude/CLAUDE.md`
+and any project `CLAUDE.md` under the run root, and both land in front of the
+planner and reviewer. Project instructions are usually welcome there; personal
+style preferences are not, and they will show up in verdict text.
 
 The memory entry uses `url` here because this is the split case: the palace is
 on the GPU host, so it runs `mempalace serve` and the Mac connects over HTTP.
@@ -588,6 +621,51 @@ check entirely, which is better than a command that does not work.
 pull decisions from unrelated repos and present them as authoritative, which is
 worse than having no memory at all.
 
+### Context window and output reserve
+
+`contextWindow` and `maxOutputTokens` are per model, and config always wins over
+discovery. Two things about them are worth getting right before the first run,
+because neither fails a health probe.
+
+**Set `contextWindow` to what your server is serving, not what the model can
+do.** These are different numbers and they routinely disagree. Ollama reports
+the architectural maximum through `/api/show` and the loaded `num_ctx` through
+`/api/ps`; on one box those read 131072 and 32768. Forge asks `/api/ps` first
+for exactly this reason. Believing the larger figure defeats the budget gate —
+it approves a 90k prompt for a 32k server, which truncates from the *front*,
+taking the system prompt and the spec with it. What comes back then reads as a
+weak model rather than a truncated request.
+
+Raise the server instead if you want the rest of the window:
+`OLLAMA_CONTEXT_LENGTH=131072`, or `num_ctx` in the Modelfile. A larger
+`num_ctx` allocates a larger KV cache, so check it still fits in VRAM — `forge
+doctor` warns when a model is only partly resident, which costs several times
+the speed rather than failing outright.
+
+**`maxOutputTokens` comes straight off the prompt budget.** `input_budget =
+contextWindow − maxOutputTokens − margin`, so reserving the whole window for
+output leaves nothing to put a prompt in and every ticket overflows before it
+starts. A config setting both to 32768 produced a prompt budget of −512.
+
+Reasoning models need more of it than you would guess: gpt-oss:20b spends about
+50 tokens thinking before it emits `OK`, and a whole-file response needs the
+thinking plus the file. 8192 is a reasonable starting point for a 32k window.
+
+`forge doctor` prints the resulting `prompt_budget` next to both, and warns when
+it drops below a third of the window.
+
+**`baselineVerify`** (default `true`) runs your verify commands once before each
+ticket, so a failure that was already in the tree is not blamed on whichever
+ticket happened to run next. Without it, one broken file fails every ticket in
+the backlog, each executor is told to fix an error in a file its ticket does not
+list, and respec then rewrites specs around somebody else's bug. Turn it off
+only when a full suite is slow enough that paying it per ticket costs more than
+the attempts it saves:
+
+```json
+"loop": { "maxAttempts": 3, "baselineVerify": false }
+```
+
 Then confirm every model actually answers:
 
 ```bash
@@ -750,11 +828,27 @@ For API-key models with published limits, declare them so the loop waits
 }
 ```
 
-For subscription-backed models the real numbers are opaque, so leave
-`rateLimit` unset and rely on the reactive path: the provider reports the limit
+For subscription-backed models the rolling usage window is opaque, so leave
+those fields unset and rely on the reactive path: the provider reports the limit
 when it hits it, and the gate parks the run until the reported reset time. The
 `claude-cli` adapter parses the CLI's limit message for that time; when the
 message carries no time it waits 15 minutes and re-probes.
+
+**Spend limits are the exception, and worth setting.** A monthly spend cap is
+denominated in dollars, and the `claude-cli` adapter records the CLI's own
+`total_cost_usd` for every call — so you can cap on it directly:
+
+```json
+"claude": {
+  "kind": "claude-cli",
+  "model": "opus",
+  "rateLimit": { "costPerWindow": 25.00, "windowSeconds": 18000 }
+}
+```
+
+This is the only *proactive* defence against a billing limit. Without it the
+loop only learns about one when the CLI refuses a call — and a refusal that
+late still costs the ticket its remaining attempts before the run parks.
 
 Either way the run enters `waiting_budget`, which is a live state — the
 dashboard shows the reason and the reopen time, and the loop resumes on its own.
@@ -833,6 +927,79 @@ A `stopped` run is resumable — `forge go` picks it back up as long as tickets
 remain. Blocked tickets carry a note saying what they need: a `BLOCKED:` from
 the executor means the spec was ambiguous, and the fix is to edit the ticket,
 not to re-run and hope.
+
+### Retrying failed tickets
+
+A ticket that exhausts `maxAttempts` is left `failed`, and once nothing is
+`pending` the run stops making progress — `forge go` finds the run but no work,
+so it just re-declares the backlog exhausted. `forge retry` reopens it:
+
+```bash
+forge retry                     # requeue every failed/blocked/skipped ticket
+forge retry --ticket TT-005     # just this one, whatever its status
+forge retry --all               # redo completed tickets too
+forge retry --go                # requeue, then start the loop
+```
+
+Each retry restores a full attempt budget, so fix the cause first — a spend
+limit needs the cap raised, and a reviewer `REJECT` on the same defect three
+times running will usually reject a fourth unless the ticket spec changes.
+
+### Letting the planner fix the spec
+
+When the failures are the spec's fault, `--respec` hands each requeued ticket
+back to the planner along with every recorded failure and asks what the ticket
+got wrong:
+
+```bash
+forge retry --respec              # revise every requeued ticket
+forge retry --ticket TT-005 --respec
+```
+
+The planner rewrites `spec`, `criteria`, `allowed_files`, and `context`, and
+the revised tickets are written back to `.hybridforge/tickets/` for you to read
+before starting. What it is looking for:
+
+| Evidence in the failures | What it changes |
+|---|---|
+| The same rejection every attempt | The wording that let the executor misread it |
+| A rejection naming an out-of-scope file | Widens `allowed_files` |
+| Behaviour nobody asked for | Adds the missing criterion |
+| A concrete defect the reviewer found | Records it in `context` so the next attempt starts knowing |
+| A guessed export name, or "I don't have the contents of X" | Adds X to `reference_files` |
+
+### Reference files — what the executor can actually see
+
+**The executor has no filesystem.** It receives the ticket and returns whole
+files as text; it cannot open anything. A ticket that says "read `src/api.rs`
+for the export names" is asking for something impossible, and the executor will
+guess instead — then get rejected for the guess.
+
+`reference_files` is the fix. Files listed there are pasted into the prompt
+read-only, alongside the current contents of everything in `allowed_files`:
+
+```json
+{"id": "TT-005", "allowed_files": ["web/main.js"],
+ "reference_files": ["src/wasm.rs"], "spec": "..."}
+```
+
+The planner is told to populate it, `--respec` adds it when the failures show a
+guessed API, and both are capped at 24k characters per file so a lockfile
+cannot crowd out the spec.
+
+This costs one planner call per ticket, so it is opt-in rather than the
+default. It is also a suggestion, not a fix: read the revised spec before
+`forge go`. If the failures show the work simply was not finished — no
+recurring theme, nothing the spec could have prevented — the planner is told to
+return the ticket unchanged and say why, and `forge retry` reports it as
+`unchanged` rather than inventing a revision.
+
+A respec never runs before the requeue is committed, so an unreachable or
+misconfigured planner costs you the revision, never the retry.
+
+Retried attempts are numbered on from where the last cycle stopped, so a ticket
+that failed three times writes its next artifacts to `attempt-4`. The failed
+attempts stay on disk; a retry never overwrites the evidence for why it failed.
 
 After merge, record durable outcomes to memory: decisions and their reasoning,
 new conventions, and any review correction that should not recur.

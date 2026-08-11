@@ -21,15 +21,54 @@ from pathlib import Path
 # A path line followed by a fenced block. The path may be bare, backticked, or
 # a `File: x` / `path/to/x:` label — models vary, and rejecting a correct
 # implementation over label punctuation is a bad trade.
+#
+# The closing fence must be at least as long as the opening one, which is the
+# CommonMark rule and the only way a file whose own contents contain fences can
+# be transported at all. A README wrapped in three backticks ends at the first
+# fence *inside* the README: the file is written truncated, and everything
+# after it is re-parsed as though it were more files. That is not theoretical —
+# it silently replaced a working `build.sh` with a fragment of markdown and
+# failed the ticket three times for a defect the executor never made.
 _BLOCK = re.compile(
     r"^[ \t]*(?:(?:File|Path)\s*:\s*)?[`'\"]?(?P<path>[\w./\\+-]+\.[\w+]+)[`'\"]?[ \t]*:?[ \t]*\n"
-    r"```[^\n]*\n"
+    r"(?P<fence>`{3,})[^\n]*\n"
     r"(?P<body>.*?)"
-    r"^```[ \t]*$",
+    r"^(?P=fence)`*[ \t]*$",
     re.MULTILINE | re.DOTALL,
 )
 
 BLOCKED_PREFIX = "BLOCKED:"
+
+# A fence line on its own — an opener with an optional language, or a closer.
+_FENCE_LINE = re.compile(r"^[ \t]*```[^\n]*$")
+
+
+def _unwrap_double_fence(body: str) -> str:
+    """Drop an inner fence the outer match swallowed.
+
+    Models sometimes wrap the whole reply in a fence, or emit the path line and
+    then two fences (`\\n```\\n```rust\\n`). `_BLOCK` binds to the *first*
+    opener, so the second one lands inside the captured body and gets written
+    into the file. That produced three `.rs` files in a real run whose second
+    line was ```` ```rust ````, which broke `cargo clippy --all-targets` for
+    every ticket afterwards — the ticket that caused it had long since passed.
+
+    Only triggers when the body's first non-blank line is itself a fence, which
+    is not something a source file does.
+    """
+    lines = body.split("\n")
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is None or not _FENCE_LINE.match(lines[first]):
+        return body
+
+    del lines[first]
+    # The matching closer, if the model emitted one, is now trailing.
+    last = next(
+        (i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None
+    )
+    if last is not None and _FENCE_LINE.match(lines[last]):
+        del lines[last]
+    return "\n".join(lines)
 
 
 @dataclass
@@ -67,16 +106,63 @@ def parse_output(text: str) -> ParsedOutput:
         return ParsedOutput(blocked_reason=marker.group("reason").strip())
 
     edits = [
-        FileEdit(path=match.group("path").replace("\\", "/"), content=match.group("body"))
+        FileEdit(
+            path=match.group("path").replace("\\", "/"),
+            content=_unwrap_double_fence(match.group("body")),
+        )
         for match in _BLOCK.finditer(text)
     ]
     return ParsedOutput(edits=edits)
 
 
+def duplicate_paths(parsed: ParsedOutput) -> list[str]:
+    """Paths the response wrote more than once, in first-seen order.
+
+    The executor is told to emit each changed file exactly once, whole. Two
+    blocks for one path therefore means something went wrong upstream of the
+    write, and the usual cause is a fence: a file containing its own fenced
+    block closes the outer fence early, and the remainder of that file gets
+    re-parsed into extra blocks whose paths came out of its prose.
+
+    Worth its own check because of the order `apply_edits` works in. The
+    spurious block is always the later one, so it wins, and the result is a
+    file replaced by a fragment of a different file — with a successful apply
+    step, no rejected paths, and nothing in the log to connect the two. Loud
+    and retryable beats silent and wrong.
+    """
+    seen: set[str] = set()
+    repeated: list[str] = []
+    for edit in parsed.edits:
+        path = normalize_path(edit.path)
+        if path in seen and path not in repeated:
+            repeated.append(path)
+        seen.add(path)
+    return repeated
+
+
+def normalize_path(path: str) -> str:
+    """Canonical repo-relative form, for comparing a model's path to a pattern.
+
+    Models write the same file several ways — `./build.sh`, `build.sh`,
+    `.\\build.sh` — and a scope check that treats those as different rejects a
+    ticket's *own* allowed file. That happened for real: TT-006 listed
+    `build.sh` and had `./build.sh` rejected as out of scope on every attempt,
+    so the ticket could never finish no matter what the executor wrote.
+
+    Only a leading `./` is stripped. An absolute path is left alone on purpose:
+    turning `/etc/passwd` into `etc/passwd` could make it match a repo-relative
+    pattern, and a scope check should never widen what it accepts.
+    """
+    normalized = path.replace("\\", "/").strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
 def matches_any(path: str, patterns: list[str]) -> bool:
-    normalized = path.replace("\\", "/")
+    normalized = normalize_path(path)
     for pattern in patterns:
-        pattern = pattern.replace("\\", "/")
+        pattern = normalize_path(pattern)
         if fnmatch.fnmatch(normalized, pattern):
             return True
         # `src/auth/**` should match `src/auth/x.py` under fnmatch too, which
