@@ -39,8 +39,19 @@ _ALLOWED_COMMANDS = {
 
 
 def snapshot(store: Store, config: Config) -> dict[str, Any]:
-    """Everything the dashboard renders, in one read."""
-    run = store.active_run() or store.latest_run()
+    """Everything the dashboard renders, in one read.
+
+    Always the newest run, terminal or not. `active_run()` looks like the right
+    choice here and is not: it skips finished runs, so an older run someone
+    left blocked outranks the one that just succeeded. A backlog that had gone
+    six-for-six reported `run 7: blocked — 6 ticket(s) need a human`, naming a
+    run two days stale, which reads as the run having just failed.
+
+    A new run always takes the highest id, so the newest row is the live one
+    whenever there is a live one. `resumable_run()` is what the loop uses to
+    decide where to continue; this is only what a human is shown.
+    """
+    run = store.latest_run()
     if run is None:
         return {"run": None, "tickets": [], "steps": [], "usage": [], "control": CONTROL_RUN}
 
@@ -92,8 +103,12 @@ def snapshot(store: Store, config: Config) -> dict[str, Any]:
         "usage": [
             {
                 **row,
-                "total": row["prompt_tokens"] + row["completion_tokens"],
-                "display": format_tokens(row["prompt_tokens"] + row["completion_tokens"]),
+                "total": row["total_tokens"],
+                "display": format_tokens(row["total_tokens"]),
+                "cached": row["cache_creation_tokens"] + row["cache_read_tokens"],
+                "cost_display": (
+                    f"${row['cost_usd']:.2f}" if row["cost_usd"] else ""
+                ),
             }
             for row in store.usage_summary()
         ],

@@ -70,11 +70,18 @@ Rules:
   cryptography, or payment flows — or when the right approach is still an open
   question. Everything else is "delegate".
 - Order tickets so that each one can assume the previous ones landed.
+- The executor has no filesystem. It sees only what the ticket carries, and it
+  returns whole files as text. Any file it must read to get an export name, a
+  signature, an enum order, or a type right belongs in `reference_files` — it
+  is pasted into the prompt read-only. A ticket that says "read src/api.rs"
+  without listing it there is asking for something the executor cannot do, and
+  it will guess instead.
 
 Reply with a single JSON object and nothing else:
 
 {"tickets": [{"id": "AB-001", "title": "...", "route": "delegate",
               "spec": "...", "allowed_files": ["..."],
+              "reference_files": ["..."],
               "criteria": ["...", "..."], "context": ""}]}
 """
 
@@ -180,6 +187,7 @@ def tickets_from_json(text: str) -> list[Ticket]:
                 position=position,
                 spec=str(item.get("spec", "")),
                 allowed_files=[str(p) for p in item.get("allowed_files", [])],
+                reference_files=[str(p) for p in item.get("reference_files", [])],
                 criteria=[str(c) for c in item.get("criteria", [])],
                 context=str(item.get("context", "")),
             )
@@ -233,6 +241,9 @@ def render_ticket(ticket: Ticket) -> str:
         "",
     ]
     lines += [f"- `{path}`" for path in ticket.allowed_files] or ["_(none listed)_"]
+    if ticket.reference_files:
+        lines += ["", "## Reference files (read-only)", ""]
+        lines += [f"- `{path}`" for path in ticket.reference_files]
     lines += ["", "## Acceptance criteria", ""]
     lines += [f"- {c}" for c in ticket.criteria] or ["_(none listed)_"]
     if ticket.context.strip():
