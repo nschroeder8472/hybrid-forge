@@ -289,6 +289,7 @@ def tests_prompt(
     failure_context: str = "",
     sources: dict[str, str] | None = None,
     rejected_bindings: list[str] | None = None,
+    own_file_errors: list[str] | None = None,
 ) -> list[Message]:
     """Ask the tester for assertions, with the evidence to match the repo.
 
@@ -372,7 +373,15 @@ implementation — it fails to compile, and takes the whole suite down with it.
 {failure_context}
 ```
 
-Read this before writing anything, and decide which kind of failure it is.
+Read this before writing anything, and decide which of three kinds it is.
+
+A failure that **names your own test file** is about your code, not your
+assertions. A compile error, an unused variable, an unused import, a lint the
+project denies — these are defects in how the test is written, and the ticket
+cannot pass while they stand. Nobody else can fix them: your file is outside
+the scope of every other role here, so rewriting the same assertions with the
+same unused variable fails the ticket again in exactly this way, and keeps
+failing. Fix the line the error points at. Keep the assertions.
 
 A failure caused by **your own assertion being wrong** — asserting on something
 the criterion never claimed, comparing a return value against source text,
@@ -385,6 +394,21 @@ wrapping it in a skip would hide a real defect and end the ticket with a green
 suite over broken code — a worse outcome than any failing test.
 
 If you cannot tell which it is, keep the assertion as written.
+"""
+
+    if own_file_errors:
+        quoted = "\n".join(f"  {line}" for line in own_file_errors)
+        body += f"""
+## These errors are in the file you are about to write
+
+```
+{quoted}
+```
+
+Not the implementation's — `{test_path}` is yours, and it is the only file in
+this project you can change. Whatever the rest of the failure says, the ticket
+cannot pass until these are gone. Fix exactly what they point at and keep every
+assertion you had.
 """
 
     if rejected_bindings:

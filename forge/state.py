@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     criteria      TEXT NOT NULL DEFAULT '[]',
     needs         TEXT NOT NULL DEFAULT '[]',
     dep_stamp     TEXT NOT NULL DEFAULT '{}',
+    baseline_tree TEXT NOT NULL DEFAULT '',
     context       TEXT NOT NULL DEFAULT '',
     blocked_note  TEXT NOT NULL DEFAULT '',
     original_spec     TEXT NOT NULL DEFAULT '',
@@ -153,6 +154,12 @@ class Ticket:
     # version of what it was built on; when a respec moves that, the pass was
     # earned against a contract that no longer exists.
     dep_stamp: dict[str, str] = field(default_factory=dict)
+    # The tree this ticket started from, captured the first time it ran and
+    # kept for its whole life. A retry cycle inherits the previous cycle's work
+    # in the tree — autoCommit is off and nothing reverts a failed ticket — so
+    # re-snapshotting per run measures the ticket against its own output and
+    # produces an empty diff for a reviewer that has nothing left to judge.
+    baseline_tree: str = ""
     context: str = ""
     blocked_note: str = ""
     # The spec and criteria as the plan was ingested, never rewritten. Respec
@@ -211,6 +218,7 @@ class Ticket:
             "criteria": json.dumps(self.criteria),
             "needs": json.dumps(self.needs),
             "dep_stamp": json.dumps(self.dep_stamp),
+            "baseline_tree": self.baseline_tree,
             "context": self.context,
             "blocked_note": self.blocked_note,
             "original_spec": self.original_spec,
@@ -233,6 +241,7 @@ class Ticket:
             criteria=json.loads(row["criteria"]),
             needs=json.loads(row["needs"]),
             dep_stamp=json.loads(row["dep_stamp"]),
+            baseline_tree=row["baseline_tree"],
             context=row["context"],
             blocked_note=row["blocked_note"],
             original_spec=row["original_spec"],
@@ -267,6 +276,7 @@ class Store:
         ("tickets", "original_criteria", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "needs", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "dep_stamp", "TEXT NOT NULL DEFAULT '{}'"),
+        ("tickets", "baseline_tree", "TEXT NOT NULL DEFAULT ''"),
     )
 
     def _migrate(self) -> None:
@@ -381,12 +391,13 @@ class Store:
                 connection.execute(
                     "INSERT OR REPLACE INTO tickets "
                     "(run_id, ticket_id, title, route, status, position, attempts, "
-                    " attempt_base, spec, allowed_files, reference_files, criteria, needs, dep_stamp, context, "
+                    " attempt_base, spec, allowed_files, reference_files, criteria, needs, dep_stamp, "
+                    " baseline_tree, context, "
                     " blocked_note, original_spec, original_criteria, "
                     " updated_at) "
                     "VALUES (:run_id, :ticket_id, :title, :route, :status, :position, "
                     ":attempts, :attempt_base, :spec, :allowed_files, :reference_files, "
-                    ":criteria, :needs, :dep_stamp, :context, "
+                    ":criteria, :needs, :dep_stamp, :baseline_tree, :context, "
                     ":blocked_note, :original_spec, :original_criteria, :now)",
                     {**row, "run_id": run_id, "now": now},
                 )
@@ -439,7 +450,8 @@ class Store:
                 "UPDATE tickets SET status = :status, attempts = :attempts, "
                 "attempt_base = :attempt_base, spec = :spec, "
                 "allowed_files = :allowed_files, reference_files = :reference_files, "
-                "criteria = :criteria, needs = :needs, dep_stamp = :dep_stamp, context = :context, "
+                "criteria = :criteria, needs = :needs, dep_stamp = :dep_stamp, "
+                "baseline_tree = :baseline_tree, context = :context, "
                 "blocked_note = :blocked_note, updated_at = :now "
                 "WHERE run_id = :run_id AND ticket_id = :ticket_id",
                 {**ticket.as_row(), "run_id": run_id, "now": time.time()},

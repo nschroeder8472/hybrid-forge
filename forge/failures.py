@@ -207,3 +207,36 @@ def _clip_lines(lines: list[str], limit: int, *, note: str) -> str:
     if len(kept) < len(lines):
         kept.append(f"[{note}: {len(lines) - len(kept)} more line(s)]")
     return "\n".join(kept)
+
+
+def errors_naming(text: str, path: str) -> list[str]:
+    """Lines of a verify failure that name `path`, with their message.
+
+    Compilers report the message on one line and the location on the next
+    (`error: unused variable: \x60x\x60` / `  --> tests\tt_001_test.rs:67:10`),
+    so a location line is returned together with whatever introduced it.
+
+    The tester's file is the only one it can change, and it is outside every
+    other role's scope. A style error there fails the ticket for as long as the
+    tester keeps reproducing it — one run spent twelve retry cycles on a single
+    unused variable, because the failure it was shown read as evidence about
+    the implementation rather than about its own file.
+    """
+    if not path:
+        return []
+    wanted = {path.replace("\\", "/").lower(), path.replace("/", "\\").lower()}
+    lines = text.splitlines()
+    found: list[str] = []
+    for index, raw in enumerate(lines):
+        lowered = raw.lower()
+        if not any(name in lowered for name in wanted):
+            continue
+        # The message this location belongs to, if the line above is one.
+        preceding = lines[index - 1].strip() if index else ""
+        if preceding and re.match(r"^(error|warning)\b", preceding, re.IGNORECASE):
+            entry = f"{preceding}\n  {raw.strip()}"
+        else:
+            entry = raw.strip()
+        if entry not in found:
+            found.append(entry)
+    return found
