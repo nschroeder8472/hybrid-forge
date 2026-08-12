@@ -22,7 +22,7 @@ second-guessing an OpenAI executor — with no code change.
   "commands": {"lint": "...", "typecheck": "...", "test": "..."},
   "neverDelegate": ["src/auth/**"],
   "memory": {"command": ["mempalace-mcp"], "room": "image-marquee"},
-  "loop": {"maxAttempts": 3, "autoCommit": false},
+  "loop": {"maxAttempts": 3, "autoCommit": false, "retryCycles": 0},
   "ui": {"host": "127.0.0.1", "port": 8799}
 }
 ```
@@ -64,6 +64,32 @@ class LoopSettings:
     # a blocked ticket gets attention; off means the run keeps making progress
     # elsewhere and reports blockers at the end.
     stop_on_blocked: bool = False
+    # Whole-backlog retry cycles once the run has ended anything other than
+    # done. Each one requeues every ticket that failed, blocked or was skipped
+    # and starts the loop over them again. 0 hands back to a human, which is
+    # the safe default; -1 means keep going until the backlog is clean or
+    # somebody stops the run.
+    retry_cycles: int = 0
+    # Have the planner rewrite each requeued ticket from why it failed before
+    # the next cycle starts — `forge retry --respec`, applied automatically.
+    # On by default: a cycle that re-runs the spec which already failed is a
+    # slower version of the same failure.
+    respec_on_retry: bool = True
+    # Let a respec rewrite the acceptance criteria as well as the spec. Off,
+    # and the loop already enforces the same rule one level down: the party
+    # being judged does not write the standard it is judged against. Left on,
+    # a ticket that keeps failing accumulates criteria derived from its own
+    # failures until they contradict the plan — one ended up asserting the
+    # opposite of what its author wrote, and every role downstream believed it.
+    respec_criteria: bool = False
+    # Re-open a ticket that passed on top of a dependency a respec has since
+    # rewritten. Its `done` was earned against a contract that no longer
+    # exists, and leaving it green reports a clean backlog over a spec that
+    # moved underneath it. On, because that misreport is the failure this
+    # whole mechanism exists to prevent — but it can re-open a large part of a
+    # backlog after one respec, and on local models that is minutes per
+    # ticket. Turn it off to be warned instead.
+    reopen_stale_dependents: bool = True
     # Seconds between control-channel checks while waiting.
     poll_seconds: float = 2.0
     # Cap on unattended wall-clock time. 0 disables.
@@ -142,6 +168,12 @@ class Config:
             max_attempts=int(loop.get("maxAttempts", 3)),
             auto_commit=bool(loop.get("autoCommit", False)),
             stop_on_blocked=bool(loop.get("stopOnBlocked", False)),
+            retry_cycles=int(loop.get("retryCycles", 0)),
+            respec_on_retry=bool(loop.get("respecOnRetry", True)),
+            respec_criteria=bool(loop.get("respecCriteria", False)),
+            reopen_stale_dependents=bool(
+                loop.get("reopenStaleDependents", True)
+            ),
             poll_seconds=float(loop.get("pollSeconds", 2.0)),
             max_runtime_seconds=int(loop.get("maxRuntimeSeconds", 0)),
             baseline_verify=bool(loop.get("baselineVerify", True)),
@@ -160,6 +192,15 @@ class Config:
     def validate(self) -> None:
         if not self.models:
             raise ConfigError("config declares no models under `models`.")
+        if self.loop.retry_cycles < -1:
+            # Caught here rather than clamped: a negative number that is not -1
+            # is a typo, and guessing which one it meant would either burn the
+            # user's tokens forever or silently do nothing.
+            raise ConfigError(
+                f"loop.retryCycles is {self.loop.retry_cycles}; expected 0 (hand "
+                f"back to a human), a positive count, or -1 (retry until the "
+                f"backlog is clean or the run is stopped)."
+            )
         for role in ROLES:
             name = self.roles.get(role)
             if not name:
@@ -242,6 +283,10 @@ class Config:
                 "maxAttempts": self.loop.max_attempts,
                 "autoCommit": self.loop.auto_commit,
                 "stopOnBlocked": self.loop.stop_on_blocked,
+                "retryCycles": self.loop.retry_cycles,
+                "respecOnRetry": self.loop.respec_on_retry,
+                "respecCriteria": self.loop.respec_criteria,
+                "reopenStaleDependents": self.loop.reopen_stale_dependents,
                 "pollSeconds": self.loop.poll_seconds,
                 "maxRuntimeSeconds": self.loop.max_runtime_seconds,
                 "baselineVerify": self.loop.baseline_verify,

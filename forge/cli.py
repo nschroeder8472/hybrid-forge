@@ -4,6 +4,8 @@
     forge doctor                   probe every configured model
     forge ingest <file|->          turn a spec or plan into a backlog
     forge go [--plan f] [--open]   run the loop until done or stopped
+    forge go --retries N           requeue what did not land, N more times
+                                   (-1: until it is clean or you stop it)
     forge status                   one-shot summary
     forge retry [--respec]         put failed tickets back on the backlog
     forge prune [--keep N]         delete the artifact trees of old runs
@@ -26,15 +28,21 @@ import time
 import webbrowser
 from pathlib import Path
 
-from . import wizard
+from . import respec, wizard
 from .artifacts import ARTIFACTS_DIR
 from .config import Config, ConfigError, default_config
 from .ingest import ingest as ingest_document
 from .ingest import write_tickets
-from .loop import CONTROL_KEY, CONTROL_PAUSE, CONTROL_RUN, CONTROL_STOP, Orchestrator
+from .loop import (
+    CONTROL_KEY,
+    CONTROL_PAUSE,
+    CONTROL_RUN,
+    CONTROL_STOP,
+    Orchestrator,
+    retries_key,
+)
 from .memory import MemoryClient
 from .profile import Profile
-from .prompts import parse_respec, respec_prompt
 from .providers import ProviderError
 from .state import (
     RUN_IDLE,
@@ -195,7 +203,9 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         provider = None
 
     try:
-        tickets, how = ingest_document(text, provider=provider, force_plan=args.replan)
+        tickets, how, derived = ingest_document(
+            text, provider=provider, force_plan=args.replan
+        )
     except (ValueError, ProviderError) as exc:
         sys.exit(f"error: {exc}")
 
@@ -211,14 +221,39 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     print(f"Run {run_id}: {len(tickets)} ticket(s) {verb}.\n")
     for ticket, path in zip(tickets, paths):
         marker = " (claude-only)" if ticket.route != "delegate" else ""
-        print(f"  {ticket.ticket_id}  {ticket.title}{marker}")
+        waits = f"  [needs {', '.join(ticket.needs)}]" if ticket.needs else ""
+        print(f"  {ticket.ticket_id}  {ticket.title}{marker}{waits}")
         print(f"      {path}")
+
+    # An ordering nobody typed is the one worth showing. Two tickets writing
+    # one file is ordinary — a ticket is a testable unit, not a file lease —
+    # but which of them goes first is a decision just made on their behalf.
+    if derived:
+        print(f"\nOrdered {len(derived)} pair(s) that write the same file:")
+        for later, earlier, path in derived:
+            print(f"  {later} waits for {earlier}  ({path})")
+
     print("\nReview the tickets, then run `forge go`.")
     return 0
 
 
 def cmd_go(args: argparse.Namespace) -> int:
     config = _load(args.root)
+
+    # Flags override config for this run only; nothing is written back. The
+    # usual shape is a config that hands blocked work to a human and one
+    # deliberate `forge go --retries -1` before going to bed.
+    retries = getattr(args, "retries", None)
+    if retries is not None:
+        if retries < -1:
+            sys.exit(
+                "error: --retries takes 0 (hand back to a human), a positive "
+                "count, or -1 (retry until the backlog is clean or you stop it)."
+            )
+        config.loop.retry_cycles = retries
+    if getattr(args, "no_respec", False):
+        config.loop.respec_on_retry = False
+
     store = _store(config)
 
     if args.plan:
@@ -242,6 +277,7 @@ def cmd_go(args: argparse.Namespace) -> int:
     if run["status"] == "stopped":
         print(f"Resuming run {run_id} ({remaining} ticket(s) left).")
 
+    url = ""
     if config.ui.enabled and not args.no_ui:
         ui_server.serve(config, store)
         url = ui_server.url_for(config)
@@ -250,6 +286,14 @@ def cmd_go(args: argparse.Namespace) -> int:
             webbrowser.open(url)
 
     print(f"Run {run_id}: {run['goal']}")
+    if config.loop.retry_cycles:
+        cycles = (
+            "until the backlog is clean or you stop it"
+            if config.loop.retry_cycles < 0
+            else f"up to {config.loop.retry_cycles} more time(s)"
+        )
+        respec_note = "with a respec" if config.loop.respec_on_retry else "without a respec"
+        print(f"Unfinished tickets will be requeued {cycles}, {respec_note}.")
     print("Ctrl-C stops after the current step.\n")
 
     orchestrator = Orchestrator(config, store)
@@ -263,6 +307,9 @@ def cmd_go(args: argparse.Namespace) -> int:
     counts = store.ticket_counts(run_id)
     print(f"\nFinished: {final}")
     print(f"  tickets: {json.dumps(counts)}")
+    spent = store.get_control(retries_key(run_id), "0")
+    if spent != "0":
+        print(f"  retry cycles: {spent}")
     for row in store.usage_summary():
         line = (
             f"  {row['model']}: {row['calls']} calls, "
@@ -275,7 +322,34 @@ def cmd_go(args: argparse.Namespace) -> int:
             line += f", ${row['cost_usd']:.2f}"
         print(line)
 
+    # The dashboard dies with this process, and the run it was showing is the
+    # one worth reading — which failed, on which ticket, with what in the event
+    # stream. Exiting the moment the loop stops takes that away at exactly the
+    # moment it becomes interesting.
+    if url and _should_wait(args):
+        print(f"\nDashboard still serving at {url} — Ctrl-C to exit.")
+        print("The run is over; this is only here so you can read it.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print()
+
     return 0 if final in ("done",) else 1
+
+
+def _should_wait(args: argparse.Namespace) -> bool:
+    """Whether to hold the dashboard open after the loop stops.
+
+    Default is "yes if a human is watching". A `forge go` in a scheduled task,
+    a CI step, or a `&&` chain must still exit on its own — a daemon that
+    silently never returns is a worse failure than a dashboard you have to
+    restart with `forge ui`.
+    """
+    wait = getattr(args, "wait", None)
+    if wait is not None:
+        return bool(wait)
+    return wizard.interactive()
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -323,12 +397,13 @@ def _respec(
     run_id: int,
     tickets: list,
     notes: dict[str, str],
+    allow_criteria: bool = False,
 ) -> None:
     """Rewrite requeued tickets from the evidence of why they failed.
 
-    Best-effort per ticket. The requeue is already committed by the time this
-    runs, so a planner that is unreachable or returns nonsense must cost the
-    user a revision, never the retry itself.
+    The revision itself lives in `forge.respec`, which the loop's automatic
+    retry cycles use too. What is here is the reporting: a human watching a
+    terminal wants each ticket's verdict as it lands.
     """
     try:
         provider = config.provider_for("planner")
@@ -336,52 +411,70 @@ def _respec(
         print(f"\nwarning: cannot respec — {exc}")
         return
 
+    # Ask for what this planner can actually produce. A hardcoded ceiling is
+    # too small for a thinking model, which spends most of its budget before
+    # the first character of the answer.
+    budget = provider.capabilities().max_output_tokens
+
+    def call(messages, limit):
+        return provider.complete(messages, max_tokens=limit, temperature=0.0)
+
+    locked = not (config.loop.respec_criteria or allow_criteria)
     print("\nRe-speccing from the recorded failures…")
+    revised: list = []
     for ticket in tickets:
-        failures = store.ticket_failures(run_id, ticket.ticket_id)
-        note = (notes.get(ticket.ticket_id) or "").strip()
-        if note:
-            failures = failures + [{"name": "gave up", "detail": note}]
-        if not failures:
-            print(f"  {ticket.ticket_id:<10} skipped — nothing recorded to learn from")
-            continue
-
-        try:
-            completion = provider.complete(
-                respec_prompt(ticket, failures), max_tokens=4096, temperature=0.0
-            )
-            revision = parse_respec(completion.text)
-        except (ProviderError, ValueError) as exc:
-            print(f"  {ticket.ticket_id:<10} unchanged — {exc}")
-            continue
-
-        rationale = revision.pop("rationale", "")
-        changed = [
-            field
-            for field, value in revision.items()
-            if value != getattr(ticket, field)
-        ]
-        if not changed:
-            print(f"  {ticket.ticket_id:<10} unchanged — planner kept the ticket as written")
-            continue
-
-        for field, value in revision.items():
-            setattr(ticket, field, value)
-        store.update_ticket(run_id, ticket)
-        store.log(
+        result = respec.revise(
+            store,
             run_id,
-            f"{ticket.ticket_id}: respec revised {', '.join(changed)}. {rationale}".strip(),
-            kind="ticket",
+            ticket,
+            notes.get(ticket.ticket_id, ""),
+            call=call,
+            budget=budget,
+            # The planner has no filesystem either, and a spec written about
+            # code nobody showed it is a guess the executor is then judged on.
+            sources=respec.sources_for(config.root, ticket),
+            criteria_locked=locked,
         )
+        if result.impossible:
+            # Parked rather than requeued: the planner has just explained that
+            # no attempt can pass, so letting the loop spend a full attempt
+            # budget proving it is the most expensive way to learn nothing.
+            ticket.status = TICKET_BLOCKED
+            ticket.blocked_note = f"respec: {result.impossible}"
+            store.update_ticket(run_id, ticket)
+            print(f"  {ticket.ticket_id:<10} CANNOT BE SATISFIED — {result.impossible}")
+            print("      Parked for you. Fix the criterion, then retry it by name.")
+            continue
+        if result.refused_criteria:
+            print(
+                f"  {ticket.ticket_id:<10} tried to change {len(result.refused_criteria)} "
+                f"criterion(s) from the plan; put back."
+            )
+            for criterion in result.refused_criteria:
+                print(f"      kept: {criterion}")
+        if not result.revised:
+            # The rationale is the content of this outcome: "kept as written"
+            # only says the planner declined to act, not why.
+            print(f"  {ticket.ticket_id:<10} unchanged — {result.note}")
+            if result.rationale:
+                print(f"      {result.rationale}")
+            continue
+        revised.append(ticket)
+        print(f"  {ticket.ticket_id:<10} revised {', '.join(result.changed)}")
+        if result.rationale:
+            print(f"      {result.rationale}")
 
-        print(f"  {ticket.ticket_id:<10} revised {', '.join(changed)}")
-        if rationale:
-            print(f"      {rationale}")
+    if not revised:
+        print("\nNo ticket was revised; the files on disk are unchanged.")
+        return
 
     # Tickets are the artifact a human reviews before the loop acts on them,
-    # so the files on disk have to carry the revision too.
-    paths = write_tickets(config.tickets_dir, store.list_tickets(run_id))
-    print(f"\nRewrote {len(paths)} ticket file(s) in {config.tickets_dir}.")
+    # so the files on disk have to carry the revision too. Only the revised
+    # ones: rewriting the whole backlog reported "6 ticket file(s)" for one
+    # revision, which reads as respec having touched work it never looked at.
+    names = ", ".join(ticket.ticket_id for ticket in revised)
+    write_tickets(config.tickets_dir, revised)
+    print(f"\nRewrote {len(revised)} ticket file(s) in {config.tickets_dir}: {names}.")
     print("Read the revised specs before starting — respec is a suggestion, not a fix.")
 
 
@@ -512,6 +605,10 @@ def cmd_retry(args: argparse.Namespace) -> int:
 
     store.set_run_status(run_id, RUN_IDLE, note=f"retrying {len(reset)} ticket(s)")
     store.log(run_id, f"Retry queued {len(reset)} ticket(s).", kind="control")
+    # A human stepping in restores the automatic budget too: the next `forge
+    # go` should get its full `retryCycles` rather than inheriting a count
+    # spent on the specs this retry has just replaced.
+    store.set_control(retries_key(run_id), "0")
 
     print(f"Run {run_id}: queued {len(reset)} ticket(s) for retry.")
     for ticket in reset:
@@ -519,7 +616,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
         print(f"  {ticket.ticket_id:<10} {ticket.title} ({prior})")
 
     if args.respec:
-        _respec(config, store, run_id, reset, notes)
+        _respec(config, store, run_id, reset, notes, allow_criteria=args.respec_criteria)
 
     # A newer run would shadow this one, since the loop always takes the
     # highest run id. Say so rather than letting `forge go` look broken.
@@ -539,6 +636,9 @@ def cmd_retry(args: argparse.Namespace) -> int:
                 goal="",
                 no_ui=args.no_ui,
                 open=False,
+                retries=args.retries,
+                no_respec=False,
+                wait=None,
             )
         )
 
@@ -606,6 +706,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--goal", default="", help="short description, used with --plan")
     p.add_argument("--no-ui", action="store_true", help="do not start the dashboard")
     p.add_argument("--open", action="store_true", help="open the dashboard in a browser")
+    p.add_argument(
+        "--retries",
+        type=int,
+        default=None,
+        metavar="N",
+        help="requeue and respec unfinished tickets N more times when the run "
+        "ends short of done; -1 keeps going until it is clean or you stop it "
+        "(default: loop.retryCycles, normally 0)",
+    )
+    p.add_argument(
+        "--no-respec",
+        action="store_true",
+        help="with --retries, requeue the tickets as written instead of having "
+        "the planner revise them first",
+    )
+    p.add_argument(
+        "--wait",
+        dest="wait",
+        action="store_true",
+        default=None,
+        help="keep the dashboard serving after the run ends (the default when "
+        "a terminal is attached)",
+    )
+    p.add_argument(
+        "--no-wait",
+        dest="wait",
+        action="store_false",
+        help="exit as soon as the run ends, closing the dashboard with it",
+    )
     p.set_defaults(func=cmd_go)
 
     p = sub.add_parser("status", help="one-shot summary of the current run")
@@ -639,7 +768,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="have the planner revise each ticket from why it failed",
     )
+    p.add_argument(
+        "--respec-criteria",
+        action="store_true",
+        help="also let the respec rewrite the acceptance criteria. Off by "
+        "default: they are the contract the attempts failed against, and a "
+        "ticket that keeps rewriting its own drifts away from the plan",
+    )
     p.add_argument("--go", action="store_true", help="start the loop straight after")
+    p.add_argument(
+        "--retries",
+        type=int,
+        default=None,
+        metavar="N",
+        help="with --go, requeue and respec unfinished tickets N more times "
+        "without asking; -1 keeps going until the backlog is clean or you stop it",
+    )
     p.add_argument("--no-ui", action="store_true", help="with --go, skip the dashboard")
     p.set_defaults(func=cmd_retry)
 

@@ -600,7 +600,8 @@ does what). Any declared model can play any role:
     "test":      "cargo test"
   },
   "neverDelegate": ["src/auth/**", "src/wasm_bridge.rs"],
-  "loop": { "maxAttempts": 3, "autoCommit": false, "stopOnBlocked": false },
+  "loop": { "maxAttempts": 3, "autoCommit": false, "stopOnBlocked": false,
+            "retryCycles": 0, "respecOnRetry": true, "respecCriteria": false },
   "ui":   { "host": "127.0.0.1", "port": 8799 }
 }
 ```
@@ -653,6 +654,45 @@ thinking plus the file. 8192 is a reasonable starting point for a 32k window.
 
 `forge doctor` prints the resulting `prompt_budget` next to both, and warns when
 it drops below a third of the window.
+
+### Thinking models answer last
+
+A thinking model writes its reasoning before a single character of its answer,
+and over the OpenAI-compatible shape that reasoning does not arrive in
+`content`. Ollama returns it as `reasoning`, vLLM and DeepSeek as
+`reasoning_content` — none of which are in the spec, and all of which still
+count against `maxOutputTokens`. Run out of budget mid-thought and the reply is
+an *empty string* with `finish_reason: length`, which reads downstream as
+"planner did not return usable JSON:" followed by nothing at all.
+
+This bites hardest where replies are longest — respec and whole-file builds —
+so a model can pass `forge doctor`, plan a backlog, and still fail every ticket.
+Forge now names this case instead of passing the empty string on, but the fix is
+config. Either give the thinking room:
+
+```json
+"local": { "kind": "openai", "baseUrl": "http://127.0.0.1:11434/v1",
+           "model": "qwen3.6:35b-a3b", "contextWindow": 32768,
+           "maxOutputTokens": 16384 }
+```
+
+or turn thinking off and reclaim the budget for the answer:
+
+```json
+"local": { "kind": "openai", "baseUrl": "http://127.0.0.1:11434/v1",
+           "model": "qwen3.6:35b-a3b", "contextWindow": 32768,
+           "maxOutputTokens": 8192,
+           "extraBody": { "reasoning_effort": "none" } }
+```
+
+`extraBody` is merged into the request body verbatim, so it also carries vLLM's
+`top_k` and OpenRouter's routing preferences. Note that `reasoning_effort` is
+the only thinking switch Ollama's `/v1` endpoint honors — `think: false` and
+`chat_template_kwargs.enable_thinking` are accepted and silently ignored, and
+the model keeps thinking.
+
+Check which you have before guessing: `ollama show <model>` lists `thinking`
+under capabilities.
 
 **`baselineVerify`** (default `true`) runs your verify commands once before each
 ticket, so a failure that was already in the tree is not blamed on whichever
@@ -923,6 +963,13 @@ Read the run status before assuming something is wrong:
 | `blocked` | Backlog exhausted, but tickets need a human. |
 | `done` / `failed` / `stopped` | Terminal for that run. |
 
+When the loop stops, `forge go` keeps the dashboard serving until you press
+Ctrl-C, so the run you most want to read — which ticket failed, on what, with
+the event stream still in front of you — does not vanish with the process. It
+holds only when a terminal is attached: a scheduled run or a CI step exits on
+its own. Force either way with `--wait` / `--no-wait`, and note that nothing is
+lost either way, since `forge ui` serves the same database afterwards.
+
 A `stopped` run is resumable — `forge go` picks it back up as long as tickets
 remain. Blocked tickets carry a note saying what they need: a `BLOCKED:` from
 the executor means the spec was ambiguous, and the fix is to edit the ticket,
@@ -941,6 +988,9 @@ forge retry --all               # redo completed tickets too
 forge retry --go                # requeue, then start the loop
 ```
 
+The loop can do this for itself instead of waiting for you — see
+[`retryCycles`](#retrying-without-you--retrycycles) below.
+
 Each retry restores a full attempt budget, so fix the cause first — a spend
 limit needs the cap raised, and a reviewer `REJECT` on the same defect three
 times running will usually reject a fourth unless the ticket spec changes.
@@ -956,9 +1006,9 @@ forge retry --respec              # revise every requeued ticket
 forge retry --ticket TT-005 --respec
 ```
 
-The planner rewrites `spec`, `criteria`, `allowed_files`, and `context`, and
-the revised tickets are written back to `.hybridforge/tickets/` for you to read
-before starting. What it is looking for:
+The planner rewrites `spec`, `allowed_files`, `reference_files`, and `context`,
+and the revised tickets are written back to `.hybridforge/tickets/` for you to
+read before starting. What it is looking for:
 
 | Evidence in the failures | What it changes |
 |---|---|
@@ -996,6 +1046,116 @@ return the ticket unchanged and say why, and `forge retry` reports it as
 
 A respec never runs before the requeue is committed, so an unreachable or
 misconfigured planner costs you the revision, never the retry.
+
+#### What a respec is not allowed to do
+
+Three limits, all of them there because a respec loop without them drifts. The
+failure that produced them: one ticket, twelve cycles, ending with acceptance
+criteria that asserted the opposite of what its author had written — and a
+tester and reviewer downstream that believed the drift completely.
+
+**The criteria are scoped by who wrote them.** Not frozen outright — that was
+tried first and made things worse in the other direction: a criterion the loop
+had invented became as immutable as a human's, so a respec could mint one no
+implementation could satisfy and then never take it back. It rewrote the spec
+around it instead, changing an xorshift constant to chase a sequence no
+xorshift produces.
+
+So provenance decides. Criteria from the ingested plan are protected: drop or
+reword one and it is put back and the attempt logged. Criteria an earlier
+revision added are the loop's own — it may revise or retire them on new
+evidence. Anything else in the reply is an addition, which is the case the
+freeze was wrongly blocking: a plan that specifies scoring in the spec and
+states no criterion for it should acquire one. Additions cannot lower the bar.
+
+A plan criterion the *human* has since removed is not resurrected — protecting
+the contract must not mean overruling the person who edited it.
+
+Allow wholesale rewrites deliberately when you mean to:
+
+```bash
+forge retry --respec --respec-criteria
+```
+
+```json
+"loop": { "respecCriteria": true }
+```
+
+**It is shown the code.** The planner has no filesystem, exactly like the
+executor — and a spec written about code nobody showed it is a guess the
+executor is then judged on. One respec wrote "SoftDrop decrements `y`" into a
+spec whose implementation incremented it. The ticket's writable and reference
+files are now pasted into the respec prompt, and it is told every claim it
+makes about behaviour must check against them.
+
+**It is shown the original.** The ingested `spec` and `criteria` are kept in
+columns nothing can rewrite, and once a ticket has drifted from them both
+versions go into the prompt: this is what a human wrote, this is what earlier
+revisions made of it, treat unjustified differences as drift to undo. Without
+it, revision ten is derived from revision nine and the plan is no longer in the
+loop at all.
+
+**It can say the ticket is impossible.** Some criteria are not wrong, they are
+unsatisfiable — two that contradict each other, or one asserting a value no
+implementation of the spec produces. A planner with no way to report that has
+only one move left, which is to bend the spec around the contradiction. So it
+can answer with `impossible` instead of a revision, naming the criterion and
+the conflict; the ticket parks with that note and spends nothing further:
+
+```
+  TT-003     CANNOT BE SATISFIED — Criterion 3 requires Game::new(1) to yield
+             [6, 3, 5, 7, 4]. No xorshift32 with the shifts this spec defines
+             produces that sequence; seed 1 yields [2, ...].
+```
+
+Nothing else in that reply is applied. A spec revised to satisfy a criterion
+the planner has just called impossible is a spec bent around a contradiction.
+
+### Retrying without you — `retryCycles`
+
+Everything above is a human typing `forge retry --respec` the next morning. The
+loop can do it itself:
+
+```json
+"loop": { "retryCycles": 2, "respecOnRetry": true }
+```
+
+```bash
+forge go --retries 2       # this run only; config is not rewritten
+forge go --retries -1      # until the backlog is clean or you stop it
+forge go --retries 2 --no-respec
+```
+
+When the backlog empties with anything still `failed`, `blocked` or `skipped`,
+a cycle requeues all of it, respecs each ticket from its recorded failures, and
+runs the backlog again. `0` is the default and hands the run back to you.
+
+**`-1` means until success or stop, and nothing else ends it.** `forge stop`,
+Ctrl-C, `loop.maxRuntimeSeconds` and a spend cap all still apply — they are the
+brakes, so set one before leaving it. Three things bound it on their own:
+
+- The spent count lives in the run database, not in memory, so a killed daemon
+  resuming yesterday's run continues its budget instead of starting a new one.
+- A cycle with nothing to requeue ends the run rather than spinning. Two cases
+  reach it: every ticket landed and the *final* verify still fails — breakage
+  no ticket owns or has the scope to fix — or what is left is claude-only.
+  Triage still holds during a retry, so a claude-only ticket is never requeued;
+  it would only be skipped again, once per cycle, forever.
+- **A respec that changed nothing ends the run.** The respec runs *before* the
+  requeue, and if every ticket comes back as written there is no cycle left to
+  run — the executor would receive the identical ticket that already failed,
+  and the only thing still varying is how the model samples. When the planner
+  says the ticket is right, the disagreement is between your executor and your
+  reviewer, and no rewrite of the ticket settles that. The same applies when
+  `respecOnRetry` is on and the planner cannot be reached at all.
+- `forge retry` resets the count. A human who has just replaced the specs the
+  automatic cycles gave up on gets the full budget against the new ones.
+
+Each cycle costs a full backlog of executor calls plus one planner call per
+requeued ticket, and the attempt numbering carries on from the last one — so
+`retryCycles: 2` with `maxAttempts: 3` is up to nine attempts on a ticket that
+keeps failing. `stopOnBlocked: true` short-circuits all of it: a blocked ticket
+stops the run there, and a stopped run is not retried.
 
 Retried attempts are numbered on from where the last cycle stopped, so a ticket
 that failed three times writes its next artifacts to `attempt-4`. The failed
@@ -1054,4 +1214,7 @@ dashboard is bound off loopback; treat it as a reminder, not a permission slip.
 | `memory: FAIL` in doctor | Under `command`, the report carries the server's own stderr — read that first; a wrong subcommand shows up as an immediate exit. Under `url`, wrong address or no proxy running |
 | Memory connects but retrieves nothing | Wrong tool auto-selected, or wrong `room`. Doctor prints the chosen tool and every available name; set `memory.searchTool` |
 | Every ticket blocks on context overflow | The model's window is too small for these tickets. Split them, or raise `contextWindow` if it was set too low by hand |
+| "planner did not return usable JSON:" with nothing after the colon | A thinking model spent its whole output budget reasoning and returned empty `content`. Raise `maxOutputTokens` or set `"extraBody": {"reasoning_effort": "none"}` — see §"Thinking models answer last" |
+| Builds truncate mid-file, `finish_reason: length` | `maxOutputTokens` too small for a whole-file reply. It defaults to 4096, which a thinking model half-spends before writing any code |
 | Slow first token every ticket | `OLLAMA_KEEP_ALIVE`, VRAM eviction by another process |
+| The run keeps re-running the same backlog | `loop.retryCycles` is set (or `forge go --retries -1` is in the command). `forge stop`, then read the respec revisions before setting it going again |

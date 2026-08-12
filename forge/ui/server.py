@@ -126,6 +126,20 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args: Any) -> None:  # noqa: A003
         return
 
+    def handle_one_request(self) -> None:
+        """Serve one request, treating a vanished client as normal.
+
+        A closed tab, a refresh, or a laptop lid mid-stream tears the socket
+        down under whichever write happens to be in flight. `socketserver`
+        answers that by printing a traceback to stderr — into the middle of the
+        run's output, where it reads as the loop having crashed. It has not:
+        nothing about a run depends on a browser being attached.
+        """
+        try:
+            super().handle_one_request()
+        except ConnectionError:
+            self.close_connection = True
+
     # ------------------------------------------------------------------
 
     def _send(self, code: int, body: bytes, content_type: str) -> None:
@@ -230,7 +244,13 @@ class Handler(BaseHTTPRequestHandler):
                     last_heartbeat = time.time()
 
                 time.sleep(1.0)
-        except (BrokenPipeError, ConnectionResetError):
+        except ConnectionError:
+            # Every way a client can vanish: BrokenPipeError and
+            # ConnectionResetError on POSIX, ConnectionAbortedError on Windows
+            # (WinError 10053), all of them subclasses of this. Catching the
+            # two POSIX names left the Windows one to reach socketserver, which
+            # printed a stack trace into the run's output every time a tab was
+            # closed.
             return
 
 

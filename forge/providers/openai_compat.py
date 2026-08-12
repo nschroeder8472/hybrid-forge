@@ -70,9 +70,26 @@ class OpenAICompatProvider(Provider):
 
         try:
             choice = data["choices"][0]
-            text = choice["message"]["content"] or ""
+            message = choice["message"]
+            text = message["content"] or ""
         except (KeyError, IndexError, TypeError) as exc:
             raise ProviderBadResponse(f"unexpected response shape: {str(data)[:400]}") from exc
+
+        finish_reason = choice.get("finish_reason") or "stop"
+        if not text.strip():
+            # Thinking models served over this shape put their chain of thought
+            # in a non-standard sibling field and leave `content` empty until
+            # they finish thinking. Spending the whole output budget there
+            # yields an empty string, which every caller downstream reports as
+            # malformed output — naming the real cause here saves that hunt.
+            reasoning = _reasoning_text(message)
+            if reasoning and finish_reason in ("length", "max_tokens"):
+                raise ProviderBadResponse(
+                    f"{self.model} spent its entire {max_tokens:,}-token output budget "
+                    "on hidden reasoning and never began its answer. Raise "
+                    "`maxOutputTokens` for this model, or turn thinking off with "
+                    '`"extraBody": {"reasoning_effort": "none"}`.'
+                )
 
         raw_usage = data.get("usage") or {}
         usage = Usage(
@@ -87,7 +104,7 @@ class OpenAICompatProvider(Provider):
         return Completion(
             text=text,
             usage=usage,
-            finish_reason=choice.get("finish_reason") or "stop",
+            finish_reason=finish_reason,
             model=data.get("model", self.model),
             raw=data,
         )
@@ -245,3 +262,22 @@ class OpenAICompatProvider(Provider):
                 f"quantization or a lower num_ctx would keep it resident."
             )
         return warnings
+
+
+# Every server spells the field differently, and none of them are in the spec:
+# Ollama says `reasoning`, DeepSeek and vLLM say `reasoning_content`, and some
+# builds nest the text under a dict rather than returning it flat.
+_REASONING_KEYS = ("reasoning", "reasoning_content")
+
+
+def _reasoning_text(message: dict[str, Any]) -> str:
+    """The hidden chain of thought a thinking model returned, if any."""
+    for key in _REASONING_KEYS:
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+        if isinstance(value, dict):
+            nested = value.get("content") or value.get("text")
+            if isinstance(nested, str) and nested.strip():
+                return nested
+    return ""

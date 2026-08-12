@@ -18,10 +18,15 @@ Per ticket:
 A failure at VERIFY loops back to BUILD with the error output attached, up to
 `maxAttempts`. A `BLOCKED:` from the executor never loops — an underspecified
 spec does not improve by being asked again.
+
+Around all of that sits an optional outer loop: when the backlog is exhausted
+and anything is still unfinished, `loop.retryCycles` requeues the wreckage,
+respecs it from the recorded failures, and runs the whole backlog again.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import subprocess
@@ -31,10 +36,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from . import respec
 from .artifacts import Artifacts
 from .budget import BudgetGate, Wait
-from .config import Config
+from .config import Config, ConfigError
 from .failures import distill, signatures
+from .ingest import write_tickets
 from .memory import MemoryClient, MemoryRefused, MemoryUnavailable, ticket_query
 from .patch import (
     apply_edits,
@@ -73,6 +80,7 @@ from .state import (
     TICKET_BLOCKED,
     TICKET_DONE,
     TICKET_FAILED,
+    TICKET_PENDING,
     TICKET_RUNNING,
     TICKET_SKIPPED,
     Store,
@@ -86,6 +94,23 @@ CONTROL_KEY = "command"
 CONTROL_RUN = "run"
 CONTROL_PAUSE = "pause"
 CONTROL_STOP = "stop"
+
+
+def evidence_key(run_id: int) -> str:
+    """Control-channel key holding the last retry cycle's failure fingerprint."""
+    return f"retry-evidence:{run_id}"
+
+
+def retries_key(run_id: int) -> str:
+    """Control-channel key holding a run's spent automatic retry cycles.
+
+    In the control table rather than in memory so the count survives what the
+    loop is built to survive: a killed daemon, a rebooted host, a `forge go`
+    that resumes yesterday's run. An in-memory counter would hand a restarted
+    run a fresh budget every time, which is exactly how `retryCycles: 3`
+    becomes unbounded without anyone choosing it.
+    """
+    return f"retries:{run_id}"
 
 
 @dataclass
@@ -481,6 +506,11 @@ class Orchestrator:
                 kind="lifecycle",
             )
 
+        # Before the first ticket: a human may have requeued something already
+        # green since the last run, and whatever was built on top of it was
+        # judged against the version now being replaced.
+        self._reopen_stale(run_id)
+
         try:
             while True:
                 self._honor_control(run_id)
@@ -488,7 +518,10 @@ class Orchestrator:
 
                 ticket = self.store.next_ticket(run_id)
                 if ticket is None:
-                    return self._finish(run_id)
+                    outcome = self._finish(run_id)
+                    if outcome == RUN_DONE or not self._retry_cycle(run_id, outcome):
+                        return outcome
+                    continue
 
                 self._work_ticket(run_id, ticket)
 
@@ -503,7 +536,134 @@ class Orchestrator:
             )
             return RUN_FAILED
 
+    def _dep_stamp(self, run_id: int, ticket: Ticket) -> dict[str, str]:
+        """Fingerprint every dependency of `ticket` as it stands right now."""
+        if not ticket.needs:
+            return {}
+        current = {t.ticket_id: t for t in self.store.list_tickets(run_id)}
+        return {
+            dep: current[dep].fingerprint
+            for dep in ticket.needs
+            if dep in current
+        }
+
+    def _stale_dependents(self, run_id: int) -> dict[str, list[str]]:
+        """Done tickets whose dependencies have been rewritten since they passed.
+
+        Transitive: re-opening a ticket makes its own dependents stale too,
+        because whatever they were built on is about to be rebuilt. Iterated to
+        a fixed point rather than walked recursively, which keeps a diamond
+        from being reported twice.
+
+        Returns `{ticket_id: [dependency that moved, ...]}` so the log can say
+        which ticket forced which re-open — an unattended run that quietly
+        re-does half a backlog needs to be able to answer why.
+        """
+        tickets = {t.ticket_id: t for t in self.store.list_tickets(run_id)}
+        stale: dict[str, list[str]] = {}
+        changing = {
+            t.ticket_id for t in tickets.values() if t.status != TICKET_DONE
+        }
+        while True:
+            found = False
+            for ticket in tickets.values():
+                if ticket.status != TICKET_DONE or ticket.ticket_id in stale:
+                    continue
+                moved = [
+                    dep
+                    for dep in ticket.needs
+                    if dep in tickets
+                    and (
+                        dep in changing
+                        or ticket.dep_stamp.get(dep) != tickets[dep].fingerprint
+                    )
+                ]
+                if moved:
+                    stale[ticket.ticket_id] = moved
+                    changing.add(ticket.ticket_id)
+                    found = True
+            if not found:
+                return stale
+
+    def _reopen_stale(self, run_id: int) -> list[str]:
+        """Requeue tickets that passed on a dependency which has since moved.
+
+        The trigger is a human, not the automatic cycle: `reset_tickets` only
+        requeues failed, blocked and skipped work, and a done ticket's
+        dependencies are necessarily done too — so nothing an unattended run
+        does on its own can move them. What does is `forge retry --ticket` or
+        `--all` on something already green, which is a normal thing to do after
+        reading a diff. Everything built on top of it was judged against the
+        version being replaced.
+
+        Off by `loop.reopenStaleDependents` for anyone who would rather be
+        warned than have a backlog redone underneath them.
+        """
+        stale = self._stale_dependents(run_id)
+        if not stale:
+            return []
+
+        if not self.config.loop.reopen_stale_dependents:
+            for ticket_id, moved in sorted(stale.items()):
+                self.store.log(
+                    run_id,
+                    f"{ticket_id}: passed against {', '.join(moved)}, which has "
+                    f"changed since. Left done — reopenStaleDependents is off.",
+                    level="warn",
+                    kind="ticket",
+                )
+            return []
+
+        for ticket_id, moved in sorted(stale.items()):
+            self.store.log(
+                run_id,
+                f"{ticket_id}: reopened — it passed against {', '.join(moved)}, "
+                f"which has changed since.",
+                level="warn",
+                kind="ticket",
+            )
+        reopened = self.store.reset_tickets(run_id, ticket_ids=sorted(stale))
+        return [ticket.ticket_id for ticket in reopened]
+
+    def _park_unreachable(self, run_id: int) -> int:
+        """Skip tickets whose dependencies will never arrive.
+
+        The scheduler stops handing out work when nothing is eligible, which
+        on an acyclic graph means every remaining ticket is waiting on one
+        that failed. Attempting them anyway is not merely wasted budget: the
+        executor runs against a half-built dependency, and the failures it
+        produces are filed as evidence about *this* ticket's spec, which respec
+        then reads as a defect to fix. One run spent three attempts per cycle
+        on a ticket whose only problem was that its dependency had not landed.
+        """
+        parked = 0
+        for ticket in self.store.list_tickets(run_id):
+            if ticket.status != TICKET_PENDING:
+                continue
+            missing = self.store.unmet_needs(run_id, ticket)
+            if not missing:
+                continue
+            ticket.status = TICKET_SKIPPED
+            ticket.blocked_note = f"dependency not met: {', '.join(missing)}"
+            self.store.update_ticket(run_id, ticket)
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: skipped — needs {', '.join(missing)}.",
+                level="warn",
+                kind="ticket",
+            )
+            parked += 1
+        return parked
+
     def _finish(self, run_id: int) -> str:
+        # Order matters here. Parking first turns "pending forever" into a
+        # reported skip, so the counts below describe the run a human has to
+        # act on rather than one that merely stopped.
+        self._park_unreachable(run_id)
+        # An unverified test file left by a ticket that did not land fails the
+        # final check below, and every ticket of any retry cycle after it.
+        self._sweep_orphan_tests(run_id)
+
         counts = self.store.ticket_counts(run_id)
         blocked = counts.get(TICKET_BLOCKED, 0) + counts.get(TICKET_FAILED, 0)
         if blocked:
@@ -545,6 +705,269 @@ class Orchestrator:
         self.store.set_run_status(run_id, RUN_DONE, "all tickets complete")
         self.store.log(run_id, "All tickets complete.", kind="lifecycle")
         return RUN_DONE
+
+    # ------------------------------------------------------------------
+    # Automatic retry cycles
+    # ------------------------------------------------------------------
+
+    def _evidence_fingerprint(self, run_id: int, ticket_ids: Sequence[str]) -> str:
+        """A stable digest of why these tickets are unfinished.
+
+        Built from the recorded step failures, which `ticket_failures` already
+        deduplicates — so a cycle that reproduces the previous one's failures
+        exactly produces the same digest, and one that fails in any new way
+        does not. Hashed rather than stored whole: this goes in a control row,
+        and the failures it summarizes can run to tens of kilobytes.
+        """
+        material: list[str] = []
+        for ticket_id in sorted(ticket_ids):
+            for failure in self.store.ticket_failures(run_id, ticket_id):
+                material.append(f"{ticket_id}::{failure['name']}::{failure['detail']}")
+        if not material:
+            # No recorded evidence at all. Never equal to a previous cycle's
+            # digest, so an absent step log can never be the thing that stops
+            # a retry — it is the one case where nothing has been learned.
+            return f"none::{time.time()}"
+        return hashlib.sha256("\n".join(material).encode("utf-8")).hexdigest()
+
+    def _retries_spent(self, run_id: int) -> int:
+        try:
+            return int(self.store.get_control(retries_key(run_id), "0"))
+        except ValueError:
+            return 0
+
+    def _retry_cycle(self, run_id: int, outcome: str) -> bool:
+        """Requeue the wreckage and go round again. Returns whether it did.
+
+        `forge retry --respec`, run by the loop itself, at the one moment the
+        evidence is complete: every ticket has been tried, every failure is in
+        the step log, and nothing is half-finished. A `False` here means the
+        run keeps the terminal state `_finish` gave it.
+
+        Cheap to get wrong in the expensive direction, so five things bound it.
+        The count is persisted, not held in memory. A cycle with nothing to
+        requeue ends the run. A cycle that reproduced the previous cycle's
+        failures exactly ends the run. A respec that changed nothing ends the
+        run, because the next cycle would hand the executor a ticket that has
+        already failed and hope for a different sample. And the control channel
+        is checked before every step of the cycle that follows, so `forge stop`
+        still lands on an unbounded one.
+        """
+        limit = self.config.loop.retry_cycles
+        if limit == 0:
+            return False
+
+        spent = self._retries_spent(run_id)
+        if limit > 0 and spent >= limit:
+            self.store.log(
+                run_id,
+                f"Run still {outcome} after {spent} automatic retry cycle(s); "
+                f"leaving it for a human. Raise loop.retryCycles, or requeue by "
+                f"hand with `forge retry --respec`.",
+                level="warn",
+                kind="lifecycle",
+            )
+            return False
+
+        # Captured before the requeue clears them — for a ticket the executor
+        # gave up on with `BLOCKED:`, the note is the only record of what it
+        # could not decide, and no step was logged as failed.
+        tickets = self.store.list_tickets(run_id)
+        notes = {t.ticket_id: t.blocked_note for t in tickets}
+        # Triage still holds. A claude-only ticket is one the plan judged
+        # unsafe to delegate, so requeueing it only gets it skipped again — and
+        # under `-1` that is a cycle that repeats forever while doing nothing
+        # but spending a planner call on each pass.
+        eligible = [
+            ticket.ticket_id
+            for ticket in tickets
+            if ticket.status in self.store.RETRYABLE and ticket.route == "delegate"
+        ]
+        if not eligible:
+            # Nothing here is the loop's to retry: either every ticket landed
+            # and the *final* verify is failing on breakage no ticket in this
+            # backlog introduced, or what is left is claude-only. Another cycle
+            # would requeue nothing and arrive straight back here, forever.
+            self.store.log(
+                run_id,
+                "Nothing left for the loop to retry — what remains needs a human "
+                "(claude-only tickets, or a failure no ticket in this backlog owns).",
+                level="warn",
+                kind="lifecycle",
+            )
+            return False
+
+        # A cycle that ends with exactly the failures the last one ended with
+        # has established that nothing in this arrangement varies: same spec,
+        # same code, same objection. Another cycle spends a full backlog of
+        # calls to reproduce it. This is the brake `-1` needs and a count
+        # cannot provide — one ticket rewriting identical code and collecting
+        # an identical rejection ran 37 attempts across a dozen cycles.
+        #
+        # Checked before the requeue: deciding to stop after resetting the
+        # tickets would leave them pending behind a run reported as blocked,
+        # and the next `forge go` would work them again anyway.
+        fingerprint = self._evidence_fingerprint(run_id, eligible)
+        if fingerprint == self.store.get_control(evidence_key(run_id), ""):
+            self.store.log(
+                run_id,
+                "Stopping the automatic retries: this cycle failed in exactly "
+                "the way the previous one did, on the same tickets. Nothing is "
+                "varying, so another cycle would spend the same calls for the "
+                "same result. Read the last rejection — the ticket needs a "
+                "human, not another attempt.",
+                level="error",
+                kind="lifecycle",
+            )
+            return False
+        self.store.set_control(evidence_key(run_id), fingerprint)
+
+        # Respec first, requeue second. A cycle whose tickets came back
+        # unchanged is a re-run of inputs that already failed, and the only
+        # thing left varying is model sampling — so whether there is anything
+        # to retry has to be known before the tickets are reset, not after.
+        if self.config.loop.respec_on_retry:
+            by_id = {ticket.ticket_id: ticket for ticket in tickets}
+            revised, asked, parked = self._respec(
+                run_id, [by_id[ticket_id] for ticket_id in eligible], notes
+            )
+            # A ticket the planner has just called unsatisfiable stays parked.
+            eligible = [ticket_id for ticket_id in eligible if ticket_id not in parked]
+            if not revised:
+                self.store.log(
+                    run_id,
+                    (
+                        "Stopping the automatic retries: the respec changed nothing, "
+                        "so another cycle would hand the executor the same ticket "
+                        "that has already failed and hope the model samples "
+                        "differently. Read the last rejection — when the planner "
+                        "says the ticket is right, the disagreement is between the "
+                        "executor and the reviewer, and no rewrite of the ticket "
+                        "settles that."
+                    )
+                    if asked
+                    else (
+                        "Stopping the automatic retries: respecOnRetry is on but the "
+                        "planner could not be reached, so every further cycle would "
+                        "be a plain re-run of tickets that already failed."
+                    ),
+                    level="error",
+                    kind="lifecycle",
+                )
+                return False
+
+        requeued = self.store.reset_tickets(run_id, ticket_ids=eligible)
+        if not requeued:
+            return False
+        # After the requeue, not before: a ticket only becomes stale once the
+        # dependency it was judged against is actually going round again.
+        self._reopen_stale(run_id)
+
+        cycle = spent + 1
+        label = f"{cycle}/{limit}" if limit > 0 else str(cycle)
+        self.store.set_control(retries_key(run_id), str(cycle))
+        self.store.log(
+            run_id,
+            f"Run ended {outcome}; starting automatic retry cycle {label} over "
+            f"{len(requeued)} ticket(s).",
+            level="warn",
+            kind="lifecycle",
+            data={"cycle": cycle, "limit": limit, "tickets": [t.ticket_id for t in requeued]},
+        )
+
+        self.store.set_run_status(run_id, RUN_RUNNING, f"retry cycle {label}")
+        return True
+
+    def _respec(
+        self, run_id: int, tickets: list[Ticket], notes: dict[str, str]
+    ) -> tuple[list[Ticket], bool, set[str]]:
+        """Rewrite each ticket from why it failed. Never raises.
+
+        Returns `(revised, asked, parked)`: the tickets whose text changed,
+        whether the planner could be reached at all, and the ids it reported as
+        unsatisfiable. The caller needs all three — a cycle over tickets that
+        came back unchanged is a re-run of inputs that already failed, and one
+        the planner never saw is not a respec at all.
+
+        Best-effort per ticket. The calls go through `_call` like every other
+        model call in the run, which is what makes an unattended cycle park on
+        a rate limit rather than fail on one.
+        """
+        parked: set[str] = set()
+        try:
+            # Ask for what this planner can produce rather than assuming a
+            # ceiling: a thinking model spends most of its budget before the
+            # first character of the answer.
+            budget = self._output_budget("planner")
+        except (ConfigError, ProviderError, OSError, ValueError) as exc:
+            self.store.log(
+                run_id,
+                f"The planner is unavailable, so nothing was re-specced ({exc}).",
+                level="warn",
+                kind="lifecycle",
+            )
+            return [], False, parked
+
+        revised: list[Ticket] = []
+        for ticket in tickets:
+            result = respec.revise(
+                self.store,
+                run_id,
+                ticket,
+                notes.get(ticket.ticket_id, ""),
+                call=lambda messages, limit: self._call(
+                    run_id, "planner", messages, max_tokens=limit, temperature=0.0
+                ),
+                budget=budget,
+                # The planner has no filesystem either. Rewriting a spec about
+                # code it cannot see is how a ticket acquired a coordinate
+                # convention the implementation had never used.
+                sources=self._sources_for(ticket)[0],
+                criteria_locked=not self.config.loop.respec_criteria,
+            )
+            if result.impossible:
+                # Spending a full attempt budget on a ticket the planner has
+                # just shown to be unsatisfiable is the most expensive way to
+                # learn nothing.
+                parked.add(ticket.ticket_id)
+                ticket.status = TICKET_BLOCKED
+                ticket.blocked_note = f"respec: {result.impossible}"
+                self.store.update_ticket(run_id, ticket)
+                continue
+            if result.revised:
+                revised.append(ticket)
+                continue
+            # The rationale is the whole content of this outcome. "Kept the
+            # ticket as written" says the planner declined to act; only its
+            # reasoning says whether that is "the spec is fine, the executor
+            # simply did not finish" or "I could not tell what to change".
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: respec left the ticket as written — "
+                f"{result.rationale or result.note}",
+                level="warn",
+                kind="ticket",
+                data={"note": result.note, "rationale": result.rationale},
+            )
+
+        if not revised:
+            return revised, True, parked
+
+        # The tickets on disk are what a human reads to understand the run. A
+        # revision that lives only in the database makes those files lie —
+        # but only the revised ones are rewritten, so the count in the log is
+        # the number of tickets respec actually changed.
+        try:
+            write_tickets(self.config.tickets_dir, revised)
+        except OSError as exc:
+            self.store.log(
+                run_id,
+                f"Could not rewrite the ticket files after respec ({exc}); "
+                f"the database holds the revised specs either way.",
+                level="warn",
+                kind="lifecycle",
+            )
+        return revised, True, parked
 
     def _work_ticket(self, run_id: int, ticket: Ticket) -> None:
         # Triage is a hard gate, not a preference. A claude-only ticket is one
@@ -641,6 +1064,10 @@ class Orchestrator:
 
             if outcome.ok:
                 ticket.status = TICKET_DONE
+                # Record what it passed on top of. Without this the pass is
+                # undated: a later respec can rewrite a dependency's contract
+                # and nothing knows this ticket was judged against the old one.
+                ticket.dep_stamp = self._dep_stamp(run_id, ticket)
                 self.store.update_ticket(run_id, ticket)
                 self.store.log(
                     run_id,
@@ -1131,6 +1558,24 @@ class Orchestrator:
         if not diff.strip():
             state = self._sources_for(ticket)[0]
 
+        # Files this attempt wrote that git reports as unchanged, because what
+        # was written matched what was already there. On a retry that is most
+        # of the ticket: the previous cycle's implementation is still on disk
+        # (autoCommit is off, and nothing reverts a failed ticket), the
+        # executor reproduces it exactly, and only the discarded test file
+        # shows up as new. A reviewer handed that diff says the implementation
+        # is missing and rejects — every attempt, every cycle, forever.
+        invisible = self._written_but_unchanged(written, diff)
+        if invisible:
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: {len(invisible)} file(s) were rewritten "
+                f"exactly as they already were, so they are absent from the "
+                f"diff; showing the reviewer their contents instead.",
+                kind="review",
+                data={"files": sorted(invisible)},
+            )
+
         step_id = self.store.start_step(run_id, ticket.ticket_id, "review")
         try:
             completion = self._call(
@@ -1146,6 +1591,7 @@ class Orchestrator:
                     # objections, and no signal that the spec was the problem.
                     prior_verdicts=list(rejections or []),
                     state=state,
+                    unchanged=invisible,
                 ),
                 max_tokens=self._output_budget("reviewer"),
                 temperature=0.0,
@@ -1394,15 +1840,77 @@ class Orchestrator:
             )
 
         directory = Path(example[0]).parent.as_posix() if example else "tests"
-        slug = re.sub(r"[^a-z0-9]+", "_", ticket.ticket_id.lower()).strip("_") or "ticket"
         prefix = "" if directory in ("", ".") else f"{directory}/"
+        slug = self._ticket_slug(ticket)
         # `_test` rather than a bare slug: it is mandatory for `go test`, it is
         # one of pytest's two default collection patterns, and it is inert
         # everywhere else.
         return f"{prefix}{slug}_test{suffix}", ""
 
+    @staticmethod
+    def _ticket_slug(ticket: Ticket) -> str:
+        """The filename-safe form of a ticket id, as `_test_target` spells it."""
+        return re.sub(r"[^a-z0-9]+", "_", ticket.ticket_id.lower()).strip("_") or "ticket"
+
+    def _owned_test_files(self, ticket: Ticket) -> list[str]:
+        """Test files that are this ticket's by name, whoever wrote them.
+
+        `_test_target` derives the tester's filename from the ticket id, so
+        `tests/tt_004_test.rs` cannot have come from anywhere but this loop
+        writing tests for TT-004. Ownership by name is what makes reclaiming
+        one idempotent.
+
+        Authorship alone is not enough, and the gap is not theoretical. The
+        `created` map records whether *this* ticket run brought the file into
+        existence, so a file that survives a single run — the tester declined
+        to author on the next one, the run ended between writing and
+        discarding — is thereafter seen as pre-existing by every run after it.
+        `created` says False forever, no ticket can ever reclaim it, and the
+        orphan fails the whole backlog until a human deletes it. One run spent
+        five retry cycles, thirty-five minutes, and roughly 800k tokens on
+        exactly that.
+        """
+        stem = f"{self._ticket_slug(ticket)}_test"
+        found: set[str] = set()
+        for pattern in self._TEST_GLOBS:
+            for path in self.config.root.glob(pattern):
+                if not path.is_file() or path.stem != stem:
+                    continue
+                relative = path.relative_to(self.config.root).as_posix()
+                if self._IGNORED_DIRS.intersection(Path(relative).parts[:-1]):
+                    continue
+                found.add(relative)
+        return sorted(found)
+
+    def _remove_test_file(self, run_id: int, ticket: Ticket, path: str) -> None:
+        """Delete one unverified test file, reporting either outcome."""
+        if not is_safe_path(self.config.root, path):
+            return
+        target = self.config.root / path
+        # Checked rather than `missing_ok`, so the log records removals that
+        # happened instead of removals that were attempted.
+        if not target.is_file():
+            return
+        try:
+            target.unlink()
+        except OSError as exc:
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: could not remove unverified test "
+                f"{path} ({exc}); it will fail later tickets.",
+                level="warn",
+                kind="ticket",
+            )
+            return
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: removed unverified test {path}.",
+            level="warn",
+            kind="ticket",
+        )
+
     def _discard_tests(self, run_id: int, ticket: Ticket, created: dict[str, bool]) -> None:
-        """Remove test files this ticket created but never got verified.
+        """Remove test files this ticket owns but never got verified.
 
         A ticket that ends failed or blocked leaves behind assertions nothing
         ever confirmed, written against an implementation that does not work.
@@ -1411,31 +1919,60 @@ class Orchestrator:
         backlog cannot recover on its own. That is the exact shape of the run
         where one abandoned `tests/wasm_layer.rs` blocked all six tickets.
 
-        Only files that did not exist before this ticket wrote them are
-        removed. Anything that was already on disk is somebody else's, and a
-        failed ticket does not earn the right to delete it.
+        Two kinds of ownership, because they carry different risks:
+
+        By name, unconditionally — the id-derived path from `_test_target`.
+        Nothing but this loop produces that filename, so there is nobody else
+        it could belong to.
+
+        By authorship, only when this run created it — a path the *plan*
+        designated. That one may be a hand-written file the ticket was asked
+        to extend, and a failed ticket does not earn the right to delete a
+        human's work.
         """
-        for path, was_created in sorted(created.items()):
-            if not was_created or not is_safe_path(self.config.root, path):
+        doomed = set(self._owned_test_files(ticket))
+        doomed.update(path for path, was_created in created.items() if was_created)
+        for path in sorted(doomed):
+            self._remove_test_file(run_id, ticket, path)
+
+    def _sweep_orphan_tests(self, run_id: int) -> None:
+        """Reclaim test files whose ticket never reached a discard of its own.
+
+        The per-ticket path covers a ticket that fails or blocks inside the
+        loop. It does not cover one that was skipped, or one whose run ended
+        between the tester writing the file and the ticket resolving. Those
+        orphans outlive the run and fail the final verify — and every ticket
+        of every later retry cycle — so the backlog is swept once more before
+        the run reports anything.
+        """
+        for ticket in self.store.list_tickets(run_id):
+            if ticket.status == TICKET_DONE:
                 continue
-            target = self.config.root / path
+            for path in self._owned_test_files(ticket):
+                self._remove_test_file(run_id, ticket, path)
+
+    def _written_but_unchanged(self, written: Sequence[str], diff: str) -> dict[str, str]:
+        """Contents of the files this attempt wrote that the diff does not show.
+
+        A file is absent from a diff for exactly one reason once it has been
+        written: what was written is what was already there. That is invisible
+        to the reviewer and indistinguishable, from its side, from work that
+        never happened.
+        """
+        found: dict[str, str] = {}
+        for path in written:
+            normalized = normalize_path(path)
+            if f"b/{normalized}" in diff or f"+++ {normalized}" in diff:
+                continue
+            if not is_safe_path(self.config.root, path):
+                continue
+            candidate = (self.config.root / path).resolve()
             try:
-                target.unlink(missing_ok=True)
-            except OSError as exc:
-                self.store.log(
-                    run_id,
-                    f"{ticket.ticket_id}: could not remove unverified test "
-                    f"{path} ({exc}); it will fail later tickets.",
-                    level="warn",
-                    kind="ticket",
-                )
+                if candidate.is_file():
+                    found[path] = candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError:
                 continue
-            self.store.log(
-                run_id,
-                f"{ticket.ticket_id}: removed unverified test {path}.",
-                level="warn",
-                kind="ticket",
-            )
+        return found
 
     def _output_budget(self, role: str) -> int:
         provider = self.config.provider_for(role)

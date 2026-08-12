@@ -25,6 +25,7 @@ import json
 import re
 from pathlib import Path
 
+from .patch import normalize_path
 from .providers import Message, Provider
 from .state import Ticket
 
@@ -44,6 +45,9 @@ _FIELD = {
 }
 
 _ROUTE = re.compile(r"^\*\*Route:\*\*\s*(?P<route>delegate|claude-only)", re.MULTILINE | re.IGNORECASE)
+
+# "**Needs:** TT-003, TT-004" — the tickets that must land before this one.
+_NEEDS = re.compile(r"^\*\*Needs:\*\*\s*(?P<needs>.+)$", re.MULTILINE | re.IGNORECASE)
 
 PLANNER_SYSTEM = """You are the planner in a plan-and-execute pipeline.
 
@@ -108,6 +112,199 @@ def _bullets(text: str) -> list[str]:
     return items
 
 
+def _ids(text: str) -> list[str]:
+    """Ticket ids out of a comma- or space-separated list."""
+    return [match.group(0) for match in re.finditer(r"[A-Z][A-Z0-9]*-\d+", text.upper())]
+
+
+def _reaches(start: str, goal: str, edges: dict[str, list[str]]) -> bool:
+    """Whether `goal` is already reachable from `start` along declared edges."""
+    seen: set[str] = set()
+    stack = [start]
+    while stack:
+        node = stack.pop()
+        if node == goal:
+            return True
+        if node in seen:
+            continue
+        seen.add(node)
+        stack.extend(edges.get(node, ()))
+    return False
+
+
+def derive_needs(tickets: list[Ticket]) -> list[tuple[str, str, str]]:
+    """Add ordering edges between tickets that write the same file.
+
+    Two tickets sharing `src/lib.rs` is not a conflict to refuse — a ticket is
+    a testable unit, and units share files. What they need is an order, so the
+    later one sees the earlier one's work instead of racing it.
+
+    Position order decides, because that is the sequence the plan's author
+    already wrote the tickets in. A declared edge always wins: derivation adds
+    an edge only where the graph does not already connect the pair in either
+    direction, so it can never contradict a human or introduce a cycle into an
+    acyclic graph.
+
+    Returns the edges it added as `(ticket, needs, because_of_file)`, for
+    reporting — an edge nobody typed should be visible before the run starts.
+    """
+    by_position = sorted(tickets, key=lambda t: (t.position, t.ticket_id))
+    edges = {ticket.ticket_id: list(ticket.needs) for ticket in tickets}
+    index = {ticket.ticket_id: ticket for ticket in tickets}
+
+    writers: dict[str, list[str]] = {}
+    for ticket in by_position:
+        for path in ticket.allowed_files:
+            writers.setdefault(normalize_path(path), []).append(ticket.ticket_id)
+
+    added: list[tuple[str, str, str]] = []
+    for path, owners in sorted(writers.items()):
+        if len(owners) < 2:
+            continue
+        for earlier, later in zip(owners, owners[1:]):
+            if _reaches(later, earlier, edges) or _reaches(earlier, later, edges):
+                continue
+            edges[later].append(earlier)
+            index[later].needs = edges[later]
+            added.append((later, earlier, path))
+    return added
+
+
+# Phrases that pin a whole file rather than assert something about it. Each is
+# a claim a later ticket writing the same file must falsify in order to do its
+# own job. The tester is already forbidden from writing assertions of this
+# shape, for exactly this reason (see prompts.py) — this applies the same rule
+# to the criteria the plan states, which is where the tester gets them from.
+_WHOLE_FILE_CLAIM = re.compile(
+    r"\b(exactly|only these|nothing else|no other|and no more|"
+    r"must not (?:contain|declare|export|include)|"
+    r"does not (?:contain|declare|export|include))\b",
+    re.IGNORECASE,
+)
+
+# `src/lib.rs`, "src/lib.rs", src/lib.rs — a path mentioned inside a criterion.
+_PATH_IN_TEXT = re.compile(r"[\w./\\-]+\.[A-Za-z0-9]+")
+
+
+def shared_file_conflicts(tickets: list[Ticket]) -> list[str]:
+    """Criteria that cannot survive another ticket writing the same file.
+
+    Two tickets owning `src/lib.rs` is ordinary and now legal — they get an
+    ordering edge. What is not legal is one of them asserting the file's whole
+    contents, because the other's job is to add to it. Ordering does not save
+    the pair: the first ticket passes, the second does its work, and the
+    first's criterion is then false forever — verification is whole-project and
+    permanent, so its own test fails every ticket that follows.
+
+    Checked only for files more than one ticket writes. A sole owner may pin
+    its file as tightly as it likes; nothing is coming to contradict it.
+    """
+    writers: dict[str, list[str]] = {}
+    for ticket in tickets:
+        for path in ticket.allowed_files:
+            writers.setdefault(normalize_path(path), []).append(ticket.ticket_id)
+
+    problems: list[str] = []
+    for ticket_id, where, claim, path in whole_file_claims(tickets):
+        others = [t for t in writers[path] if t != ticket_id]
+        problems.append(
+            f"{ticket_id} ({where}): {claim.strip()!r}\n"
+            f"      {path} is also written by {', '.join(others)}, so a "
+            f"whole-file claim about it cannot stay true.\n"
+            f"      State what the file must declare, not what it must "
+            f"contain and nothing more."
+        )
+    return list(dict.fromkeys(problems))
+
+
+def whole_file_claims(tickets: list[Ticket]) -> list[tuple[str, str, str, str]]:
+    """Every pinning claim about a file more than one ticket writes.
+
+    Returns `(ticket_id, where, claim, path)`. Separate from the reporting
+    above so a caller holding one revision can ask which of its criteria are
+    the offending ones rather than parsing them back out of a message.
+    """
+    writers: dict[str, list[str]] = {}
+    for ticket in tickets:
+        for path in ticket.allowed_files:
+            writers.setdefault(normalize_path(path), []).append(ticket.ticket_id)
+    shared = {path for path, owners in writers.items() if len(owners) > 1}
+    if not shared:
+        return []
+
+    found: list[tuple[str, str, str, str]] = []
+    for ticket in tickets:
+        for where, claim in _claims(ticket):
+            if not _WHOLE_FILE_CLAIM.search(claim):
+                continue
+            named = {
+                normalize_path(match.group(0))
+                for match in _PATH_IN_TEXT.finditer(claim)
+            }
+            for path in sorted(named & shared):
+                found.append((ticket.ticket_id, where, claim, path))
+    return found
+
+
+def _claims(ticket: Ticket) -> list[tuple[str, str]]:
+    """Every self-contained statement the ticket makes, with where it came from.
+
+    The spec is scanned as well as the criteria, and it is the half that
+    matters: a plan states "src/lib.rs must end up containing exactly these
+    three lines" in its prose, and the tester turns that into an assertion
+    downstream. Checking only the criteria bullets misses the sentence the
+    criteria were derived from.
+
+    Split into sentences rather than searched whole, so a whole-file phrase in
+    one paragraph and a path in another do not combine into a false report.
+    """
+    units: list[tuple[str, str]] = [("criterion", c) for c in ticket.criteria]
+    for line in ticket.spec.splitlines():
+        for sentence in re.split(r"(?<=[.:;])\s+", line):
+            if sentence.strip():
+                units.append(("spec", sentence))
+    return units
+
+
+def graph_problems(tickets: list[Ticket]) -> list[str]:
+    """Everything wrong with the dependency graph, in human terms.
+
+    Checked at ingest because that is the last moment a fix is free. A
+    dangling id or a cycle discovered mid-run costs a scheduler that cannot
+    explain why nothing is eligible.
+    """
+    known = {ticket.ticket_id for ticket in tickets}
+    problems: list[str] = []
+
+    for ticket in tickets:
+        for dep in ticket.needs:
+            if dep == ticket.ticket_id:
+                problems.append(f"{ticket.ticket_id} needs itself")
+            elif dep not in known:
+                problems.append(f"{ticket.ticket_id} needs {dep}, which is not in this backlog")
+
+    # Depth-first cycle detection, reporting the path so the fix is obvious.
+    edges = {t.ticket_id: [d for d in t.needs if d in known] for t in tickets}
+    state: dict[str, int] = {}
+
+    def walk(node: str, path: list[str]) -> None:
+        state[node] = 1
+        for dep in edges.get(node, ()):
+            if state.get(dep) == 1:
+                loop = path[path.index(dep) :] + [dep] if dep in path else [node, dep]
+                problems.append("dependency cycle: " + " -> ".join(loop))
+            elif state.get(dep, 0) == 0:
+                walk(dep, path + [dep])
+        state[node] = 2
+
+    for ticket in tickets:
+        if state.get(ticket.ticket_id, 0) == 0:
+            walk(ticket.ticket_id, [ticket.ticket_id])
+
+    # Same pair can surface from either end of a cycle; report each once.
+    return list(dict.fromkeys(problems))
+
+
 def parse_plan(text: str) -> list[Ticket]:
     """Parse a document that already contains tickets.
 
@@ -128,6 +325,9 @@ def parse_plan(text: str) -> list[Ticket]:
         route_match = _ROUTE.search(body)
         route = (route_match.group("route").lower() if route_match else "delegate")
 
+        needs_match = _NEEDS.search(body)
+        needs = _ids(needs_match.group("needs")) if needs_match else []
+
         tickets.append(
             Ticket(
                 ticket_id=header.group("id"),
@@ -137,22 +337,36 @@ def parse_plan(text: str) -> list[Ticket]:
                 spec=_section(body, found["spec"], boundaries),
                 allowed_files=_bullets(_section(body, found["allowed"], boundaries)),
                 criteria=_bullets(_section(body, found["criteria"], boundaries)),
+                needs=needs,
                 context=_section(body, found["context"], boundaries),
             )
         )
     return tickets
 
 
-def plan_with_model(provider: Provider, text: str, *, max_tokens: int = 8192) -> list[Ticket]:
+def plan_with_model(
+    provider: Provider, text: str, *, max_tokens: int | None = None
+) -> list[Ticket]:
     """Have the planner role convert a freeform document into tickets."""
+    # A whole backlog is the longest single reply the planner ever produces, so
+    # give it everything the model can emit rather than a fixed guess.
+    budget = max_tokens or max(8192, provider.capabilities().max_output_tokens)
     completion = provider.complete(
         [
             Message(role="system", content=PLANNER_SYSTEM),
             Message(role="user", content=f"Specification:\n\n{text}"),
         ],
-        max_tokens=max_tokens,
+        max_tokens=budget,
         temperature=0.1,
     )
+    # Distinguish "the model wrote nonsense" from "the model was still writing",
+    # which the JSON error below cannot tell apart on its own.
+    if completion.truncated:
+        raise ValueError(
+            f"planner ran out of output room after {budget:,} tokens with "
+            f"{len(completion.text):,} characters written; raise maxOutputTokens "
+            f"for the planner model or split the specification"
+        )
     return tickets_from_json(completion.text)
 
 
@@ -189,6 +403,7 @@ def tickets_from_json(text: str) -> list[Ticket]:
                 allowed_files=[str(p) for p in item.get("allowed_files", [])],
                 reference_files=[str(p) for p in item.get("reference_files", [])],
                 criteria=[str(c) for c in item.get("criteria", [])],
+                needs=[str(n).strip() for n in item.get("needs", []) if str(n).strip()],
                 context=str(item.get("context", "")),
             )
         )
@@ -200,13 +415,43 @@ def ingest(
     *,
     provider: Provider | None = None,
     force_plan: bool = False,
-) -> tuple[list[Ticket], str]:
-    """Convert a document into tickets. Returns (tickets, how).
+) -> tuple[list[Ticket], str, list[tuple[str, str, str]]]:
+    """Convert a document into tickets. Returns (tickets, how, derived_edges).
 
     `how` names which path was taken so the caller can say so — a user who
     handed over a carefully written plan should be told whether it was used
     verbatim or re-planned.
+
+    The dependency graph is completed and checked here, in the one place both
+    paths converge. Ingest is the last moment a bad graph is free to fix: a
+    cycle found mid-run costs a scheduler that can only report that nothing is
+    eligible, without being able to say why.
     """
+    tickets, how = _parse_or_plan(source, provider=provider, force_plan=force_plan)
+    derived = derive_needs(tickets)
+
+    problems = graph_problems(tickets)
+    if problems:
+        raise ValueError(
+            "the backlog's dependencies do not resolve:\n  "
+            + "\n  ".join(problems)
+        )
+
+    conflicts = shared_file_conflicts(tickets)
+    if conflicts:
+        raise ValueError(
+            "these criteria cannot all hold at once:\n  "
+            + "\n  ".join(conflicts)
+        )
+    return tickets, how, derived
+
+
+def _parse_or_plan(
+    source: str,
+    *,
+    provider: Provider | None = None,
+    force_plan: bool = False,
+) -> tuple[list[Ticket], str]:
     if not force_plan and looks_like_plan(source):
         tickets = parse_plan(source)
         if tickets:
@@ -232,6 +477,12 @@ def render_ticket(ticket: Ticket) -> str:
         f"# {ticket.ticket_id}: {ticket.title}".rstrip(),
         "",
         f"**Route:** {ticket.route}",
+    ]
+    # Emitted whenever present, including when ingest derived it: an edge a
+    # human never typed is exactly the one worth showing them.
+    if ticket.needs:
+        lines.append(f"**Needs:** {', '.join(ticket.needs)}")
+    lines += [
         "",
         "## Spec",
         "",
