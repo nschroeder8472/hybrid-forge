@@ -134,8 +134,32 @@ someone who will read it months from now with no memory of this ticket.>
 """
 
 
-def _criteria_block(ticket: Ticket) -> str:
-    return "\n".join(f"- {c}" for c in ticket.criteria) or "- (none stated)"
+def _criteria_block(ticket: Ticket, criteria: Sequence[str] | None = None) -> str:
+    items = ticket.criteria if criteria is None else criteria
+    return "\n".join(f"- {c}" for c in items) or "- (none stated)"
+
+
+def _criteria_provenance_block(ticket: Ticket) -> str:
+    """The criteria, each marked with who wrote it.
+
+    Provenance is the whole distinction: a criterion a human put in the plan
+    outranks the planner revising the ticket, and one an earlier revision
+    invented does not. Without the marks the planner cannot tell which of its
+    own past inventions it is allowed to take back.
+    """
+    original = set(ticket.original_criteria)
+    lines = []
+    for criterion in ticket.criteria:
+        # No anchor recorded — a run ingested before originals were kept.
+        # Everything is treated as the plan's, which errs toward leaving a
+        # human's contract alone.
+        if not ticket.original_criteria or criterion in original:
+            lines.append(f"- {criterion}\n  _(from the plan — you may not change this)_")
+        else:
+            lines.append(
+                f"- {criterion}\n  _(added by an earlier revision — you may revise or retire it)_"
+            )
+    return "\n".join(lines) or "- (none stated)"
 
 
 def _files_block(ticket: Ticket) -> str:
@@ -375,6 +399,7 @@ def review_prompt(
     *,
     prior_verdicts: Sequence[str] = (),
     state: dict[str, str] | None = None,
+    unchanged: dict[str, str] | None = None,
 ) -> list[Message]:
     messages = [Message(role="system", content=REVIEWER_SYSTEM)]
 
@@ -411,6 +436,24 @@ say so and ACCEPT: a ticket whose work was already done is finished, not
 failed. If they are not, REJECT and name what is missing.
 
 {_sources_block(state)}
+"""
+
+    if unchanged:
+        # The retry case, and the one that used to be unrecoverable. A ticket
+        # requeued after a failed cycle starts with the previous cycle's work
+        # already on disk, so the executor rewrites it byte for byte and git
+        # reports no change — while the discarded test file reappears as new.
+        # The reviewer then sees a diff holding nothing but tests, concludes
+        # the implementation was never written, and rejects. Correctly, on the
+        # evidence it was given, forever.
+        body += f"""
+## Written by this attempt, but identical to what was already on disk
+These files are part of this ticket's work. The executor wrote them again this
+attempt and the contents matched what was already there, so they do not appear
+in the diff above. They are **not** missing. This is their current content —
+judge the criteria against it, exactly as if it were in the diff.
+
+{_sources_block(unchanged)}
 """
 
     if prior_verdicts:
@@ -620,11 +663,31 @@ Reply with JSON and nothing else:
   "allowed_files": ["revised scope"],
   "reference_files": ["files the executor must be shown to get this right"],
   "context": "what the next attempt should already know"
-}"""
+}
+
+`context` is read by the executor as established fact. Put conclusions there,
+never your reasoning towards them: "the board is 10x20, not 20x20" belongs in
+it, "let me re-verify whether the sequence could be..." does not.
+
+Reply with `{"impossible": "..."}` instead when the ticket cannot be made
+satisfiable — see the section on that below, if this ticket has one."""
 
 
-def respec_prompt(ticket: Ticket, failures: list[dict[str, str]]) -> list[Message]:
-    """Ask the planner to fix a ticket that its own executor could not satisfy."""
+def respec_prompt(
+    ticket: Ticket,
+    failures: list[dict[str, str]],
+    *,
+    sources: dict[str, str] | None = None,
+    criteria_locked: bool = True,
+) -> list[Message]:
+    """Ask the planner to fix a ticket that its own executor could not satisfy.
+
+    `sources` is the code this ticket owns and reads, as it exists right now.
+    Without it the planner is doing the thing this pipeline forbids everywhere
+    else — writing about a codebase it cannot see. It wrote "SoftDrop
+    decrements y" into a spec whose implementation increments it, and the
+    executor was then judged against the planner's guess.
+    """
     evidence = "\n\n".join(
         f"### Attempt {index}: {item['name']} failed\n{item['detail'].strip()}"
         for index, item in enumerate(failures, start=1)
@@ -640,17 +703,98 @@ def respec_prompt(ticket: Ticket, failures: list[dict[str, str]]) -> list[Messag
 
 ## Current reference files (pasted in read-only)
 {_reference_block(ticket)}
+"""
 
+    # Listed once. When the criteria are scoped by provenance they are shown
+    # below with their marks instead, and printing them twice invites a reply
+    # that revises one copy.
+    if not criteria_locked:
+        body += f"""
 ## Current acceptance criteria
 {_criteria_block(ticket)}
+"""
 
+    body += f"""
 ## Current context
 {ticket.context.strip() or "(none)"}
+"""
 
+    if ticket.drifted:
+        # The anchor. Each revision is derived from the last, so without the
+        # ingested text in front of it the planner cannot tell its own
+        # accumulated drift from what a human actually asked for — and it will
+        # keep revising away from the plan, one plausible step at a time.
+        body += f"""
+## What this ticket said when the plan was ingested
+This is the human-authored original. The "current" text above is what earlier
+revisions have made of it. Where the two disagree, the original is the intent;
+treat any difference you cannot justify from the failures below as drift you
+should undo rather than build on.
+
+### Original spec
+{ticket.original_spec}
+
+### Original acceptance criteria
+{_criteria_block(ticket, ticket.original_criteria)}
+"""
+
+    if sources:
+        body += f"""
+## The code as it exists right now
+These are the real contents of the files this ticket writes and reads. Every
+statement you make about how this code behaves must be checked against them.
+Do not describe a function, a field, a coordinate convention, or an index base
+that contradicts what is here — if the code and the current spec disagree,
+say which one you are changing and why.
+
+{_sources_block(sources)}
+"""
+
+    body += f"""
 ## What happened, oldest attempt first
 {evidence}
+"""
 
-Revise the ticket so the next attempt can succeed."""
+    if criteria_locked:
+        # Scoped by provenance rather than frozen outright. A blanket freeze
+        # made a machine-invented criterion as immutable as a human-authored
+        # one, so the loop could mint an impossible criterion and then never
+        # retire it — which is exactly what happened, and then the planner
+        # rewrote the spec around it instead.
+        body += f"""
+## What you may do to the acceptance criteria
+
+{_criteria_provenance_block(ticket)}
+
+Return `criteria` as the complete list you want the ticket to have. The rules
+applied to it:
+
+- Criteria marked **from the plan** are a human's contract. Drop or reword one
+  and it will be put back, and the attempt to change it reported.
+- Criteria marked **added by an earlier revision** are the loop's own. Revise
+  them, or leave them out to retire them, if the evidence says they were wrong.
+- Anything else you list is added. Add a criterion when the failures show
+  behavior nobody asked for, or when the spec requires something no criterion
+  checks. Never add one to describe a bug the attempts happened to produce.
+
+Omit `criteria` entirely to leave them exactly as they are.
+
+## If a criterion cannot be satisfied at all
+Some criteria are not wrong, they are impossible: two that contradict each
+other, or one asserting a specific value that no implementation of this spec
+produces. Do not rewrite the spec to chase it, and do not weaken it by hand.
+
+Reply with an `impossible` field naming the criterion and the contradiction,
+in plain terms a human can check. That parks the ticket for a person to settle
+and costs nothing further. It is the right answer, not a failure to answer:
+
+{{"impossible": "Criterion 3 requires Game::new(1) to yield [6, 3, 5, 7, 4]. \
+No xorshift32 with the shifts this spec defines produces that sequence — \
+seed 1 yields [2, ...]. Either the constant or the criterion is wrong, and \
+nothing in the failures says which."}}
+"""
+
+    body += "\nRevise the ticket so the next attempt can succeed."
 
     return [
         Message(role="system", content=RESPEC_SYSTEM),
@@ -682,7 +826,7 @@ def parse_respec(text: str) -> dict[str, Any]:
         raise ValueError("planner reply was not a JSON object")
 
     revision: dict[str, Any] = {}
-    for key in ("spec", "context", "rationale"):
+    for key in ("spec", "context", "rationale", "impossible"):
         if isinstance(data.get(key), str) and data[key].strip():
             revision[key] = data[key].strip()
     for key in ("criteria", "allowed_files", "reference_files"):
@@ -694,6 +838,10 @@ def parse_respec(text: str) -> dict[str, Any]:
             if items:
                 revision[key] = items
 
-    if not revision.get("spec"):
+    # A ticket whose criteria cannot be satisfied has no revised spec to give,
+    # and demanding one is what produced a planner that changed an xorshift
+    # constant to chase a sequence no xorshift produces. Reporting the
+    # contradiction is a complete answer.
+    if not revision.get("spec") and not revision.get("impossible"):
         raise ValueError("planner reply carried no revised spec")
     return revision

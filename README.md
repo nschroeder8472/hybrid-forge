@@ -172,6 +172,8 @@ forge init [--defaults]     # set up .hybridforge/ for this repo, with prompts
 forge doctor                # probe every configured model
 forge ingest <file|->       # spec or plan -> reviewable backlog
 forge go [--plan f] [--open]# run until done or stopped
+forge go --retries N        # requeue and respec what did not land, N more
+                            # times; -1 = until clean or stopped
 forge status                # one-shot summary
 forge retry [--respec]      # requeue failed tickets, optionally re-specced
 forge pause | resume | stop # applied after the current step, never mid-patch

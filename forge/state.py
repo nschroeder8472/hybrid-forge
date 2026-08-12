@@ -12,6 +12,7 @@ artifacts are the tickets, which stay as markdown.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -48,8 +49,12 @@ CREATE TABLE IF NOT EXISTS tickets (
     allowed_files TEXT NOT NULL DEFAULT '[]',
     reference_files TEXT NOT NULL DEFAULT '[]',
     criteria      TEXT NOT NULL DEFAULT '[]',
+    needs         TEXT NOT NULL DEFAULT '[]',
+    dep_stamp     TEXT NOT NULL DEFAULT '{}',
     context       TEXT NOT NULL DEFAULT '',
     blocked_note  TEXT NOT NULL DEFAULT '',
+    original_spec     TEXT NOT NULL DEFAULT '',
+    original_criteria TEXT NOT NULL DEFAULT '[]',
     updated_at    REAL NOT NULL,
     UNIQUE(run_id, ticket_id)
 );
@@ -138,13 +143,58 @@ class Ticket:
     # and the reviewer rejects the guess.
     reference_files: list[str] = field(default_factory=list)
     criteria: list[str] = field(default_factory=list)
+    # Ticket ids that must reach `done` before this one is eligible. A ticket
+    # is a testable unit, not a file lease: two tickets may both write
+    # `src/lib.rs`, and what they need is an order, not exclusive ownership.
+    # Declared in the plan, or derived at ingest from a file they share.
+    needs: list[str] = field(default_factory=list)
+    # What each dependency looked like when this ticket last passed, as
+    # `{dep_id: fingerprint}`. A ticket earns `done` against a particular
+    # version of what it was built on; when a respec moves that, the pass was
+    # earned against a contract that no longer exists.
+    dep_stamp: dict[str, str] = field(default_factory=dict)
     context: str = ""
     blocked_note: str = ""
+    # The spec and criteria as the plan was ingested, never rewritten. Respec
+    # revises a ticket from the *current* one, so without an anchor the tenth
+    # revision is derived from the ninth and nothing is left of what a human
+    # asked for. One ticket drifted until its criteria asserted the opposite
+    # of the plan's, and every party downstream believed the drift.
+    original_spec: str = ""
+    original_criteria: list[str] = field(default_factory=list)
+
+    @property
+    def drifted(self) -> bool:
+        """Whether the ticket now differs from what was ingested.
+
+        False when there is no anchor to compare against — a run from before
+        the originals were recorded reports no drift rather than claiming
+        drift from an empty string.
+        """
+        if not self.original_spec:
+            return False
+        if self.spec != self.original_spec:
+            return True
+        return bool(self.original_criteria) and self.criteria != self.original_criteria
 
     @property
     def attempt_number(self) -> int:
         """Globally increasing attempt index, used to name artifacts."""
         return self.attempt_base + self.attempts
+
+    @property
+    def fingerprint(self) -> str:
+        """What a dependent of this ticket was actually depending on.
+
+        Spec, criteria and writable scope — the three things a respec changes
+        that alter what a dependent was built against. Deliberately not status
+        or attempts: a ticket re-running and passing again with the same
+        contract invalidates nothing.
+        """
+        payload = json.dumps(
+            [self.spec, self.criteria, self.allowed_files], sort_keys=True
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
     def as_row(self) -> dict[str, Any]:
         return {
@@ -159,8 +209,12 @@ class Ticket:
             "allowed_files": json.dumps(self.allowed_files),
             "reference_files": json.dumps(self.reference_files),
             "criteria": json.dumps(self.criteria),
+            "needs": json.dumps(self.needs),
+            "dep_stamp": json.dumps(self.dep_stamp),
             "context": self.context,
             "blocked_note": self.blocked_note,
+            "original_spec": self.original_spec,
+            "original_criteria": json.dumps(self.original_criteria),
         }
 
     @classmethod
@@ -177,8 +231,12 @@ class Ticket:
             allowed_files=json.loads(row["allowed_files"]),
             reference_files=json.loads(row["reference_files"]),
             criteria=json.loads(row["criteria"]),
+            needs=json.loads(row["needs"]),
+            dep_stamp=json.loads(row["dep_stamp"]),
             context=row["context"],
             blocked_note=row["blocked_note"],
+            original_spec=row["original_spec"],
+            original_criteria=json.loads(row["original_criteria"]),
         )
 
 
@@ -205,6 +263,10 @@ class Store:
         ("usage", "cost_usd", "REAL NOT NULL DEFAULT 0"),
         ("tickets", "attempt_base", "INTEGER NOT NULL DEFAULT 0"),
         ("tickets", "reference_files", "TEXT NOT NULL DEFAULT '[]'"),
+        ("tickets", "original_spec", "TEXT NOT NULL DEFAULT ''"),
+        ("tickets", "original_criteria", "TEXT NOT NULL DEFAULT '[]'"),
+        ("tickets", "needs", "TEXT NOT NULL DEFAULT '[]'"),
+        ("tickets", "dep_stamp", "TEXT NOT NULL DEFAULT '{}'"),
     )
 
     def _migrate(self) -> None:
@@ -309,31 +371,58 @@ class Store:
             for position, ticket in enumerate(tickets):
                 row = ticket.as_row()
                 row["position"] = position if not ticket.position else ticket.position
+                # Ingest is the only moment the original is knowable, so it is
+                # captured here rather than asked for. Everything downstream
+                # rewrites `spec`; nothing may write these again.
+                row["original_spec"] = ticket.original_spec or ticket.spec
+                row["original_criteria"] = json.dumps(
+                    ticket.original_criteria or ticket.criteria
+                )
                 connection.execute(
                     "INSERT OR REPLACE INTO tickets "
                     "(run_id, ticket_id, title, route, status, position, attempts, "
-                    " attempt_base, spec, allowed_files, reference_files, criteria, context, "
-                    " blocked_note, "
+                    " attempt_base, spec, allowed_files, reference_files, criteria, needs, dep_stamp, context, "
+                    " blocked_note, original_spec, original_criteria, "
                     " updated_at) "
                     "VALUES (:run_id, :ticket_id, :title, :route, :status, :position, "
                     ":attempts, :attempt_base, :spec, :allowed_files, :reference_files, "
-                    ":criteria, :context, "
-                    ":blocked_note, :now)",
+                    ":criteria, :needs, :dep_stamp, :context, "
+                    ":blocked_note, :original_spec, :original_criteria, :now)",
                     {**row, "run_id": run_id, "now": now},
                 )
 
     def next_ticket(self, run_id: int) -> Ticket | None:
-        """The next unit of work, or None when the backlog is exhausted.
+        """The next eligible unit of work, or None when none is runnable.
 
-        Ordering is by position then id, so a plan's intended sequence is
-        honored — later tickets often assume earlier ones landed.
+        Eligible means pending and every ticket in `needs` already done. Ties
+        break on position then id, so a plan's intended reading order still
+        decides among tickets that could equally run now.
+
+        None does not always mean the backlog is finished. With a validated
+        acyclic graph it means one of two things — nothing is left, or what is
+        left is waiting on a dependency that failed. `Orchestrator._finish`
+        separates them; see `_park_unreachable`.
         """
-        row = self._connection.execute(
-            "SELECT * FROM tickets WHERE run_id = ? AND status IN (?, ?) "
-            "ORDER BY position, id LIMIT 1",
-            (run_id, TICKET_PENDING, TICKET_RUNNING),
-        ).fetchone()
-        return Ticket.from_row(row) if row else None
+        for ticket in self.list_tickets(run_id):
+            if ticket.status not in (TICKET_PENDING, TICKET_RUNNING):
+                continue
+            if self.unmet_needs(run_id, ticket):
+                continue
+            return ticket
+        return None
+
+    def unmet_needs(self, run_id: int, ticket: Ticket) -> list[str]:
+        """Dependencies of `ticket` that have not reached done."""
+        if not ticket.needs:
+            return []
+        done = {
+            row["ticket_id"]
+            for row in self._connection.execute(
+                "SELECT ticket_id FROM tickets WHERE run_id = ? AND status = ?",
+                (run_id, TICKET_DONE),
+            )
+        }
+        return [dep for dep in ticket.needs if dep not in done]
 
     def list_tickets(self, run_id: int) -> list[Ticket]:
         rows = self._connection.execute(
@@ -342,12 +431,15 @@ class Store:
         return [Ticket.from_row(row) for row in rows]
 
     def update_ticket(self, run_id: int, ticket: Ticket) -> None:
+        # `original_spec` and `original_criteria` are deliberately absent from
+        # this statement. They are the anchor a respec is judged against, and
+        # an anchor that any caller can move is not one.
         with self._write() as connection:
             connection.execute(
                 "UPDATE tickets SET status = :status, attempts = :attempts, "
                 "attempt_base = :attempt_base, spec = :spec, "
                 "allowed_files = :allowed_files, reference_files = :reference_files, "
-                "criteria = :criteria, context = :context, "
+                "criteria = :criteria, needs = :needs, dep_stamp = :dep_stamp, context = :context, "
                 "blocked_note = :blocked_note, updated_at = :now "
                 "WHERE run_id = :run_id AND ticket_id = :ticket_id",
                 {**ticket.as_row(), "run_id": run_id, "now": time.time()},
