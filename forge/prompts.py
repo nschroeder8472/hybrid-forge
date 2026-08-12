@@ -288,6 +288,7 @@ def tests_prompt(
     example_test: tuple[str, str] | None = None,
     failure_context: str = "",
     sources: dict[str, str] | None = None,
+    rejected_bindings: list[str] | None = None,
 ) -> list[Message]:
     """Ask the tester for assertions, with the evidence to match the repo.
 
@@ -384,6 +385,28 @@ wrapping it in a skip would hide a real defect and end the ticket with a green
 suite over broken code — a worse outcome than any failing test.
 
 If you cannot tell which it is, keep the assertion as written.
+"""
+
+    if rejected_bindings:
+        quoted = "\n".join(f"  {line}" for line in rejected_bindings)
+        body += f"""
+## Your last answer was rejected before it reached disk
+
+It declared the code under test as a foreign binding:
+
+```
+{quoted}
+```
+
+An `extern` block, `dlopen`, `ctypes.CDLL` or `DllImport` *re-declares* a
+symbol rather than referencing the one this project builds. The linker has
+nothing to resolve it against, so the target fails to **link** — which does not
+fail your test, it fails the whole suite, including every other ticket's tests
+in the same target.
+
+Call the functions the way the rest of this project calls them: import the
+module and call it directly. These tests run on the host, where an exported
+function is an ordinary function of its own language.
 """
 
     return [

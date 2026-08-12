@@ -47,6 +47,7 @@ from .patch import (
     apply_edits,
     duplicate_paths,
     enforce_scope,
+    foreign_bindings,
     is_safe_path,
     matches_any,
     normalize_path,
@@ -138,6 +139,12 @@ class Orchestrator:
         # for a twenty-ticket run logs once rather than twenty times.
         self._memory_warned = False
         self._memory_failures = 0
+        # Tickets that got a test file, and tickets that were told they should
+        # not have one. Individually a skip is routine; every ticket in a run
+        # skipping is a misconfiguration, and it presents as a quiet `info`
+        # line per ticket rather than as anything wrong. See `_finish`.
+        self._tests_authored = 0
+        self._tests_skipped = 0
 
     # ------------------------------------------------------------------
     # Project memory
@@ -585,6 +592,30 @@ class Orchestrator:
             if not found:
                 return stale
 
+    def _report_test_coverage(self, run_id: int) -> None:
+        """Say so when the whole run authored no tests.
+
+        One ticket skipping test authoring is ordinary — a build script or a
+        stylesheet has nothing a unit test can assert against, and review
+        checks its criteria instead. Every ticket skipping is a project-level
+        misconfiguration wearing the same clothes, and it reported itself as a
+        routine `info` line per ticket. A run once degraded to review-only
+        after its second ticket and said nothing that read as wrong.
+        """
+        if not self.config.commands.get("test") or self._tests_authored:
+            return
+        if not self._tests_skipped:
+            return
+        self.store.log(
+            run_id,
+            f"No ticket in this run authored tests ({self._tests_skipped} "
+            f"skipped) while a test command is configured. Verification ran on "
+            f"review alone. Check that `commands.test` and the files the "
+            f"tickets write are the same language.",
+            level="warn",
+            kind="lifecycle",
+        )
+
     def _reopen_stale(self, run_id: int) -> list[str]:
         """Requeue tickets that passed on a dependency which has since moved.
 
@@ -663,6 +694,7 @@ class Orchestrator:
         # An unverified test file left by a ticket that did not land fails the
         # final check below, and every ticket of any retry cycle after it.
         self._sweep_orphan_tests(run_id)
+        self._report_test_coverage(run_id)
 
         counts = self.store.ticket_counts(run_id)
         blocked = counts.get(TICKET_BLOCKED, 0) + counts.get(TICKET_FAILED, 0)
@@ -1378,14 +1410,25 @@ class Orchestrator:
         # The criteria come from the ticket, never from the executor's own
         # suggestion. A model that writes both the code and the assertion it is
         # judged against will encode its bugs as passing tests.
-        example = self._example_test(written)
-        test_path, no_tests_because = self._test_target(ticket, written, example)
+        # Suffix first, example second. The suite decides which language it is
+        # written in; the example only shows how. Reading the language off
+        # whichever example turned up first is what let one `.js` file in a
+        # Rust repo disable test authoring for the whole backlog.
+        suffix = self._suite_suffix(written, exclude=written)
+        example = self._example_test(written, suffix)
+        test_path, no_tests_because = self._test_target(
+            ticket, written, example, suffix
+        )
         if test_path:
             # On a retry the ticket's own test file is already on disk, and a
             # fixed path makes that the common case rather than the rare one.
             # Handing it back as "the convention this repo follows" would
             # launder the previous attempt's mistakes into a rule.
-            example = self._example_test(written + [test_path])
+            example = self._example_test(written + [test_path], suffix)
+        if ticket.criteria and test_path:
+            self._tests_authored += 1
+        if ticket.criteria and no_tests_because:
+            self._tests_skipped += 1
         if ticket.criteria and no_tests_because:
             # Not a failure. The criteria are still checked at review, which is
             # the right place for "the build script takes a --release flag" or
@@ -1402,12 +1445,14 @@ class Orchestrator:
             step_id = self.store.start_step(run_id, ticket.ticket_id, "tests")
             existed = (self.config.root / test_path).exists()
             try:
-                completion = self._call(
-                    run_id,
-                    "tester",
-                    tests_prompt(
-                        ticket,
-                        written,
+                rejected_bindings: list[str] = []
+                for remaining in (1, 0):
+                    completion = self._call(
+                        run_id,
+                        "tester",
+                        tests_prompt(
+                            ticket,
+                            written,
                         # One fixed path per ticket. A tester free to name its
                         # own file renames it on every retry and leaves the
                         # previous one running forever.
@@ -1427,28 +1472,60 @@ class Orchestrator:
                         # not fail a test, it fails to compile, and then every
                         # later ticket's verify step fails on a file that has
                         # nothing to do with it. All read-only here: the tester
-                        # writes its own file and returns none of these.
-                        sources=self._sources_for(ticket, extra=written)[0],
-                    ),
-                    max_tokens=self._output_budget("tester"),
-                    temperature=0.1,
-                )
-                # Half a test file is worse than no test file: it fails verify
-                # on a syntax error, which reads as the implementation being
-                # broken. Discard it and let review check the criteria instead
-                # — the same trade the handler below already makes.
-                if completion.truncated:
-                    raise ValueError("tester hit its output limit; partial tests discarded")
-                # Exactly one path, and not the ticket's source files either.
-                # The previous allowlist was every test-shaped path in the
-                # repository, which let one ticket's tester scatter six files
-                # across three attempts and let it overwrite the very
-                # implementation it was supposed to be judging.
-                test_parsed = enforce_scope(
-                    parse_output(completion.text),
-                    [test_path],
-                    self.config.never_delegate,
-                )
+                            # writes its own file and returns none of these.
+                            sources=self._sources_for(ticket, extra=written)[0],
+                            rejected_bindings=rejected_bindings,
+                        ),
+                        max_tokens=self._output_budget("tester"),
+                        temperature=0.1,
+                    )
+                    # Half a test file is worse than no test file: it fails
+                    # verify on a syntax error, which reads as the
+                    # implementation being broken. Discard it and let review
+                    # check the criteria instead — the same trade the handler
+                    # below already makes.
+                    if completion.truncated:
+                        raise ValueError("tester hit its output limit; partial tests discarded")
+                    # Exactly one path, and not the ticket's source files
+                    # either. The previous allowlist was every test-shaped path
+                    # in the repository, which let one ticket's tester scatter
+                    # six files across three attempts and let it overwrite the
+                    # very implementation it was supposed to be judging.
+                    test_parsed = enforce_scope(
+                        parse_output(completion.text),
+                        [test_path],
+                        self.config.never_delegate,
+                    )
+                    # A test that re-declares its subject with `extern` or
+                    # `dlopen` does not fail an assertion, it fails to link —
+                    # and takes every other test in the target down with it.
+                    # TESTER_SYSTEM already forbids this; a small local model
+                    # did it anyway, seven unresolved symbols at a time. So it
+                    # is rejected here and asked for once more, with what was
+                    # wrong quoted back.
+                    rejected_bindings = [
+                        line
+                        for edit in test_parsed.edits
+                        for line in foreign_bindings(edit.content)
+                    ]
+                    if not rejected_bindings:
+                        break
+                    self.store.log(
+                        run_id,
+                        f"{ticket.ticket_id}: tester declared the code under test "
+                        f"as a foreign binding "
+                        f"({'; '.join(rejected_bindings)[:200]}); "
+                        + ("asking again." if remaining else "discarding the tests."),
+                        level="warn",
+                        kind="ticket",
+                    )
+                    if not remaining:
+                        raise ValueError(
+                            "tester kept declaring the code under test as a "
+                            "foreign binding; tests discarded rather than "
+                            "breaking the link for every other ticket"
+                        )
+
                 if test_parsed.rejected:
                     self.store.log(
                         run_id,
@@ -1732,26 +1809,30 @@ class Orchestrator:
         }
     )
 
-    def _example_test(self, exclude: list[str]) -> tuple[str, str] | None:
+    def _example_test(
+        self, exclude: list[str], suffix: str = ""
+    ) -> tuple[str, str] | None:
         """An existing test file for the tester to imitate, if the repo has one.
 
         Framework is not a preference here, it is a hard constraint: a pytest
         file under `unittest discover` collects zero tests. One real example
         settles it more reliably than any instruction.
 
-        Files this ticket just wrote are excluded — handing back the tester's
-        own previous attempt would launder a wrong guess into a convention.
+        `suffix` filters to the language the suite is actually written in.
+        This used to run the other way round — the first example found decided
+        the suffix — which in a mixed repo showed the tester a JavaScript file
+        and asked it for Rust. The suite decides; the example follows.
 
-        So are generated directories and non-source extensions. This answer
-        decides which language the whole TESTS step believes the suite is
-        written in, so picking up a `.json` fingerprint file does not merely
-        show a bad example — it concludes the project's tests are JSON and
-        skips test authoring for every ticket in the run.
+        Files this ticket just wrote are excluded — handing back the tester's
+        own previous attempt would launder a wrong guess into a convention. So
+        are generated directories and non-source extensions.
         """
         written = {p.replace("\\", "/") for p in exclude}
         for pattern in self._TEST_GLOBS:
             for path in sorted(self.config.root.glob(pattern)):
                 if not path.is_file() or path.suffix in ("", ".pyc"):
+                    continue
+                if suffix and path.suffix.lower() != suffix:
                     continue
                 relative = path.relative_to(self.config.root).as_posix()
                 if relative in written:
@@ -1784,18 +1865,97 @@ class Orchestrator:
         }
     )
 
-    def _suite_suffix(
-        self, written: list[str], example: tuple[str, str] | None
-    ) -> str:
+    # What each test runner collects, matched as a substring of the configured
+    # test command so a containerised or wrapped invocation still resolves.
+    # Longest-lived evidence in the project: a repo with a Rust core and a
+    # browser shell has both `.rs` and `.js` under tests/, and only the command
+    # says which of them the suite actually is.
+    _RUNNER_SUFFIXES: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("cargo", (".rs",)),
+        ("pytest", (".py",)),
+        ("unittest", (".py",)),
+        ("nosetests", (".py",)),
+        ("tox", (".py",)),
+        ("gotestsum", (".go",)),
+        ("go test", (".go",)),
+        ("dotnet test", (".cs",)),
+        ("xcodebuild", (".swift",)),
+        ("swift test", (".swift",)),
+        ("rspec", (".rb",)),
+        ("rake", (".rb",)),
+        ("phpunit", (".php",)),
+        ("ctest", (".cpp", ".cc", ".c")),
+        ("gradle", (".kt", ".java")),
+        ("mvn", (".java",)),
+        ("deno test", (".ts",)),
+        # JavaScript runners collect several extensions, so these narrow the
+        # field rather than settling it; the repo's own files break the tie.
+        ("vitest", (".ts", ".tsx", ".js", ".jsx")),
+        ("jest", (".ts", ".tsx", ".js", ".jsx")),
+        ("playwright", (".ts", ".js")),
+        ("cypress", (".ts", ".js")),
+        ("mocha", (".ts", ".js")),
+        ("ava", (".ts", ".js")),
+        ("npm test", (".ts", ".tsx", ".js", ".jsx")),
+        ("pnpm test", (".ts", ".tsx", ".js", ".jsx")),
+        ("yarn test", (".ts", ".tsx", ".js", ".jsx")),
+    )
+
+    def _runner_suffixes(self) -> tuple[str, ...]:
+        """Extensions the configured test command can collect, if it names a
+        runner this knows. Empty when there is no command or no match."""
+        command = (self.config.commands.get("test") or "").lower()
+        if not command:
+            return ()
+        for needle, suffixes in self._RUNNER_SUFFIXES:
+            if needle in command:
+                return suffixes
+        return ()
+
+    def _repo_test_suffixes(self, exclude: list[str]) -> Counter[str]:
+        """How many test files of each extension the repo already has."""
+        skip = {p.replace("\\", "/") for p in exclude}
+        counts: Counter[str] = Counter()
+        for pattern in self._TEST_GLOBS:
+            for path in self.config.root.glob(pattern):
+                if not path.is_file() or path.suffix.lower() in self._UNTESTABLE_SUFFIXES:
+                    continue
+                relative = path.relative_to(self.config.root).as_posix()
+                if relative in skip:
+                    continue
+                if self._IGNORED_DIRS.intersection(Path(relative).parts[:-1]):
+                    continue
+                counts[path.suffix.lower()] += 1
+        return counts
+
+    def _suite_suffix(self, written: list[str], exclude: list[str] | None = None) -> str:
         """The file extension this project's test command actually collects.
 
-        Taken from a real test file when the repo has one, because that is
-        evidence rather than inference. Otherwise guessed from what the ticket
-        just wrote, which is only wrong on the very first ticket of a fresh
-        repository — where there is nothing yet for the guess to contradict.
+        The command decides, because it is the only thing in the project that
+        states how tests are run. Reading it off one existing test file instead
+        is what broke a Rust backlog: the browser-shell ticket legitimately
+        wrote `tests/tt_005_test.js`, and from then on every Rust ticket was
+        told the suite collects `.js`, wrote no tests at all, and had the skip
+        reported as routine. Verification quietly degraded to review-only for
+        the rest of the run.
+
+        Where a runner collects several extensions — the JavaScript ones — the
+        repo's own files break the tie. Where no command is configured, the
+        repo's majority decides, and a majority is used rather than the first
+        file found so one stray fixture cannot outvote a whole suite. A fresh
+        repo with neither falls back to what this ticket just wrote, which can
+        only be wrong before there is anything to contradict it.
         """
-        if example is not None:
-            return Path(example[0]).suffix.lower()
+        repo = self._repo_test_suffixes(exclude or [])
+        allowed = self._runner_suffixes()
+        if allowed:
+            for suffix, _count in repo.most_common():
+                if suffix in allowed:
+                    return suffix
+            return allowed[0]
+        if repo:
+            return repo.most_common(1)[0][0]
+
         counts: Counter[str] = Counter()
         for path in written:
             suffix = Path(path).suffix.lower()
@@ -1804,7 +1964,11 @@ class Orchestrator:
         return counts.most_common(1)[0][0] if counts else ""
 
     def _test_target(
-        self, ticket: Ticket, written: list[str], example: tuple[str, str] | None
+        self,
+        ticket: Ticket,
+        written: list[str],
+        example: tuple[str, str] | None,
+        suffix: str = "",
     ) -> tuple[str, str]:
         """Where this ticket's tests go, or why it should not have any.
 
@@ -1827,7 +1991,20 @@ class Orchestrator:
         if len(designated) == 1:
             return designated[0], ""
 
-        suffix = self._suite_suffix(written, example)
+        # Asked before the language question, and it is a different question: a
+        # ticket that wrote only a README and two build scripts has nothing to
+        # assert against in any language, and saying "wrote no .rs file" about
+        # it names the wrong problem.
+        if not any(
+            Path(path).suffix and Path(path).suffix.lower() not in self._UNTESTABLE_SUFFIXES
+            for path in written
+        ):
+            return "", (
+                "the ticket wrote no source file whose behavior a test could "
+                "assert against"
+            )
+
+        suffix = suffix or self._suite_suffix(written)
         if not suffix:
             return "", (
                 "the ticket wrote no source file whose behavior a test could "

@@ -235,3 +235,61 @@ def apply_edits(root: Path, edits: list[FileEdit]) -> list[str]:
         target.write_text(body, encoding="utf-8")
         written.append(edit.path)
     return written
+
+
+# Ways a test file can re-declare the code under test instead of referencing
+# it. Every one of these introduces a symbol the linker or loader must resolve
+# from somewhere else at build time — and in a test target built from the same
+# crate, there is nowhere else. The result is not a failing assertion but a
+# failing *link*, which takes down every other test in the target with it.
+_FOREIGN_BINDINGS: tuple[tuple[str, str], ...] = (
+    # Rust / C / C++: `extern "C" { fn game_new(); }`. The block form only —
+    # `extern crate serde` and `pub extern "C" fn` are declarations of a
+    # different kind and are fine.
+    (r'extern\s*(?:"[A-Za-z0-9_-]+"\s*)?\{', 'extern block'),
+    # Python ctypes and cffi.
+    (r"\bctypes\s*\.\s*(?:CDLL|cdll|WinDLL|windll|PyDLL)\b", "ctypes"),
+    (r"\bCDLL\s*\(", "ctypes"),
+    (r"\bcdll\s*\.\s*LoadLibrary\b", "ctypes"),
+    (r"\bffi\s*\.\s*dlopen\s*\(", "cffi"),
+    # cgo. Only the import itself; the word "C" is too common otherwise.
+    (r'^\s*import\s+"C"\s*$', "cgo import"),
+    # .NET P/Invoke.
+    (r"\[\s*DllImport\b", "DllImport"),
+    # JVM.
+    (r"\bSystem\s*\.\s*load(?:Library)?\s*\(", "System.loadLibrary"),
+    # JavaScript / Deno FFI.
+    (r"\bDeno\s*\.\s*dlopen\s*\(", "Deno.dlopen"),
+    (r"\bffi\s*\.\s*Library\s*\(", "node-ffi"),
+    (r"\bkoffi\s*\.\s*load\s*\(", "koffi"),
+    # The bare C call, whatever the language wrapping it.
+    (r"\bdlopen\s*\(", "dlopen"),
+)
+
+_FOREIGN_BINDING_RES = tuple(
+    (re.compile(pattern, re.MULTILINE), label) for pattern, label in _FOREIGN_BINDINGS
+)
+
+
+def foreign_bindings(text: str) -> list[str]:
+    """Lines in `text` that re-declare code under test as a foreign binding.
+
+    Returned as `label: line` so the tester can be shown exactly what was
+    rejected. Empty when the file references its subject normally, which is
+    what a host-run test of an exported function is supposed to do.
+
+    A comment mentioning one of these is not a declaration, so obvious comment
+    lines are skipped. The check is a net, not a parser: it exists because a
+    prohibition in the prompt was ignored by a small local model, and its
+    failure mode is asking for one rewrite that was not needed.
+    """
+    found: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("//", "#", "*", "--")) or line.startswith("/*"):
+            continue
+        for pattern, label in _FOREIGN_BINDING_RES:
+            if pattern.search(line):
+                found.append(f"{label}: {line[:120]}")
+                break
+    return found

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from .ingest import whole_file_claims
+from .ingest import derive_needs, whole_file_claims
 from .patch import is_safe_path
 from .prompts import parse_respec, respec_prompt
 from .providers import Completion, Message, ProviderError
@@ -128,6 +128,31 @@ def _drop_whole_file_claims(
         return proposed, []
     kept = [c for c in proposed if c not in offending]
     return kept, sorted(offending.items())
+
+
+def _order_shared_scope(
+    store: Store, run_id: int, ticket: Ticket
+) -> list[tuple[str, str, str]]:
+    """Order any pair this revision has left writing the same file.
+
+    Reuses the ingest rule, so a scope respec widened mid-run is arranged the
+    same way the plan would have been: position order, and only where the graph
+    does not already connect the pair in either direction — which is what keeps
+    it from contradicting a declared edge or closing a cycle.
+
+    `ticket` is passed in already carrying the revision, so the caller can
+    persist it once. Every *other* ticket the ordering touches is written here.
+    """
+    backlog = [
+        ticket if other.ticket_id == ticket.ticket_id else other
+        for other in store.list_tickets(run_id)
+    ]
+    added = derive_needs(backlog)
+    by_id = {other.ticket_id: other for other in backlog}
+    for later, _earlier, _path in added:
+        if later != ticket.ticket_id:
+            store.update_ticket(run_id, by_id[later])
+    return added
 
 
 def _merge_criteria(ticket: Ticket, proposed: list[str]) -> tuple[list[str], list[str]]:
@@ -245,6 +270,13 @@ def revise(
             impossible=impossible,
         )
 
+    # The graph is not the planner's to edit. Respec sees one ticket and the
+    # reasons it failed; it cannot see the file conflict on the other side of
+    # an edge, so dropping one would let two tickets race for a file that the
+    # backlog had already ordered. Edges are added below, from scope, where
+    # the whole backlog is in view.
+    revision.pop("needs", None)
+
     # Instruction-following is not an access control, so provenance is enforced
     # here rather than merely described in the prompt.
     refused: list[str] = []
@@ -293,6 +325,23 @@ def revise(
 
     for field_name, value in revision.items():
         setattr(ticket, field_name, value)
+
+    # Widening scope into a file another ticket writes is legal — a ticket is a
+    # testable unit, not a file lease — but it is only safe once the two are
+    # ordered. Taking the file without the edge leaves them racing for it, and
+    # whichever runs second overwrites the first. Respec asks for the file; the
+    # backlog decides who goes first.
+    for later, earlier, path in _order_shared_scope(store, run_id, ticket):
+        store.log(
+            run_id,
+            f"{later}: now waits for {earlier} — respec took on {path}, "
+            f"which {earlier} also writes.",
+            level="warn",
+            kind="ticket",
+        )
+        if later == ticket.ticket_id and "needs" not in changed:
+            changed.append("needs")
+
     store.update_ticket(run_id, ticket)
     store.log(
         run_id,

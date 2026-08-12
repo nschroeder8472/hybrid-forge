@@ -40,6 +40,7 @@ from forge.loop import Orchestrator, StepResult
 from forge.patch import (
     duplicate_paths,
     enforce_scope,
+    foreign_bindings,
     is_safe_path,
     matches_any,
     normalize_path,
@@ -2070,8 +2071,10 @@ class TestOneTestFilePerTicket(unittest.TestCase):
         self.assertEqual(first, "tests/tt_004_test.rs")
         self.assertEqual(first, second)
 
-    def test_an_example_test_decides_the_directory_and_extension(self):
-        orch, _ = self._orchestrator()
+    def test_an_example_test_decides_the_directory(self):
+        """Where the suite lives is the example's to say. Which language it is
+        written in is not — see the test command tests below."""
+        orch, _ = self._orchestrator(test_command="python -m pytest")
         example = ("test/unit/thing_test.py", "import unittest\n")
 
         path, _ = orch._test_target(Ticket("T-1"), ["app.py"], example)
@@ -2421,6 +2424,121 @@ class TestDependencyGraph(unittest.TestCase):
             ingest_document(plan)
 
         self.assertIn("cycle", str(caught.exception))
+
+
+class TestRespecMayWidenScopeButNotTheGraph(unittest.TestCase):
+    """Widening into a file another ticket writes is legal — a ticket is a
+    testable unit, not a file lease. It is only *safe* once the pair is
+    ordered: without the edge they race for the file and whichever runs second
+    overwrites the first. Respec asks for the file; the backlog decides who
+    goes first."""
+
+    def _store(self, first_files=("src/game.rs",), second_files=("src/wasm.rs",)):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(
+            run_id,
+            [
+                Ticket("T-1", status="failed", attempts=3, position=0,
+                       allowed_files=list(first_files), spec="one"),
+                Ticket("T-2", position=1, allowed_files=list(second_files), spec="two"),
+            ],
+        )
+        step = store.start_step(run_id, "T-1", "review")
+        store.end_step(step, "failed", "REJECT: nope")
+        return store, run_id
+
+    def _revise(self, store, run_id, **payload):
+        def call(_messages, _budget):
+            return Completion(text=json.dumps(payload), usage=Usage())
+
+        ticket = store.list_tickets(run_id)[0]
+        return respec.revise(store, run_id, ticket, call=call, budget=1024)
+
+    def _by_id(self, store, run_id):
+        return {t.ticket_id: t for t in store.list_tickets(run_id)}
+
+    def test_taking_on_another_tickets_file_adds_the_ordering_edge(self):
+        store, run_id = self._store()
+        self._revise(
+            store, run_id,
+            spec="revised", allowed_files=["src/game.rs", "src/wasm.rs"],
+        )
+
+        after = self._by_id(store, run_id)
+        # T-1 is position 0, so the later ticket is the one that waits.
+        self.assertEqual(after["T-2"].needs, ["T-1"])
+        self.assertEqual(after["T-1"].needs, [])
+
+    def test_the_widening_is_still_applied(self):
+        store, run_id = self._store()
+        self._revise(
+            store, run_id,
+            spec="revised", allowed_files=["src/game.rs", "src/wasm.rs"],
+        )
+
+        self.assertIn("src/wasm.rs", self._by_id(store, run_id)["T-1"].allowed_files)
+
+    def test_the_new_edge_is_reported(self):
+        store, run_id = self._store()
+        self._revise(
+            store, run_id,
+            spec="revised", allowed_files=["src/game.rs", "src/wasm.rs"],
+        )
+
+        messages = " ".join(e["message"] for e in store.events_after(0))
+        self.assertIn("now waits for", messages)
+        self.assertIn("src/wasm.rs", messages)
+
+    def test_widening_into_nobodys_file_adds_no_edge(self):
+        store, run_id = self._store()
+        self._revise(
+            store, run_id,
+            spec="revised", allowed_files=["src/game.rs", "src/brand_new.rs"],
+        )
+
+        after = self._by_id(store, run_id)
+        self.assertEqual(after["T-1"].needs, [])
+        self.assertEqual(after["T-2"].needs, [])
+
+    def test_an_existing_edge_is_not_duplicated_or_reversed(self):
+        store, run_id = self._store()
+        second = store.list_tickets(run_id)[1]
+        second.needs = ["T-1"]
+        store.update_ticket(run_id, second)
+
+        self._revise(
+            store, run_id,
+            spec="revised", allowed_files=["src/game.rs", "src/wasm.rs"],
+        )
+
+        after = self._by_id(store, run_id)
+        self.assertEqual(after["T-2"].needs, ["T-1"])
+        self.assertEqual(after["T-1"].needs, [])
+
+    def test_respec_may_not_edit_the_graph_itself(self):
+        """The planner sees one ticket and why it failed. It cannot see the
+        file conflict on the other side of an edge, so dropping one would let
+        two tickets race for a file the backlog had already ordered."""
+        store, run_id = self._store()
+        first = store.list_tickets(run_id)[0]
+        first.needs = ["T-2"]
+        store.update_ticket(run_id, first)
+
+        self._revise(store, run_id, spec="revised", needs=[])
+
+        self.assertEqual(self._by_id(store, run_id)["T-1"].needs, ["T-2"])
+
+    def test_the_edge_counts_as_a_revision(self):
+        """A cycle whose respec changed nothing ends the run, so an ordering
+        the planner caused has to register as a change."""
+        store, run_id = self._store()
+        result = self._revise(
+            store, run_id,
+            spec="one", allowed_files=["src/game.rs", "src/wasm.rs"],
+        )
+
+        self.assertTrue(result.revised)
 
 
 class TestRespecCannotPinASharedFile(unittest.TestCase):
@@ -2846,6 +2964,259 @@ class TestStaleDependentsAreReopened(unittest.TestCase):
         messages = " ".join(e["message"] for e in orch.store.events_after(0))
         self.assertIn("TT-002: reopened", messages)
         self.assertIn("TT-001", messages)
+
+
+class TestForeignBindingsInTests(unittest.TestCase):
+    """A test that re-declares its subject with `extern` or `dlopen` does not
+    fail an assertion — it fails to *link*, and takes every other test in the
+    same target with it. TESTER_SYSTEM forbids exactly this, in detail, and a
+    small local model did it anyway: seven unresolved symbols, three cycles."""
+
+    # The file that actually broke a run, trimmed.
+    REAL = (
+        'use std::ffi::CString;\n'
+        'use std::os::raw::c_char;\n'
+        'extern "C" {\n'
+        '    fn game_new(seed: u32) -> *mut c_void;\n'
+        '    fn game_score(g: *mut c_void) -> u32;\n'
+        '}\n'
+        '#[test]\n'
+        'fn test_game_new_and_score() { unsafe { game_new(1); } }\n'
+    )
+
+    def test_the_file_that_broke_the_run_is_caught(self):
+        found = foreign_bindings(self.REAL)
+        self.assertEqual(len(found), 1)
+        self.assertIn("extern block", found[0])
+
+    def test_the_correct_version_of_the_same_test_is_clean(self):
+        good = (
+            "use tetris::wasm;\n"
+            "#[test]\n"
+            "fn test_game_new_and_score() {\n"
+            "    let g = wasm::game_new(1);\n"
+            "    assert_eq!(wasm::game_score(g), 0);\n"
+            "}\n"
+        )
+        self.assertEqual(foreign_bindings(good), [])
+
+    def test_ordinary_rust_declarations_are_not_flagged(self):
+        for line in (
+            "extern crate serde;",
+            'pub extern "C" fn game_new(seed: u32) -> u32 { seed }',
+            "use std::os::raw::c_char;",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(foreign_bindings(line), [], line)
+
+    def test_a_comment_is_not_a_declaration(self):
+        self.assertEqual(foreign_bindings('// extern "C" { fn x(); }'), [])
+        self.assertEqual(foreign_bindings("# lib = ctypes.CDLL('x')"), [])
+
+    def test_other_languages_are_caught_too(self):
+        for text, label in (
+            ('lib = ctypes.CDLL("./libgame.so")', "ctypes"),
+            ('from ctypes import cdll\ncdll.LoadLibrary("x")', "ctypes"),
+            ('import "C"', "cgo import"),
+            ('[DllImport("game.dll")]', "DllImport"),
+            ('const lib = Deno.dlopen("./game.so", {});', "Deno.dlopen"),
+            ('System.loadLibrary("game");', "System.loadLibrary"),
+        ):
+            with self.subTest(text=text):
+                found = foreign_bindings(text)
+                self.assertTrue(found, text)
+                self.assertIn(label, found[0])
+
+    def test_the_prompt_quotes_back_what_was_rejected(self):
+        body = tests_prompt(
+            Ticket("TT-004", criteria=["game_score() returns 0"]),
+            ["src/wasm.rs"],
+            test_path="tests/tt_004_test.rs",
+            rejected_bindings=['extern block: extern "C" {'],
+        )[1].content
+
+        self.assertIn("rejected before it reached disk", body)
+        self.assertIn('extern "C" {', body)
+
+    def test_a_clean_answer_carries_no_rejection_section(self):
+        body = tests_prompt(
+            Ticket("TT-004", criteria=["game_score() returns 0"]),
+            ["src/wasm.rs"],
+            test_path="tests/tt_004_test.rs",
+        )[1].content
+
+        self.assertNotIn("rejected before it reached disk", body)
+
+
+class TestTheTesterIsAskedAgainForForeignBindings(unittest.TestCase):
+    """Rejected before it reaches disk, then asked for once more with the
+    offending line quoted. A prohibition a model ignores needs an enforcement
+    point, not stronger wording."""
+
+    BAD = 'tests/tt_004_test.rs\n```rust\nextern "C" { fn game_new(); }\n```'
+    GOOD = (
+        "tests/tt_004_test.rs\n```rust\n"
+        "use tetris::wasm;\n#[test]\nfn t() { wasm::game_new(1); }\n```"
+    )
+
+    def _run(self, *tester_replies):
+        orch, root, run_id = _stub_orchestrator()
+        orch.config.loop.max_attempts = 1
+        orch._call = _replies(
+            "src/wasm.rs\n```rust\npub fn game_new(s: u32) -> u32 { s }\n```",
+            *tester_replies,
+            "ACCEPT\nfine",
+        )
+        orch._work_ticket(
+            run_id,
+            Ticket("TT-004", allowed_files=["src/wasm.rs"], criteria=["game_new works"]),
+        )
+        return orch, root, run_id
+
+    def _tests_file(self, root):
+        return root / "tests" / "tt_004_test.rs"
+
+    def test_a_second_answer_that_is_clean_is_kept(self):
+        _orch, root, _run_id = self._run(self.BAD, self.GOOD)
+
+        self.assertTrue(self._tests_file(root).exists())
+        self.assertNotIn("extern", self._tests_file(root).read_text(encoding="utf-8"))
+
+    def test_a_tester_that_keeps_doing_it_gets_its_tests_discarded(self):
+        _orch, root, _run_id = self._run(self.BAD, self.BAD)
+
+        self.assertFalse(self._tests_file(root).exists())
+
+    def test_the_rejection_is_reported(self):
+        orch, _root, run_id = self._run(self.BAD, self.BAD)
+
+        messages = " ".join(e["message"] for e in orch.store.events_after(0))
+        self.assertIn("foreign binding", messages)
+
+    def test_a_clean_first_answer_is_not_asked_twice(self):
+        orch, root, _run_id = self._run(self.GOOD)
+
+        self.assertTrue(self._tests_file(root).exists())
+
+
+class TestTheTestCommandDecidesTheLanguage(unittest.TestCase):
+    """A polyglot repo — a Rust core with a browser shell — has test files of
+    several extensions under tests/. Reading the suite's language off whichever
+    one turned up first is what disabled test authoring for a whole backlog:
+    the shell ticket legitimately wrote `tests/tt_005_test.js`, and from then
+    on every Rust ticket was told the suite collects `.js`, wrote nothing, and
+    had the skip logged as routine."""
+
+    def _orch(self, test_command="cargo test"):
+        root = Path(tempfile.mkdtemp())
+        config = Config(
+            root=root,
+            models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
+            roles={r: "m" for r in ("planner", "executor", "tester", "reviewer")},
+            commands={"lint": "", "typecheck": "", "test": test_command},
+        )
+        return Orchestrator(config, Store(root / "t.db")), root
+
+    def _with_tests(self, root, *names):
+        (root / "tests").mkdir(exist_ok=True)
+        for name in names:
+            (root / "tests" / name).write_text("x\n", encoding="utf-8")
+
+    def test_a_stray_js_file_no_longer_hijacks_a_rust_suite(self):
+        orch, root = self._orch("cargo test")
+        self._with_tests(root, "tt_005_test.js")
+
+        path, reason = orch._test_target(
+            Ticket("TT-003"), ["src/game.rs"], None, orch._suite_suffix(["src/game.rs"])
+        )
+
+        self.assertEqual(path, "tests/tt_003_test.rs")
+        self.assertEqual(reason, "")
+
+    def test_the_command_outvotes_a_repo_full_of_the_other_language(self):
+        orch, root = self._orch("cargo test")
+        self._with_tests(root, "a_test.js", "b_test.js", "c_test.js")
+
+        self.assertEqual(orch._suite_suffix(["src/game.rs"]), ".rs")
+
+    def test_common_runners_resolve(self):
+        for command, expected in (
+            ("cargo test", ".rs"),
+            ("python -m pytest -q", ".py"),
+            ("python -m unittest discover tests", ".py"),
+            ("go test ./...", ".go"),
+            ("dotnet test", ".cs"),
+            ("bundle exec rspec", ".rb"),
+            ("swift test", ".swift"),
+        ):
+            with self.subTest(command=command):
+                orch, _ = self._orch(command)
+                self.assertEqual(orch._suite_suffix(["src/thing.xyz"]), expected)
+
+    def test_a_containerised_command_still_resolves(self):
+        orch, _ = self._orch(
+            'docker run --rm --network none -v "/abs/repo":/w -w /w '
+            "python:3.12-slim python -m pytest -q"
+        )
+        self.assertEqual(orch._suite_suffix(["src/app.py"]), ".py")
+
+    def test_a_javascript_runner_lets_the_repo_break_the_tie(self):
+        orch, root = self._orch("npx vitest run")
+        self._with_tests(root, "a_test.ts", "b_test.ts")
+
+        self.assertEqual(orch._suite_suffix(["src/app.ts"]), ".ts")
+
+    def test_an_unrecognised_command_falls_back_to_the_repo_majority(self):
+        """One stray fixture must not outvote a suite. The old rule took the
+        first file it found, in glob order."""
+        orch, root = self._orch("make check")
+        self._with_tests(root, "a_test.rs", "b_test.rs", "c_test.rs", "odd_test.js")
+
+        self.assertEqual(orch._suite_suffix(["src/game.rs"]), ".rs")
+
+    def test_a_fresh_repo_falls_back_to_what_the_ticket_wrote(self):
+        orch, _ = self._orch("make check")
+        self.assertEqual(orch._suite_suffix(["src/game.rs"]), ".rs")
+
+    def test_the_example_shown_matches_the_language_asked_for(self):
+        """Otherwise the tester is handed a JavaScript file and asked for Rust."""
+        orch, root = self._orch("cargo test")
+        self._with_tests(root, "shell_test.js", "core_test.rs")
+
+        found = orch._example_test([], orch._suite_suffix([]))
+
+        self.assertIsNotNone(found)
+        self.assertTrue(found[0].endswith(".rs"), found[0])
+
+    def test_a_cross_language_ticket_is_still_told_why_it_gets_no_tests(self):
+        orch, _ = self._orch("cargo test")
+
+        path, reason = orch._test_target(
+            Ticket("TT-005"), ["web/main.js"], None, orch._suite_suffix(["web/main.js"])
+        )
+
+        self.assertEqual(path, "")
+        self.assertIn(".rs", reason)
+
+    def test_a_run_that_authored_no_tests_at_all_says_so(self):
+        orch, _root = self._orch("cargo test")
+        run_id = orch.store.create_run("g")
+        orch._tests_skipped = 4
+
+        orch._finish(run_id)
+
+        messages = " ".join(e["message"] for e in orch.store.events_after(0))
+        self.assertIn("No ticket in this run authored tests", messages)
+
+    def test_a_run_with_some_tests_stays_quiet(self):
+        orch, _root = self._orch("cargo test")
+        run_id = orch.store.create_run("g")
+        orch._tests_skipped, orch._tests_authored = 2, 3
+
+        orch._finish(run_id)
+
+        messages = " ".join(e["message"] for e in orch.store.events_after(0))
+        self.assertNotIn("No ticket in this run authored tests", messages)
 
 
 class TestOrphanedTestsNeverOutliveTheirTicket(unittest.TestCase):
