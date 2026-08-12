@@ -40,7 +40,7 @@ from . import respec
 from .artifacts import Artifacts
 from .budget import BudgetGate, Wait
 from .config import Config, ConfigError
-from .failures import distill, signatures
+from .failures import distill, errors_naming, signatures
 from .ingest import write_tickets
 from .memory import MemoryClient, MemoryRefused, MemoryUnavailable, ticket_query
 from .patch import (
@@ -1044,7 +1044,17 @@ class Orchestrator:
         # it. Taken per ticket rather than per attempt on purpose: a retry is
         # judged on everything the ticket has accumulated, which is what will
         # actually be committed.
-        baseline = self._snapshot()
+        # Captured the first time this ticket runs and kept from then on. A
+        # retry cycle starts with the previous cycle's implementation still in
+        # the tree, so a fresh snapshot here would take that work as the
+        # starting point: the executor rewrites it byte for byte, git reports
+        # nothing, and the reviewer is asked to approve a change it cannot see.
+        # It refuses — correctly, on the evidence — twenty-eight times in one
+        # run, over nine cycles, for a ticket whose implementation was fine.
+        if not ticket.baseline_tree:
+            ticket.baseline_tree = self._snapshot()
+            self.store.update_ticket(run_id, ticket)
+        baseline = ticket.baseline_tree
 
         # Taken once per ticket, for the same reason as the snapshot: this is
         # the state the ticket inherited, and every attempt is judged against
@@ -1475,6 +1485,15 @@ class Orchestrator:
                             # writes its own file and returns none of these.
                             sources=self._sources_for(ticket, extra=written)[0],
                             rejected_bindings=rejected_bindings,
+                            # Pointed at rather than left to be noticed. The
+                            # tester is the only role that can edit this file,
+                            # and a style error in it fails the ticket for as
+                            # long as the tester keeps reproducing it — which
+                            # it will, because a failure naming its own file
+                            # reads like evidence about the implementation.
+                            own_file_errors=errors_naming(
+                                failure_context, test_path
+                            ),
                         ),
                         max_tokens=self._output_budget("tester"),
                         temperature=0.1,
@@ -1624,7 +1643,9 @@ class Orchestrator:
             return StepResult(ok=False, detail=detail)
 
         # --- REVIEW --------------------------------------------------
-        diff = self._diff(baseline)
+        # The ticket's own files, plus the test file written on its behalf —
+        # which the plan did not list but the review is expected to see.
+        diff = self._diff(baseline, [*ticket.allowed_files, test_path])
         # A ticket can pass verification having changed nothing — because the
         # work was already on disk, or because it rewrote a file byte for byte.
         # Handed `(empty diff)` and nothing else, a reviewer has no way to tell
@@ -2201,34 +2222,43 @@ class Orchestrator:
         except (FileNotFoundError, OSError):
             return ""
 
-    def _diff(self, since: str = "") -> str:
+    def _diff(self, since: str = "", paths: Sequence[str] = ()) -> str:
         """The changeset a reviewer should judge.
 
-        Scoped to one ticket when `since` is a tree captured before it started.
-        That distinction is load-bearing: `autoCommit` is off by default, so a
-        verified ticket's work stays in the working tree, and a whole-tree diff
-        shows every earlier ticket's changes to the reviewer of the current
-        one. It then correctly rejects them as outside this ticket's allowed
-        files — the executor is blamed for work it did not do, and a backlog
-        fails from its second ticket onward.
+        Scoped to one ticket two ways, and it needs both. `since` is the tree
+        captured before the ticket started; `paths` are the files it owns.
 
-        Anything the ticket did not touch appears in both trees and cancels
-        out, which also keeps stale build output and leftovers from a failed
-        earlier attempt out of the reviewer's view.
+        Time alone used to do the whole job — anything the ticket did not touch
+        appeared in both trees and cancelled out. That works only while the
+        baseline moves forward with the ticket. Now it is pinned for the
+        ticket's whole life, so work other tickets landed in between no longer
+        cancels, and without a path filter the reviewer would see it and
+        correctly reject it as outside this ticket's scope. That is the failure
+        this method exists to prevent, arriving from the other direction.
+
+        A pathspec is only applied when every path is literal. A glob in
+        `allowed_files` is a scope rule rather than a filename, and git would
+        read it under its own matching rules — showing the reviewer less than
+        the ticket changed, which is worse than showing it more.
         """
+        wanted = [path for path in paths if path]
+        globbed = any(character in path for path in wanted for character in "*?[")
+        pathspec = ["--", *wanted] if wanted and not globbed else []
         try:
             if since:
                 current = self._snapshot()
                 if current:
-                    result = self._git("diff-tree", "-p", since, current)
+                    result = self._git("diff-tree", "-p", since, current, *pathspec)
                     if result.returncode == 0:
                         return result.stdout
 
-            # No baseline, or git refused one: fall back to the whole tree.
+            # No baseline, or git refused one — a pruned object, a fresh clone,
+            # a tree hash from a run whose history is gone. A degraded diff
+            # beats a failed review, so fall back to the whole tree.
             # `git add -N` registers new files with the index without staging
             # their contents, so a ticket that creates a file still appears.
             self._git("add", "-N", ".")
-            return self._git("diff").stdout
+            return self._git("diff", *pathspec).stdout
         except FileNotFoundError:
             return "(git not available; diff unavailable)"
 

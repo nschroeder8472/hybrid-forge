@@ -46,7 +46,7 @@ from forge.patch import (
     normalize_path,
     parse_output,
 )
-from forge.failures import distill, signatures
+from forge.failures import distill, errors_naming, signatures
 from forge.prompts import (
     build_prompt,
     parse_respec,
@@ -1637,6 +1637,167 @@ class TestTesterEvidence(unittest.TestCase):
         self.assertNotIn("did not pass verification", body)
 
 
+class TestTheBaselineIsAnchoredToTheTicket(unittest.TestCase):
+    """A retry cycle inherits the previous cycle's work in the tree, because
+    autoCommit is off and nothing reverts a failed ticket. Re-snapshotting per
+    run therefore measures the ticket against its own output: the executor
+    rewrites it byte for byte, git reports nothing, and the reviewer is asked
+    to approve a change it cannot see. One run drew twenty-eight rejections
+    across nine cycles that way, on an implementation that was fine."""
+
+    def _repo(self):
+        root = Path(tempfile.mkdtemp())
+        for args in (
+            ["init", "-q"],
+            ["config", "user.email", "t@t.local"],
+            ["config", "user.name", "T"],
+        ):
+            subprocess.run(["git", *args], cwd=root, capture_output=True, check=False)
+        (root / "seed.txt").write_text("seed\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, check=False)
+        subprocess.run(
+            ["git", "commit", "-qm", "initial"], cwd=root, capture_output=True, check=False
+        )
+        config = Config(
+            root=root,
+            models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
+            roles={r: "m" for r in ("planner", "executor", "tester", "reviewer")},
+        )
+        orch = Orchestrator(config, Store(root / "t.db"))
+        return orch, root, orch.store.create_run("g")
+
+    def _capture(self, orch, run_id, ticket):
+        """What `_run_ticket` does at the top of each run."""
+        if not ticket.baseline_tree:
+            ticket.baseline_tree = orch._snapshot()
+            orch.store.update_ticket(run_id, ticket)
+        return ticket.baseline_tree
+
+    def test_a_retry_still_sees_the_work_the_first_cycle_wrote(self):
+        orch, root, run_id = self._repo()
+        ticket = Ticket("TT-005", allowed_files=["web/main.js"])
+        orch.store.add_tickets(run_id, [ticket])
+
+        self._capture(orch, run_id, ticket)
+        (root / "web").mkdir()
+        (root / "web" / "main.js").write_text("export const go = 1;\n", encoding="utf-8")
+
+        # Cycle two: same ticket, file already on disk, rewritten identically.
+        reloaded = orch.store.list_tickets(run_id)[0]
+        baseline = self._capture(orch, run_id, reloaded)
+        diff = orch._diff(baseline, reloaded.allowed_files)
+
+        self.assertIn("web/main.js", diff)
+        self.assertIn("export const go", diff)
+
+    def test_re_snapshotting_per_run_is_what_produced_the_empty_diff(self):
+        """The behavior being replaced, asserted so the fix cannot silently
+        regress to it."""
+        orch, root, _run_id = self._repo()
+        (root / "web").mkdir()
+        (root / "web" / "main.js").write_text("export const go = 1;\n", encoding="utf-8")
+
+        fresh = orch._snapshot()  # what the old code did on every retry
+
+        self.assertEqual(orch._diff(fresh, ["web/main.js"]).strip(), "")
+
+    def test_another_tickets_work_is_excluded_even_across_cycles(self):
+        """The pinned baseline stops time from isolating the ticket, so the
+        path filter has to. Without it the reviewer sees work its executor did
+        not do and rejects it as out of scope."""
+        orch, root, run_id = self._repo()
+        ticket = Ticket("TT-005", allowed_files=["web/main.js"])
+        orch.store.add_tickets(run_id, [ticket])
+        baseline = self._capture(orch, run_id, ticket)
+
+        (root / "web").mkdir()
+        (root / "web" / "main.js").write_text("mine = 1\n", encoding="utf-8")
+        (root / "build.sh").write_text("# another ticket landed this\n", encoding="utf-8")
+
+        diff = orch._diff(baseline, ticket.allowed_files)
+
+        self.assertIn("web/main.js", diff)
+        self.assertNotIn("build.sh", diff)
+
+    def test_the_test_file_is_in_scope_even_though_the_plan_never_listed_it(self):
+        orch, root, run_id = self._repo()
+        ticket = Ticket("TT-005", allowed_files=["src/a.rs"])
+        orch.store.add_tickets(run_id, [ticket])
+        baseline = self._capture(orch, run_id, ticket)
+
+        (root / "src").mkdir()
+        (root / "src" / "a.rs").write_text("fn a() {}\n", encoding="utf-8")
+        (root / "tests").mkdir()
+        (root / "tests" / "tt_005_test.rs").write_text("#[test]\nfn t() {}\n", encoding="utf-8")
+
+        diff = orch._diff(baseline, [*ticket.allowed_files, "tests/tt_005_test.rs"])
+
+        self.assertIn("src/a.rs", diff)
+        self.assertIn("tt_005_test.rs", diff)
+
+    def test_a_glob_in_scope_falls_back_to_the_unscoped_diff(self):
+        """A glob is a scope rule, not a filename. Handing it to git as a
+        pathspec would apply git's matching rules and show the reviewer less
+        than the ticket changed, which is worse than showing it more."""
+        orch, root, run_id = self._repo()
+        baseline = orch._snapshot()
+        (root / "src").mkdir()
+        (root / "src" / "deep.rs").write_text("fn d() {}\n", encoding="utf-8")
+
+        diff = orch._diff(baseline, ["src/**/*.rs"])
+
+        self.assertIn("deep.rs", diff)
+
+    def test_an_unusable_baseline_degrades_rather_than_failing(self):
+        orch, root, _run_id = self._repo()
+        (root / "later.txt").write_text("x\n", encoding="utf-8")
+
+        diff = orch._diff("0" * 40, ["later.txt"])
+
+        self.assertIn("later.txt", diff)
+
+    def test_the_baseline_is_captured_once_and_then_reused(self):
+        orch, root, run_id = self._repo()
+        ticket = Ticket("TT-005", allowed_files=["a.txt"])
+        orch.store.add_tickets(run_id, [ticket])
+
+        first = self._capture(orch, run_id, ticket)
+        (root / "a.txt").write_text("changed\n", encoding="utf-8")
+        second = self._capture(orch, run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertEqual(first, second)
+        self.assertTrue(first)
+
+    def test_the_unchanged_fallback_has_nothing_left_to_report(self):
+        """The signal that the cause is gone rather than papered over. The
+        contents-instead-of-diff section still exists for a file rewritten
+        identically inside one cycle; a retry should no longer need it."""
+        orch, root, run_id = self._repo()
+        ticket = Ticket("TT-005", allowed_files=["web/main.js"])
+        orch.store.add_tickets(run_id, [ticket])
+        baseline = self._capture(orch, run_id, ticket)
+
+        (root / "web").mkdir()
+        (root / "web" / "main.js").write_text("export const go = 1;\n", encoding="utf-8")
+        # Cycle two rewrites it byte for byte.
+        reloaded = orch.store.list_tickets(run_id)[0]
+        diff = orch._diff(self._capture(orch, run_id, reloaded), reloaded.allowed_files)
+
+        self.assertEqual(baseline, reloaded.baseline_tree)
+        self.assertEqual(orch._written_but_unchanged(["web/main.js"], diff), {})
+
+    def test_it_survives_a_restart(self):
+        """The baseline is persisted state now, so a daemon killed mid-run must
+        resume against the same starting point rather than the tree it wakes to."""
+        orch, root, run_id = self._repo()
+        ticket = Ticket("TT-005", allowed_files=["a.txt"])
+        orch.store.add_tickets(run_id, [ticket])
+        captured = self._capture(orch, run_id, ticket)
+
+        reopened = Store(root / "t.db")
+        self.assertEqual(reopened.list_tickets(run_id)[0].baseline_tree, captured)
+
+
 class TestTicketScopedDiff(unittest.TestCase):
     """`autoCommit` is off by default, so a verified ticket's work stays in the
     working tree. A whole-tree diff therefore shows ticket N's reviewer
@@ -2964,6 +3125,78 @@ class TestStaleDependentsAreReopened(unittest.TestCase):
         messages = " ".join(e["message"] for e in orch.store.events_after(0))
         self.assertIn("TT-002: reopened", messages)
         self.assertIn("TT-001", messages)
+
+
+class TestTheTesterIsPointedAtItsOwnErrors(unittest.TestCase):
+    """The tester's file is outside every other role's scope, so a style error
+    in it fails the ticket for as long as the tester keeps reproducing it. One
+    run spent twelve retry cycles on a single unused variable: the failure it
+    was shown read as evidence about the implementation, so it rewrote the
+    assertions and left the variable alone every time."""
+
+    LINT = (
+        "lint failed:\n"
+        "Checking tetris v0.1.0 (D:\\repo)\n"
+        "error: unused variable: `x`\n"
+        "  --> tests\\tt_001_test.rs:67:10\n"
+        "   |\n"
+        "67 |     for (x, y) in cells {\n"
+        "   = note: `-D unused-variables` implied by `-D warnings`\n"
+    )
+
+    def test_the_error_and_its_location_are_extracted_together(self):
+        found = errors_naming(self.LINT, "tests/tt_001_test.rs")
+
+        self.assertEqual(len(found), 1)
+        self.assertIn("unused variable", found[0])
+        self.assertIn("tt_001_test.rs:67", found[0])
+
+    def test_a_windows_path_matches_a_posix_one(self):
+        """The compiler prints `tests\\a_test.rs`; the loop holds `tests/a_test.rs`."""
+        self.assertTrue(errors_naming(self.LINT, "tests/tt_001_test.rs"))
+
+    def test_errors_in_other_files_are_not_claimed(self):
+        self.assertEqual(errors_naming(self.LINT, "src/piece.rs"), [])
+
+    def test_an_implementation_failure_yields_nothing(self):
+        text = "error[E0432]: unresolved import\n  --> src/game.rs:4:5\n"
+        self.assertEqual(errors_naming(text, "tests/tt_001_test.rs"), [])
+
+    def test_no_test_path_yields_nothing(self):
+        self.assertEqual(errors_naming(self.LINT, ""), [])
+
+    def test_the_prompt_puts_them_in_front_of_the_tester(self):
+        body = tests_prompt(
+            Ticket("TT-001", criteria=["cells() returns four"]),
+            ["src/piece.rs"],
+            test_path="tests/tt_001_test.rs",
+            failure_context=self.LINT,
+            own_file_errors=errors_naming(self.LINT, "tests/tt_001_test.rs"),
+        )[1].content
+
+        self.assertIn("errors are in the file you are about to write", body)
+        self.assertIn("unused variable", body)
+
+    def test_a_clean_attempt_carries_no_such_section(self):
+        body = tests_prompt(
+            Ticket("TT-001", criteria=["cells() returns four"]),
+            ["src/piece.rs"],
+            test_path="tests/tt_001_test.rs",
+        )[1].content
+
+        self.assertNotIn("errors are in the file you are about to write", body)
+
+    def test_the_three_branches_are_all_stated(self):
+        body = tests_prompt(
+            Ticket("TT-001", criteria=["c"]),
+            ["src/piece.rs"],
+            test_path="tests/tt_001_test.rs",
+            failure_context="something failed",
+        )[1].content
+
+        self.assertIn("names your own test file", body)
+        self.assertIn("your own assertion being wrong", body)
+        self.assertIn("the implementation being wrong", body)
 
 
 class TestForeignBindingsInTests(unittest.TestCase):
