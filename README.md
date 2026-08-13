@@ -176,6 +176,8 @@ forge go --retries N        # requeue and respec what did not land, N more
                             # times; -1 = until clean or stopped
 forge status                # one-shot summary
 forge retry [--respec]      # requeue failed tickets, optionally re-specced
+forge criteria [ID --accept N]
+                            # adopt a criterion the loop proposed and refused
 forge pause | resume | stop # applied after the current step, never mid-patch
 forge ui                    # dashboard without running the loop
 forge ui --host IP --port N # bind it elsewhere, this run only (no auth!)
@@ -220,6 +222,10 @@ first `forge init`. [docs/SETUP.md](docs/SETUP.md) is the reference behind it:
 every option, every alternative, and the full security discussion. The daemon is
 stdlib-only Python 3.10+ — a failed `pip install` is a bad way to discover that
 an overnight run never started.
+
+[docs/CONFIG.md](docs/CONFIG.md) is the key-by-key reference for
+`.hybridforge/config.json`, with a populated example at
+[templates/config.sample.json](templates/config.sample.json) to copy from.
 
 [docs/ROADMAP.md](docs/ROADMAP.md) holds what is not built yet and why — the
 bug-report loop first among it.

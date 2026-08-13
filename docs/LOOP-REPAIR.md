@@ -13,7 +13,12 @@ what unblocks what, not by severity.
 below records what it was replayed against, and where a fix could not be
 verified against surviving data that is said plainly.
 
-Still open: 2.3, 3.1, 3.2, 3.3, 3.5, 3.6, and the conditional 2.4 and 4.1. A clean
+Everything else has since landed on `fix/loop-repair-open-items`: 3.2 and 3.5,
+then 2.3, 3.3, 3.6, 3.1 with its promotion path, and 4.1 behind a flag that is
+off. All of it is unverified against a run — written from run 5's evidence and
+covered by tests, not by a replay.
+
+Still open: the conditional 2.4, and the measurement 4.1 asks for. A clean
 run from an empty repository — no drifted specs carried over — is the validation
 that has not been done yet.
 
@@ -735,7 +740,15 @@ not against surviving data.
 
 ---
 
-### 2.3 Cap the prior-verdict block and make it droppable
+### 2.3 Cap the prior-verdict block and make it droppable — **done**
+
+Both history blocks now travel as their own user message, because the gate
+drops whole messages and these were inside the ticket body. `review_prompt`
+emits `PRIOR_VERDICTS_HEADING` and `build_prompt` emits
+`PRIOR_FAILURES_HEADING`, both after the context message and before the ticket,
+so the drop order is memory, then history, and never the spec. `_PRIOR_VERDICTS
+= 3` caps what the reviewer is shown, which is what keeps trimming a last
+resort rather than a routine.
 
 **Problem.** `rejections` is uncapped (`forge/loop.py:1130`, appended at
 `1775-1776`) while `prior_failures` is capped at two (`_PRIOR_FAILURES`,
@@ -777,7 +790,35 @@ fabricates.
 
 ## Phase 3 — Close the gap between the reviewer's bar and the planner's
 
-### 3.1 Allow criteria the spec already states
+### 3.1 Allow criteria the spec already states — **done**
+
+`_spec_entailed` compares a proposed criterion's content words against each
+sentence of `original_spec` — the ingested one, so the loop cannot rewrite the
+spec and then mint criteria out of what it just wrote. A criterion is admitted
+when one sentence covers 80% of its content words and it has at least five of
+them; below that floor, overlap is coincidence. Admissions are logged at `info`
+with the criteria named, so the heuristic is auditable rather than merely
+plausible, and `forge retry --respec` prints them.
+
+The refusal message no longer claims the plan is silent. It now says the
+criterion appears neither in the criteria nor in the spec — the two places that
+are enforced — and points at re-ingesting the plan.
+
+**The promotion path.** `forge criteria` lists what respec proposed and the
+loop refused, read back out of the run log — the refusal is already an event,
+and a second store of the same fact is a second thing to keep true.
+`forge criteria TT-006 --accept 1` adopts one: it lands on the ticket *and* on
+`original_criteria`, so it is plan-authored from that moment and the ratchet
+protects it from the next revision exactly as if a human had written it in the
+plan. The ticket file is rewritten so the artifact a human reads does not lie,
+and the adoption is logged.
+
+The anchor stays unwritable everywhere else. `Store.promote_criteria` is its
+only writer after ingest, it is reachable from the CLI alone, and
+`update_ticket` still cannot touch the anchor at all — which is the property
+that made the refusal worth enforcing in the first place. A ticket that has
+already passed is not requeued behind anyone's back; the command prints the
+`forge retry --ticket` line and leaves the call to a human.
 
 **Problem.** `REVIEWER_SYSTEM:98` instructs the reviewer to reject when *"a
 criterion is unmet **or the diff does something the spec did not ask for**"*, and
@@ -837,7 +878,21 @@ after Phase 1 and only with the audit log.
 
 ---
 
-### 3.2 Protect plan-authored context
+### 3.2 Protect plan-authored context — **done**
+
+`original_context` is recorded at ingest beside `original_spec` and
+`original_criteria`, and is absent from `update_ticket` for the same reason they
+are: an anchor any caller can move is not one. A revised `context` is appended
+to the plan's paragraph rather than written over it, skipped when the revision
+already contains it, and the restoration is logged and printed by `forge retry
+--respec`. `_refuse_protocol_edits` now anchors `context` on the original too,
+so a formatting phrase the plan never used is still judged as introduced after
+a revision has rewritten what it is compared against. A context-only change now
+counts as drift, which is what puts the ingested text in front of the planner.
+
+Ticket text that predates the column has no anchor, and is left to the planner
+exactly as before — the guard protects a paragraph a human wrote, and reports no
+paragraph rather than inventing one.
 
 **Problem.** `context` is a full replacement with no equivalent of
 `original_criteria`. Respec used it as a rationale scratchpad and deleted the
@@ -875,7 +930,20 @@ is gone, and what replaced it is false.
 
 ---
 
-### 3.3 Carry rejection history across cycles
+### 3.3 Carry rejection history across cycles — **done**
+
+`_work_ticket` seeds both lists from the step log when `attempt_base > 0`:
+failures through `ticket_failures`, verdicts through a new
+`Store.ticket_rejections`, which reads failed `review` steps whole rather than
+distilled — a verdict is prose the reviewer wrote for its own successor, and
+`distill` is built for compiler output. Seeded verdicts go through
+`strip_prompt_echo` on the way in, for the same reason the live list does. The
+2.3 caps apply to both, so a fourth cycle seeds three verdicts rather than
+twelve.
+
+Seeding is conditional on `attempt_base` because the step log is per ticket,
+not per cycle: unconditional, the first cycle would show a ticket its own
+current attempts back to itself.
 
 **Problem.** `history` and `rejections` are locals in `_run_ticket`
 (`forge/loop.py:1129-1130`). A retry cycle calls `_run_ticket` fresh, so both
@@ -929,6 +997,23 @@ backticks — which feeds the 1.1 false positives.
 
 An experiment, not a fix. Run it only against a green Phase 1–3 baseline.
 
+**Built — `loop.executorTurns`, default 0.** `Store.ticket_turns` rebuilds the
+exchange from `steps` on every call: each `build` step's reply paired with the
+step that failed next. A reply with no failure after it is dropped rather than
+paired with the next one along — an attempt can end without a failed step, and
+attaching that reply to a later failure would tell the executor its code caused
+something it never reached. `build_prompt` writes the ticket once, then each
+answer as an `assistant` turn with its failure as the reply to it, and the
+newest failure as the last word. Old exchanges are droppable, the newest failure
+is not, and the flat `prior_failures` block is suppressed when turns are present
+— it is the same failures, each now attached to the answer that caused it.
+
+Executor only. Planner, tester and reviewer keep single-turn prompts; a reviewer
+inheriting the executor's turns stops being an independent check.
+
+**Not measured.** The comparison the section asks for — same backlog, flag on
+and off, watching for anchoring — has not been run.
+
 **Premise.** The daemon-owned state machine is right and does not change. What
 is separable is *prompt shape*: the daemon can reconstruct a multi-turn message
 list from SQLite on every call. Stateless transport, conversational shape, no
@@ -977,7 +1062,29 @@ planner/tester/reviewer single-turn. Compare against the same backlog.
 
 ---
 
-### 3.5 A design decision in spec prose has no protection — **open**
+### 3.5 A design decision in spec prose has no protection — **done**
+
+Landed with 3.2. `ingest.plan_decisions` reads the sentences a plan marked as
+settled out of `original_spec` — everything under a heading about decisions
+("Design decisions, already made", "do not revisit", "non-negotiable"), plus any
+single line that marks itself (`**Decision:** ...`) for a spec with no room for
+a section. A revised spec that no longer states one of them is refused whole and
+the dropped sentence named, in the run log and in `forge retry --respec`.
+
+Three deliberate limits. It protects what the plan *labelled*, not prose in
+general: an unmarked sentence stays freely revisable, because a guard over all
+prose would refuse every genuine clarification. Matching is on a normalised form
+— punctuation and backticks may change, the words may not — which is the bar the
+prompt now asks for and the one a human can check by reading. And a decision
+whose normalised text is under 24 characters is skipped, because containment
+proves nothing at that length.
+
+The whole spec revision is refused rather than the sentence stitched back in: a
+spec revised around a dropped decision has already reasoned from its absence,
+and restoring the sentence into that reasoning produces a spec contradicting
+itself.
+
+The original write-up follows.
 
 **Found in run 5, in a backlog that passed.** `plan.md` opens with a section
 headed *"Design decisions, already made — implement them, do not revisit them"*,
@@ -1018,7 +1125,20 @@ commentary.
 
 ---
 
-### 3.6 A ticket can be verified by reading rather than by running — **open**
+### 3.6 A ticket can be verified by reading rather than by running — **done**
+
+`_tests_authored` and `_tests_skipped` hold ticket ids rather than counts, and
+`_report_unexecuted` names at run end every ticket that reached `done` while
+skipping test authoring and never authoring any. A ticket that skipped on the
+attempt that wrote nothing and authored on the one that did is not named — what
+matters is whether it ended covered. Neither is a ticket that failed: the claim
+is about what a green ticket proved.
+
+No new dependency, no browser driving, and nothing new is tested. The run says
+what its green did not cover, which is the thing that would have pointed at the
+two files worth opening by hand.
+
+The original write-up follows.
 
 **Found by opening the finished game in a browser.** The backlog was green — all
 six tickets `done`, lint and typecheck clean, 36 tests passing — and the page
@@ -1108,11 +1228,13 @@ land too — one branch to push when the backlog is green.
 | — | 1.7 | Done — respec cannot describe the reply format |
 | — | 1.8 | Done — unreadable reply reprompted once |
 | — | 1.9 | Done — heading-decorated path line read |
-| 1 | 3.2 | Now also covers spec prose — see 3.5 |
-| 2 | 2.3 | Prerequisite for 3.3 |
-| 5 | 3.3, 3.2 | Information architecture; 3.2 carries a migration |
-| 6 | 3.1 | Deliberately loosens a guard; wants a stable baseline |
-| 7 | 2.4, 4.1 | Conditional and experimental |
+| — | 3.2, 3.5 | Done — context anchored, marked decisions protected |
+| — | 2.3 | Done — history is its own droppable message, capped at three |
+| — | 3.3 | Done — both lists seeded from the step log on a retry cycle |
+| — | 3.6 | Done — a review-only ticket is named at run end |
+| — | 3.1 | Done — spec-entailed criteria admitted, `forge criteria` adopts the rest |
+| — | 4.1 | Built behind `loop.executorTurns`; unmeasured |
+| 1 | 2.4 | Conditional on the reviewer still fabricating |
 
 1.6 is a decision, not a code change, and should be settled before the next
 baseline run.

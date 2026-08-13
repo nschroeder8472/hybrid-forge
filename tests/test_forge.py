@@ -10,6 +10,9 @@ get tests; the HTTP adapters do not, since exercising them needs a live model.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import dataclasses
+import io
 import json
 import subprocess
 import sys
@@ -24,12 +27,13 @@ from types import SimpleNamespace
 from forge import cli, modelfiles, respec
 from forge.artifacts import Artifacts
 from forge.budget import BudgetGate, ContextOverflow, RateLimitPolicy
-from forge.config import Config, ConfigError, LoopSettings, UISettings
+from forge.config import ROLES, Config, ConfigError, LoopSettings, UISettings
 from forge.ingest import (
     derive_needs,
     graph_problems,
     looks_like_plan,
     parse_plan,
+    plan_decisions,
     plan_with_model,
     render_ticket,
     shared_file_conflicts,
@@ -37,7 +41,7 @@ from forge.ingest import (
 )
 from forge.ingest import ingest as ingest_document
 from forge.respec import _merge_criteria, _refuse_protocol_edits
-from forge.loop import Orchestrator, StepResult
+from forge.loop import _DROPPABLE_HEADINGS, _droppable, Orchestrator, StepResult
 from forge.patch import (
     describe_unparsed,
     duplicate_paths,
@@ -58,6 +62,7 @@ from forge.prompts import (
     strip_prompt_echo,
     tests_prompt,
 )
+from forge.providers import build_provider
 from forge.providers.base import (
     Capabilities,
     Completion,
@@ -1070,6 +1075,68 @@ class TestAutomaticRetryCycles(unittest.TestCase):
         self.assertEqual(ticket.spec, "old spec")
 
 
+class TestTheSampleConfigStaysHonest(unittest.TestCase):
+    """`templates/config.sample.json` is what a person copies. A sample that
+    does not load is worse than none — it sends the reader hunting through
+    their own edits for a mistake the file shipped with."""
+
+    SAMPLE = Path(__file__).resolve().parents[1] / "templates" / "config.sample.json"
+
+    def _loaded(self) -> Config:
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            self.SAMPLE.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        return Config.load(root)
+
+    def test_it_loads_and_validates(self):
+        config = self._loaded()
+        self.assertEqual(sorted(config.roles), sorted(ROLES))
+        self.assertEqual(config.record_role, "reviewer")
+
+    def test_every_declared_model_can_be_built(self):
+        # Including the one no role uses: it is there to be swapped in, and a
+        # sample that only works until you do that is a trap.
+        config = self._loaded()
+        for name in config.models:
+            provider = build_provider(name, config.model_block(name))
+            self.assertTrue(provider.kind)
+
+    def test_the_spend_caps_are_real_policies(self):
+        config = self._loaded()
+        policies = config.rate_limit_policies()
+        self.assertFalse(policies["claude"].is_empty)
+        self.assertFalse(policies["api"].is_empty)
+
+    def test_it_names_every_loop_setting(self):
+        # The guard that keeps the sample and CONFIG.md from rotting: a knob
+        # added to LoopSettings without a line here fails this test rather
+        # than quietly going undocumented.
+        written = json.loads(self.SAMPLE.read_text(encoding="utf-8"))["loop"]
+        expected = {
+            _camel(field.name) for field in dataclasses.fields(LoopSettings)
+        }
+        self.assertEqual(set(written), expected)
+
+    def test_the_reference_documents_every_loop_setting(self):
+        reference = (
+            Path(__file__).resolve().parents[1] / "docs" / "CONFIG.md"
+        ).read_text(encoding="utf-8")
+
+        missing = [
+            _camel(field.name)
+            for field in dataclasses.fields(LoopSettings)
+            if f"`{_camel(field.name)}`" not in reference
+        ]
+        self.assertEqual(missing, [], "undocumented loop settings")
+
+
+def _camel(name: str) -> str:
+    head, *rest = name.split("_")
+    return head + "".join(part.title() for part in rest)
+
+
 class TestRetryCycleConfig(unittest.TestCase):
     """The knob is read from config, and a typo in it must not run forever."""
 
@@ -1092,6 +1159,20 @@ class TestRetryCycleConfig(unittest.TestCase):
         config = self._load({})
         self.assertEqual(config.loop.retry_cycles, 0)
         self.assertTrue(config.loop.respec_on_retry)
+
+    def test_the_conversational_executor_is_off_by_default(self):
+        self.assertEqual(self._load({}).loop.executor_turns, 0)
+
+    def test_the_turn_count_is_read_and_survives_a_write(self):
+        config = self._load({"executorTurns": 2})
+        self.assertEqual(config.loop.executor_turns, 2)
+        config.write()
+        self.assertEqual(Config.load(config.root).loop.executor_turns, 2)
+
+    def test_a_negative_turn_count_is_rejected(self):
+        # Nothing sensible to mean by it, and clamping would hide the typo.
+        with self.assertRaises(ConfigError):
+            self._load({"executorTurns": -1})
 
     def test_both_knobs_are_read(self):
         config = self._load({"retryCycles": -1, "respecOnRetry": False})
@@ -1500,6 +1581,235 @@ class TestTheOriginalTicketIsAnAnchor(unittest.TestCase):
         run_id = reopened.create_run("goal")
         reopened.add_tickets(run_id, [Ticket("T-1", spec="s")])
         self.assertEqual(reopened.list_tickets(run_id)[0].original_spec, "s")
+
+    def test_the_context_is_anchored_too(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(run_id, [Ticket("T-1", spec="s", context="the plan's rule")])
+
+        ticket = store.list_tickets(run_id)[0]
+        self.assertEqual(ticket.original_context, "the plan's rule")
+
+        ticket.context = "something a revision wrote"
+        ticket.original_context = "a rewritten history"
+        store.update_ticket(run_id, ticket)
+        self.assertEqual(
+            store.list_tickets(run_id)[0].original_context, "the plan's rule"
+        )
+
+    def test_a_context_only_change_counts_as_drift(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(run_id, [Ticket("T-1", spec="s", context="the plan's rule")])
+
+        ticket = store.list_tickets(run_id)[0]
+        self.assertFalse(ticket.drifted)
+        ticket.context = "a revision's paragraph"
+        self.assertTrue(ticket.drifted)
+
+
+class TestThePlansContextSurvivesARespec(unittest.TestCase):
+    """`context` was the one plan-authored field with no provenance rule.
+
+    Respec returns a whole new string, so the plan's paragraph was simply gone:
+    in one run five of six tickets lost the executor's bare-path-line rule and
+    the do-not-write-tests rule to a sentence of the planner's own reasoning
+    about why scaffold files keep being omitted. The system prompt still
+    carried both rules, so this was degradation rather than deletion — but the
+    redundancy holding a weak local model to format is what got deleted.
+    """
+
+    PLAN_CONTEXT = "Write each file as a bare path line, then the contents."
+
+    def _store(self, context=PLAN_CONTEXT):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(
+            run_id, [Ticket("T-1", spec="old", context=context, status="failed")]
+        )
+        step = store.start_step(run_id, "T-1", "review")
+        store.end_step(step, "failed", "REJECT: nope")
+        return store, run_id
+
+    def _reply(self, **payload):
+        def call(_messages, _budget):
+            return Completion(text=json.dumps(payload), usage=Usage())
+
+        return call
+
+    def test_respec_cannot_delete_the_plans_context(self):
+        store, run_id = self._store()
+        ticket = store.list_tickets(run_id)[0]
+
+        respec.revise(
+            store,
+            run_id,
+            ticket,
+            call=self._reply(spec="a revised spec", context="The board is 10x20."),
+            budget=1024,
+        )
+
+        stored = store.list_tickets(run_id)[0].context
+        self.assertIn(self.PLAN_CONTEXT, stored)
+        self.assertIn("The board is 10x20", stored)
+
+    def test_a_revision_that_kept_the_paragraph_is_not_given_it_twice(self):
+        store, run_id = self._store()
+        ticket = store.list_tickets(run_id)[0]
+
+        respec.revise(
+            store,
+            run_id,
+            ticket,
+            call=self._reply(
+                spec="a revised spec",
+                context=f"{self.PLAN_CONTEXT}\n\nThe board is 10x20.",
+            ),
+            budget=1024,
+        )
+
+        stored = store.list_tickets(run_id)[0].context
+        self.assertEqual(stored.count(self.PLAN_CONTEXT), 1)
+
+    def test_the_restoration_reaches_the_run_log(self):
+        store, run_id = self._store()
+        ticket = store.list_tickets(run_id)[0]
+
+        respec.revise(
+            store,
+            run_id,
+            ticket,
+            call=self._reply(spec="a revised spec", context="only mine"),
+            budget=1024,
+        )
+
+        messages = [row["message"] for row in store.events_after(0)]
+        self.assertTrue(
+            any("put back" in message for message in messages),
+            "a context the loop restored must be visible to a human",
+        )
+
+    def test_a_ticket_the_plan_gave_no_context_is_left_to_the_planner(self):
+        # Nothing to protect, so nothing is prepended — the planner's paragraph
+        # stands alone rather than being appended to an empty anchor.
+        store, run_id = self._store(context="")
+        ticket = store.list_tickets(run_id)[0]
+
+        respec.revise(
+            store,
+            run_id,
+            ticket,
+            call=self._reply(spec="a revised spec", context="the whole story"),
+            budget=1024,
+        )
+
+        self.assertEqual(store.list_tickets(run_id)[0].context, "the whole story")
+
+
+class TestADecisionInSpecProseIsProtected(unittest.TestCase):
+    """A plan can state a decision as well as a requirement, and the criteria
+    ratchet never covered it.
+
+    One plan opened with "Design decisions, already made — implement them, do
+    not revisit them", and one of them was that randomness is a xorshift32.
+    Respec observed that the criteria only require determinism and revised the
+    spec to "an internal deterministic PRNG". A Numerical Recipes LCG shipped,
+    every criterion passed, and the reviewer accepted it correctly because no
+    criterion named xorshift. The ticket was green and the decision was gone.
+    """
+
+    DECISION = "Randomness is a xorshift32 seeded from JavaScript."
+    SPEC = (
+        "Implement Game::tick.\n"
+        "\n"
+        "### Design decisions, already made\n"
+        "\n"
+        f"{DECISION}\n"
+    )
+
+    def _store(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(
+            run_id, [Ticket("T-1", spec=self.SPEC, criteria=["ticks"], status="failed")]
+        )
+        step = store.start_step(run_id, "T-1", "review")
+        store.end_step(step, "failed", "REJECT: nope")
+        return store, run_id
+
+    def _reply(self, **payload):
+        def call(_messages, _budget):
+            return Completion(text=json.dumps(payload), usage=Usage())
+
+        return call
+
+    def test_a_marked_decision_is_read_out_of_the_plans_prose(self):
+        self.assertEqual(plan_decisions(self.SPEC), [self.DECISION])
+
+    def test_a_line_may_mark_itself_where_there_is_no_room_for_a_section(self):
+        found = plan_decisions(
+            "- **Decision:** the store is SQLite, not Postgres.\n"
+            "The board is ten columns wide.\n"
+        )
+        self.assertEqual(found, ["- **Decision:** the store is SQLite, not Postgres."])
+
+    def test_a_spec_revision_that_drops_a_decision_is_refused(self):
+        store, run_id = self._store()
+        ticket = store.list_tickets(run_id)[0]
+
+        respec.revise(
+            store,
+            run_id,
+            ticket,
+            call=self._reply(
+                spec="Implement Game::tick with an internal deterministic PRNG.",
+                context="the executor should start here",
+            ),
+            budget=1024,
+        )
+
+        stored = store.list_tickets(run_id)[0]
+        self.assertEqual(stored.spec, self.SPEC)
+        # Only the spec is refused; the rest of the revision still lands.
+        self.assertIn("the executor should start here", stored.context)
+
+    def test_the_refusal_reaches_the_run_log(self):
+        store, run_id = self._store()
+        ticket = store.list_tickets(run_id)[0]
+
+        respec.revise(
+            store, run_id, ticket, call=self._reply(spec="a deterministic PRNG"), budget=1024
+        )
+
+        messages = [row["message"] for row in store.events_after(0)]
+        self.assertTrue(any("marked as settled" in message for message in messages))
+
+    def test_a_revision_that_keeps_the_decision_goes_through(self):
+        store, run_id = self._store()
+        ticket = store.list_tickets(run_id)[0]
+        revised = f"Implement Game::tick and Game::lock.\n\n{self.DECISION}"
+
+        respec.revise(store, run_id, ticket, call=self._reply(spec=revised), budget=1024)
+
+        self.assertEqual(store.list_tickets(run_id)[0].spec, revised)
+
+    def test_unmarked_prose_stays_freely_revisable(self):
+        # This protects what the plan labelled, not prose in general. A spec
+        # with no decisions section is revised exactly as before.
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(
+            run_id, [Ticket("T-1", spec="Implement Game::tick.", status="failed")]
+        )
+        step = store.start_step(run_id, "T-1", "review")
+        store.end_step(step, "failed", "REJECT: nope")
+        ticket = store.list_tickets(run_id)[0]
+
+        respec.revise(
+            store, run_id, ticket, call=self._reply(spec="Implement Game::step."), budget=1024
+        )
+
+        self.assertEqual(store.list_tickets(run_id)[0].spec, "Implement Game::step.")
 
 
 class TestTheDashboardOutlivesTheRun(unittest.TestCase):
@@ -3135,7 +3445,8 @@ class TestRespecMayNotRaiseTheBar(unittest.TestCase):
         self._revise(store, run_id, ["a", "b", "a bar nobody asked for"])
 
         messages = " ".join(e["message"] for e in store.events_after(0))
-        self.assertIn("the plan does not state", messages)
+        self.assertIn("the plan states nowhere", messages)
+        self.assertIn("a bar nobody asked for", messages)
         self.assertIn("a bar nobody asked for", messages)
 
     def test_unlocking_the_criteria_restores_the_old_behaviour(self):
@@ -3161,6 +3472,252 @@ class TestRespecMayNotRaiseTheBar(unittest.TestCase):
         )
 
         self.assertFalse(result.revised)
+
+
+class TestACriterionTheSpecAlreadyStatesIsNotARatchet(unittest.TestCase):
+    """The reviewer is given the spec and told to reject work that contradicts
+    it, so the bar it enforces is spec ∪ criteria — while the ratchet tested
+    novelty against the criteria alone. The planner was therefore forbidden
+    from writing down a requirement the reviewer was required to enforce. One
+    run spent three cycles on that gap over a single line: the planner proposed
+    the `set -eu` criterion and was refused twice, the reviewer rejected the
+    ticket for exactly that requirement twice, and the spec stated it all
+    along."""
+
+    SPEC = (
+        "build.sh begins with #!/usr/bin/env sh then set -eu.\n"
+        "src/lib.rs declares pub mod piece."
+    )
+    STATED = "build.sh must start with #!/usr/bin/env sh and set -eu"
+
+    def _store(self, spec=SPEC, original_spec=""):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        ticket = Ticket(
+            "T-1",
+            spec=spec,
+            criteria=["the plan's bar"],
+            original_criteria=["the plan's bar"],
+            status="failed",
+        )
+        store.add_tickets(run_id, [ticket])
+        if original_spec:
+            # As if a later revision had rewritten the spec: the anchor keeps
+            # what was ingested, which is what entailment is judged against.
+            store._connection.execute(
+                "UPDATE tickets SET original_spec = ? WHERE run_id = ?",
+                (original_spec, run_id),
+            )
+            store._connection.commit()
+        step = store.start_step(run_id, "T-1", "review")
+        store.end_step(step, "failed", "REJECT: nope")
+        return store, run_id
+
+    def _revise(self, store, run_id, criteria, spec=SPEC):
+        def call(_messages, _budget):
+            return Completion(
+                text=json.dumps({"spec": spec, "criteria": criteria}), usage=Usage()
+            )
+
+        return respec.revise(
+            store, run_id, store.list_tickets(run_id)[0], call=call, budget=1024
+        )
+
+    def test_a_criterion_restating_the_spec_is_not_treated_as_a_new_demand(self):
+        store, run_id = self._store()
+
+        result = self._revise(store, run_id, ["the plan's bar", self.STATED])
+
+        self.assertIn(self.STATED, store.list_tickets(run_id)[0].criteria)
+        self.assertEqual(result.admitted_criteria, [self.STATED])
+        self.assertEqual(result.minted_criteria, [])
+
+    def test_the_allowance_is_logged_so_the_heuristic_can_be_audited(self):
+        store, run_id = self._store()
+
+        self._revise(store, run_id, ["the plan's bar", self.STATED])
+
+        messages = [row["message"] for row in store.events_after(0)]
+        self.assertTrue(any("restate the spec" in message for message in messages))
+
+    def test_a_criterion_absent_from_the_spec_is_still_refused(self):
+        store, run_id = self._store()
+        invented = "the page includes an element with id hint"
+
+        result = self._revise(store, run_id, ["the plan's bar", invented])
+
+        self.assertEqual(store.list_tickets(run_id)[0].criteria, ["the plan's bar"])
+        self.assertEqual(result.minted_criteria, [invented])
+
+    def test_a_criterion_too_short_to_judge_is_refused(self):
+        # Overlap on three words is coincidence, and a false positive here lets
+        # the loop raise its own bar — the regression the ratchet exists to stop.
+        store, run_id = self._store()
+
+        result = self._revise(store, run_id, ["the plan's bar", "src/lib.rs declares"])
+
+        self.assertEqual(result.minted_criteria, ["src/lib.rs declares"])
+
+    def test_entailment_is_judged_against_the_ingested_spec(self):
+        # Otherwise the loop could rewrite the spec and then mint criteria out
+        # of the sentence it had just written.
+        store, run_id = self._store(original_spec="a spec that says none of this")
+
+        result = self._revise(store, run_id, ["the plan's bar", self.STATED])
+
+        self.assertEqual(result.minted_criteria, [self.STATED])
+        self.assertEqual(result.admitted_criteria, [])
+
+    def test_the_refusal_no_longer_claims_the_plan_is_silent(self):
+        # The old message read "if these are things it genuinely must do, the
+        # plan is what needs changing" — false when the plan does state them,
+        # in the spec, which is the case this whole guard exists for.
+        store, run_id = self._store()
+
+        self._revise(store, run_id, ["the plan's bar", "an element with id hint"])
+
+        messages = " ".join(row["message"] for row in store.events_after(0))
+        self.assertNotIn("the plan is what needs changing", messages)
+
+
+class TestAdoptingACriterionRespecWasRefused(unittest.TestCase):
+    """Respec may not add to the standard it is judged against — it runs on a
+    ticket that has just failed, and a ticket that keeps failing does not need
+    a higher bar. But a refused proposal is sometimes right, and accepting one
+    used to mean editing `plan.md` and re-ingesting the whole backlog: a fresh
+    run, and every ticket that had already passed done again."""
+
+    PROPOSED = "clearing four lines at once scores 800"
+
+    def _project(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
+                    "roles": {r: "m" for r in ("planner", "executor", "tester", "reviewer")},
+                }
+            ),
+            encoding="utf-8",
+        )
+        config = Config.load(root)
+        store = Store(config.db_path)
+        run_id = store.create_run("goal")
+        store.add_tickets(
+            run_id,
+            [Ticket("TT-003", spec="s", criteria=["the plan's bar"], status="failed")],
+        )
+        store.log(
+            run_id,
+            "TT-003: respec proposed 1 criterion(s) the plan states nowhere",
+            level="warn",
+            kind="ticket",
+            data={"minted": [self.PROPOSED], "ticket": "TT-003"},
+        )
+        store.close()
+        return root, config
+
+    def _run(self, root, *argv):
+        parsed = cli.build_parser().parse_args(["--root", str(root), "criteria", *argv])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            parsed.func(parsed)
+        return out.getvalue()
+
+    def _tickets(self, config):
+        store = Store(config.db_path)
+        try:
+            return store.list_tickets(int(store.latest_run()["id"]))
+        finally:
+            store.close()
+
+    def test_a_refused_proposal_is_listed_with_the_command_that_adopts_it(self):
+        root, _config = self._project()
+
+        printed = self._run(root)
+
+        self.assertIn(self.PROPOSED, printed)
+        self.assertIn("forge criteria TT-003 --accept 1", printed)
+
+    def test_accepting_one_makes_it_the_plans_own(self):
+        root, config = self._project()
+
+        self._run(root, "TT-003", "--accept", "1")
+
+        ticket = self._tickets(config)[0]
+        self.assertIn(self.PROPOSED, ticket.criteria)
+        # Plan-authored from here: the ratchet protects it from the next
+        # revision exactly as if a human had written it in the plan.
+        self.assertIn(self.PROPOSED, ticket.original_criteria)
+
+    def test_an_adopted_criterion_stops_being_outstanding(self):
+        root, _config = self._project()
+        self._run(root, "TT-003", "--accept", "1")
+
+        printed = self._run(root)
+
+        self.assertIn("nothing outstanding", printed)
+
+    def test_the_ticket_file_is_rewritten_so_it_does_not_lie(self):
+        root, config = self._project()
+
+        self._run(root, "TT-003", "--accept", "1")
+
+        written = (config.tickets_dir / "TT-003.md").read_text(encoding="utf-8")
+        self.assertIn(self.PROPOSED, written)
+
+    def test_the_adoption_is_recorded_in_the_run(self):
+        root, config = self._project()
+
+        self._run(root, "TT-003", "--accept", "1")
+
+        store = Store(config.db_path)
+        messages = " ".join(row["message"] for row in store.events_after(0))
+        store.close()
+        self.assertIn("a human adopted 1 criterion(s)", messages)
+
+    def test_a_number_that_is_not_on_offer_is_refused(self):
+        root, _config = self._project()
+
+        with self.assertRaises(SystemExit) as caught:
+            self._run(root, "TT-003", "--accept", "2")
+
+        self.assertIn("there is no 2", str(caught.exception))
+
+    def test_accepting_without_naming_a_ticket_says_so(self):
+        root, _config = self._project()
+
+        with self.assertRaises(SystemExit) as caught:
+            self._run(root, "--accept", "1")
+
+        self.assertIn("name the ticket", str(caught.exception))
+
+    def test_adopting_the_same_criterion_twice_does_not_duplicate_it(self):
+        # The second call has nothing outstanding to number, so the guard that
+        # fires is the empty-list one — and either way the ticket ends with one.
+        root, config = self._project()
+        self._run(root, "TT-003", "--accept", "1")
+
+        with self.assertRaises(SystemExit):
+            self._run(root, "TT-003", "--accept", "1")
+
+        ticket = self._tickets(config)[0]
+        self.assertEqual(ticket.criteria.count(self.PROPOSED), 1)
+
+    def test_a_ticket_that_already_passed_is_not_requeued_behind_your_back(self):
+        root, config = self._project()
+        store = Store(config.db_path)
+        run_id = int(store.latest_run()["id"])
+        ticket = store.list_tickets(run_id)[0]
+        ticket.status = TICKET_DONE
+        store.update_ticket(run_id, ticket)
+        store.close()
+
+        printed = self._run(root, "TT-003", "--accept", "1")
+
+        self.assertIn("forge retry --ticket TT-003", printed)
+        self.assertEqual(self._tickets(config)[0].status, TICKET_DONE)
 
 
 class TestRespecCannotPinASharedFile(unittest.TestCase):
@@ -4008,7 +4565,7 @@ class TestTheTestCommandDecidesTheLanguage(unittest.TestCase):
     def test_a_run_that_authored_no_tests_at_all_says_so(self):
         orch, _root = self._orch("cargo test")
         run_id = orch.store.create_run("g")
-        orch._tests_skipped = 4
+        orch._tests_skipped = {"T-1", "T-2", "T-3", "T-4"}
 
         orch._finish(run_id)
 
@@ -4018,12 +4575,66 @@ class TestTheTestCommandDecidesTheLanguage(unittest.TestCase):
     def test_a_run_with_some_tests_stays_quiet(self):
         orch, _root = self._orch("cargo test")
         run_id = orch.store.create_run("g")
-        orch._tests_skipped, orch._tests_authored = 2, 3
+        orch._tests_skipped = {"T-1", "T-2"}
+        orch._tests_authored = {"T-3", "T-4", "T-5"}
 
         orch._finish(run_id)
 
         messages = " ".join(e["message"] for e in orch.store.events_after(0))
         self.assertNotIn("No ticket in this run authored tests", messages)
+
+
+class TestAGreenTicketMayHaveRunNothing(unittest.TestCase):
+    """A backlog went green — six tickets done, lint and typecheck clean, 36
+    tests passing — and the page loaded to an empty board. TT-005's criteria
+    were all token-presence checks ("`web/main.js` calls
+    `WebAssembly.instantiateStreaming`"), every one of them true of code that
+    threw on the next line. It authored no tests, and `cargo test` runs no
+    JavaScript, so its criteria were checked by reading. Nothing in the
+    pipeline could have caught that. What it can do is say so."""
+
+    def _orch(self, done: list[str], skipped: set[str], authored: set[str] = frozenset()):
+        orch, _root, run_id = _stub_orchestrator({"test": "cargo test"})
+        orch.store.add_tickets(
+            run_id,
+            [Ticket(ticket_id, status=TICKET_DONE) for ticket_id in done],
+        )
+        orch._tests_skipped = set(skipped)
+        orch._tests_authored = set(authored)
+        orch._finish(run_id)
+        return " ".join(e["message"] for e in orch.store.events_after(0))
+
+    def test_a_ticket_verified_by_reading_is_named_at_run_end(self):
+        messages = self._orch(
+            done=["TT-004", "TT-005"], skipped={"TT-005"}, authored={"TT-004"}
+        )
+
+        self.assertIn("TT-005 passed on review alone", messages)
+        self.assertIn("rather than by running anything", messages)
+        self.assertNotIn("TT-004 passed on review alone", messages)
+
+    def test_several_are_named_together(self):
+        messages = self._orch(
+            done=["TT-004", "TT-005", "TT-006"],
+            skipped={"TT-005", "TT-006"},
+            authored={"TT-004"},
+        )
+        self.assertIn("TT-005, TT-006 passed on review alone", messages)
+
+    def test_a_ticket_that_authored_tests_on_a_later_attempt_is_not_named(self):
+        # Skipping on the attempt that wrote nothing and authoring on the one
+        # that did is ordinary. What matters is whether the ticket ended up
+        # covered, not whether it was ever briefly uncovered.
+        messages = self._orch(
+            done=["TT-004"], skipped={"TT-004"}, authored={"TT-004"}
+        )
+        self.assertNotIn("passed on review alone", messages)
+
+    def test_a_ticket_that_never_passed_is_not_named(self):
+        # The claim is about what a green ticket proved. A failed one makes no
+        # claim to undercut.
+        messages = self._orch(done=[], skipped={"TT-005"}, authored={"TT-004"})
+        self.assertNotIn("passed on review alone", messages)
 
 
 class TestOrphanedTestsNeverOutliveTheirTicket(unittest.TestCase):
@@ -4173,41 +4784,374 @@ class TestWritableFilesAreNeverAbridged(unittest.TestCase):
         self.assertEqual(called, [])
 
 
+def _joined(messages) -> str:
+    """Every message in a prompt as one string.
+
+    History now travels in its own message so the budget gate can drop it, so
+    asserting against the last message alone would test where a block sits
+    rather than whether the role is told.
+    """
+    return "\n\n".join(message.content for message in messages)
+
+
+class TestHistoryIsTrimmedRatherThanBlocking(unittest.TestCase):
+    """The rejection block was the one part of a prompt that grew without
+    bound, and it was not droppable. A ticket that accumulated enough rejection
+    text overflowed the window, and `ContextOverflow` becomes `blocked=True` —
+    a hard stop for the crime of having been reviewed too often. Not reachable
+    at `maxAttempts: 3`; reachable the moment that is raised, and sooner on a
+    small single-model window."""
+
+    class _Model(Provider):
+        kind = "stub"
+
+        def __init__(self, window: int):
+            super().__init__("local", {})
+            self._window = window
+
+        def complete(self, messages, *, max_tokens, temperature=0.2, timeout=600):
+            raise NotImplementedError
+
+        def capabilities(self):
+            return Capabilities(context_window=self._window, max_output_tokens=256)
+
+        def count_tokens(self, messages):
+            return sum(len(m.content) for m in messages)
+
+    def _fit(self, messages, window):
+        gate = BudgetGate(Store(Path(tempfile.mkdtemp()) / "t.db"), {})
+        return gate.fit(
+            self._Model(window),
+            messages,
+            max_output=256,
+            droppable=lambda m: m.role == "user"
+            and m.content.startswith(_DROPPABLE_HEADINGS),
+        )
+
+    def test_a_long_rejection_history_is_trimmed_rather_than_blocking(self):
+        messages = review_prompt(
+            Ticket("T-1", spec="the spec that must survive"),
+            "diff --git a/x b/x",
+            prior_verdicts=["REJECT: " + "x" * 4000 for _ in range(6)],
+        )
+
+        kept = _joined(self._fit(messages, window=4096))
+
+        self.assertIn("the spec that must survive", kept)
+        self.assertNotIn("already rejected this ticket", kept)
+
+    def test_earlier_failures_are_droppable_too(self):
+        messages = build_prompt(
+            Ticket("T-1", spec="the spec that must survive"),
+            prior_failures=[
+                f"Attempt {index}:\n"
+                + "\n".join(f"error[E{line}]: something is broken" for line in range(60))
+                for index in range(6)
+            ],
+        )
+
+        kept = _joined(self._fit(messages, window=4096))
+
+        self.assertIn("the spec that must survive", kept)
+        self.assertNotIn("Earlier attempts on this ticket", kept)
+
+    def test_retrieved_memory_goes_before_the_history_does(self):
+        # Both are droppable and the gate drops in message order, so the
+        # prompts put context first: what has already been tried is worth more
+        # than what a memory server thought was topical.
+        messages = review_prompt(
+            Ticket("T-1", spec="s", context="a paragraph of retrieved memory. " * 200),
+            "diff",
+            prior_verdicts=["REJECT: the error path is swallowed"],
+        )
+
+        kept = _joined(self._fit(messages, window=4096))
+
+        self.assertNotIn("retrieved memory", kept)
+        self.assertIn("the error path is swallowed", kept)
+
+    def test_the_reviewer_is_shown_a_bounded_number_of_verdicts(self):
+        # Trimming is the gate's last resort; the cap is what keeps it from
+        # being needed. `_PRIOR_FAILURES` has always had one — this is its
+        # counterpart on the side that actually grew.
+        orch, _, run_id = _stub_orchestrator()
+        seen: list[list[Message]] = []
+
+        def call(_run_id, role, messages, **_kwargs):
+            if role == "reviewer":
+                seen.append(messages)
+            return Completion(text="REJECT: still wrong", usage=Usage())
+
+        orch._call = call
+        rejections = [f"REJECT: objection {index}" for index in range(6)]
+
+        orch._attempt(
+            run_id, Ticket("T-1", allowed_files=["src/a.py"]), "", rejections=rejections
+        )
+
+        shown = _joined(seen[-1])
+        self.assertIn("objection 5", shown)
+        self.assertNotIn("objection 0", shown)
+
+
+class TestTheExecutorCanSeeItsOwnAnswers(unittest.TestCase):
+    """The executor has never seen its own output. It is handed the spec, the
+    files as they exist on disk and the failures — with nothing anywhere saying
+    that it wrote those files. That is the state behind "Looking at the files
+    provided, I can see they already implement the spec correctly": a model
+    reading its own work as somebody else's. Behind `loop.executorTurns`,
+    because a model shown its own wrong answer as an assistant turn also
+    defends it more readily, and which effect wins is a measurement."""
+
+    TURNS = [
+        ("src/a.py\n```python\nx = 1\n```", "lint failed: x is unused"),
+        ("src/a.py\n```python\nx = 2\n```", "review rejected: still wrong"),
+    ]
+
+    def test_each_answer_is_replayed_as_the_executors_own_turn(self):
+        messages = build_prompt(Ticket("T-1", spec="s"), prior_turns=self.TURNS)
+
+        assistants = [m.content for m in messages if m.role == "assistant"]
+        self.assertEqual(assistants, [reply for reply, _ in self.TURNS])
+
+    def test_the_ticket_is_asked_once_and_not_rewritten_by_what_followed(self):
+        # The executor already answered this turn. Editing it now would make
+        # its own replies look like answers to a question nobody asked.
+        messages = build_prompt(
+            Ticket("T-1", spec="s"), "the newest failure", prior_turns=self.TURNS
+        )
+
+        first_user = next(m for m in messages if m.role == "user")
+        self.assertIn("## Spec", first_user.content)
+        self.assertNotIn("the newest failure", first_user.content)
+
+    def test_the_newest_failure_is_the_last_word(self):
+        messages = build_prompt(
+            Ticket("T-1", spec="s"), "the newest failure", prior_turns=self.TURNS
+        )
+
+        self.assertEqual(messages[-1].role, "user")
+        self.assertIn("the newest failure", messages[-1].content)
+        self.assertIn("Return the complete files again", messages[-1].content)
+
+    def test_the_stored_failure_stands_in_when_no_context_is_passed(self):
+        messages = build_prompt(Ticket("T-1", spec="s"), prior_turns=self.TURNS)
+        self.assertIn("review rejected: still wrong", messages[-1].content)
+
+    def test_the_flat_failure_block_is_superseded_by_the_turns(self):
+        # The same failures, each one now attached to the answer that caused
+        # it. Printing both spends the window to say it twice.
+        messages = build_prompt(
+            Ticket("T-1", spec="s"),
+            prior_failures=["Attempt 1: lint failed"],
+            prior_turns=self.TURNS,
+        )
+
+        self.assertNotIn("Earlier attempts on this ticket", _joined(messages))
+
+    def test_an_old_exchange_is_droppable_and_the_newest_one_is_not(self):
+        messages = build_prompt(
+            Ticket("T-1", spec="s"), "the newest failure", prior_turns=self.TURNS
+        )
+
+        # system, ticket, [answer 1, its failure], answer 2, newest failure
+        roles = [m.role for m in messages]
+        self.assertEqual(roles, ["system", "user", "assistant", "user", "assistant", "user"])
+        self.assertEqual(
+            [_droppable(m) for m in messages],
+            [False, False, True, True, True, False],
+        )
+
+
+class TestTurnsAreRebuiltFromTheStepLog(unittest.TestCase):
+    """Held in SQLite rather than in the attempt loop, so the transport stays
+    stateless and a retry cycle inherits the thread."""
+
+    def _store(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        return store, store.create_run("goal")
+
+    def _attempt(self, store, run_id, reply, failure, *, name="review"):
+        step = store.start_step(run_id, "T-1", "build")
+        store.end_step(step, "ok" if reply else "failed", reply)
+        if failure:
+            step = store.start_step(run_id, "T-1", name)
+            store.end_step(step, "failed", failure)
+
+    def test_a_reply_is_paired_with_the_failure_that_followed_it(self):
+        store, run_id = self._store()
+        self._attempt(store, run_id, "first answer", "lint failed")
+        self._attempt(store, run_id, "second answer", "review rejected")
+
+        turns = store.ticket_turns(run_id, "T-1", limit=2)
+
+        self.assertEqual([reply for reply, _ in turns], ["first answer", "second answer"])
+        self.assertIn("lint failed", turns[0][1])
+
+    def test_a_reply_with_no_failure_after_it_is_dropped(self):
+        # An attempt can end without a failed step — a reply the harness could
+        # not read is refused before anything runs. Pairing it with the next
+        # failure would tell the executor its code caused something it never
+        # reached.
+        store, run_id = self._store()
+        self._attempt(store, run_id, "unreadable answer", "")
+        self._attempt(store, run_id, "second answer", "review rejected")
+
+        turns = store.ticket_turns(run_id, "T-1", limit=4)
+
+        self.assertEqual([reply for reply, _ in turns], ["second answer"])
+
+    def test_only_the_last_few_turns_are_kept(self):
+        store, run_id = self._store()
+        for index in range(5):
+            self._attempt(store, run_id, f"answer {index}", f"failure {index}")
+
+        turns = store.ticket_turns(run_id, "T-1", limit=2)
+
+        self.assertEqual([reply for reply, _ in turns], ["answer 3", "answer 4"])
+
+    def test_a_ticket_that_has_not_run_has_no_turns(self):
+        store, run_id = self._store()
+        self.assertEqual(store.ticket_turns(run_id, "T-1"), [])
+
+
+class TestConversationalExecutorIsOffUntilAskedFor(unittest.TestCase):
+    """A flag, and an experiment. The flat prompt stays the default."""
+
+    def _run(self, turns: int):
+        orch, _root, run_id = _stub_orchestrator()
+        orch.config.loop.max_attempts = 2
+        orch.config.loop.executor_turns = turns
+        seen: list[list[Message]] = []
+
+        def call(_run_id, role, messages, **_kwargs):
+            if role == "executor":
+                seen.append(messages)
+            return Completion(
+                text={
+                    "executor": "src/a.py\n```python\nx = 1\n```",
+                    "tester": "tests/t_1_test.py\n```python\ndef test_a(): pass\n```",
+                }.get(role, "REJECT\nthe error path is swallowed"),
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        orch._call = call
+        orch._work_ticket(run_id, Ticket("T-1", allowed_files=["src/a.py"]))
+        return seen
+
+    def test_off_by_default_nothing_is_replayed(self):
+        seen = self._run(turns=0)
+
+        self.assertEqual(len(seen), 2, "the ticket should have had two attempts")
+        self.assertEqual([m.role for m in seen[-1] if m.role == "assistant"], [])
+
+    def test_on_the_second_attempt_reads_its_own_answer(self):
+        seen = self._run(turns=2)
+
+        second = seen[-1]
+        assistants = [m.content for m in second if m.role == "assistant"]
+        self.assertEqual(assistants, ["src/a.py\n```python\nx = 1\n```"])
+        self.assertIn("the error path is swallowed", second[-1].content)
+
+
+class TestARetryCycleRemembersWhatFailed(unittest.TestCase):
+    """`history` and `rejections` are locals in the attempt loop, and a retry
+    cycle enters it fresh. So cycle 2's reviewer met a ticket it had already
+    rejected three times as though for the first time and re-raised the same
+    objections, while the one nudge designed to notice a third identical
+    objection — "a rejection that repeats is evidence the spec is wrong" —
+    could never fire, because the list it reads was empty exactly when it
+    mattered. Both records were durable in the step log the whole time."""
+
+    def _seeded(self, attempt_base: int):
+        orch, root, run_id = _stub_orchestrator()
+        orch.config.loop.max_attempts = 1
+
+        step = orch.store.start_step(run_id, "TT-001", "review")
+        orch.store.end_step(step, "failed", "REJECT: the error path is swallowed")
+        step = orch.store.start_step(run_id, "TT-001", "lint")
+        orch.store.end_step(step, "failed", "error[E0433]: unresolved import")
+
+        seen: dict[str, str] = {}
+
+        def call(_run_id, role, messages, **_kwargs):
+            seen[role] = _joined(messages)
+            return {
+                "executor": "src/game.rs\n```rust\npub fn go() {}\n```",
+                "tester": "tests/tt_001_test.rs\n```rust\n#[test]\nfn a() {}\n```",
+            }.get(role, "ACCEPT")
+
+        orch._call = lambda run_id, role, messages, **kw: Completion(
+            text=call(run_id, role, messages, **kw), usage=Usage(), finish_reason="stop"
+        )
+        orch._work_ticket(
+            run_id,
+            Ticket(
+                "TT-001",
+                allowed_files=["src/game.rs"],
+                criteria=["go() exists"],
+                attempt_base=attempt_base,
+            ),
+        )
+        return seen
+
+    def test_a_second_cycle_reviewer_sees_the_first_cycles_rejections(self):
+        seen = self._seeded(attempt_base=3)
+        self.assertIn("the error path is swallowed", seen["reviewer"])
+        self.assertIn("do not replace it with a fresh objection", seen["reviewer"])
+
+    def test_a_second_cycle_executor_sees_the_first_cycles_failures(self):
+        seen = self._seeded(attempt_base=3)
+        self.assertIn("E0433", seen["executor"])
+
+    def test_a_first_cycle_starts_with_nothing_to_remember(self):
+        # The step log is per ticket, not per cycle. Seeding unconditionally
+        # would show a ticket its own current cycle back to itself.
+        seen = self._seeded(attempt_base=0)
+        self.assertNotIn("already rejected", seen["reviewer"])
+        self.assertNotIn("Earlier attempts on this ticket", seen["executor"])
+
+
 class TestFailureHistoryReachesBothRoles(unittest.TestCase):
     """`failure_context` carries only the newest failure, which is what lets an
     executor oscillate — fix A breaks B, fix B brings A back — for its whole
     retry budget with nothing able to see the cycle."""
 
     def test_earlier_failures_are_carried_forward_to_the_executor(self):
-        body = build_prompt(
-            Ticket("T-1", spec="s"),
-            "lint failed:\nerror: B is broken",
-            prior_failures=["Attempt 1: lint failed:\nerror: A is broken"],
-        )[-1].content
+        prompt = _joined(
+            build_prompt(
+                Ticket("T-1", spec="s"),
+                "lint failed:\nerror: B is broken",
+                prior_failures=["Attempt 1: lint failed:\nerror: A is broken"],
+            )
+        )
 
-        self.assertIn("A is broken", body)
-        self.assertIn("B is broken", body)
-        self.assertIn("undoing each other", body)
+        self.assertIn("A is broken", prompt)
+        self.assertIn("B is broken", prompt)
+        self.assertIn("undoing each other", prompt)
 
     def test_a_first_attempt_carries_no_history_section(self):
-        body = build_prompt(Ticket("T-1", spec="s"))[-1].content
-        self.assertNotIn("Earlier attempts on this ticket", body)
+        prompt = _joined(build_prompt(Ticket("T-1", spec="s")))
+        self.assertNotIn("Earlier attempts on this ticket", prompt)
 
     def test_the_reviewer_is_shown_its_own_earlier_rejections(self):
-        body = review_prompt(
-            Ticket("T-1", spec="s"),
-            "diff --git a/x b/x",
-            prior_verdicts=["REJECT\nthe error path is swallowed"],
-        )[-1].content
+        prompt = _joined(
+            review_prompt(
+                Ticket("T-1", spec="s"),
+                "diff --git a/x b/x",
+                prior_verdicts=["REJECT\nthe error path is swallowed"],
+            )
+        )
 
-        self.assertIn("the error path is swallowed", body)
+        self.assertIn("the error path is swallowed", prompt)
         # The instruction that stops three attempts dying on three unrelated
         # objections is the whole point of showing them.
-        self.assertIn("do not replace it with a fresh objection", body)
+        self.assertIn("do not replace it with a fresh objection", prompt)
 
     def test_a_first_review_carries_no_prior_verdicts(self):
-        body = review_prompt(Ticket("T-1", spec="s"), "diff")[-1].content
-        self.assertNotIn("already rejected", body)
+        prompt = _joined(review_prompt(Ticket("T-1", spec="s"), "diff"))
+        self.assertNotIn("already rejected", prompt)
 
     def test_a_rejection_is_recorded_for_the_next_review(self):
         orch, _, run_id = _stub_orchestrator()

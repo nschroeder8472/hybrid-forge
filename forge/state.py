@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -56,6 +57,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     blocked_note  TEXT NOT NULL DEFAULT '',
     original_spec     TEXT NOT NULL DEFAULT '',
     original_criteria TEXT NOT NULL DEFAULT '[]',
+    original_context  TEXT NOT NULL DEFAULT '',
     updated_at    REAL NOT NULL,
     UNIQUE(run_id, ticket_id)
 );
@@ -115,6 +117,17 @@ RUN_DONE = "done"
 RUN_FAILED = "failed"
 RUN_STOPPED = "stopped"
 
+def _criterion_key(criterion: str) -> str:
+    """A criterion reduced to what it asserts, for comparing two spellings.
+
+    Backticks, punctuation and case are presentation: a criterion reworded in
+    only those has not become a second demand. `respec._key` strips a
+    provenance note first and then defers to this, so both sides of the
+    ratchet decide sameness the same way.
+    """
+    return re.sub(r"[^a-z0-9]+", "", criterion.lower())
+
+
 TICKET_PENDING = "pending"
 TICKET_RUNNING = "running"
 TICKET_DONE = "done"
@@ -169,6 +182,11 @@ class Ticket:
     # of the plan's, and every party downstream believed the drift.
     original_spec: str = ""
     original_criteria: list[str] = field(default_factory=list)
+    # The plan's context paragraph, kept for the same reason. `context` is a
+    # full replacement with no provenance of its own, and respec used it as a
+    # rationale scratchpad: five tickets lost the plan's bare-path-line rule to
+    # a sentence about why the executor keeps omitting scaffold files.
+    original_context: str = ""
 
     @property
     def drifted(self) -> bool:
@@ -181,6 +199,8 @@ class Ticket:
         if not self.original_spec:
             return False
         if self.spec != self.original_spec:
+            return True
+        if self.original_context and self.context != self.original_context:
             return True
         return bool(self.original_criteria) and self.criteria != self.original_criteria
 
@@ -223,6 +243,7 @@ class Ticket:
             "blocked_note": self.blocked_note,
             "original_spec": self.original_spec,
             "original_criteria": json.dumps(self.original_criteria),
+            "original_context": self.original_context,
         }
 
     @classmethod
@@ -246,6 +267,7 @@ class Ticket:
             blocked_note=row["blocked_note"],
             original_spec=row["original_spec"],
             original_criteria=json.loads(row["original_criteria"]),
+            original_context=row["original_context"],
         )
 
 
@@ -274,6 +296,7 @@ class Store:
         ("tickets", "reference_files", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "original_spec", "TEXT NOT NULL DEFAULT ''"),
         ("tickets", "original_criteria", "TEXT NOT NULL DEFAULT '[]'"),
+        ("tickets", "original_context", "TEXT NOT NULL DEFAULT ''"),
         ("tickets", "needs", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "dep_stamp", "TEXT NOT NULL DEFAULT '{}'"),
         ("tickets", "baseline_tree", "TEXT NOT NULL DEFAULT ''"),
@@ -388,17 +411,18 @@ class Store:
                 row["original_criteria"] = json.dumps(
                     ticket.original_criteria or ticket.criteria
                 )
+                row["original_context"] = ticket.original_context or ticket.context
                 connection.execute(
                     "INSERT OR REPLACE INTO tickets "
                     "(run_id, ticket_id, title, route, status, position, attempts, "
                     " attempt_base, spec, allowed_files, reference_files, criteria, needs, dep_stamp, "
                     " baseline_tree, context, "
-                    " blocked_note, original_spec, original_criteria, "
+                    " blocked_note, original_spec, original_criteria, original_context, "
                     " updated_at) "
                     "VALUES (:run_id, :ticket_id, :title, :route, :status, :position, "
                     ":attempts, :attempt_base, :spec, :allowed_files, :reference_files, "
                     ":criteria, :needs, :dep_stamp, :baseline_tree, :context, "
-                    ":blocked_note, :original_spec, :original_criteria, :now)",
+                    ":blocked_note, :original_spec, :original_criteria, :original_context, :now)",
                     {**row, "run_id": run_id, "now": now},
                 )
 
@@ -442,9 +466,9 @@ class Store:
         return [Ticket.from_row(row) for row in rows]
 
     def update_ticket(self, run_id: int, ticket: Ticket) -> None:
-        # `original_spec` and `original_criteria` are deliberately absent from
-        # this statement. They are the anchor a respec is judged against, and
-        # an anchor that any caller can move is not one.
+        # `original_spec`, `original_criteria` and `original_context` are
+        # deliberately absent from this statement. They are the anchor a respec
+        # is judged against, and an anchor that any caller can move is not one.
         with self._write() as connection:
             connection.execute(
                 "UPDATE tickets SET status = :status, attempts = :attempts, "
@@ -456,6 +480,92 @@ class Store:
                 "WHERE run_id = :run_id AND ticket_id = :ticket_id",
                 {**ticket.as_row(), "run_id": run_id, "now": time.time()},
             )
+
+    def promote_criteria(
+        self, run_id: int, ticket_id: str, criteria: list[str]
+    ) -> tuple[Ticket | None, list[str]]:
+        """Adopt criteria into the plan's contract on a human's say-so.
+
+        The one path that moves `original_criteria` after ingest, and it exists
+        because the alternative was worse. Respec refuses a criterion the plan
+        states nowhere, which is right — the party being judged does not get to
+        add to the standard — but the refusal left a human editing `plan.md`
+        and re-ingesting the whole backlog to accept a single line, redoing
+        work that had already passed. So a person can adopt one here, and what
+        they adopt becomes plan-authored: protected by the ratchet from the
+        next revision onwards, exactly as if they had written it in the plan.
+
+        Deliberately not reachable from the loop. Every other caller writes
+        through `update_ticket`, which cannot touch the anchor at all.
+
+        Returns `(ticket, adopted)`; `ticket` is None when the id is unknown.
+        Criteria the ticket already carries are skipped rather than duplicated.
+        """
+        matching = [t for t in self.list_tickets(run_id) if t.ticket_id == ticket_id]
+        if not matching:
+            return None, []
+        ticket = matching[0]
+
+        known = {_criterion_key(c) for c in ticket.criteria}
+        adopted = []
+        for criterion in criteria:
+            key = _criterion_key(criterion)
+            if not key or key in known:
+                continue
+            known.add(key)
+            adopted.append(criterion)
+        if not adopted:
+            return ticket, []
+
+        ticket.criteria = ticket.criteria + adopted
+        ticket.original_criteria = ticket.original_criteria + adopted
+        with self._write() as connection:
+            connection.execute(
+                "UPDATE tickets SET criteria = :criteria, "
+                "original_criteria = :original_criteria, updated_at = :now "
+                "WHERE run_id = :run_id AND ticket_id = :ticket_id",
+                {**ticket.as_row(), "run_id": run_id, "now": time.time()},
+            )
+        return ticket, adopted
+
+    def proposed_criteria(self, run_id: int) -> dict[str, list[str]]:
+        """Criteria respec proposed and the loop refused, by ticket.
+
+        Read back out of the run log rather than kept in a table of their own:
+        the refusal is already an event, and a second store of the same fact is
+        a second thing to keep true. Anything the ticket has since acquired —
+        adopted here, or written into the plan and re-ingested — is filtered
+        out, so the list is what is still outstanding rather than a history.
+        """
+        rows = self._connection.execute(
+            "SELECT data FROM events WHERE run_id = ? AND kind = 'ticket' "
+            "AND data LIKE '%\"minted\"%' ORDER BY id",
+            (run_id,),
+        ).fetchall()
+
+        on_ticket = {
+            ticket.ticket_id: {_criterion_key(c) for c in ticket.criteria}
+            for ticket in self.list_tickets(run_id)
+        }
+        pending: dict[str, list[str]] = {}
+        for row in rows:
+            try:
+                data = json.loads(row["data"])
+            except json.JSONDecodeError:
+                continue
+            ticket_id = data.get("ticket", "")
+            if ticket_id not in on_ticket:
+                continue
+            for criterion in data.get("minted", []):
+                key = _criterion_key(criterion)
+                if key in on_ticket[ticket_id]:
+                    continue
+                # A ticket that failed the same way twice proposed the same
+                # criterion twice. It is one outstanding decision, not two.
+                if key in {_criterion_key(c) for c in pending.get(ticket_id, [])}:
+                    continue
+                pending.setdefault(ticket_id, []).append(criterion)
+        return pending
 
     def ticket_failures(
         self, run_id: int, ticket_id: str, limit: int = 6
@@ -492,6 +602,74 @@ class Store:
             seen.add(key)
             failures.append({"name": row["name"], "detail": detail})
         return failures[-limit:]
+
+    def ticket_turns(
+        self, run_id: int, ticket_id: str, limit: int = 2
+    ) -> list[tuple[str, str]]:
+        """Prior attempts as `(what the executor replied, what failed)`, oldest first.
+
+        The executor has never seen its own output. It is handed the spec, the
+        files as they exist on disk, and the failures — with nothing anywhere
+        saying that it wrote those files. That is the state behind "Looking at
+        the files provided, I can see they already implement the spec
+        correctly": a model reading its own work as somebody else's.
+
+        Both halves of each turn are already durable. The build step keeps the
+        raw reply, and the step that failed next keeps why. Rebuilding the
+        conversation here rather than holding it in the attempt loop is what
+        keeps the daemon's state machine the only state machine: transport
+        stays stateless, the shape is conversational, and a retry cycle
+        inherits the thread the same way `ticket_failures` inherits failures.
+
+        A reply with no failure after it is dropped rather than paired with the
+        next one along. An attempt can end without a failed step — a reply the
+        harness could not read is refused before anything runs — and attaching
+        that reply to a later, unrelated failure would tell the executor its
+        code caused something it never reached.
+        """
+        rows = self._connection.execute(
+            "SELECT name, status, detail FROM steps "
+            "WHERE run_id = ? AND ticket_id = ? ORDER BY id",
+            (run_id, ticket_id),
+        ).fetchall()
+
+        turns: list[tuple[str, str]] = []
+        reply = ""
+        for row in rows:
+            if row["name"] == "build":
+                # A new build ends the previous turn whatever came of it, so an
+                # unpaired reply is discarded here rather than carried forward.
+                reply = row["detail"] if row["status"] == "ok" else ""
+                continue
+            if not reply or row["status"] != "failed" or not row["detail"]:
+                continue
+            turns.append((reply, distill(row["detail"], limit=2500)))
+            reply = ""
+        return turns[-limit:] if limit else turns
+
+    def ticket_rejections(
+        self, run_id: int, ticket_id: str, limit: int = 3
+    ) -> list[str]:
+        """Verdicts the reviewer has already rejected this ticket with, oldest first.
+
+        The attempt loop keeps these in memory, and a retry cycle calls into it
+        fresh — so a second cycle's reviewer met a ticket it had already
+        rejected three times as though for the first time, and re-raised the
+        same objections from scratch. The nudge that a repeated rejection means
+        the spec is wrong could never fire, because the list it reads was
+        always empty at the moment it mattered.
+
+        Kept whole rather than distilled: a verdict is prose the reviewer wrote
+        for its own successor, and `distill` is built for compiler output.
+        """
+        rows = self._connection.execute(
+            "SELECT detail FROM steps "
+            "WHERE run_id = ? AND ticket_id = ? AND name = 'review' "
+            "AND status = 'failed' AND detail != '' "
+            "ORDER BY id DESC LIMIT ?",
+            (run_id, ticket_id, limit),
+        ).fetchall()
+        return [row["detail"] for row in reversed(rows)]
 
     # Statuses a retry reopens by default: work that stopped without landing.
     RETRYABLE = (TICKET_FAILED, TICKET_BLOCKED, TICKET_SKIPPED)

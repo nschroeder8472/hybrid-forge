@@ -20,11 +20,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from .ingest import derive_needs, whole_file_claims
+from .ingest import derive_needs, plan_decisions, whole_file_claims
 from .patch import is_safe_path
 from .prompts import parse_respec, respec_prompt
 from .providers import Completion, Message, ProviderError
-from .state import Store, Ticket
+from .state import Store, Ticket, _criterion_key
 
 # `(messages, max_tokens) -> Completion`. Temperature is the caller's business.
 Caller = Callable[[list[Message], int], Completion]
@@ -48,6 +48,17 @@ class Revision:
     # locked: respec runs on a ticket that has just failed, and its job is
     # to make that ticket satisfiable rather than harder.
     minted_criteria: list[str] = field(default_factory=list)
+    # Criteria the planner added that only restate a sentence of the spec. Kept
+    # rather than refused: the reviewer is given the spec and enforces it
+    # already, so writing one down makes an existing demand checkable rather
+    # than raising the bar.
+    admitted_criteria: list[str] = field(default_factory=list)
+    # Decisions the plan marked as settled that a revised spec dropped. The
+    # spec revision was refused whole; these say which sentence cost it.
+    refused_decisions: list[str] = field(default_factory=list)
+    # Whether the plan's context paragraph had to be put back in front of a
+    # revision that replaced it.
+    restored_context: bool = False
     # The planner's report that no revision can make this ticket satisfiable.
     # A complete answer, not a failure to answer — the ticket parks for a human
     # rather than spending another full attempt budget.
@@ -115,7 +126,7 @@ def _key(criterion: str) -> str:
     once as missing and once as new. Instruction-following is not an access
     control, and it is not a comparison key either.
     """
-    return re.sub(r"[^a-z0-9]+", "", _PROVENANCE_NOTE.sub("", criterion).lower())
+    return _criterion_key(_PROVENANCE_NOTE.sub("", criterion))
 
 
 # Ways of describing the executor's reply format. That format is the harness's
@@ -160,7 +171,10 @@ def _refuse_protocol_edits(ticket: Ticket, revision: dict) -> list[tuple[str, st
     talks about fences — a markdown tool, a docs generator — can still be
     revised. Returns the fields dropped, with the phrase that cost them.
     """
-    anchors = {"spec": ticket.original_spec or ticket.spec, "context": ticket.context}
+    anchors = {
+        "spec": ticket.original_spec or ticket.spec,
+        "context": ticket.original_context or ticket.context,
+    }
     dropped: list[tuple[str, str]] = []
     for field_name, anchor in anchors.items():
         if field_name not in revision:
@@ -170,6 +184,113 @@ def _refuse_protocol_edits(ticket: Ticket, revision: dict) -> list[tuple[str, st
             revision.pop(field_name)
             dropped.append((field_name, sorted(introduced)[0]))
     return dropped
+
+
+def _normalise(text: str) -> str:
+    """Text reduced to what it says, for asking whether it is still there."""
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+# A decision short enough to appear inside an unrelated sentence by accident.
+# Below this, containment proves nothing and the guard would fire on noise.
+_DECISION_FLOOR = 24
+
+
+def _dropped_decisions(ticket: Ticket, proposed: str) -> list[str]:
+    """Decisions the plan marked as settled that a revised spec no longer states.
+
+    Compared on a normalised form, so punctuation and backticks are free to
+    change; the words are not. That is the bar the prompt asks for — copy the
+    sentence back — and the one a human can check by reading.
+    """
+    anchor = ticket.original_spec or ticket.spec
+    kept = _normalise(proposed)
+    return [
+        decision
+        for decision in plan_decisions(anchor)
+        if len(_normalise(decision)) >= _DECISION_FLOOR
+        and _normalise(decision) not in kept
+    ]
+
+
+def _preserve_plan_context(ticket: Ticket, revision: dict) -> bool:
+    """Fold a revised `context` into the plan's rather than over it.
+
+    `context` is the one field with no provenance rule: respec returns a whole
+    new string and the plan's paragraph is simply gone. It went that way on
+    five of six tickets in one run, replaced by a sentence of the planner's
+    reasoning — the executor's path-line rule and the do-not-write-tests rule
+    with it. The system prompt still carries both, so this was degradation
+    rather than deletion, but the redundancy holding a weak local model to
+    format was what got deleted.
+
+    Appending keeps both halves and costs a paragraph. The plan's text leads,
+    because it is what a human wrote and what the executor should read first.
+    Returns whether anything was restored, for reporting.
+    """
+    anchor = (ticket.original_context or "").strip()
+    if not anchor or "context" not in revision:
+        return False
+    proposed = (revision["context"] or "").strip()
+    if _normalise(anchor) in _normalise(proposed):
+        return False
+    revision["context"] = f"{anchor}\n\n{proposed}".strip()
+    return True
+
+
+# Words that carry no demand of their own. A criterion and the spec sentence it
+# restates rarely share their grammar, and matching on it would let two
+# unrelated statements agree about "the" and "must".
+_FILLER = frozenset(
+    """a an and are as at be begins by can contains do does each every for from
+    has have in is it its may must not of on or should so start starts than that
+    the then this to when which will with""".split()
+)
+
+# What a criterion has to have in common with a spec sentence before it counts
+# as a restatement of it. Deliberately close to total: a false positive here
+# lets the loop raise its own bar, which is the regression the ratchet exists
+# to stop. A criterion with fewer content words than the floor is not judged at
+# all — at that length, overlap is coincidence.
+_ENTAILMENT_COVERAGE = 0.8
+_ENTAILMENT_FLOOR = 5
+
+
+def _content_words(text: str) -> list[str]:
+    words = re.findall(r"[a-z0-9_][\w:./\\+#!\-]*", text.lower())
+    return [word for word in words if word not in _FILLER]
+
+
+def _spec_entailed(ticket: Ticket, criterion: str) -> bool:
+    """Whether a proposed criterion only restates something the spec states.
+
+    The reviewer is given the spec and told to reject work that contradicts it,
+    so the bar it actually applies is spec ∪ criteria — while `_merge_criteria`
+    tested novelty against the criteria alone. The planner was therefore
+    forbidden from writing down a requirement the reviewer was required to
+    enforce. One run spent three cycles on that gap over a single line: the
+    planner proposed "build.sh must start with #!/usr/bin/env sh and set -eu"
+    and was refused twice, while the reviewer rejected the ticket for exactly
+    that requirement twice, and the plan stated it in the spec the whole time.
+
+    A criterion that restates a spec sentence is not a ratchet — the spec is
+    enforced either way. Judged against `original_spec` where there is one, so
+    the loop cannot rewrite the spec and then mint criteria out of what it just
+    wrote.
+    """
+    wanted = _content_words(criterion)
+    if len(wanted) < _ENTAILMENT_FLOOR:
+        return False
+    anchor = ticket.original_spec or ticket.spec
+    for line in anchor.splitlines():
+        for sentence in re.split(r"(?<=[.:;])\s+", line):
+            stated = set(_content_words(sentence))
+            if not stated:
+                continue
+            covered = sum(1 for word in wanted if word in stated)
+            if covered / len(wanted) >= _ENTAILMENT_COVERAGE:
+                return True
+    return False
 
 
 def _drop_whole_file_claims(
@@ -405,14 +526,56 @@ def revise(
             kind="ticket",
         )
 
+    # A decision is not a criterion, so the ratchet never covered it. Refused
+    # whole: a spec revised around a dropped decision has already reasoned from
+    # its absence, and keeping the sentence while keeping the rest of that
+    # reasoning would produce a spec that contradicts itself.
+    dropped: list[str] = []
+    if "spec" in revision:
+        dropped = _dropped_decisions(ticket, revision["spec"])
+        if dropped:
+            revision.pop("spec")
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: respec dropped {len(dropped)} decision(s) "
+                f"the plan marked as settled; the spec revision was refused. A "
+                f"decision is not a criterion, so nothing downstream would have "
+                f"noticed — the ticket would have gone green against a choice "
+                f"nobody made:\n"
+                + "\n".join(f"  - {decision}" for decision in dropped[:5]),
+                level="warn",
+                kind="ticket",
+                data={"decisions": dropped},
+            )
+
+    restored_context = _preserve_plan_context(ticket, revision)
+    if restored_context:
+        store.log(
+            run_id,
+            f"{ticket.ticket_id}: respec replaced the plan's context; the "
+            f"plan's paragraph was put back and the revision appended to it. "
+            f"Context is where the plan states rules the executor needs every "
+            f"attempt — put your reasoning in the rationale instead.",
+            level="warn",
+            kind="ticket",
+        )
+
     # Instruction-following is not an access control, so provenance is enforced
     # here rather than merely described in the prompt.
     refused: list[str] = []
     minted: list[str] = []
+    admitted: list[str] = []
     if criteria_locked and "criteria" in revision:
         revision["criteria"], refused, minted = _merge_criteria(
             ticket, revision["criteria"]
         )
+        # Admitted after the ratchet has run, not inside it: the ratchet's rule
+        # is about who wrote a criterion, and this one is about whether the
+        # reviewer is already enforcing it.
+        admitted = [c for c in minted if _spec_entailed(ticket, c)]
+        if admitted:
+            revision["criteria"] = revision["criteria"] + admitted
+            minted = [c for c in minted if c not in admitted]
 
     if "criteria" in revision:
         revision["criteria"], pinned = _drop_whole_file_claims(
@@ -445,6 +608,19 @@ def revise(
             kind="ticket",
             data={"restored": refused},
         )
+    if admitted:
+        # Logged because it is a heuristic deciding that two sentences say the
+        # same thing, and a heuristic nobody can audit is one nobody can fix.
+        store.log(
+            run_id,
+            f"{ticket.ticket_id}: respec proposed {len(admitted)} criterion(s) "
+            f"that restate the spec; admitted. The reviewer is given the spec "
+            f"and enforces it either way, so writing one down raises no bar — "
+            f"it only makes the bar checkable:\n"
+            + "\n".join(f"  - {criterion}" for criterion in admitted[:5]),
+            kind="ticket",
+            data={"admitted": admitted},
+        )
     if minted:
         # Surfaced rather than dropped in silence, for the same reason a
         # restoration is: respec reaching for the same new criterion every
@@ -452,13 +628,19 @@ def revise(
         store.log(
             run_id,
             f"{ticket.ticket_id}: respec proposed {len(minted)} criterion(s) the "
-            f"plan does not state; refused. A ticket that keeps failing does not "
-            f"need a higher bar — if these are things it genuinely must do, the "
-            f"plan is what needs changing:\n"
+            f"plan states nowhere — not in the criteria, and not in the spec, "
+            f"which the reviewer would have enforced; refused. A ticket that "
+            f"keeps failing does not need a higher bar. If these are things it "
+            f"genuinely must do, adopt one with "
+            f"`forge criteria {ticket.ticket_id} --accept N` and it becomes the "
+            f"plan's:\n"
             + "\n".join(f"  - {criterion}" for criterion in minted[:5]),
             level="warn",
             kind="ticket",
-            data={"minted": minted},
+            # The ticket id is in the message too, but a reader that has to
+            # parse it back out of prose is a reader that breaks when the prose
+            # changes. `forge criteria` reads this.
+            data={"minted": minted, "ticket": ticket.ticket_id},
         )
 
     if not changed:
@@ -468,6 +650,9 @@ def revise(
             note="planner kept the ticket as written",
             refused_criteria=refused,
             minted_criteria=minted,
+            admitted_criteria=admitted,
+            refused_decisions=dropped,
+            restored_context=restored_context,
         )
 
     for field_name, value in revision.items():
@@ -501,4 +686,7 @@ def revise(
         rationale=rationale,
         refused_criteria=refused,
         minted_criteria=minted,
+        admitted_criteria=admitted,
+        refused_decisions=dropped,
+        restored_context=restored_context,
     )

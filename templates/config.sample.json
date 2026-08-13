@@ -1,0 +1,88 @@
+{
+  "room": "image-marquee",
+  "models": {
+    "local": {
+      "kind": "openai",
+      "baseUrl": "http://192.168.1.10:11434/v1",
+      "model": "qwen3.6:35b-a3b",
+      "contextWindow": 32768,
+      "maxOutputTokens": 8192,
+      "temperature": 0.6,
+      "topP": 0.95
+    },
+    "local-plan": {
+      "kind": "openai",
+      "baseUrl": "http://192.168.1.10:11434/v1",
+      "model": "qwen3.6:35b-a3b",
+      "contextWindow": 32768,
+      "maxOutputTokens": 16384,
+      "temperature": 0.6
+    },
+    "claude": {
+      "kind": "claude-cli",
+      "model": "opus",
+      "contextWindow": 200000,
+      "maxOutputTokens": 32000,
+      "rateLimit": {
+        "tokensPerWindow": 0,
+        "costPerWindow": 15.0,
+        "windowSeconds": 18000
+      }
+    },
+    "api": {
+      "kind": "anthropic",
+      "model": "claude-sonnet-5",
+      "apiKeyEnv": "ANTHROPIC_API_KEY",
+      "contextWindow": 200000,
+      "maxOutputTokens": 16384,
+      "rateLimit": {
+        "requestsPerMinute": 50,
+        "tokensPerMinute": 40000
+      }
+    }
+  },
+  "roles": {
+    "planner": "local-plan",
+    "executor": "local",
+    "tester": "local",
+    "reviewer": "claude"
+  },
+  "commands": {
+    "lint": "cargo clippy --all-targets -- -D warnings",
+    "typecheck": "cargo check --all-targets",
+    "test": "cargo test"
+  },
+  "neverDelegate": [
+    "src/auth/**",
+    "migrations/**",
+    ".github/workflows/**"
+  ],
+  "memory": {
+    "command": ["mempalace-mcp"],
+    "room": "image-marquee",
+    "limit": 6,
+    "maxTokens": 1200,
+    "write": true,
+    "recordRole": "reviewer",
+    "maxWriteChars": 2000
+  },
+  "loop": {
+    "maxAttempts": 3,
+    "autoCommit": false,
+    "stopOnBlocked": false,
+    "retryCycles": 2,
+    "respecOnRetry": true,
+    "respecCriteria": false,
+    "reopenStaleDependents": true,
+    "preflight": true,
+    "pollSeconds": 2.0,
+    "maxRuntimeSeconds": 0,
+    "baselineVerify": true,
+    "executorTurns": 0
+  },
+  "ui": {
+    "host": "127.0.0.1",
+    "port": 8799,
+    "enabled": true
+  }
+}

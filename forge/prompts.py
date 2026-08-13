@@ -17,9 +17,21 @@ from .failures import distill
 from .providers import Message
 from .state import Ticket
 
-# The prefix that marks a message as droppable to the budget gate. Memory and
-# ticket context live behind it; the spec never does.
+# The prefixes that mark a message as droppable to the budget gate. Memory and
+# ticket context live behind the first; the spec never does.
 CONTEXT_HEADING = "## Established project context"
+
+# History, carried in its own message so it can be trimmed instead of blocking
+# the ticket. Both are worth having and neither is worth a ticket: an executor
+# without its earlier failures may oscillate, a reviewer without its earlier
+# verdicts may raise a fresh objection — a ticket that will not fit does none
+# of the work at all.
+PRIOR_FAILURES_HEADING = "## Earlier attempts on this ticket, oldest first"
+PRIOR_VERDICTS_HEADING = "## You have already rejected this ticket"
+
+# The feedback turn in a conversational executor prompt, for every attempt but
+# the newest. Marked so the gate can drop an old exchange whole.
+PRIOR_ATTEMPT_HEADING = "## That attempt failed"
 
 EXECUTOR_SYSTEM = """You are the executor in a plan-and-execute pipeline.
 
@@ -248,12 +260,51 @@ def build_prompt(
     *,
     prior_failures: Sequence[str] = (),
     malformed: str = "",
+    prior_turns: Sequence[tuple[str, str]] = (),
 ) -> list[Message]:
+    """The executor's prompt, in one of two shapes.
+
+    `prior_turns` selects the second. Given `(reply, what failed)` pairs it
+    writes a real exchange — the ticket, then each of the executor's own
+    answers as an `assistant` turn with the failure that followed as the reply
+    to it — instead of one user message that mutates every attempt. What that
+    buys is the thing the flat shape cannot say: *you wrote these files*. Shown
+    the same files as disk state with no such claim, a model reads its own work
+    as somebody else's and answers "they already implement the spec correctly".
+
+    The flat shape stays the default and stays here rather than in a second
+    function: everything above the failure history is identical, and two copies
+    of the spec block would drift.
+    """
     messages = [Message(role="system", content=EXECUTOR_SYSTEM)]
 
     context = _context_message(ticket, retrieved)
     if context is not None:
         messages.append(context)
+
+    # Its own message, ahead of the ticket, because the gate drops whole
+    # messages and this is one the executor can lose and still do the work.
+    # Without it it sees only the newest failure and can oscillate: a change
+    # that fixes A breaks B, the fix for B brings A back, and three attempts go
+    # by with nothing able to see the cycle.
+    #
+    # Superseded by the turns themselves when there are any: the same failures,
+    # each one attached to the answer that caused it.
+    if prior_failures and not prior_turns:
+        earlier = "\n\n".join(distill(entry, limit=800) for entry in prior_failures)
+        messages.append(
+            Message(
+                role="user",
+                content=f"""{PRIOR_FAILURES_HEADING}
+These already failed. A fix you have tried before will fail the same way
+again — if the newest failure is one you have already seen here, the two
+changes are undoing each other, and you need a third approach that satisfies
+both rather than alternating between them.
+
+{earlier}
+""",
+            )
+        )
 
     body = f"""Ticket: {ticket.ticket_id} — {ticket.title}
 
@@ -287,29 +338,13 @@ here rather than assuming them.
 {_sources_block(reference)}
 """
 
+    tail = ""
     if failure_context:
-        body += f"""
+        tail += f"""
 ## Your previous attempt failed verification
 Fix the cause. Do not work around the check.
 
 {failure_context}
-"""
-
-    if prior_failures:
-        # Without this the executor sees only the newest failure and can
-        # oscillate: a change that fixes A breaks B, the fix for B brings A
-        # back, and three attempts go by with nothing able to see the cycle.
-        earlier = "\n\n".join(
-            distill(entry, limit=800) for entry in prior_failures
-        )
-        body += f"""
-## Earlier attempts on this ticket, oldest first
-These already failed. A fix you have tried before will fail the same way
-again — if the newest failure is one you have already seen here, the two
-changes are undoing each other, and you need a third approach that satisfies
-both rather than alternating between them.
-
-{earlier}
 """
 
     if malformed:
@@ -318,7 +353,7 @@ both rather than alternating between them.
         # rather than being folded in with the verification failures above: the
         # implementation may be perfectly good and nothing about it should
         # change, which is the opposite of what "your attempt failed" invites.
-        body += f"""
+        tail += f"""
 ## Your last answer could not be read, and nothing was written
 {malformed}
 
@@ -327,8 +362,43 @@ code to fix this — the code was never the problem, and changing it now loses
 work that may already have been correct.
 """
 
-    body += "\nImplement this now."
-    messages.append(Message(role="user", content=body))
+    if not prior_turns:
+        messages.append(Message(role="user", content=body + tail + "\nImplement this now."))
+        return messages
+
+    # The ticket as it was first asked, unchanged by what happened next: this
+    # is the turn the executor already answered, and rewriting it now would
+    # make its own replies look like answers to a question nobody asked.
+    messages.append(Message(role="user", content=body + "\nImplement this now."))
+
+    for reply, failed in prior_turns[:-1]:
+        messages.append(Message(role="assistant", content=reply))
+        messages.append(
+            Message(
+                role="user",
+                content=f"{PRIOR_ATTEMPT_HEADING}\n{distill(failed, limit=800)}",
+            )
+        )
+
+    last_reply, last_failed = prior_turns[-1]
+    messages.append(Message(role="assistant", content=last_reply))
+    # The newest failure is the instruction for this attempt, so it is stated
+    # in full and outside the droppable headings. `failure_context` is the same
+    # failure the loop has in hand; the stored one stands in when a caller has
+    # not passed it.
+    newest = tail or f"""
+## Your previous attempt failed verification
+Fix the cause. Do not work around the check.
+
+{last_failed}
+"""
+    messages.append(
+        Message(
+            role="user",
+            content=newest
+            + "\nReturn the complete files again, in the format above.",
+        )
+    )
     return messages
 
 
@@ -509,6 +579,10 @@ def review_prompt(
     if context is not None:
         messages.append(context)
 
+    verdicts = _prior_verdicts_message(prior_verdicts)
+    if verdicts is not None:
+        messages.append(verdicts)
+
     body = f"""Ticket: {ticket.ticket_id} — {ticket.title}
 
 ## Spec
@@ -556,13 +630,28 @@ judge the criteria against it, exactly as if it were in the diff.
 {_sources_block(unchanged)}
 """
 
-    if prior_verdicts:
-        earlier = "\n\n".join(
-            f"### Attempt {index}\n{verdict.strip()}"
-            for index, verdict in enumerate(prior_verdicts, start=1)
-        )
-        body += f"""
-## You have already rejected this ticket
+    messages.append(Message(role="user", content=body))
+    return messages
+
+
+def _prior_verdicts_message(prior_verdicts: Sequence[str]) -> Message | None:
+    """The reviewer's own earlier rejections, in a message the gate may drop.
+
+    Kept out of the body deliberately. This block is the only one that grows
+    with every attempt, and while it was part of the ticket message a ticket
+    that accumulated enough rejection text overflowed the window and came back
+    `blocked` — a hard stop, for the crime of having been reviewed too often.
+    Trimming costs the reviewer some memory; blocking costs the ticket.
+    """
+    if not prior_verdicts:
+        return None
+    earlier = "\n\n".join(
+        f"### Attempt {index}\n{verdict.strip()}"
+        for index, verdict in enumerate(prior_verdicts, start=1)
+    )
+    return Message(
+        role="user",
+        content=f"""{PRIOR_VERDICTS_HEADING}
 {earlier}
 
 Read these before deciding. If the objection you raised has been addressed,
@@ -571,10 +660,8 @@ before, which ends the ticket in three rounds over three unrelated points. If
 the same defect is still there, say so plainly and in the same terms: a
 rejection that repeats is evidence the spec is wrong rather than the code, and
 saying it in those words is what gets that noticed.
-"""
-
-    messages.append(Message(role="user", content=body))
-    return messages
+""",
+    )
 
 
 # The headings `review_prompt` writes into its own body. Listed here so
@@ -799,6 +886,14 @@ Rules:
   to fix, and a spec that contradicts the harness makes the ticket impossible:
   one told the executor not to use code fences, when a fence is the only thing
   the parser can read. Say it in the rationale instead.
+- A spec may state a decision as well as a requirement — "randomness is a
+  xorshift32 seeded from JavaScript", under a heading saying it is settled.
+  Copy every such sentence back into the revised spec, in its own words. They
+  are not criteria, so nothing downstream checks them: drop one and the ticket
+  goes green against a choice nobody made. If the failures show a decision is
+  the problem, say so in the rationale — that is a human's call, not yours.
+- `context` is appended to the plan's, never written over it. It carries rules
+  the executor needs on every attempt, and they are not yours to retire.
 - If the failures show the work simply was not finished — no recurring theme,
   no ambiguity, nothing the spec could have prevented — say so by returning
   the ticket essentially unchanged with a rationale explaining why.
@@ -886,6 +981,14 @@ should undo rather than build on.
 ### Original acceptance criteria
 {_criteria_block(ticket, ticket.original_criteria)}
 """
+        if ticket.original_context.strip():
+            body += f"""
+### Original context
+This paragraph is the plan's, and it is kept whatever you return: anything you
+write in `context` is appended to it, not put in its place.
+
+{ticket.original_context.strip()}
+"""
 
     if sources:
         body += f"""
@@ -923,9 +1026,13 @@ applied to it:
   put back, and the attempt to change it reported.
 - Criteria under **Added by an earlier revision** are the loop's own. Revise
   them, or leave them out to retire them, if the evidence says they were wrong.
-- Anything else you list is added. Add a criterion when the failures show
-  behavior nobody asked for, or when the spec requires something no criterion
-  checks. Never add one to describe a bug the attempts happened to produce.
+- Anything else you list is added. A criterion that restates a sentence of the
+  spec is kept: the reviewer is given the spec and enforces it either way, so
+  writing it down raises no bar, it only makes an existing demand checkable.
+  Quote the spec's own wording when you do that — the closer the two are, the
+  more reliably it is recognised as a restatement rather than a new demand.
+  A criterion the spec does not state is refused. Never add one to describe a
+  bug the attempts happened to produce.
 
 Omit `criteria` entirely to leave them exactly as they are.
 

@@ -289,6 +289,55 @@ def _claims(ticket: Ticket) -> list[tuple[str, str]]:
     return units
 
 
+# A heading — markdown or a bold line standing alone — that opens a run of
+# decisions rather than requirements.
+_DECISION_HEADING = re.compile(
+    r"(?:design\s+)?decisions?\b|already\s+(?:made|decided|settled)|"
+    r"do\s+not\s+revisit|non-?negotiable",
+    re.IGNORECASE,
+)
+
+_HEADING_LINE = re.compile(r"^\s*(?:#{1,6}\s+\S|\*\*[^*]+\*\*\s*:?\s*$)")
+
+# "Decision: the PRNG is xorshift32", "- **Decision:** ..." — a single line
+# marked on its own, for a spec with no room for a section.
+_DECISION_LINE = re.compile(r"^\s*(?:[-*+]\s*)?\**\s*decisions?\b\**\s*:", re.IGNORECASE)
+
+
+def _sentences(line: str) -> list[str]:
+    return [part.strip() for part in re.split(r"(?<=[.:;])\s+", line) if part.strip()]
+
+
+def plan_decisions(text: str) -> list[str]:
+    """Sentences the plan marked as decided rather than required.
+
+    A plan can put load-bearing choices in prose — "randomness is a xorshift32
+    seeded from JavaScript" — under a heading that says they are settled. The
+    criteria ratchet does not cover them: they are not criteria, so respec may
+    revise them away, and it did. One ticket's spec went from naming xorshift32
+    to "an internal deterministic PRNG", an LCG shipped, every criterion passed
+    and the reviewer was right to accept it. The decision a human wrote down
+    was gone and nothing downstream could tell.
+
+    Recognised two ways, because a plan may have room for a section or only for
+    a line: everything under a heading about decisions, and any single line that
+    marks itself. Anything else in the spec stays freely revisable — this
+    protects what was labelled, not prose in general.
+    """
+    found: list[str] = []
+    in_block = False
+    for line in text.splitlines():
+        if _DECISION_LINE.match(line):
+            found.extend(_sentences(line))
+            continue
+        if _HEADING_LINE.match(line):
+            in_block = bool(_DECISION_HEADING.search(line))
+            continue
+        if in_block and line.strip():
+            found.extend(_sentences(line))
+    return list(dict.fromkeys(found))
+
+
 def graph_problems(tickets: list[Ticket]) -> list[str]:
     """Everything wrong with the dependency graph, in human terms.
 

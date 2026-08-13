@@ -65,6 +65,9 @@ from .providers import (
 )
 from .prompts import (
     CONTEXT_HEADING,
+    PRIOR_ATTEMPT_HEADING,
+    PRIOR_FAILURES_HEADING,
+    PRIOR_VERDICTS_HEADING,
     build_prompt,
     parse_record,
     parse_verdict,
@@ -93,6 +96,32 @@ from .state import (
 
 # Consecutive memory failures before the loop stops trying for this run.
 MEMORY_FAILURE_LIMIT = 3
+
+# Message prefixes the budget gate may drop to make a prompt fit. Everything a
+# role is judged on — the spec, the criteria, the diff — is outside this list
+# and stays whatever the window costs.
+_DROPPABLE_HEADINGS = (
+    CONTEXT_HEADING,
+    PRIOR_FAILURES_HEADING,
+    PRIOR_VERDICTS_HEADING,
+    PRIOR_ATTEMPT_HEADING,
+)
+
+
+def _droppable(message: Message) -> bool:
+    """Whether the budget gate may leave this message out to make a prompt fit.
+
+    Everything a role is judged on — the spec, the criteria, the diff, the
+    newest failure — is outside this and stays whatever the window costs.
+
+    An executor's own replayed answer goes too, and its half of the exchange
+    may be dropped without the feedback that followed it. That is a turn short
+    of a conversation, not a lie: it degrades to what the flat prompt has
+    always shown, which is the failure with no answer attached.
+    """
+    if message.role == "assistant":
+        return True
+    return message.role == "user" and message.content.startswith(_DROPPABLE_HEADINGS)
 
 CONTROL_KEY = "command"
 CONTROL_RUN = "run"
@@ -145,9 +174,12 @@ class Orchestrator:
         # Tickets that got a test file, and tickets that were told they should
         # not have one. Individually a skip is routine; every ticket in a run
         # skipping is a misconfiguration, and it presents as a quiet `info`
-        # line per ticket rather than as anything wrong. See `_finish`.
-        self._tests_authored = 0
-        self._tests_skipped = 0
+        # line per ticket rather than as anything wrong. Held as ids rather
+        # than counts because a ticket that ends green having authored nothing
+        # was checked by reading rather than by running, and `_finish` says
+        # which ones those were. See `_report_test_coverage`.
+        self._tests_authored: set[str] = set()
+        self._tests_skipped: set[str] = set()
 
     # ------------------------------------------------------------------
     # Project memory
@@ -362,10 +394,14 @@ class Orchestrator:
             provider,
             messages,
             max_output=max_tokens,
-            # Only the context block is droppable, and it is identified by the
-            # same constant that writes it — a literal here would silently stop
-            # matching the day the heading is reworded.
-            droppable=lambda m: m.role == "user" and m.content.startswith(CONTEXT_HEADING),
+            # Retrieved context and history are droppable; the spec and the
+            # criteria are not. Each block is identified by the same constant
+            # that writes it — a literal here would silently stop matching the
+            # day a heading is reworded. The gate drops in message order, and
+            # the prompts put context ahead of history, so a prompt that has to
+            # lose something loses retrieved memory before it loses the record
+            # of what has already been tried.
+            droppable=_droppable,
         )
 
         while True:
@@ -728,18 +764,57 @@ class Orchestrator:
         routine `info` line per ticket. A run once degraded to review-only
         after its second ticket and said nothing that read as wrong.
         """
+        self._report_unexecuted(run_id)
         if not self.config.commands.get("test") or self._tests_authored:
             return
         if not self._tests_skipped:
             return
         self.store.log(
             run_id,
-            f"No ticket in this run authored tests ({self._tests_skipped} "
+            f"No ticket in this run authored tests ({len(self._tests_skipped)} "
             f"skipped) while a test command is configured. Verification ran on "
             f"review alone. Check that `commands.test` and the files the "
             f"tickets write are the same language.",
             level="warn",
             kind="lifecycle",
+        )
+
+    def _report_unexecuted(self, run_id: int) -> None:
+        """Name the tickets that went green without anything being run.
+
+        A ticket that authors no tests is checked at review, against its
+        criteria — and criteria for a browser shell are often satisfiable by a
+        text search. One read `web/main.js` calls `WebAssembly.instantiateStreaming`,
+        which was true of code that threw on the next line: the backlog was
+        green, the suite was 36 tests, and the page loaded to an empty board.
+        Nothing in the pipeline could have caught it, and nothing said so.
+
+        This does not test anything new. It says what the green did not cover,
+        which is what would have pointed a human at the two files worth opening
+        by hand.
+        """
+        review_only = self._tests_skipped - self._tests_authored
+        if not review_only:
+            return
+        named = sorted(
+            ticket.ticket_id
+            for ticket in self.store.list_tickets(run_id)
+            if ticket.status == TICKET_DONE and ticket.ticket_id in review_only
+        )
+        if not named:
+            return
+        subject = "It authored" if len(named) == 1 else "None of them authored"
+        them = "it" if len(named) == 1 else "them"
+        self.store.log(
+            run_id,
+            f"{', '.join(named)} passed on review alone. {subject} no tests and "
+            f"nothing the test command runs covers {them}, so the criteria were "
+            f"checked by reading the diff rather than by running anything. A "
+            f"criterion a text search can satisfy is also satisfied by code that "
+            f"never executes — open {them} by hand before trusting this run.",
+            level="warn",
+            kind="lifecycle",
+            data={"review_only": named},
         )
 
     def _reopen_stale(self, run_id: int) -> list[str]:
@@ -1264,6 +1339,29 @@ class Orchestrator:
         history: list[str] = []
         rejections: list[str] = []
 
+        # Seeded from the step log on a retry cycle. Both lists are locals, and
+        # a cycle enters here fresh — so cycle 2's reviewer met a ticket it had
+        # already rejected three times as though for the first time, re-raised
+        # the same objections, and the "a rejection that repeats means the spec
+        # is wrong" nudge never fired, because `prior_verdicts` was empty
+        # exactly when it mattered. Same for the executor and its own failures.
+        if ticket.attempt_base:
+            history = [
+                f"Earlier cycle, {item['name']} failed:\n{item['detail']}"
+                for item in self.store.ticket_failures(
+                    run_id, ticket.ticket_id, limit=self._PRIOR_FAILURES
+                )
+            ]
+            # Stripped on the way in for the same reason the live list is: this
+            # goes straight into the next reviewer's prompt, and a verdict
+            # carrying the prompt's own headings offers them back for copying.
+            rejections = [
+                strip_prompt_echo(verdict)
+                for verdict in self.store.ticket_rejections(
+                    run_id, ticket.ticket_id, limit=self._PRIOR_VERDICTS
+                )
+            ]
+
         while ticket.attempts < self.config.loop.max_attempts:
             ticket.attempts += 1
             self.store.update_ticket(run_id, ticket)
@@ -1354,6 +1452,11 @@ class Orchestrator:
     # to expose an A-then-B-then-A cycle without crowding the spec out of the
     # window; the full history is in the step log either way.
     _PRIOR_FAILURES = 2
+    # Earlier rejections shown to the reviewer, for the same reason and with
+    # the same ceiling. Uncapped, this was the one block that grew with every
+    # attempt: three is enough to show an objection repeating, which is the
+    # signal the block exists for.
+    _PRIOR_VERDICTS = 3
 
     def _scope_guidance(
         self, ticket: Ticket, rejected: list[str], *, total_loss: bool
@@ -1495,6 +1598,18 @@ class Orchestrator:
             )
             return StepResult(ok=False, blocked=True, detail=detail)
 
+        # Rebuilt from the step log on every call, so the transport stays
+        # stateless and a retry cycle inherits the thread — the daemon's state
+        # machine remains the only state machine. Empty unless the flag is set,
+        # which keeps the flat prompt the default.
+        prior_turns = (
+            self.store.ticket_turns(
+                run_id, ticket.ticket_id, limit=self.config.loop.executor_turns
+            )
+            if self.config.loop.executor_turns
+            else []
+        )
+
         step_id = self.store.start_step(run_id, ticket.ticket_id, "build")
         # A reply that did not parse into files is a formatting mistake, not a
         # failed implementation, and spending a whole attempt on one buys
@@ -1521,6 +1636,7 @@ class Orchestrator:
                         sources,
                         prior_failures=prior_failures,
                         malformed=malformed,
+                        prior_turns=prior_turns,
                     ),
                     max_tokens=self._output_budget("executor"),
                 )
@@ -1668,9 +1784,9 @@ class Orchestrator:
             # launder the previous attempt's mistakes into a rule.
             example = self._example_test(written + [test_path], suffix)
         if ticket.criteria and test_path:
-            self._tests_authored += 1
+            self._tests_authored.add(ticket.ticket_id)
         if ticket.criteria and no_tests_because:
-            self._tests_skipped += 1
+            self._tests_skipped.add(ticket.ticket_id)
         if ticket.criteria and no_tests_because:
             # Not a failure. The criteria are still checked at review, which is
             # the right place for "the build script takes a --release flag" or
@@ -1919,7 +2035,7 @@ class Orchestrator:
                     # them a reviewer can object to X, get X fixed, then object
                     # to Y it never raised — three attempts, three unrelated
                     # objections, and no signal that the spec was the problem.
-                    prior_verdicts=list(rejections or []),
+                    prior_verdicts=list(rejections or [])[-self._PRIOR_VERDICTS :],
                     state=state,
                     unchanged=invisible,
                 ),
