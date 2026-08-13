@@ -65,6 +65,8 @@ from .providers import (
 )
 from .prompts import (
     CONTEXT_HEADING,
+    PRIOR_FAILURES_HEADING,
+    PRIOR_VERDICTS_HEADING,
     build_prompt,
     parse_record,
     parse_verdict,
@@ -93,6 +95,15 @@ from .state import (
 
 # Consecutive memory failures before the loop stops trying for this run.
 MEMORY_FAILURE_LIMIT = 3
+
+# Message prefixes the budget gate may drop to make a prompt fit. Everything a
+# role is judged on — the spec, the criteria, the diff — is outside this list
+# and stays whatever the window costs.
+_DROPPABLE_HEADINGS = (
+    CONTEXT_HEADING,
+    PRIOR_FAILURES_HEADING,
+    PRIOR_VERDICTS_HEADING,
+)
 
 CONTROL_KEY = "command"
 CONTROL_RUN = "run"
@@ -362,10 +373,15 @@ class Orchestrator:
             provider,
             messages,
             max_output=max_tokens,
-            # Only the context block is droppable, and it is identified by the
-            # same constant that writes it — a literal here would silently stop
-            # matching the day the heading is reworded.
-            droppable=lambda m: m.role == "user" and m.content.startswith(CONTEXT_HEADING),
+            # Retrieved context and history are droppable; the spec and the
+            # criteria are not. Each block is identified by the same constant
+            # that writes it — a literal here would silently stop matching the
+            # day a heading is reworded. The gate drops in message order, and
+            # the prompts put context ahead of history, so a prompt that has to
+            # lose something loses retrieved memory before it loses the record
+            # of what has already been tried.
+            droppable=lambda m: m.role == "user"
+            and m.content.startswith(_DROPPABLE_HEADINGS),
         )
 
         while True:
@@ -1354,6 +1370,11 @@ class Orchestrator:
     # to expose an A-then-B-then-A cycle without crowding the spec out of the
     # window; the full history is in the step log either way.
     _PRIOR_FAILURES = 2
+    # Earlier rejections shown to the reviewer, for the same reason and with
+    # the same ceiling. Uncapped, this was the one block that grew with every
+    # attempt: three is enough to show an objection repeating, which is the
+    # signal the block exists for.
+    _PRIOR_VERDICTS = 3
 
     def _scope_guidance(
         self, ticket: Ticket, rejected: list[str], *, total_loss: bool
@@ -1919,7 +1940,7 @@ class Orchestrator:
                     # them a reviewer can object to X, get X fixed, then object
                     # to Y it never raised — three attempts, three unrelated
                     # objections, and no signal that the spec was the problem.
-                    prior_verdicts=list(rejections or []),
+                    prior_verdicts=list(rejections or [])[-self._PRIOR_VERDICTS :],
                     state=state,
                     unchanged=invisible,
                 ),

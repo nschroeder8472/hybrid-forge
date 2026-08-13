@@ -17,7 +17,7 @@ verified against surviving data that is said plainly.
 `fix/protect-plan-authored-context`, unverified against a run — they were
 written from run 5's evidence and are covered by tests, not by a replay.
 
-Still open: 2.3, 3.1, 3.3, 3.6, and the conditional 2.4 and 4.1. A clean
+Still open: 3.1, 3.3, 3.6, and the conditional 2.4 and 4.1. A clean
 run from an empty repository — no drifted specs carried over — is the validation
 that has not been done yet.
 
@@ -739,7 +739,15 @@ not against surviving data.
 
 ---
 
-### 2.3 Cap the prior-verdict block and make it droppable
+### 2.3 Cap the prior-verdict block and make it droppable — **done**
+
+Both history blocks now travel as their own user message, because the gate
+drops whole messages and these were inside the ticket body. `review_prompt`
+emits `PRIOR_VERDICTS_HEADING` and `build_prompt` emits
+`PRIOR_FAILURES_HEADING`, both after the context message and before the ticket,
+so the drop order is memory, then history, and never the spec. `_PRIOR_VERDICTS
+= 3` caps what the reviewer is shown, which is what keeps trimming a last
+resort rather than a routine.
 
 **Problem.** `rejections` is uncapped (`forge/loop.py:1130`, appended at
 `1775-1776`) while `prior_failures` is capped at two (`_PRIOR_FAILURES`,
@@ -1149,11 +1157,11 @@ land too — one branch to push when the backlog is green.
 | — | 1.8 | Done — unreadable reply reprompted once |
 | — | 1.9 | Done — heading-decorated path line read |
 | — | 3.2, 3.5 | Done — context anchored, marked decisions protected |
-| 1 | 2.3 | Prerequisite for 3.3 |
-| 2 | 3.3 | Information architecture; wants 2.3's caps first |
-| 3 | 3.6 | Reporting only — says what a green ticket did not prove |
-| 4 | 3.1 | Deliberately loosens a guard; wants a stable baseline |
-| 5 | 2.4, 4.1 | Conditional and experimental |
+| — | 2.3 | Done — history is its own droppable message, capped at three |
+| 1 | 3.3 | Information architecture; wants 2.3's caps first |
+| 2 | 3.6 | Reporting only — says what a green ticket did not prove |
+| 3 | 3.1 | Deliberately loosens a guard; wants a stable baseline |
+| 4 | 2.4, 4.1 | Conditional and experimental |
 
 1.6 is a decision, not a code change, and should be settled before the next
 baseline run.

@@ -38,7 +38,7 @@ from forge.ingest import (
 )
 from forge.ingest import ingest as ingest_document
 from forge.respec import _merge_criteria, _refuse_protocol_edits
-from forge.loop import Orchestrator, StepResult
+from forge.loop import _DROPPABLE_HEADINGS, Orchestrator, StepResult
 from forge.patch import (
     describe_unparsed,
     duplicate_paths,
@@ -4403,41 +4403,155 @@ class TestWritableFilesAreNeverAbridged(unittest.TestCase):
         self.assertEqual(called, [])
 
 
+def _joined(messages) -> str:
+    """Every message in a prompt as one string.
+
+    History now travels in its own message so the budget gate can drop it, so
+    asserting against the last message alone would test where a block sits
+    rather than whether the role is told.
+    """
+    return "\n\n".join(message.content for message in messages)
+
+
+class TestHistoryIsTrimmedRatherThanBlocking(unittest.TestCase):
+    """The rejection block was the one part of a prompt that grew without
+    bound, and it was not droppable. A ticket that accumulated enough rejection
+    text overflowed the window, and `ContextOverflow` becomes `blocked=True` —
+    a hard stop for the crime of having been reviewed too often. Not reachable
+    at `maxAttempts: 3`; reachable the moment that is raised, and sooner on a
+    small single-model window."""
+
+    class _Model(Provider):
+        kind = "stub"
+
+        def __init__(self, window: int):
+            super().__init__("local", {})
+            self._window = window
+
+        def complete(self, messages, *, max_tokens, temperature=0.2, timeout=600):
+            raise NotImplementedError
+
+        def capabilities(self):
+            return Capabilities(context_window=self._window, max_output_tokens=256)
+
+        def count_tokens(self, messages):
+            return sum(len(m.content) for m in messages)
+
+    def _fit(self, messages, window):
+        gate = BudgetGate(Store(Path(tempfile.mkdtemp()) / "t.db"), {})
+        return gate.fit(
+            self._Model(window),
+            messages,
+            max_output=256,
+            droppable=lambda m: m.role == "user"
+            and m.content.startswith(_DROPPABLE_HEADINGS),
+        )
+
+    def test_a_long_rejection_history_is_trimmed_rather_than_blocking(self):
+        messages = review_prompt(
+            Ticket("T-1", spec="the spec that must survive"),
+            "diff --git a/x b/x",
+            prior_verdicts=["REJECT: " + "x" * 4000 for _ in range(6)],
+        )
+
+        kept = _joined(self._fit(messages, window=4096))
+
+        self.assertIn("the spec that must survive", kept)
+        self.assertNotIn("already rejected this ticket", kept)
+
+    def test_earlier_failures_are_droppable_too(self):
+        messages = build_prompt(
+            Ticket("T-1", spec="the spec that must survive"),
+            prior_failures=[
+                f"Attempt {index}:\n"
+                + "\n".join(f"error[E{line}]: something is broken" for line in range(60))
+                for index in range(6)
+            ],
+        )
+
+        kept = _joined(self._fit(messages, window=4096))
+
+        self.assertIn("the spec that must survive", kept)
+        self.assertNotIn("Earlier attempts on this ticket", kept)
+
+    def test_retrieved_memory_goes_before_the_history_does(self):
+        # Both are droppable and the gate drops in message order, so the
+        # prompts put context first: what has already been tried is worth more
+        # than what a memory server thought was topical.
+        messages = review_prompt(
+            Ticket("T-1", spec="s", context="a paragraph of retrieved memory. " * 200),
+            "diff",
+            prior_verdicts=["REJECT: the error path is swallowed"],
+        )
+
+        kept = _joined(self._fit(messages, window=4096))
+
+        self.assertNotIn("retrieved memory", kept)
+        self.assertIn("the error path is swallowed", kept)
+
+    def test_the_reviewer_is_shown_a_bounded_number_of_verdicts(self):
+        # Trimming is the gate's last resort; the cap is what keeps it from
+        # being needed. `_PRIOR_FAILURES` has always had one — this is its
+        # counterpart on the side that actually grew.
+        orch, _, run_id = _stub_orchestrator()
+        seen: list[list[Message]] = []
+
+        def call(_run_id, role, messages, **_kwargs):
+            if role == "reviewer":
+                seen.append(messages)
+            return Completion(text="REJECT: still wrong", usage=Usage())
+
+        orch._call = call
+        rejections = [f"REJECT: objection {index}" for index in range(6)]
+
+        orch._attempt(
+            run_id, Ticket("T-1", allowed_files=["src/a.py"]), "", rejections=rejections
+        )
+
+        shown = _joined(seen[-1])
+        self.assertIn("objection 5", shown)
+        self.assertNotIn("objection 0", shown)
+
+
 class TestFailureHistoryReachesBothRoles(unittest.TestCase):
     """`failure_context` carries only the newest failure, which is what lets an
     executor oscillate — fix A breaks B, fix B brings A back — for its whole
     retry budget with nothing able to see the cycle."""
 
     def test_earlier_failures_are_carried_forward_to_the_executor(self):
-        body = build_prompt(
-            Ticket("T-1", spec="s"),
-            "lint failed:\nerror: B is broken",
-            prior_failures=["Attempt 1: lint failed:\nerror: A is broken"],
-        )[-1].content
+        prompt = _joined(
+            build_prompt(
+                Ticket("T-1", spec="s"),
+                "lint failed:\nerror: B is broken",
+                prior_failures=["Attempt 1: lint failed:\nerror: A is broken"],
+            )
+        )
 
-        self.assertIn("A is broken", body)
-        self.assertIn("B is broken", body)
-        self.assertIn("undoing each other", body)
+        self.assertIn("A is broken", prompt)
+        self.assertIn("B is broken", prompt)
+        self.assertIn("undoing each other", prompt)
 
     def test_a_first_attempt_carries_no_history_section(self):
-        body = build_prompt(Ticket("T-1", spec="s"))[-1].content
-        self.assertNotIn("Earlier attempts on this ticket", body)
+        prompt = _joined(build_prompt(Ticket("T-1", spec="s")))
+        self.assertNotIn("Earlier attempts on this ticket", prompt)
 
     def test_the_reviewer_is_shown_its_own_earlier_rejections(self):
-        body = review_prompt(
-            Ticket("T-1", spec="s"),
-            "diff --git a/x b/x",
-            prior_verdicts=["REJECT\nthe error path is swallowed"],
-        )[-1].content
+        prompt = _joined(
+            review_prompt(
+                Ticket("T-1", spec="s"),
+                "diff --git a/x b/x",
+                prior_verdicts=["REJECT\nthe error path is swallowed"],
+            )
+        )
 
-        self.assertIn("the error path is swallowed", body)
+        self.assertIn("the error path is swallowed", prompt)
         # The instruction that stops three attempts dying on three unrelated
         # objections is the whole point of showing them.
-        self.assertIn("do not replace it with a fresh objection", body)
+        self.assertIn("do not replace it with a fresh objection", prompt)
 
     def test_a_first_review_carries_no_prior_verdicts(self):
-        body = review_prompt(Ticket("T-1", spec="s"), "diff")[-1].content
-        self.assertNotIn("already rejected", body)
+        prompt = _joined(review_prompt(Ticket("T-1", spec="s"), "diff"))
+        self.assertNotIn("already rejected", prompt)
 
     def test_a_rejection_is_recorded_for_the_next_review(self):
         orch, _, run_id = _stub_orchestrator()

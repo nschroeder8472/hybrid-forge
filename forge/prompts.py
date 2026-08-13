@@ -17,9 +17,17 @@ from .failures import distill
 from .providers import Message
 from .state import Ticket
 
-# The prefix that marks a message as droppable to the budget gate. Memory and
-# ticket context live behind it; the spec never does.
+# The prefixes that mark a message as droppable to the budget gate. Memory and
+# ticket context live behind the first; the spec never does.
 CONTEXT_HEADING = "## Established project context"
+
+# History, carried in its own message so it can be trimmed instead of blocking
+# the ticket. Both are worth having and neither is worth a ticket: an executor
+# without its earlier failures may oscillate, a reviewer without its earlier
+# verdicts may raise a fresh objection — a ticket that will not fit does none
+# of the work at all.
+PRIOR_FAILURES_HEADING = "## Earlier attempts on this ticket, oldest first"
+PRIOR_VERDICTS_HEADING = "## You have already rejected this ticket"
 
 EXECUTOR_SYSTEM = """You are the executor in a plan-and-execute pipeline.
 
@@ -255,6 +263,27 @@ def build_prompt(
     if context is not None:
         messages.append(context)
 
+    # Its own message, ahead of the ticket, because the gate drops whole
+    # messages and this is one the executor can lose and still do the work.
+    # Without it it sees only the newest failure and can oscillate: a change
+    # that fixes A breaks B, the fix for B brings A back, and three attempts go
+    # by with nothing able to see the cycle.
+    if prior_failures:
+        earlier = "\n\n".join(distill(entry, limit=800) for entry in prior_failures)
+        messages.append(
+            Message(
+                role="user",
+                content=f"""{PRIOR_FAILURES_HEADING}
+These already failed. A fix you have tried before will fail the same way
+again — if the newest failure is one you have already seen here, the two
+changes are undoing each other, and you need a third approach that satisfies
+both rather than alternating between them.
+
+{earlier}
+""",
+            )
+        )
+
     body = f"""Ticket: {ticket.ticket_id} — {ticket.title}
 
 ## Spec
@@ -293,23 +322,6 @@ here rather than assuming them.
 Fix the cause. Do not work around the check.
 
 {failure_context}
-"""
-
-    if prior_failures:
-        # Without this the executor sees only the newest failure and can
-        # oscillate: a change that fixes A breaks B, the fix for B brings A
-        # back, and three attempts go by with nothing able to see the cycle.
-        earlier = "\n\n".join(
-            distill(entry, limit=800) for entry in prior_failures
-        )
-        body += f"""
-## Earlier attempts on this ticket, oldest first
-These already failed. A fix you have tried before will fail the same way
-again — if the newest failure is one you have already seen here, the two
-changes are undoing each other, and you need a third approach that satisfies
-both rather than alternating between them.
-
-{earlier}
 """
 
     if malformed:
@@ -509,6 +521,10 @@ def review_prompt(
     if context is not None:
         messages.append(context)
 
+    verdicts = _prior_verdicts_message(prior_verdicts)
+    if verdicts is not None:
+        messages.append(verdicts)
+
     body = f"""Ticket: {ticket.ticket_id} — {ticket.title}
 
 ## Spec
@@ -556,13 +572,28 @@ judge the criteria against it, exactly as if it were in the diff.
 {_sources_block(unchanged)}
 """
 
-    if prior_verdicts:
-        earlier = "\n\n".join(
-            f"### Attempt {index}\n{verdict.strip()}"
-            for index, verdict in enumerate(prior_verdicts, start=1)
-        )
-        body += f"""
-## You have already rejected this ticket
+    messages.append(Message(role="user", content=body))
+    return messages
+
+
+def _prior_verdicts_message(prior_verdicts: Sequence[str]) -> Message | None:
+    """The reviewer's own earlier rejections, in a message the gate may drop.
+
+    Kept out of the body deliberately. This block is the only one that grows
+    with every attempt, and while it was part of the ticket message a ticket
+    that accumulated enough rejection text overflowed the window and came back
+    `blocked` — a hard stop, for the crime of having been reviewed too often.
+    Trimming costs the reviewer some memory; blocking costs the ticket.
+    """
+    if not prior_verdicts:
+        return None
+    earlier = "\n\n".join(
+        f"### Attempt {index}\n{verdict.strip()}"
+        for index, verdict in enumerate(prior_verdicts, start=1)
+    )
+    return Message(
+        role="user",
+        content=f"""{PRIOR_VERDICTS_HEADING}
 {earlier}
 
 Read these before deciding. If the objection you raised has been addressed,
@@ -571,10 +602,8 @@ before, which ends the ticket in three rounds over three unrelated points. If
 the same defect is still there, say so plainly and in the same terms: a
 rejection that repeats is evidence the spec is wrong rather than the code, and
 saying it in those words is what gets that noticed.
-"""
-
-    messages.append(Message(role="user", content=body))
-    return messages
+""",
+    )
 
 
 # The headings `review_prompt` writes into its own body. Listed here so
