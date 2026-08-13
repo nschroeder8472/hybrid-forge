@@ -223,6 +223,10 @@ every option, every alternative, and the full security discussion. The daemon is
 stdlib-only Python 3.10+ — a failed `pip install` is a bad way to discover that
 an overnight run never started.
 
+[docs/CONFIG.md](docs/CONFIG.md) is the key-by-key reference for
+`.hybridforge/config.json`, with a populated example at
+[templates/config.sample.json](templates/config.sample.json) to copy from.
+
 [docs/ROADMAP.md](docs/ROADMAP.md) holds what is not built yet and why — the
 bug-report loop first among it.
 

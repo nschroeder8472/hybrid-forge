@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import io
 import json
 import subprocess
@@ -26,7 +27,7 @@ from types import SimpleNamespace
 from forge import cli, modelfiles, respec
 from forge.artifacts import Artifacts
 from forge.budget import BudgetGate, ContextOverflow, RateLimitPolicy
-from forge.config import Config, ConfigError, LoopSettings, UISettings
+from forge.config import ROLES, Config, ConfigError, LoopSettings, UISettings
 from forge.ingest import (
     derive_needs,
     graph_problems,
@@ -61,6 +62,7 @@ from forge.prompts import (
     strip_prompt_echo,
     tests_prompt,
 )
+from forge.providers import build_provider
 from forge.providers.base import (
     Capabilities,
     Completion,
@@ -1071,6 +1073,68 @@ class TestAutomaticRetryCycles(unittest.TestCase):
         ticket = store.list_tickets(run_id)[0]
         self.assertEqual(ticket.status, "failed")
         self.assertEqual(ticket.spec, "old spec")
+
+
+class TestTheSampleConfigStaysHonest(unittest.TestCase):
+    """`templates/config.sample.json` is what a person copies. A sample that
+    does not load is worse than none — it sends the reader hunting through
+    their own edits for a mistake the file shipped with."""
+
+    SAMPLE = Path(__file__).resolve().parents[1] / "templates" / "config.sample.json"
+
+    def _loaded(self) -> Config:
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            self.SAMPLE.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        return Config.load(root)
+
+    def test_it_loads_and_validates(self):
+        config = self._loaded()
+        self.assertEqual(sorted(config.roles), sorted(ROLES))
+        self.assertEqual(config.record_role, "reviewer")
+
+    def test_every_declared_model_can_be_built(self):
+        # Including the one no role uses: it is there to be swapped in, and a
+        # sample that only works until you do that is a trap.
+        config = self._loaded()
+        for name in config.models:
+            provider = build_provider(name, config.model_block(name))
+            self.assertTrue(provider.kind)
+
+    def test_the_spend_caps_are_real_policies(self):
+        config = self._loaded()
+        policies = config.rate_limit_policies()
+        self.assertFalse(policies["claude"].is_empty)
+        self.assertFalse(policies["api"].is_empty)
+
+    def test_it_names_every_loop_setting(self):
+        # The guard that keeps the sample and CONFIG.md from rotting: a knob
+        # added to LoopSettings without a line here fails this test rather
+        # than quietly going undocumented.
+        written = json.loads(self.SAMPLE.read_text(encoding="utf-8"))["loop"]
+        expected = {
+            _camel(field.name) for field in dataclasses.fields(LoopSettings)
+        }
+        self.assertEqual(set(written), expected)
+
+    def test_the_reference_documents_every_loop_setting(self):
+        reference = (
+            Path(__file__).resolve().parents[1] / "docs" / "CONFIG.md"
+        ).read_text(encoding="utf-8")
+
+        missing = [
+            _camel(field.name)
+            for field in dataclasses.fields(LoopSettings)
+            if f"`{_camel(field.name)}`" not in reference
+        ]
+        self.assertEqual(missing, [], "undocumented loop settings")
+
+
+def _camel(name: str) -> str:
+    head, *rest = name.split("_")
+    return head + "".join(part.title() for part in rest)
 
 
 class TestRetryCycleConfig(unittest.TestCase):

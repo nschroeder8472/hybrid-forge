@@ -606,6 +606,11 @@ does what). Any declared model can play any role:
 }
 ```
 
+Every key this file understands is documented in
+[CONFIG.md](CONFIG.md), and a fully populated example — two local endpoints, a
+Claude reviewer with a spend cap, memory, and every `loop` knob spelled out —
+lives at [templates/config.sample.json](../templates/config.sample.json).
+
 Two choices worth making deliberately rather than by default:
 
 **Do not put the executor and reviewer on the same model.** A model reviewing
