@@ -464,7 +464,7 @@ next baseline run, because it changes what TT-002 is actually being asked to do.
 Model choice fixed the acute problem. These make the harness resilient to the
 next weak reviewer rather than dependent on a strong one.
 
-### 2.1 Require cited evidence for every objection
+### 2.1 Require cited evidence for every objection — **done**
 
 **Problem.** `REVIEWER_SYSTEM` (`forge/prompts.py:84-99`) lets the reviewer
 assert an absence without showing what it looked at.
@@ -484,13 +484,20 @@ assert an absence without showing what it looked at.
 or name the identifier it searched for and did not find. An objection without
 either is not a finding.
 
-**Files.** `forge/prompts.py:84-99`.
+**Landed as.** An added clause in `REVIEWER_SYSTEM` requiring a quoted line
+per objection, or the exact text searched for when the objection is that
+something is missing, plus the canvas example as the reason it is not a
+formality. A closing instruction not to restate the sections it was given,
+which is 2.2's problem addressed at the source.
 
-**Risk.** Low. Prompt-only.
+**Risk.** Low. Prompt-only, and it cannot make a correct reviewer worse.
+
+**Not enforced.** The citation is asked for, not checked. Mechanical
+verification is 2.4, still conditional on whether the new reviewer needs it.
 
 ---
 
-### 2.2 Strip harness scaffolding from stored verdicts
+### 2.2 Strip harness scaffolding from stored verdicts — **done**
 
 **Problem.** The reviewer echoed the prompt's own headings back as part of its
 verdict. That text is stored verbatim (`forge/loop.py:1775-1776`) and fed back
@@ -500,13 +507,28 @@ again. The block nests on itself each round.
 **Evidence.** Steps 17 and 24 contain `## You have already rejected this ticket
 / ### Attempt 1 / … Read these before deciding …` inside the stored verdict.
 
-**Fix.** Truncate a verdict at the first known harness heading before storing it
-as a prior verdict. Keep the raw completion in `steps.detail` — that is the
-durable record.
+**Landed as.** `strip_prompt_echo` in `forge/prompts.py`, applied where the
+verdict joins `rejections` in `forge/loop.py`. The headings live beside the
+prompt that writes them so the two cannot drift.
 
-**Files.** `forge/loop.py:1775-1776`.
+Matching is split by how much of a line has to match. The long headings are
+sentences no reviewer writes by accident, so a prefix is enough. `## Spec`,
+`## Diff` and `## Acceptance criteria` are ordinary markdown a reviewer might
+quote out of a README it is reviewing — especially now that 2.1 asks it to quote
+things — so those count only when the line is nothing else.
 
-**Tests.** `test_a_verdict_that_echoes_the_prompt_is_not_fed_back`.
+Only the copy used as a prompt is trimmed. The raw completion stays whole in
+`steps.detail` and in the detail handed to the executor.
+
+**Tests.** `test_a_verdict_that_echoes_the_prompt_is_not_fed_back` end to end,
+plus `TestStrippingThePromptEcho` for the clean verdict, idempotence, a quoted
+heading inside a citation, a wholesale prompt copy, and the empty string.
+
+**Verification gap.** The evidence for this was run 1 steps 17 and 24, and that
+`run.db` was replaced by the run 2 re-run. Scanning every verdict in both
+surviving databases finds 4 recorded and 0 carrying echo — the new reviewer does
+not do it. So the fix is tested against a reconstruction of the observed shape,
+not against surviving data.
 
 **Risk.** Low.
 
@@ -768,7 +790,7 @@ land too — one branch to push when the backlog is green.
 | — | 1.0 | Done — `308fb6a` |
 | — | 1.1, 1.3, 1.4, 3.4 | Done — `88ed838` |
 | — | 1.5 | Done — amnesty now stops at the ticket's own scope |
-| 2 | 2.1, 2.2 | Prompt-only; cheap insurance against the next weak reviewer |
+| — | 2.1, 2.2 | Done — citation required, prompt echo stripped |
 | 3 | 1.2 | Only meaningful once 1.0 can tell empty from unparseable |
 | 4 | 2.3 | Prerequisite for 3.3 |
 | 5 | 3.3, 3.2 | Information architecture; 3.2 carries a migration |

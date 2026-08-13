@@ -54,6 +54,7 @@ from forge.prompts import (
     parse_verdict,
     respec_prompt,
     review_prompt,
+    strip_prompt_echo,
     tests_prompt,
 )
 from forge.providers.base import (
@@ -4107,6 +4108,65 @@ class TestFailureHistoryReachesBothRoles(unittest.TestCase):
 
         self.assertEqual(len(rejections), 1)
         self.assertIn("missing the error path", rejections[0])
+
+    def test_the_reviewer_must_cite_what_it_looked_at(self):
+        # Reviewers reject work that is plainly present — one said a canvas
+        # "does not specify a width of 240 and a height of 480" about a file
+        # whose second line said exactly that, three times running.
+        system = review_prompt(Ticket("T-1", spec="s"), "diff")[0].content
+
+        self.assertIn("EVERY objection must cite", system)
+        self.assertIn("name the exact text", system)
+
+    def test_a_verdict_that_echoes_the_prompt_is_not_fed_back(self):
+        # Observed: the reviewer copied the prompt's own headings into its
+        # verdict, which was then quoted into the next attempt's prompt and
+        # offered for copying again. The block nested on itself every round.
+        orch, _, run_id = _stub_orchestrator()
+        echoed = (
+            "REJECT\nthe error path is swallowed\n\n"
+            "## You have already rejected this ticket\n"
+            "### Attempt 1\n"
+            "REJECT\nsomething else entirely\n\n"
+            "Read these before deciding.\n"
+        )
+        orch._call = _replies("src/a.py\n```python\nx = 1\n```", echoed)
+        rejections: list[str] = []
+
+        orch._attempt(
+            run_id, Ticket("T-1", allowed_files=["src/a.py"]), "", rejections=rejections
+        )
+
+        self.assertEqual(rejections, ["REJECT\nthe error path is swallowed"])
+        self.assertNotIn("already rejected", rejections[0])
+
+
+class TestStrippingThePromptEcho(unittest.TestCase):
+    """What the reviewer wrote survives; what it copied does not."""
+
+    def test_a_clean_verdict_is_untouched(self):
+        verdict = "REJECT\n- `main.js:12` calls game_input(' ') rather than 4."
+        self.assertEqual(strip_prompt_echo(verdict), verdict)
+
+    def test_stripping_is_idempotent(self):
+        once = strip_prompt_echo("ACCEPT\nfine\n\n### Attempt 1\nold\n")
+        self.assertEqual(strip_prompt_echo(once), once)
+
+    def test_a_quoted_heading_inside_a_citation_survives(self):
+        # 2.1 asks the reviewer to quote what it looked at, and what it looked
+        # at may be a README. An ordinary markdown heading in a citation is not
+        # an echo of the prompt.
+        verdict = "REJECT\nREADME.md line 8 reads:\n  ## Building\nwhich never mentions rustup."
+        self.assertEqual(strip_prompt_echo(verdict), verdict)
+
+    def test_a_wholesale_copy_of_the_prompt_keeps_only_the_verdict(self):
+        self.assertEqual(
+            strip_prompt_echo("ACCEPT\nlooks right\n\n## Spec\nbuild the thing\n"),
+            "ACCEPT\nlooks right",
+        )
+
+    def test_an_empty_verdict_survives_the_trip(self):
+        self.assertEqual(strip_prompt_echo(""), "")
 
 
 class TestEmptyDiffShowsState(unittest.TestCase):

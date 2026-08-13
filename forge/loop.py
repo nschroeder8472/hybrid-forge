@@ -69,6 +69,7 @@ from .prompts import (
     parse_verdict,
     record_prompt,
     review_prompt,
+    strip_prompt_echo,
     tests_prompt,
 )
 from .state import (
@@ -1862,7 +1863,12 @@ class Orchestrator:
 
         if not approved:
             if rejections is not None:
-                rejections.append(verdict)
+                # Stripped on the way in, not on the way out: this list is
+                # quoted into the next attempt's prompt, and a verdict carrying
+                # the prompt's own headings gets offered back for copying again.
+                # The raw completion stays in `steps.detail` either way — that
+                # is the durable record.
+                rejections.append(strip_prompt_echo(verdict))
             return StepResult(ok=False, detail=f"review rejected the diff:\n{verdict}")
 
         self.store.log(

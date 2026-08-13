@@ -93,9 +93,25 @@ Check specifically:
 - No silent scope creep, dropped error handling, or swallowed exceptions.
 - Nothing contradicts the established project context, when any is supplied.
 
+EVERY objection must cite what you looked at. Quote the line you are objecting
+to, or — when you are objecting that something is missing — name the exact text
+you searched for and did not find. An objection with neither is not a finding,
+and you must not raise it.
+
+This is not a formality. Reviewers reject work that is plainly present: one
+said a canvas "does not specify a width of 240 and a height of 480" about a
+file whose second line read `<canvas id="board" width="240" height="480">`, and
+said it three times. Quoting first is what catches that before you send it.
+Search the material you were given for the thing you are about to call missing,
+and if you find it, you have no objection.
+
 Begin your reply with exactly one word on its own line: ACCEPT or REJECT.
-Then give your reasoning, shortest decisive point first. Reject when a
-criterion is unmet or the diff does something the spec did not ask for.
+Then give your reasoning, shortest decisive point first, each point carrying
+its citation. Reject when a criterion is unmet or the diff does something the
+spec did not ask for.
+
+Write only your verdict and your reasoning. Do not restate the sections you
+were given — no `## Spec`, no `## Diff`, no repetition of earlier attempts.
 """
 
 
@@ -543,6 +559,48 @@ saying it in those words is what gets that noticed.
 
     messages.append(Message(role="user", content=body))
     return messages
+
+
+# The headings `review_prompt` writes into its own body. Listed here so
+# `strip_prompt_echo` cannot drift from the prompt it is cleaning up after.
+#
+# Split by how much of a line has to match. The long ones are sentences no
+# reviewer writes by accident, so a prefix is safe. The short ones are ordinary
+# markdown a reviewer might legitimately quote out of a README it is reviewing,
+# so they only count as an echo when the line is nothing else.
+_ECHOED_SECTIONS = (
+    "## The diff is empty",
+    "## Written by this attempt",
+    "## You have already rejected this ticket",
+    "### Attempt ",
+)
+_ECHOED_EXACTLY = ("## Spec", "## Acceptance criteria", "## Diff")
+
+
+def strip_prompt_echo(verdict: str) -> str:
+    """Cut a verdict at the first heading the reviewer copied out of its prompt.
+
+    A rejection is fed back to the next attempt as a prior verdict, so anything
+    left in it is quoted into the following prompt and offered for copying
+    again. One reviewer echoed `## You have already rejected this ticket`,
+    complete with the attempt it was shown and the paragraph telling it not to
+    invent fresh objections; the block then nested on itself every round.
+
+    Only the tail is dropped, and only from the copy used as a prompt. The
+    verdict itself comes first — the format requires the ACCEPT/REJECT line at
+    the top — so cutting at the first heading keeps every word the reviewer
+    actually wrote about the code. The raw completion is kept whole in the step
+    log regardless.
+    """
+    lines = (verdict or "").splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        echoed = stripped in _ECHOED_EXACTLY or any(
+            stripped.startswith(heading) for heading in _ECHOED_SECTIONS
+        )
+        if echoed:
+            return "\n".join(lines[:index]).strip()
+    return (verdict or "").strip()
 
 
 def parse_verdict(text: str) -> tuple[bool, str]:
