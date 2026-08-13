@@ -7,6 +7,16 @@ completed. Every file anchor below is against `hybrid-forge` at `961b06b`.
 The run failed for four independent reasons that compounded. Ordered here by
 what unblocks what, not by severity.
 
+**Status.** Everything in Phase 1, plus 2.1, 2.2, 3.4 and 1.6, has landed on
+`fix/loop-repair`. As of run 5 the `alllocal` backlog completes: all six tickets
+`done`, lint and typecheck clean, 36 tests passing across four files. Each fix
+below records what it was replayed against, and where a fix could not be
+verified against surviving data that is said plainly.
+
+Still open: 2.3, 3.1, 3.2, 3.3, 3.5, and the conditional 2.4 and 4.1. A clean
+run from an empty repository — no drifted specs carried over — is the validation
+that has not been done yet.
+
 ---
 
 ## Phase 0 — Baseline: done
@@ -260,6 +270,18 @@ third ask, and the attempt should end while the evidence is fresh.
 Replayed over every build response recorded in run 4: **8 replies now get a
 second ask, 11 proceed unchanged** — six of the eight are TT-003's.
 
+**How it actually performed.** On its first outing it fired four times and
+recovered nothing: TT-003's failure was a *stable* shape, `#### src/game.rs`,
+and a model told its path line is missing has nothing to act on when it does not
+experience that line as missing. That is 1.9, and it is the fix that mattered
+for TT-003.
+
+The reprompt still earns its place. Once 1.9 landed, TT-003's winning attempt
+opened with an unreadable reply, was asked again, and passed review on the
+second — a transient slip, which is what this is for. The lesson is the split: a
+reprompt answers a slip, a parser change answers a shape. Check whether the
+failure repeats before reaching for the prompt.
+
 **Tests.** `TestAnUnreadableReplyIsAskedForAgain` — recovery on the second ask
 with the complaint and the do-not-rewrite instruction present, a readable reply
 never asked twice, two failures spending the attempt, and one case each for
@@ -267,6 +289,42 @@ blocked, empty, and partial.
 
 **Risk.** Low-moderate. Worst case doubles the build calls in an attempt, which
 is the trade for not spending the attempt itself.
+
+---
+
+### 1.9 A path line that arrived as a markdown heading — **done** (`4cd209c`)
+
+**Found in run 5.** TT-003 spent thirteen replies across four cycles emitting
+
+```
+#### src/game.rs
+```rust
+use crate::board::Board;
+```
+
+above a correct implementation, and was told each time that its response
+contained a fenced code block with no file path before it. The 1.8 reprompt did
+not help: the model does not experience `#### src/game.rs` as a missing path, so
+being told the path is missing gives it nothing to change.
+
+**Landed as.** The path line in `_BLOCK` now tolerates a leading markdown
+heading and bold markers, beside the backticks and `File:` labels it already
+took. Decorations around the path are the harness's to absorb; the executor
+getting them exactly right was never the part that mattered.
+
+Replayed over every build response recorded to that point: **13 previously
+unreadable replies parse, 16 parse identically, 0 gain a phantom edit.** All 13
+are TT-003's.
+
+**Risk.** This widens the rule enough that a heading naming a file — `##
+README.md` in a document — could be read as a path. That only arises in prose
+being rescanned after a fence closed early, and 1.0 withholds such text rather
+than applying it. A test asserts `### Using build.ps1 (Windows)` is still not a
+path.
+
+**Outcome.** TT-003 passed on its next attempt, after nineteen. TT-004 followed
+in one. The backlog went green: lint and typecheck clean, 36 tests passing
+across four files, every file the plan asked for on disk.
 
 ---
 
@@ -917,6 +975,47 @@ planner/tester/reviewer single-turn. Compare against the same backlog.
 
 ---
 
+---
+
+### 3.5 A design decision in spec prose has no protection — **open**
+
+**Found in run 5, in a backlog that passed.** `plan.md` opens with a section
+headed *"Design decisions, already made — implement them, do not revisit them"*,
+and one of them is:
+
+> **Randomness** is a xorshift32 seeded from JavaScript
+
+TT-003's spec now says "an internal deterministic PRNG". Respec's rationale:
+
+> "The spec incorrectly pinned the PRNG algorithm to xorshift32 while tests only
+> require determinism"
+
+What shipped is a Numerical Recipes LCG:
+
+```rust
+self.state = self.state.wrapping_mul(1664525).wrapping_add(1013904223);
+```
+
+It is deterministic, it satisfies every criterion, and the reviewer accepted it
+correctly, because no criterion names xorshift. The ticket is green and the
+decision a human wrote down is gone.
+
+This is the criteria ratchet's blind spot, exactly inverted from 3.1. The
+ratchet protects criteria from being weakened; nothing protects a design
+decision stated in prose. Respec observed that the criteria are the real
+contract and revised the spec to match them — locally reasonable, globally
+wrong, and invisible because everything downstream agreed.
+
+Related to 1.7 (respec editing what was not its to edit) and to 3.2 (protecting
+plan-authored context). 3.2 should be widened from context to spec prose: keep
+`original_spec` as the anchor it already is, and refuse a revision that drops a
+sentence the plan marked as a decision rather than a requirement.
+
+Worth noting the ordering problem this exposes. Every guard so far assumed the
+criteria are the contract and the spec explains it. A plan can also put load-
+bearing decisions in the spec, and the harness has no way to tell those from
+commentary.
+
 ## Suggested landing order
 
 Revised after run 2. 1.0 moves to the front — it destroys files, and it is
@@ -937,7 +1036,9 @@ land too — one branch to push when the backlog is green.
 | — | 1.2 | Done — empty reply reviewed against disk |
 | — | 1.7 | Done — respec cannot describe the reply format |
 | — | 1.8 | Done — unreadable reply reprompted once |
-| 1 | 2.3 | Prerequisite for 3.3 |
+| — | 1.9 | Done — heading-decorated path line read |
+| 1 | 3.2 | Now also covers spec prose — see 3.5 |
+| 2 | 2.3 | Prerequisite for 3.3 |
 | 5 | 3.3, 3.2 | Information architecture; 3.2 carries a migration |
 | 6 | 3.1 | Deliberately loosens a guard; wants a stable baseline |
 | 7 | 2.4, 4.1 | Conditional and experimental |
