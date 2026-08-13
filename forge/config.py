@@ -107,6 +107,22 @@ class LoopSettings:
     # it off when a full suite is slow enough that paying it per ticket costs
     # more than the attempts it saves.
     baseline_verify: bool = True
+    # Prior attempts replayed to the executor as real conversation turns — its
+    # own reply as an `assistant` message, the failure that followed as the
+    # next `user` one — capped at this many. 0 keeps the single-message shape.
+    #
+    # Off by default because it is an experiment with a known risk in both
+    # directions. The executor has never seen its own output: it is shown the
+    # files as they exist on disk, with nothing saying it wrote them, which is
+    # the state that produced "Looking at the files provided, I can see they
+    # already implement the spec correctly." As a conversation that confusion
+    # cannot arise, and the turns append rather than mutate, so the KV prefix
+    # stays stable instead of being re-prefilled every attempt. Against that:
+    # a model shown its own wrong answer as an assistant turn defends it more
+    # readily. The current shape already anchors through disk state, so the
+    # trade is not clean either way — which is why this is measured on a
+    # backlog rather than switched on.
+    executor_turns: int = 0
 
 
 @dataclass
@@ -185,6 +201,7 @@ class Config:
             poll_seconds=float(loop.get("pollSeconds", 2.0)),
             max_runtime_seconds=int(loop.get("maxRuntimeSeconds", 0)),
             baseline_verify=bool(loop.get("baselineVerify", True)),
+            executor_turns=int(loop.get("executorTurns", 0)),
         )
 
         ui = data.get("ui", {}) or {}
@@ -208,6 +225,12 @@ class Config:
                 f"loop.retryCycles is {self.loop.retry_cycles}; expected 0 (hand "
                 f"back to a human), a positive count, or -1 (retry until the "
                 f"backlog is clean or the run is stopped)."
+            )
+        if self.loop.executor_turns < 0:
+            raise ConfigError(
+                f"loop.executorTurns is {self.loop.executor_turns}; expected 0 "
+                f"(the single-message prompt) or the number of prior attempts "
+                f"to replay to the executor as conversation turns."
             )
         for role in ROLES:
             name = self.roles.get(role)
@@ -299,6 +322,7 @@ class Config:
                 "pollSeconds": self.loop.poll_seconds,
                 "maxRuntimeSeconds": self.loop.max_runtime_seconds,
                 "baselineVerify": self.loop.baseline_verify,
+                "executorTurns": self.loop.executor_turns,
             },
             "ui": {"host": self.ui.host, "port": self.ui.port, "enabled": self.ui.enabled},
         }

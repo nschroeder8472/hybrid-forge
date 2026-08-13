@@ -29,6 +29,10 @@ CONTEXT_HEADING = "## Established project context"
 PRIOR_FAILURES_HEADING = "## Earlier attempts on this ticket, oldest first"
 PRIOR_VERDICTS_HEADING = "## You have already rejected this ticket"
 
+# The feedback turn in a conversational executor prompt, for every attempt but
+# the newest. Marked so the gate can drop an old exchange whole.
+PRIOR_ATTEMPT_HEADING = "## That attempt failed"
+
 EXECUTOR_SYSTEM = """You are the executor in a plan-and-execute pipeline.
 
 A senior engineer has already made the design decisions. Implement the spec
@@ -256,7 +260,22 @@ def build_prompt(
     *,
     prior_failures: Sequence[str] = (),
     malformed: str = "",
+    prior_turns: Sequence[tuple[str, str]] = (),
 ) -> list[Message]:
+    """The executor's prompt, in one of two shapes.
+
+    `prior_turns` selects the second. Given `(reply, what failed)` pairs it
+    writes a real exchange — the ticket, then each of the executor's own
+    answers as an `assistant` turn with the failure that followed as the reply
+    to it — instead of one user message that mutates every attempt. What that
+    buys is the thing the flat shape cannot say: *you wrote these files*. Shown
+    the same files as disk state with no such claim, a model reads its own work
+    as somebody else's and answers "they already implement the spec correctly".
+
+    The flat shape stays the default and stays here rather than in a second
+    function: everything above the failure history is identical, and two copies
+    of the spec block would drift.
+    """
     messages = [Message(role="system", content=EXECUTOR_SYSTEM)]
 
     context = _context_message(ticket, retrieved)
@@ -268,7 +287,10 @@ def build_prompt(
     # Without it it sees only the newest failure and can oscillate: a change
     # that fixes A breaks B, the fix for B brings A back, and three attempts go
     # by with nothing able to see the cycle.
-    if prior_failures:
+    #
+    # Superseded by the turns themselves when there are any: the same failures,
+    # each one attached to the answer that caused it.
+    if prior_failures and not prior_turns:
         earlier = "\n\n".join(distill(entry, limit=800) for entry in prior_failures)
         messages.append(
             Message(
@@ -316,8 +338,9 @@ here rather than assuming them.
 {_sources_block(reference)}
 """
 
+    tail = ""
     if failure_context:
-        body += f"""
+        tail += f"""
 ## Your previous attempt failed verification
 Fix the cause. Do not work around the check.
 
@@ -330,7 +353,7 @@ Fix the cause. Do not work around the check.
         # rather than being folded in with the verification failures above: the
         # implementation may be perfectly good and nothing about it should
         # change, which is the opposite of what "your attempt failed" invites.
-        body += f"""
+        tail += f"""
 ## Your last answer could not be read, and nothing was written
 {malformed}
 
@@ -339,8 +362,43 @@ code to fix this — the code was never the problem, and changing it now loses
 work that may already have been correct.
 """
 
-    body += "\nImplement this now."
-    messages.append(Message(role="user", content=body))
+    if not prior_turns:
+        messages.append(Message(role="user", content=body + tail + "\nImplement this now."))
+        return messages
+
+    # The ticket as it was first asked, unchanged by what happened next: this
+    # is the turn the executor already answered, and rewriting it now would
+    # make its own replies look like answers to a question nobody asked.
+    messages.append(Message(role="user", content=body + "\nImplement this now."))
+
+    for reply, failed in prior_turns[:-1]:
+        messages.append(Message(role="assistant", content=reply))
+        messages.append(
+            Message(
+                role="user",
+                content=f"{PRIOR_ATTEMPT_HEADING}\n{distill(failed, limit=800)}",
+            )
+        )
+
+    last_reply, last_failed = prior_turns[-1]
+    messages.append(Message(role="assistant", content=last_reply))
+    # The newest failure is the instruction for this attempt, so it is stated
+    # in full and outside the droppable headings. `failure_context` is the same
+    # failure the loop has in hand; the stored one stands in when a caller has
+    # not passed it.
+    newest = tail or f"""
+## Your previous attempt failed verification
+Fix the cause. Do not work around the check.
+
+{last_failed}
+"""
+    messages.append(
+        Message(
+            role="user",
+            content=newest
+            + "\nReturn the complete files again, in the format above.",
+        )
+    )
     return messages
 
 

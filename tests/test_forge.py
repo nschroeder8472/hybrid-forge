@@ -40,7 +40,7 @@ from forge.ingest import (
 )
 from forge.ingest import ingest as ingest_document
 from forge.respec import _merge_criteria, _refuse_protocol_edits
-from forge.loop import _DROPPABLE_HEADINGS, Orchestrator, StepResult
+from forge.loop import _DROPPABLE_HEADINGS, _droppable, Orchestrator, StepResult
 from forge.patch import (
     describe_unparsed,
     duplicate_paths,
@@ -1095,6 +1095,20 @@ class TestRetryCycleConfig(unittest.TestCase):
         config = self._load({})
         self.assertEqual(config.loop.retry_cycles, 0)
         self.assertTrue(config.loop.respec_on_retry)
+
+    def test_the_conversational_executor_is_off_by_default(self):
+        self.assertEqual(self._load({}).loop.executor_turns, 0)
+
+    def test_the_turn_count_is_read_and_survives_a_write(self):
+        config = self._load({"executorTurns": 2})
+        self.assertEqual(config.loop.executor_turns, 2)
+        config.write()
+        self.assertEqual(Config.load(config.root).loop.executor_turns, 2)
+
+    def test_a_negative_turn_count_is_rejected(self):
+        # Nothing sensible to mean by it, and clamping would hide the typo.
+        with self.assertRaises(ConfigError):
+            self._load({"executorTurns": -1})
 
     def test_both_knobs_are_read(self):
         config = self._load({"retryCycles": -1, "respecOnRetry": False})
@@ -4814,6 +4828,167 @@ class TestHistoryIsTrimmedRatherThanBlocking(unittest.TestCase):
         shown = _joined(seen[-1])
         self.assertIn("objection 5", shown)
         self.assertNotIn("objection 0", shown)
+
+
+class TestTheExecutorCanSeeItsOwnAnswers(unittest.TestCase):
+    """The executor has never seen its own output. It is handed the spec, the
+    files as they exist on disk and the failures — with nothing anywhere saying
+    that it wrote those files. That is the state behind "Looking at the files
+    provided, I can see they already implement the spec correctly": a model
+    reading its own work as somebody else's. Behind `loop.executorTurns`,
+    because a model shown its own wrong answer as an assistant turn also
+    defends it more readily, and which effect wins is a measurement."""
+
+    TURNS = [
+        ("src/a.py\n```python\nx = 1\n```", "lint failed: x is unused"),
+        ("src/a.py\n```python\nx = 2\n```", "review rejected: still wrong"),
+    ]
+
+    def test_each_answer_is_replayed_as_the_executors_own_turn(self):
+        messages = build_prompt(Ticket("T-1", spec="s"), prior_turns=self.TURNS)
+
+        assistants = [m.content for m in messages if m.role == "assistant"]
+        self.assertEqual(assistants, [reply for reply, _ in self.TURNS])
+
+    def test_the_ticket_is_asked_once_and_not_rewritten_by_what_followed(self):
+        # The executor already answered this turn. Editing it now would make
+        # its own replies look like answers to a question nobody asked.
+        messages = build_prompt(
+            Ticket("T-1", spec="s"), "the newest failure", prior_turns=self.TURNS
+        )
+
+        first_user = next(m for m in messages if m.role == "user")
+        self.assertIn("## Spec", first_user.content)
+        self.assertNotIn("the newest failure", first_user.content)
+
+    def test_the_newest_failure_is_the_last_word(self):
+        messages = build_prompt(
+            Ticket("T-1", spec="s"), "the newest failure", prior_turns=self.TURNS
+        )
+
+        self.assertEqual(messages[-1].role, "user")
+        self.assertIn("the newest failure", messages[-1].content)
+        self.assertIn("Return the complete files again", messages[-1].content)
+
+    def test_the_stored_failure_stands_in_when_no_context_is_passed(self):
+        messages = build_prompt(Ticket("T-1", spec="s"), prior_turns=self.TURNS)
+        self.assertIn("review rejected: still wrong", messages[-1].content)
+
+    def test_the_flat_failure_block_is_superseded_by_the_turns(self):
+        # The same failures, each one now attached to the answer that caused
+        # it. Printing both spends the window to say it twice.
+        messages = build_prompt(
+            Ticket("T-1", spec="s"),
+            prior_failures=["Attempt 1: lint failed"],
+            prior_turns=self.TURNS,
+        )
+
+        self.assertNotIn("Earlier attempts on this ticket", _joined(messages))
+
+    def test_an_old_exchange_is_droppable_and_the_newest_one_is_not(self):
+        messages = build_prompt(
+            Ticket("T-1", spec="s"), "the newest failure", prior_turns=self.TURNS
+        )
+
+        # system, ticket, [answer 1, its failure], answer 2, newest failure
+        roles = [m.role for m in messages]
+        self.assertEqual(roles, ["system", "user", "assistant", "user", "assistant", "user"])
+        self.assertEqual(
+            [_droppable(m) for m in messages],
+            [False, False, True, True, True, False],
+        )
+
+
+class TestTurnsAreRebuiltFromTheStepLog(unittest.TestCase):
+    """Held in SQLite rather than in the attempt loop, so the transport stays
+    stateless and a retry cycle inherits the thread."""
+
+    def _store(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        return store, store.create_run("goal")
+
+    def _attempt(self, store, run_id, reply, failure, *, name="review"):
+        step = store.start_step(run_id, "T-1", "build")
+        store.end_step(step, "ok" if reply else "failed", reply)
+        if failure:
+            step = store.start_step(run_id, "T-1", name)
+            store.end_step(step, "failed", failure)
+
+    def test_a_reply_is_paired_with_the_failure_that_followed_it(self):
+        store, run_id = self._store()
+        self._attempt(store, run_id, "first answer", "lint failed")
+        self._attempt(store, run_id, "second answer", "review rejected")
+
+        turns = store.ticket_turns(run_id, "T-1", limit=2)
+
+        self.assertEqual([reply for reply, _ in turns], ["first answer", "second answer"])
+        self.assertIn("lint failed", turns[0][1])
+
+    def test_a_reply_with_no_failure_after_it_is_dropped(self):
+        # An attempt can end without a failed step — a reply the harness could
+        # not read is refused before anything runs. Pairing it with the next
+        # failure would tell the executor its code caused something it never
+        # reached.
+        store, run_id = self._store()
+        self._attempt(store, run_id, "unreadable answer", "")
+        self._attempt(store, run_id, "second answer", "review rejected")
+
+        turns = store.ticket_turns(run_id, "T-1", limit=4)
+
+        self.assertEqual([reply for reply, _ in turns], ["second answer"])
+
+    def test_only_the_last_few_turns_are_kept(self):
+        store, run_id = self._store()
+        for index in range(5):
+            self._attempt(store, run_id, f"answer {index}", f"failure {index}")
+
+        turns = store.ticket_turns(run_id, "T-1", limit=2)
+
+        self.assertEqual([reply for reply, _ in turns], ["answer 3", "answer 4"])
+
+    def test_a_ticket_that_has_not_run_has_no_turns(self):
+        store, run_id = self._store()
+        self.assertEqual(store.ticket_turns(run_id, "T-1"), [])
+
+
+class TestConversationalExecutorIsOffUntilAskedFor(unittest.TestCase):
+    """A flag, and an experiment. The flat prompt stays the default."""
+
+    def _run(self, turns: int):
+        orch, _root, run_id = _stub_orchestrator()
+        orch.config.loop.max_attempts = 2
+        orch.config.loop.executor_turns = turns
+        seen: list[list[Message]] = []
+
+        def call(_run_id, role, messages, **_kwargs):
+            if role == "executor":
+                seen.append(messages)
+            return Completion(
+                text={
+                    "executor": "src/a.py\n```python\nx = 1\n```",
+                    "tester": "tests/t_1_test.py\n```python\ndef test_a(): pass\n```",
+                }.get(role, "REJECT\nthe error path is swallowed"),
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        orch._call = call
+        orch._work_ticket(run_id, Ticket("T-1", allowed_files=["src/a.py"]))
+        return seen
+
+    def test_off_by_default_nothing_is_replayed(self):
+        seen = self._run(turns=0)
+
+        self.assertEqual(len(seen), 2, "the ticket should have had two attempts")
+        self.assertEqual([m.role for m in seen[-1] if m.role == "assistant"], [])
+
+    def test_on_the_second_attempt_reads_its_own_answer(self):
+        seen = self._run(turns=2)
+
+        second = seen[-1]
+        assistants = [m.content for m in second if m.role == "assistant"]
+        self.assertEqual(assistants, ["src/a.py\n```python\nx = 1\n```"])
+        self.assertIn("the error path is swallowed", second[-1].content)
 
 
 class TestARetryCycleRemembersWhatFailed(unittest.TestCase):

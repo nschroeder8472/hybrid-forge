@@ -17,7 +17,7 @@ verified against surviving data that is said plainly.
 `fix/protect-plan-authored-context`, unverified against a run — they were
 written from run 5's evidence and are covered by tests, not by a replay.
 
-Still open: the conditional 2.4 and 4.1. A clean
+Still open: the conditional 2.4, and the measurement 4.1 asks for. A clean
 run from an empty repository — no drifted specs carried over — is the validation
 that has not been done yet.
 
@@ -996,6 +996,23 @@ backticks — which feeds the 1.1 false positives.
 
 An experiment, not a fix. Run it only against a green Phase 1–3 baseline.
 
+**Built — `loop.executorTurns`, default 0.** `Store.ticket_turns` rebuilds the
+exchange from `steps` on every call: each `build` step's reply paired with the
+step that failed next. A reply with no failure after it is dropped rather than
+paired with the next one along — an attempt can end without a failed step, and
+attaching that reply to a later failure would tell the executor its code caused
+something it never reached. `build_prompt` writes the ticket once, then each
+answer as an `assistant` turn with its failure as the reply to it, and the
+newest failure as the last word. Old exchanges are droppable, the newest failure
+is not, and the flat `prior_failures` block is suppressed when turns are present
+— it is the same failures, each now attached to the answer that caused it.
+
+Executor only. Planner, tester and reviewer keep single-turn prompts; a reviewer
+inheriting the executor's turns stops being an independent check.
+
+**Not measured.** The comparison the section asks for — same backlog, flag on
+and off, watching for anchoring — has not been run.
+
 **Premise.** The daemon-owned state machine is right and does not change. What
 is separable is *prompt shape*: the daemon can reconstruct a multi-turn message
 list from SQLite on every call. Stateless transport, conversational shape, no
@@ -1215,7 +1232,8 @@ land too — one branch to push when the backlog is green.
 | — | 3.3 | Done — both lists seeded from the step log on a retry cycle |
 | — | 3.6 | Done — a review-only ticket is named at run end |
 | — | 3.1 | Done — spec-entailed criteria admitted, `forge criteria` adopts the rest |
-| 1 | 2.4, 4.1 | Conditional and experimental |
+| — | 4.1 | Built behind `loop.executorTurns`; unmeasured |
+| 1 | 2.4 | Conditional on the reviewer still fabricating |
 
 1.6 is a decision, not a code change, and should be settled before the next
 baseline run.

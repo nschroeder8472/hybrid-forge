@@ -807,6 +807,30 @@ the attempts it saves:
 "loop": { "maxAttempts": 3, "baselineVerify": false }
 ```
 
+**`executorTurns`** (default `0`, off) replays that many prior attempts to the
+executor as real conversation turns — its own reply as an `assistant` message,
+the failure that followed as the next `user` one — instead of one user message
+rewritten every attempt. What it buys is the one thing the flat prompt cannot
+say: *you wrote these files*. Shown the same files as disk state with nothing
+claiming authorship, a model reads its own work as somebody else's and answers
+"they already implement the spec correctly". Turns also append rather than
+mutate, so the KV prefix stays stable instead of being re-prefilled each time —
+which matters most with a single local model loaded.
+
+It is off because the trade is not clean: a model shown its own wrong answer as
+an assistant turn defends it more readily, and the flat prompt already anchors
+that way through disk state. Which effect wins is a measurement, so run the same
+backlog both ways rather than assuming:
+
+```json
+"loop": { "maxAttempts": 3, "executorTurns": 2 }
+```
+
+Nothing else changes. The conversation is rebuilt from `run.db` on every call,
+so transport stays stateless, a retry cycle inherits the thread, and the planner,
+tester and reviewer keep their single-turn prompts — a reviewer that inherited
+the executor's turns would stop being an independent check.
+
 Then confirm every model actually answers:
 
 ```bash

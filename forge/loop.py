@@ -65,6 +65,7 @@ from .providers import (
 )
 from .prompts import (
     CONTEXT_HEADING,
+    PRIOR_ATTEMPT_HEADING,
     PRIOR_FAILURES_HEADING,
     PRIOR_VERDICTS_HEADING,
     build_prompt,
@@ -103,7 +104,24 @@ _DROPPABLE_HEADINGS = (
     CONTEXT_HEADING,
     PRIOR_FAILURES_HEADING,
     PRIOR_VERDICTS_HEADING,
+    PRIOR_ATTEMPT_HEADING,
 )
+
+
+def _droppable(message: Message) -> bool:
+    """Whether the budget gate may leave this message out to make a prompt fit.
+
+    Everything a role is judged on — the spec, the criteria, the diff, the
+    newest failure — is outside this and stays whatever the window costs.
+
+    An executor's own replayed answer goes too, and its half of the exchange
+    may be dropped without the feedback that followed it. That is a turn short
+    of a conversation, not a lie: it degrades to what the flat prompt has
+    always shown, which is the failure with no answer attached.
+    """
+    if message.role == "assistant":
+        return True
+    return message.role == "user" and message.content.startswith(_DROPPABLE_HEADINGS)
 
 CONTROL_KEY = "command"
 CONTROL_RUN = "run"
@@ -383,8 +401,7 @@ class Orchestrator:
             # the prompts put context ahead of history, so a prompt that has to
             # lose something loses retrieved memory before it loses the record
             # of what has already been tried.
-            droppable=lambda m: m.role == "user"
-            and m.content.startswith(_DROPPABLE_HEADINGS),
+            droppable=_droppable,
         )
 
         while True:
@@ -1581,6 +1598,18 @@ class Orchestrator:
             )
             return StepResult(ok=False, blocked=True, detail=detail)
 
+        # Rebuilt from the step log on every call, so the transport stays
+        # stateless and a retry cycle inherits the thread — the daemon's state
+        # machine remains the only state machine. Empty unless the flag is set,
+        # which keeps the flat prompt the default.
+        prior_turns = (
+            self.store.ticket_turns(
+                run_id, ticket.ticket_id, limit=self.config.loop.executor_turns
+            )
+            if self.config.loop.executor_turns
+            else []
+        )
+
         step_id = self.store.start_step(run_id, ticket.ticket_id, "build")
         # A reply that did not parse into files is a formatting mistake, not a
         # failed implementation, and spending a whole attempt on one buys
@@ -1607,6 +1636,7 @@ class Orchestrator:
                         sources,
                         prior_failures=prior_failures,
                         malformed=malformed,
+                        prior_turns=prior_turns,
                     ),
                     max_tokens=self._output_budget("executor"),
                 )

@@ -603,6 +603,50 @@ class Store:
             failures.append({"name": row["name"], "detail": detail})
         return failures[-limit:]
 
+    def ticket_turns(
+        self, run_id: int, ticket_id: str, limit: int = 2
+    ) -> list[tuple[str, str]]:
+        """Prior attempts as `(what the executor replied, what failed)`, oldest first.
+
+        The executor has never seen its own output. It is handed the spec, the
+        files as they exist on disk, and the failures — with nothing anywhere
+        saying that it wrote those files. That is the state behind "Looking at
+        the files provided, I can see they already implement the spec
+        correctly": a model reading its own work as somebody else's.
+
+        Both halves of each turn are already durable. The build step keeps the
+        raw reply, and the step that failed next keeps why. Rebuilding the
+        conversation here rather than holding it in the attempt loop is what
+        keeps the daemon's state machine the only state machine: transport
+        stays stateless, the shape is conversational, and a retry cycle
+        inherits the thread the same way `ticket_failures` inherits failures.
+
+        A reply with no failure after it is dropped rather than paired with the
+        next one along. An attempt can end without a failed step — a reply the
+        harness could not read is refused before anything runs — and attaching
+        that reply to a later, unrelated failure would tell the executor its
+        code caused something it never reached.
+        """
+        rows = self._connection.execute(
+            "SELECT name, status, detail FROM steps "
+            "WHERE run_id = ? AND ticket_id = ? ORDER BY id",
+            (run_id, ticket_id),
+        ).fetchall()
+
+        turns: list[tuple[str, str]] = []
+        reply = ""
+        for row in rows:
+            if row["name"] == "build":
+                # A new build ends the previous turn whatever came of it, so an
+                # unpaired reply is discarded here rather than carried forward.
+                reply = row["detail"] if row["status"] == "ok" else ""
+                continue
+            if not reply or row["status"] != "failed" or not row["detail"]:
+                continue
+            turns.append((reply, distill(row["detail"], limit=2500)))
+            reply = ""
+        return turns[-limit:] if limit else turns
+
     def ticket_rejections(
         self, run_id: int, ticket_id: str, limit: int = 3
     ) -> list[str]:
