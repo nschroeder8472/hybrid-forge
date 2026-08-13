@@ -768,9 +768,14 @@ def cmd_bug(args: argparse.Namespace) -> int:
     # for. See forge/evidence.py.
     found = evidence.gather(config.root, report)
     if not found:
+        # Says which of the two it is, because the fixes are different: an
+        # empty project is a wrong --root, and a project whose files are all
+        # ignored is a .gitignore doing more than it meant to.
         print(
-            "warning: no repository evidence could be gathered — this may not "
-            "be a git checkout. The ticket will be scoped from the report alone."
+            f"warning: nothing to search in {config.root}. Either that is the "
+            f"wrong directory, or everything in it is ignored. The ticket will "
+            f"be scoped from the report alone, and the planner will probably "
+            f"refuse it."
         )
 
     budget = max(2048, provider.capabilities().max_output_tokens // 4)
@@ -787,7 +792,7 @@ def cmd_bug(args: argparse.Namespace) -> int:
             located = provider.complete(
                 locate_prompt(report, found), max_tokens=budget, temperature=0.0
             )
-            candidates = parse_locate(located.text, evidence.tracked_files(config.root))
+            candidates = parse_locate(located.text, evidence.repo_files(config.root))
         except (ProviderError, ValueError) as exc:
             # Best effort by design: the second pass still has the file list
             # and the grep hits, which is what it had before this existed.

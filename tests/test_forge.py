@@ -4931,7 +4931,7 @@ class TestEvidenceForABugReport(unittest.TestCase):
     def test_the_same_word_in_two_cases_is_searched_once(self):
         self.assertEqual(evidence.terms("`SoftDrop` and softdrop"), ["SoftDrop"])
 
-    def test_it_lists_tracked_files_and_where_the_words_appear(self):
+    def test_it_lists_the_files_and_where_the_words_appear(self):
         gathered = evidence.gather(self._repo(), self.REPORT)
 
         self.assertIn("src/game.rs", gathered)
@@ -4940,7 +4940,45 @@ class TestEvidenceForABugReport(unittest.TestCase):
         # prompt — a planner scoped to target/junk.rs writes a useless ticket.
         self.assertNotIn("junk.rs", gathered)
 
-    def test_a_directory_that_is_not_a_checkout_yields_nothing(self):
+    def test_work_that_was_never_committed_is_still_searched(self):
+        """The case that broke it. `autoCommit` is off by default, so a project
+        the loop has just built is entirely untracked — `git ls-files` reports
+        nothing about it, and the first bug report against fresh work reached
+        the planner with an empty file list and came back "no repository
+        evidence was provided". The report was fine; the search never looked."""
+        root = Path(tempfile.mkdtemp())
+        (root / "src").mkdir()
+        (root / "src" / "game.rs").write_text("fn soft_drop() {}\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=root, capture_output=True, check=False)
+
+        gathered = evidence.gather(root, "`soft_drop` locks too early")
+
+        self.assertIn("src/game.rs", gathered)
+        self.assertIn("soft_drop", gathered)
+
+    def test_a_project_without_git_is_still_searched(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "game.py").write_text("def soft_drop():\n    pass\n", encoding="utf-8")
+
+        gathered = evidence.gather(root, "`soft_drop` locks too early")
+
+        self.assertIn("game.py", gathered)
+        self.assertIn("soft_drop", gathered)
+
+    def test_the_walk_skips_what_a_gitignore_would_have(self):
+        # A listing of node_modules is not evidence, and it would crowd out
+        # everything that is.
+        root = Path(tempfile.mkdtemp())
+        (root / "node_modules" / "dep").mkdir(parents=True)
+        (root / "node_modules" / "dep" / "index.js").write_text("x", encoding="utf-8")
+        (root / "app.js").write_text("function draw() {}\n", encoding="utf-8")
+
+        gathered = evidence.gather(root, "drawing is wrong")
+
+        self.assertIn("app.js", gathered)
+        self.assertNotIn("node_modules", gathered)
+
+    def test_an_empty_directory_yields_nothing(self):
         # An honest empty block. A planner told "here is the evidence" over an
         # invented tree scopes a ticket to files that do not exist.
         self.assertEqual(evidence.gather(Path(tempfile.mkdtemp()), self.REPORT), "")

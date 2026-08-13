@@ -58,15 +58,90 @@ def _git(root: Path, *args: str) -> list[str]:
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
-def tracked_files(root: Path, limit: int = MAX_FILES) -> list[str]:
-    """The repository's tracked files, which is the only list worth showing.
+# Directories and extensions a walk must skip when git is not there to say so.
+# Everything here is either generated, vendored, or not text.
+_SKIP_DIRS = frozenset(
+    """.git .hg .svn node_modules target dist build out vendor .venv venv
+    __pycache__ .mypy_cache .pytest_cache .ruff_cache .tox .next .idea
+    .gradle .terraform coverage htmlcov""".split()
+)
+_SKIP_SUFFIXES = frozenset(
+    """.pyc .pyo .so .dylib .dll .exe .bin .o .a .class .jar .zip .gz .tar .rar
+    .7z .png .jpg .jpeg .gif .bmp .ico .webp .pdf .mp3 .mp4 .mov .wav .ttf
+    .woff .woff2 .eot .wasm .lock .db .sqlite""".split()
+)
+# Big enough for any source file; past it, it is data.
+MAX_SCAN_BYTES = 512_000
 
-    `git ls-files` rather than a walk: it already honours `.gitignore`, so
-    `node_modules`, `target/` and a virtualenv never reach the prompt. A repo
-    that is not a git checkout returns nothing rather than a directory listing
-    of every build artifact it happens to contain.
+
+def repo_files(root: Path, limit: int = MAX_FILES) -> list[str]:
+    """Every source file in the project, tracked or not.
+
+    Untracked matters more here than anywhere else in this codebase. A project
+    the loop has just built is *entirely* untracked — `autoCommit` is off by
+    default, which is the right default and means the work sits in the tree
+    uncommitted. `git ls-files` alone reports nothing about it, so the first
+    bug report filed against fresh work reached the planner with an empty file
+    list and came back "no repository evidence was provided". The report was
+    fine; the search never looked at the code.
+
+    So: tracked files, plus untracked ones git does not ignore, and a plain
+    walk when there is no git at all. The walk skips the directories a
+    `.gitignore` would have — a listing of `node_modules` is not evidence, and
+    it would crowd out everything that is.
     """
-    return sorted(_git(root, "ls-files"))[:limit]
+    found = _git(root, "ls-files")
+    found += _git(root, "ls-files", "--others", "--exclude-standard")
+    if found:
+        return sorted(dict.fromkeys(found))[:limit]
+    return _walk(root, limit)
+
+
+def _walk(root: Path, limit: int = MAX_FILES) -> list[str]:
+    """The project's files without git's help. Never raises."""
+    found: list[str] = []
+    try:
+        for path in sorted(root.rglob("*")):
+            if len(found) >= limit:
+                break
+            if not path.is_file() or path.suffix.lower() in _SKIP_SUFFIXES:
+                continue
+            relative = path.relative_to(root)
+            if any(part in _SKIP_DIRS for part in relative.parts):
+                continue
+            found.append(relative.as_posix())
+    except OSError:
+        return found
+    return found
+
+
+def _read(root: Path, path: str) -> str:
+    """One file's text, or "" if it is not text this can search."""
+    try:
+        candidate = root / path
+        if candidate.stat().st_size > MAX_SCAN_BYTES:
+            return ""
+        return candidate.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _scan(root: Path, files: list[str], match, limit: int) -> list[str]:
+    """Search the project without git, as `path:line: text`.
+
+    The fallback under both searches below. Slower than `git grep`, and
+    unbothered by whether a file has ever been committed — which is the case
+    that matters, because a bug is usually reported against work still sitting
+    in the tree.
+    """
+    found: list[str] = []
+    for path in files:
+        for number, line in enumerate(_read(root, path).splitlines(), start=1):
+            if len(found) >= limit:
+                return found
+            if match(line):
+                found.append(f"{path}:{number}: {line.strip()[:LINE_LIMIT]}")
+    return found
 
 
 # Words in a report worth searching for: a backticked span, something that
@@ -156,6 +231,12 @@ _DEFINITION = (
     r"[[:space:]]+[A-Za-z_]"
 )
 
+# The same rule in Python spelling, for the scan that runs when git cannot.
+_PY_DEFINITION = re.compile(
+    r"^\s*(?:pub\s+|export\s+|public\s+|private\s+|protected\s+|static\s+|async\s+)*"
+    r"(?:def|fn|func|function|class|struct|enum|trait|interface|impl|type)\s+[A-Za-z_]"
+)
+
 MAX_SYMBOLS = 300
 
 # Extensions where a line matching the definition pattern is prose or markup
@@ -174,8 +255,14 @@ def symbol_index(root: Path, limit: int = MAX_SYMBOLS) -> list[str]:
     model — can see that `commit_lines` is where lines and score meet. Grepped
     rather than parsed, because a wrong index is worse than a shallow one.
     """
+    # `--untracked` for the same reason `repo_files` asks for it: the work a
+    # bug is reported against has usually not been committed yet.
+    lines = _git(root, "grep", "-n", "-I", "-E", "--untracked", "--", _DEFINITION)
+    if not lines:
+        lines = _scan(root, repo_files(root), _PY_DEFINITION.match, limit * 4)
+
     found = []
-    for line in _git(root, "grep", "-n", "-I", "-E", "--", _DEFINITION):
+    for line in lines:
         path = line.split(":", 1)[0]
         # `class` and `type` are ordinary words in prose and markup. Filtered
         # here rather than by pathspec so the same call works whatever the
@@ -216,7 +303,10 @@ def hits(root: Path, term: str, limit: int = MAX_HITS) -> list[str]:
     Fixed-string, case-insensitive, and capped. The planner needs enough to
     tell `src/game.rs` from `src/board.rs`, not a concordance.
     """
-    lines = _git(root, "grep", "-n", "-I", "-i", "-F", "--", term)
+    lines = _git(root, "grep", "-n", "-I", "-i", "-F", "--untracked", "--", term)
+    if not lines:
+        wanted = term.lower()
+        lines = _scan(root, repo_files(root), lambda line: wanted in line.lower(), limit)
     trimmed = []
     for line in lines[:limit]:
         trimmed.append(line[:LINE_LIMIT] + ("…" if len(line) > LINE_LIMIT else ""))
@@ -233,7 +323,7 @@ def gather(root: Path, report: str) -> str:
     """
     sections: list[str] = []
 
-    files = tracked_files(root)
+    files = repo_files(root)
     if files:
         listing = "\n".join(files)
         note = (

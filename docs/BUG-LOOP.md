@@ -58,8 +58,12 @@ listed, which is the bridge from the report's words to the code's names: "score
 stops updating" matches no line in a codebase that calls it `commit_lines`, but
 a reader can see where lines and score meet.
 
-Either way the tracked file list comes too, from `git ls-files`, so build output
-and vendored directories never reach the prompt.
+Either way the project's file list comes too — **tracked and untracked**, which
+matters more here than anywhere else: `autoCommit` is off by default, so a
+project the loop has just built is entirely uncommitted, and a search that only
+knew about tracked files found nothing at all in it. Ignored paths are still
+skipped, and a project with no git at all is walked directly, minus the
+directories a `.gitignore` would have named.
 
 **Then it reads.** A first pass hands the planner that evidence and asks one
 question: which files are worth opening? The harness reads the ones it names —
