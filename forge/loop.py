@@ -513,6 +513,13 @@ class Orchestrator:
                 kind="lifecycle",
             )
 
+        unreachable = self._preflight(run_id)
+        if unreachable:
+            self.store.set_run_status(
+                run_id, RUN_FAILED, f"{len(unreachable)} role(s) unreachable"
+            )
+            return RUN_FAILED
+
         # Before the first ticket: a human may have requeued something already
         # green since the last run, and whatever was built on top of it was
         # judged against the version now being replaced.
@@ -685,6 +692,50 @@ class Orchestrator:
             )
             parked += 1
         return parked
+
+    def _preflight(self, run_id: int) -> list[str]:
+        """Probe every configured role before spending a ticket on it.
+
+        `forge doctor` has always caught a dead endpoint in two seconds; `forge
+        go` did not ask, so a missing model produced a full backlog of blocked
+        tickets, a respec pass over each one, and a stop — all reporting
+        whatever the failure looked like from inside the loop rather than what
+        it was. One run blamed six tickets of 1-3k tokens for being "too large
+        for this model" when the model was not on the server at all.
+
+        Each distinct model is probed once, not each role, so the common
+        single-model config costs one call. Returns the model names that did
+        not answer.
+        """
+        if not self.config.loop.preflight:
+            return []
+
+        checked: dict[str, str] = {}
+        for role in sorted(set(self.config.roles)):
+            try:
+                provider = self.config.provider_for(role)
+            except ConfigError as exc:
+                self.store.log(
+                    run_id,
+                    f"Cannot start: the {role} role is not configured — {exc}",
+                    level="error",
+                    kind="lifecycle",
+                )
+                return [role]
+            if provider.name in checked:
+                continue
+            report = provider.health()
+            checked[provider.name] = report
+            if report.startswith("FAIL"):
+                self.store.log(
+                    run_id,
+                    f"Cannot start: the {role} model did not answer. {report} "
+                    f"Nothing has been spent. Fix it and run `forge doctor` to "
+                    f"confirm before starting again.",
+                    level="error",
+                    kind="lifecycle",
+                )
+        return [name for name, report in checked.items() if report.startswith("FAIL")]
 
     def _finish(self, run_id: int) -> str:
         # Order matters here. Parking first turns "pending forever" into a

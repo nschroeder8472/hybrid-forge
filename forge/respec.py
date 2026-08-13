@@ -44,6 +44,10 @@ class Revision:
     # criterion every cycle is the signal that a human should look at whether
     # it is satisfiable at all.
     refused_criteria: list[str] = field(default_factory=list)
+    # Criteria the planner tried to add. Refused while the criteria are
+    # locked: respec runs on a ticket that has just failed, and its job is
+    # to make that ticket satisfiable rather than harder.
+    minted_criteria: list[str] = field(default_factory=list)
     # The planner's report that no revision can make this ticket satisfiable.
     # A complete answer, not a failure to answer — the ticket parks for a human
     # rather than spending another full attempt budget.
@@ -155,7 +159,9 @@ def _order_shared_scope(
     return added
 
 
-def _merge_criteria(ticket: Ticket, proposed: list[str]) -> tuple[list[str], list[str]]:
+def _merge_criteria(
+    ticket: Ticket, proposed: list[str]
+) -> tuple[list[str], list[str], list[str]]:
     """Apply a proposed criteria list under the provenance rule.
 
     Plan-authored criteria survive whatever the planner does; criteria an
@@ -165,8 +171,29 @@ def _merge_criteria(ticket: Ticket, proposed: list[str]) -> tuple[list[str], lis
     the failing party rewrite the standard until it asserted the opposite of
     what a human wrote.
 
-    Returns `(criteria, refused)` — the list to store, and the plan-authored
-    criteria the planner tried to remove, which were put back.
+    Returns `(criteria, refused, minted)` — the list to store, the
+    plan-authored criteria the planner tried to remove and got put back, and
+    the criteria it tried to *add*, which are refused.
+
+    Adding is refused because of when respec runs. It runs on a ticket that
+    has just exhausted its attempts, and its whole purpose is to produce one
+    the next attempt can satisfy; raising the bar at that moment cannot serve
+    that purpose. Left open, the bar only ever rose — one ticket went from the
+    plan's nine criteria to sixteen across six cycles, and the criterion
+    blocking it at the end was one respec had invented two cycles earlier. The
+    party being judged does not get to add to the standard it is judged
+    against, which is the same rule the loop already enforces one level down
+    when it stops the executor writing its own tests.
+
+    A ticket already inflated unwinds on its next revision: the invented
+    criteria are not protected, so they survive only while respec keeps asking
+    for them, and as fresh proposals they are now refused.
+
+    Clarification still has somewhere to go. Respec rewrites `spec` and
+    `context` freely, and that is where a vague requirement belongs — the
+    criteria are the contract, the spec explains it. A revision that needs a
+    new clause in the contract is reporting that the plan was wrong, which is
+    a human's call.
 
     What is protected is the plan's criteria *still on the ticket*, not every
     criterion the plan ever stated. Resurrecting one a human has since removed
@@ -186,14 +213,20 @@ def _merge_criteria(ticket: Ticket, proposed: list[str]) -> tuple[list[str], lis
     for the executor to read as two separate demands.
     """
     original = {_key(c) for c in (ticket.original_criteria or ticket.criteria)}
-    protected = [criterion for criterion in ticket.criteria if _key(criterion) in original]
-    seen = {_key(criterion) for criterion in proposed}
-    refused = [criterion for criterion in protected if _key(criterion) not in seen]
-    kept = {_key(criterion) for criterion in protected}
-    additions = [criterion for criterion in proposed if _key(criterion) not in kept]
+    known = {_key(criterion) for criterion in ticket.criteria}
+    wanted = {_key(criterion) for criterion in proposed}
+
+    protected = [c for c in ticket.criteria if _key(c) in original]
+    refused = [c for c in protected if _key(c) not in wanted]
+    # Criteria an earlier revision invented. Not protected — the loop may take
+    # its own back, and that is how a ticket already inflated returns to the
+    # plan's bar — but kept while respec still asks for them.
+    retained = [c for c in ticket.criteria if _key(c) not in original and _key(c) in wanted]
+    minted = [c for c in proposed if _key(c) not in known]
+
     # Protected criteria first, in the order the ticket already had them, so
     # restoring one never reshuffles the contract a human reads.
-    return protected + additions, refused
+    return protected + retained, refused, minted
 
 
 def revise(
@@ -280,8 +313,11 @@ def revise(
     # Instruction-following is not an access control, so provenance is enforced
     # here rather than merely described in the prompt.
     refused: list[str] = []
+    minted: list[str] = []
     if criteria_locked and "criteria" in revision:
-        revision["criteria"], refused = _merge_criteria(ticket, revision["criteria"])
+        revision["criteria"], refused, minted = _merge_criteria(
+            ticket, revision["criteria"]
+        )
 
     if "criteria" in revision:
         revision["criteria"], pinned = _drop_whole_file_claims(
@@ -314,6 +350,21 @@ def revise(
             kind="ticket",
             data={"restored": refused},
         )
+    if minted:
+        # Surfaced rather than dropped in silence, for the same reason a
+        # restoration is: respec reaching for the same new criterion every
+        # cycle is the plan being underspecified in a nameable way.
+        store.log(
+            run_id,
+            f"{ticket.ticket_id}: respec proposed {len(minted)} criterion(s) the "
+            f"plan does not state; refused. A ticket that keeps failing does not "
+            f"need a higher bar — if these are things it genuinely must do, the "
+            f"plan is what needs changing:\n"
+            + "\n".join(f"  - {criterion}" for criterion in minted[:5]),
+            level="warn",
+            kind="ticket",
+            data={"minted": minted},
+        )
 
     if not changed:
         return Revision(
@@ -321,6 +372,7 @@ def revise(
             rationale=rationale,
             note="planner kept the ticket as written",
             refused_criteria=refused,
+            minted_criteria=minted,
         )
 
     for field_name, value in revision.items():
@@ -353,4 +405,5 @@ def revise(
         changed=changed,
         rationale=rationale,
         refused_criteria=refused,
+        minted_criteria=minted,
     )

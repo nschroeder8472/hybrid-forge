@@ -311,6 +311,8 @@ def cmd_go(args: argparse.Namespace) -> int:
         config.loop.retry_cycles = retries
     if getattr(args, "no_respec", False):
         config.loop.respec_on_retry = False
+    if getattr(args, "no_preflight", False):
+        config.loop.preflight = False
 
     store = _store(config)
 
@@ -785,6 +787,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--plan", default="", help="ingest this spec first, then start")
     p.add_argument("--goal", default="", help="short description, used with --plan")
     p.add_argument("--no-ui", action="store_true", help="do not start the dashboard")
+    p.add_argument(
+        "--no-preflight",
+        action="store_true",
+        help="skip the model probe before the first ticket (default: probe, so "
+        "a dead endpoint fails in seconds instead of one ticket at a time)",
+    )
     p.add_argument("--open", action="store_true", help="open the dashboard in a browser")
     p.add_argument(
         "--retries",
