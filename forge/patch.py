@@ -157,17 +157,22 @@ def parse_output(text: str) -> ParsedOutput:
 
 
 def describe_unparsed(text: str) -> str:
-    """Why a reply yielded no edits, in terms the executor can act on.
+    """What went wrong in a reply that yielded no edits, or `""` if nothing did.
 
     "No file edits" is true of a model that decided there was nothing to do, of
     one that wrote a whole file and forgot the path line, and of one that put
     the path line inside the fence. Those need three different corrections, and
     reporting them identically sent a respec looking for defects in the spec
     when the fix was a missing header line.
+
+    An empty return distinguishes the first from the rest: the reply carries no
+    file content at all, badly formatted or otherwise. That is not necessarily a
+    failure — a ticket whose work is already on disk has nothing to write — so
+    the caller judges it against the criteria rather than spending an attempt.
     """
     if list(_BLOCK.finditer(text)):
         # The caller asked about a reply that did parse. Nothing to add.
-        return "executor returned no file edits"
+        return ""
 
     lines = text.split("\n")
     fenced = any(_FENCE_RUN.match(line) for line in lines)
@@ -210,7 +215,7 @@ def describe_unparsed(text: str) -> str:
             "surrounding fence."
         )
 
-    return "executor returned no file edits"
+    return ""
 
 
 def duplicate_paths(parsed: ParsedOutput) -> list[str]:

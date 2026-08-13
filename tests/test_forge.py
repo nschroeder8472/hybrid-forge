@@ -229,18 +229,17 @@ class TestUnparsedOutput(unittest.TestCase):
         )
         self.assertIn("did not fence their contents", message)
 
-    def test_a_reply_with_nothing_in_it_is_reported_plainly(self):
+    def test_a_reply_carrying_no_file_content_raises_no_complaint(self):
+        # Not a formatting failure — there is nothing here that was meant to be
+        # a file. The caller judges it against the criteria instead of spending
+        # an attempt on it.
         self.assertEqual(
-            describe_unparsed("I have reviewed the files and they look correct."),
-            "executor returned no file edits",
+            describe_unparsed("I have reviewed the files and they look correct."), ""
         )
 
     def test_a_reply_that_parsed_is_not_second_guessed(self):
         fence = "`" * 3
-        self.assertEqual(
-            describe_unparsed(f"a.rs\n{fence}\nx\n{fence}\n"),
-            "executor returned no file edits",
-        )
+        self.assertEqual(describe_unparsed(f"a.rs\n{fence}\nx\n{fence}\n"), "")
 
 
 class TestScopeEnforcement(unittest.TestCase):
@@ -4139,6 +4138,82 @@ class TestFailureHistoryReachesBothRoles(unittest.TestCase):
 
         self.assertEqual(rejections, ["REJECT\nthe error path is swallowed"])
         self.assertNotIn("already rejected", rejections[0])
+
+
+class TestAnExecutorThatWritesNothing(unittest.TestCase):
+    """Disk is never reverted between attempts and the executor is shown the
+    current files, so "there is nothing to change" is sometimes the honest
+    answer. Failing the attempt for it is how a finished ticket failed three
+    times a cycle — one reply read "Looking at the files provided, I can see
+    they already implement the spec correctly." It did."""
+
+    NOTHING = "Looking at the files provided, they already implement the spec."
+
+    def test_an_empty_reply_is_reviewed_against_disk_instead_of_failing(self):
+        orch, root, run_id = _stub_orchestrator()
+        (root / "src").mkdir(parents=True, exist_ok=True)
+        (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        seen: list[str] = []
+
+        def call(_run_id, role, messages, **_kwargs):
+            seen.append(role)
+            if role == "reviewer":
+                return Completion(
+                    text="ACCEPT\nalready satisfied on disk", usage=Usage()
+                )
+            return Completion(text=self.NOTHING, usage=Usage())
+
+        orch._call = call
+        result = orch._attempt(run_id, Ticket("T-1", allowed_files=["src/a.py"]), "")
+
+        self.assertTrue(result.ok)
+        self.assertIn("reviewer", seen)
+
+    def test_the_file_already_there_is_left_alone(self):
+        orch, root, run_id = _stub_orchestrator()
+        (root / "src").mkdir(parents=True, exist_ok=True)
+        (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        orch._call = lambda _r, role, *_a, **_k: Completion(
+            text="ACCEPT\nfine" if role == "reviewer" else self.NOTHING, usage=Usage()
+        )
+
+        orch._attempt(run_id, Ticket("T-1", allowed_files=["src/a.py"]), "")
+
+        self.assertEqual(
+            (root / "src" / "a.py").read_text(encoding="utf-8"), "x = 1\n"
+        )
+
+    def test_no_test_file_is_authored_for_an_attempt_that_wrote_nothing(self):
+        # A test on disk for an attempt that changed nothing is the orphan the
+        # fixed-path rule exists to prevent.
+        orch, _root, run_id = _stub_orchestrator()
+        roles: list[str] = []
+
+        def call(_run_id, role, *_a, **_k):
+            roles.append(role)
+            return Completion(
+                text="ACCEPT\nfine" if role == "reviewer" else self.NOTHING,
+                usage=Usage(),
+            )
+
+        orch._call = call
+        orch._attempt(
+            run_id, Ticket("T-1", allowed_files=["src/a.py"], criteria=["c"]), ""
+        )
+
+        self.assertNotIn("tester", roles)
+
+    def test_a_reply_the_parser_could_not_read_still_fails(self):
+        # The distinction 1.0 drew: content that was meant to be a file, and
+        # arrived unreadable, is a failure and says which shape it was.
+        orch, _root, run_id = _stub_orchestrator()
+        fence = "`" * 3
+        orch._call = _replies(f"{fence}python\nx = 1\n{fence}\n")
+
+        result = orch._attempt(run_id, Ticket("T-1", allowed_files=["src/a.py"]), "")
+
+        self.assertFalse(result.ok)
+        self.assertIn("no file path", result.detail)
 
 
 class TestStrippingThePromptEcho(unittest.TestCase):

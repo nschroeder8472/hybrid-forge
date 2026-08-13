@@ -1495,8 +1495,19 @@ class Orchestrator:
                 ),
             )
 
+        # An empty parse is two different situations. A reply carrying file
+        # content the parser could not read is a failure, and the complaint says
+        # which shape it was. A reply carrying no file content at all may simply
+        # be a ticket whose work is already on disk — the executor is shown the
+        # current files, so "there is nothing to change" is sometimes the honest
+        # answer, and spending an attempt punishing it is how a finished ticket
+        # failed three times a cycle.
+        wrote_nothing = False
         if parsed.is_empty:
-            return StepResult(ok=False, detail=describe_unparsed(completion.text))
+            complaint = describe_unparsed(completion.text)
+            if complaint:
+                return StepResult(ok=False, detail=complaint)
+            wrote_nothing = True
 
         # Two blocks for one path means the response did not parse into the
         # files it describes, and applying it would write the wrong one last.
@@ -1519,43 +1530,51 @@ class Orchestrator:
             )
 
         # --- APPLY ---------------------------------------------------
-        scoped = enforce_scope(parsed, ticket.allowed_files, self.config.never_delegate)
-        if scoped.rejected:
-            self.store.log(
-                run_id,
-                f"{ticket.ticket_id}: rejected out-of-scope edits: "
-                f"{'; '.join(scoped.rejected)}",
-                level="warn",
-                kind="scope",
+        written: list[str] = []
+        scope_note = ""
+        if not wrote_nothing:
+            scoped = enforce_scope(
+                parsed, ticket.allowed_files, self.config.never_delegate
             )
-        if not scoped.edits:
-            return StepResult(
-                ok=False,
-                detail=self._scope_guidance(ticket, scoped.rejected, total_loss=True),
-            )
+            if scoped.rejected:
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: rejected out-of-scope edits: "
+                    f"{'; '.join(scoped.rejected)}",
+                    level="warn",
+                    kind="scope",
+                )
+            if not scoped.edits:
+                return StepResult(
+                    ok=False,
+                    detail=self._scope_guidance(
+                        ticket, scoped.rejected, total_loss=True
+                    ),
+                )
 
-        step_id = self.store.start_step(run_id, ticket.ticket_id, "apply")
-        try:
-            written = apply_edits(self.config.root, scoped.edits)
-        except ValueError as exc:
-            self.store.end_step(step_id, "failed", str(exc))
-            return StepResult(ok=False, blocked=True, detail=str(exc))
-        self.store.end_step(step_id, "ok", "\n".join(written))
-        self._record_step(
-            ticket,
-            "apply",
-            "ok",
-            {"written": written, "rejected": scoped.rejected},
-        )
-        # A partial rejection used to be logged and then dropped. The executor
-        # saw a successful apply, lint failed on the piece that never landed,
-        # and it had no way to connect the two — so it re-sent the same edit
-        # every attempt. Carry the rejection forward as verification evidence.
-        scope_note = (
-            self._scope_guidance(ticket, scoped.rejected, total_loss=False)
-            if scoped.rejected
-            else ""
-        )
+            step_id = self.store.start_step(run_id, ticket.ticket_id, "apply")
+            try:
+                written = apply_edits(self.config.root, scoped.edits)
+            except ValueError as exc:
+                self.store.end_step(step_id, "failed", str(exc))
+                return StepResult(ok=False, blocked=True, detail=str(exc))
+            self.store.end_step(step_id, "ok", "\n".join(written))
+            self._record_step(
+                ticket,
+                "apply",
+                "ok",
+                {"written": written, "rejected": scoped.rejected},
+            )
+            # A partial rejection used to be logged and then dropped. The
+            # executor saw a successful apply, lint failed on the piece that
+            # never landed, and it had no way to connect the two — so it re-sent
+            # the same edit every attempt. Carry the rejection forward as
+            # verification evidence.
+            scope_note = (
+                self._scope_guidance(ticket, scoped.rejected, total_loss=False)
+                if scoped.rejected
+                else ""
+            )
 
         # --- TESTS ---------------------------------------------------
         # The criteria come from the ticket, never from the executor's own
@@ -1570,6 +1589,15 @@ class Orchestrator:
         test_path, no_tests_because = self._test_target(
             ticket, written, example, suffix
         )
+        if wrote_nothing:
+            # Nothing was written this attempt, so there is no new behavior to
+            # assert against — and authoring a file here would put a test on
+            # disk for an attempt that changed nothing. Whatever this ticket
+            # wrote earlier is still present and still runs at verify.
+            test_path, no_tests_because = "", (
+                "the attempt wrote no files, so there is nothing new to assert "
+                "against"
+            )
         if test_path:
             # On a retry the ticket's own test file is already on disk, and a
             # fixed path makes that the common case rather than the rare one.

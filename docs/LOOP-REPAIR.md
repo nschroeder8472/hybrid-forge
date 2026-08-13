@@ -212,7 +212,7 @@ writes.
 
 ---
 
-### 1.2 A genuinely empty response should be reviewed, not failed
+### 1.2 A genuinely empty response should be reviewed, not failed — **done**
 
 **Revised after run 2.** The original version of this item assumed
 `"executor returned no file edits"` meant the executor had nothing to do. In run
@@ -251,16 +251,31 @@ is finished, not failed."* The empty-executor path short-circuits before
 reaching any of it. Skip TESTS when no file changed; attempt capping still
 bounds the no-op case.
 
-**Files.** `forge/loop.py:1405-1409`.
+**Landed as.** `describe_unparsed` now returns `""` when a reply carries no
+file content at all, which is the signal that separates "nothing to write" from
+"content the parser could not read". In `_attempt`, a complaint still fails the
+attempt; an empty one sets `wrote_nothing`, which skips APPLY and forces
+`test_path` empty so the existing `no_tests_because` path handles the message.
+Everything downstream is untouched — VERIFY and REVIEW already knew what to do
+with a ticket that changed nothing.
 
-**Tests.**
+Authoring a test on an attempt that wrote no files is exactly the orphan the
+fixed-path rule exists to prevent, so that is skipped rather than merely
+unused. Tests the ticket wrote on an earlier attempt stay on disk and still run.
 
-- `test_an_executor_that_writes_nothing_is_reviewed_against_disk`
-- `test_a_ticket_already_satisfied_on_disk_passes_without_an_edit`
+**Tests.** `TestAnExecutorThatWritesNothing` — reviewed rather than failed, the
+existing file left byte-identical, no tester call, and an unreadable reply still
+failing with its specific complaint.
 
-**Risk.** Low-moderate. This is the one change that can turn a previously
-failing ticket green, so it depends on an accurate reviewer — satisfied as of
-Phase 0 — and on 1.0 landing first.
+**Verification gap.** The recorded instances of this were run 1 steps 61-62, 94
+and 100-101, and that `run.db` was replaced by the re-run. Classifying every
+executor response in both surviving databases under the new logic gives 6
+applied, 6 refused for a short fence, 8 refused as unreadable, and **0** taking
+the new path. So this changes the outcome of nothing recorded — it is purely
+additive protection, exercised by tests rather than by surviving data.
+
+**Risk.** Low-moderate. It is the one change that can turn a previously failing
+ticket green, so it depends on an accurate reviewer — satisfied as of Phase 0.
 
 ---
 
@@ -444,7 +459,7 @@ place a dirty tree can leave without comment.
 
 ---
 
-### 1.6 Configuration note — not a code change
+### 1.6 Configuration note — **done**
 
 `alllocal`'s lint command is `cargo clippy -- -D warnings`, which makes style
 lints fatal. TT-002 lost its three attempts to three *different* clippy lints in
@@ -452,10 +467,19 @@ sequence: `E0308` (step 18), `manual_range_contains` (step 26), then
 `unnecessary_cast` (step 71). Each fix surfaced the next lint.
 
 That is a treadmill a local executor will rarely walk off, and it is a plan
-configuration choice rather than a harness defect. Consider narrowing to
-correctness lints (`-D clippy::correctness`) and leaving style lints as
-warnings, at least while the loop is being debugged. Worth deciding before the
-next baseline run, because it changes what TT-002 is actually being asked to do.
+configuration choice rather than a harness defect.
+
+Narrowed in `alllocal/.hybridforge/config.json` to:
+
+```
+cargo clippy --all-targets -- -D clippy::correctness -D clippy::suspicious
+```
+
+Measured on the tree as it stands: 6 errors and exit 101 under `-D warnings`, 0
+errors and exit 0 under the narrowed set. The style lints that were failing
+TT-002 — `manual_range_contains`, `unnecessary_cast` — are warnings again, while
+the bug-shaped groups stay fatal. Real compile errors fail regardless of lint
+level, and `typecheck` runs `cargo check --all-targets` besides.
 
 ---
 
@@ -791,8 +815,8 @@ land too — one branch to push when the backlog is green.
 | — | 1.1, 1.3, 1.4, 3.4 | Done — `88ed838` |
 | — | 1.5 | Done — amnesty now stops at the ticket's own scope |
 | — | 2.1, 2.2 | Done — citation required, prompt echo stripped |
-| 3 | 1.2 | Only meaningful once 1.0 can tell empty from unparseable |
-| 4 | 2.3 | Prerequisite for 3.3 |
+| — | 1.2 | Done — empty reply reviewed against disk |
+| 1 | 2.3 | Prerequisite for 3.3 |
 | 5 | 3.3, 3.2 | Information architecture; 3.2 carries a migration |
 | 6 | 3.1 | Deliberately loosens a guard; wants a stable baseline |
 | 7 | 2.4, 4.1 | Conditional and experimental |
