@@ -4237,6 +4237,131 @@ class TestFailureHistoryReachesBothRoles(unittest.TestCase):
         self.assertNotIn("already rejected", rejections[0])
 
 
+class TestAnUnreadableReplyIsAskedForAgain(unittest.TestCase):
+    """A reply that did not parse is a formatting mistake, not a failed
+    implementation, and spending a whole attempt on one buys nothing — the next
+    attempt re-reads the same spec and the model repeats itself. One ticket lost
+    six of its nine attempts to a fenced block with no path line above it, while
+    the three that parsed drew specific review objections it never had the
+    budget left to answer."""
+
+    GOOD = "src/game.rs\n```rust\npub struct Game;\n```"
+    NO_PATH = "Looking at the error, I can see the issue:\n\n```rust\npub struct Game;\n```"
+
+    def _orchestrator(self):
+        orch, root, run_id = _stub_orchestrator()
+        return orch, root, run_id
+
+    def test_a_second_ask_inside_the_attempt_recovers_the_work(self):
+        orch, root, run_id = self._orchestrator()
+        replies = iter([self.NO_PATH, self.GOOD])
+        asked: list[str] = []
+
+        def call(_run_id, role, messages, **_kwargs):
+            if role != "executor":
+                return Completion(text="ACCEPT\nfine", usage=Usage())
+            asked.append("\n".join(m.content for m in messages))
+            return Completion(text=next(replies), usage=Usage())
+
+        orch._call = call
+        result = orch._attempt(run_id, Ticket("T-1", allowed_files=["src/game.rs"]), "")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(asked), 2)
+        # The second ask carries the complaint, and tells it not to rewrite.
+        self.assertIn("could not be read", asked[1])
+        self.assertIn("no file path", asked[1])
+        self.assertIn("code was never the problem", asked[1])
+        self.assertEqual(
+            (root / "src" / "game.rs").read_text(encoding="utf-8").strip(),
+            "pub struct Game;",
+        )
+
+    def test_a_readable_reply_is_never_asked_twice(self):
+        orch, _root, run_id = self._orchestrator()
+        builds = []
+
+        def call(_run_id, role, _messages, **_kwargs):
+            if role != "executor":
+                return Completion(text="ACCEPT\nfine", usage=Usage())
+            builds.append(1)
+            return Completion(text=self.GOOD, usage=Usage())
+
+        orch._call = call
+        orch._attempt(run_id, Ticket("T-1", allowed_files=["src/game.rs"]), "")
+
+        self.assertEqual(len(builds), 1)
+
+    def test_twice_unreadable_spends_the_attempt(self):
+        orch, _root, run_id = self._orchestrator()
+        builds = []
+
+        def call(_run_id, _role, _messages, **_kwargs):
+            builds.append(1)
+            return Completion(text=self.NO_PATH, usage=Usage())
+
+        orch._call = call
+        result = orch._attempt(run_id, Ticket("T-1", allowed_files=["src/game.rs"]), "")
+
+        self.assertFalse(result.ok)
+        self.assertIn("no file path", result.detail)
+        self.assertEqual(len(builds), 2)
+
+    def test_a_blocked_reply_is_a_decision_not_a_formatting_mistake(self):
+        orch, _root, run_id = self._orchestrator()
+        builds = []
+
+        def call(_run_id, _role, _messages, **_kwargs):
+            builds.append(1)
+            return Completion(text="BLOCKED: two criteria contradict", usage=Usage())
+
+        orch._call = call
+        result = orch._attempt(run_id, Ticket("T-1", allowed_files=["src/game.rs"]), "")
+
+        self.assertTrue(result.blocked)
+        self.assertEqual(len(builds), 1)
+
+    def test_a_reply_with_no_file_content_is_not_asked_again(self):
+        # The 1.2 case: nothing to write may be the honest answer, and asking
+        # again would talk a finished ticket into inventing an edit.
+        orch, _root, run_id = self._orchestrator()
+        builds = []
+
+        def call(_run_id, role, _messages, **_kwargs):
+            if role != "executor":
+                return Completion(text="ACCEPT\nalready satisfied", usage=Usage())
+            builds.append(1)
+            return Completion(text="The files already implement the spec.", usage=Usage())
+
+        orch._call = call
+        orch._attempt(run_id, Ticket("T-1", allowed_files=["src/game.rs"]), "")
+
+        self.assertEqual(len(builds), 1)
+
+    def test_a_partly_readable_reply_is_kept_rather_than_risked(self):
+        # Something parsed, so it is written and the attempt reports what is
+        # missing. Asking again could trade a partial answer for a worse one.
+        orch, root, run_id = self._orchestrator()
+        f = "`" * 3
+        builds = []
+
+        def call(_run_id, _role, _messages, **_kwargs):
+            builds.append(1)
+            return Completion(
+                text=f"build.sh\n{f}sh\ncargo build\n{f}\n\n"
+                f"README.md\n{f}\n# T\n\n{f}sh\nx\n{f}\n\n## More\n\ndone\n{f}\n",
+                usage=Usage(),
+            )
+
+        orch._call = call
+        orch._attempt(
+            run_id, Ticket("T-1", allowed_files=["build.sh", "README.md"]), ""
+        )
+
+        self.assertEqual(len(builds), 1)
+        self.assertTrue((root / "build.sh").exists())
+
+
 class TestAnExecutorThatWritesNothing(unittest.TestCase):
     """Disk is never reverted between attempts and the executor is shown the
     current files, so "there is nothing to change" is sometimes the honest

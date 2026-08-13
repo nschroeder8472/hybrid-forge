@@ -247,6 +247,7 @@ def build_prompt(
     sources: dict[str, str] | None = None,
     *,
     prior_failures: Sequence[str] = (),
+    malformed: str = "",
 ) -> list[Message]:
     messages = [Message(role="system", content=EXECUTOR_SYSTEM)]
 
@@ -309,6 +310,21 @@ changes are undoing each other, and you need a third approach that satisfies
 both rather than alternating between them.
 
 {earlier}
+"""
+
+    if malformed:
+        # Not a failed attempt — the same answer, rejected before it reached
+        # disk because the harness could not read it. Worth its own heading
+        # rather than being folded in with the verification failures above: the
+        # implementation may be perfectly good and nothing about it should
+        # change, which is the opposite of what "your attempt failed" invites.
+        body += f"""
+## Your last answer could not be read, and nothing was written
+{malformed}
+
+Send the same implementation again in the format above. Do not rewrite the
+code to fix this — the code was never the problem, and changing it now loses
+work that may already have been correct.
 """
 
     body += "\nImplement this now."

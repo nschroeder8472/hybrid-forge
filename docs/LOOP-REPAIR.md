@@ -209,6 +209,67 @@ common case.
 
 ---
 
+### 1.8 Ask again inside the attempt when a reply does not parse — **done**
+
+**Found in run 4**, the first clean run with every earlier fix in place. Four of
+six tickets passed, including TT-006, which converged file-by-file exactly as
+partial application intended:
+
+```
+apply ok :: build.sh, build.ps1
+apply ok :: build.sh, build.ps1
+apply ok :: build.sh, build.ps1
+apply ok :: build.sh, build.ps1
+apply ok :: build.sh, build.ps1, README.md   <- passed
+```
+
+TT-003 did not, and the reason is not the work. Of its nine attempts:
+
+| outcome | count |
+|---|---|
+| parsed, applied, reviewed | 3 |
+| **no parseable output** | **6** |
+
+Every one of the six was Mode B — a fenced block with no path line — and the
+pattern is that the executor drops the path line whenever it narrates before
+answering. The whole third cycle produced nothing parseable, so respec's second
+revision was never tested against anything.
+
+The three attempts that did land drew accurate, specific review objections: the
+RNG reset on every lock instead of persisting, and scoring applied after the
+level update rather than before. Answerable defects. It never had the budget
+left to answer them.
+
+**Landed as.** `_malformed_reply` on the orchestrator, and a `for remaining in
+(1, 0)` loop around the build call — the same shape the tester already uses to
+reprompt a rejected test file. The complaint goes back through a new `malformed`
+section of `build_prompt`, which tells the executor the code was never the
+problem and not to rewrite it.
+
+Refused and asked again: unreadable content (modes B, C, D), a short fence with
+nothing clean beside it, and duplicate paths. **Not** reprompted: a `BLOCKED:`
+reply (a decision), a reply carrying no file content at all (1.2 — may be a
+finished ticket, and asking again would talk it into inventing an edit), a
+partial parse (already written, and a second ask could trade it for worse), and
+a response cut off at the output limit (the retry gets the same budget and runs
+out of it the same way).
+
+Once only. A model that cannot follow the format twice will not follow it on the
+third ask, and the attempt should end while the evidence is fresh.
+
+Replayed over every build response recorded in run 4: **8 replies now get a
+second ask, 11 proceed unchanged** — six of the eight are TT-003's.
+
+**Tests.** `TestAnUnreadableReplyIsAskedForAgain` — recovery on the second ask
+with the complaint and the do-not-rewrite instruction present, a readable reply
+never asked twice, two failures spending the attempt, and one case each for
+blocked, empty, and partial.
+
+**Risk.** Low-moderate. Worst case doubles the build calls in an attempt, which
+is the trade for not spending the attempt itself.
+
+---
+
 ### 1.1 The provenance marker leaks into the criterion key — **done** (`88ed838`)
 
 **Problem.** `_criteria_provenance_block` (`forge/prompts.py:142-162`) renders
@@ -875,6 +936,7 @@ land too — one branch to push when the backlog is green.
 | — | 2.1, 2.2 | Done — citation required, prompt echo stripped |
 | — | 1.2 | Done — empty reply reviewed against disk |
 | — | 1.7 | Done — respec cannot describe the reply format |
+| — | 1.8 | Done — unreadable reply reprompted once |
 | 1 | 2.3 | Prerequisite for 3.3 |
 | 5 | 3.3, 3.2 | Information architecture; 3.2 carries a migration |
 | 6 | 3.1 | Deliberately loosens a guard; wants a stable baseline |

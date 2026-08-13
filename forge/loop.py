@@ -44,6 +44,7 @@ from .failures import distill, errors_naming, signatures
 from .ingest import write_tickets
 from .memory import MemoryClient, MemoryRefused, MemoryUnavailable, ticket_query
 from .patch import (
+    ParsedOutput,
     apply_edits,
     describe_unparsed,
     duplicate_paths,
@@ -484,6 +485,40 @@ class Orchestrator:
         else:
             detail += " Emit each file exactly once."
         return detail
+
+    @staticmethod
+    def _duplicate_guidance(repeated: list[str]) -> str:
+        return (
+            "Your response contained more than one block for the same file, so "
+            "nothing was written:\n"
+            + "\n".join(f"- {path}" for path in repeated)
+            + "\n\nThe usual cause is a fence, not a mistake in the code. A "
+            "file whose own contents contain ``` closes its wrapping fence "
+            "early, and the rest of that file is then read as further files "
+            "named after whatever paths appear in its prose. Wrap any such "
+            "file in a longer fence — four backticks or five — and emit each "
+            "file exactly once."
+        )
+
+    def _malformed_reply(self, parsed: ParsedOutput, text: str) -> str:
+        """Why a reply did not parse into files, or `""` if it did.
+
+        Only formatting. A `BLOCKED:` reply is a decision, and a reply carrying
+        no file content at all may be a ticket whose work is already done —
+        neither is malformed, and neither is worth asking again about.
+
+        A reply that parsed *some* files is not malformed either. Those are
+        written, and the attempt reports what is still missing; asking again
+        would risk trading a partial answer for a worse one.
+        """
+        if parsed.is_blocked:
+            return ""
+        if parsed.truncated and not parsed.edits:
+            return self._fence_guidance(parsed.truncated)
+        if parsed.is_empty:
+            return describe_unparsed(text)
+        repeated = duplicate_paths(parsed)
+        return self._duplicate_guidance(repeated) if repeated else ""
 
     @staticmethod
     def _signature_scope(signature: str, allowed: list[str]) -> bool:
@@ -1461,99 +1496,91 @@ class Orchestrator:
             return StepResult(ok=False, blocked=True, detail=detail)
 
         step_id = self.store.start_step(run_id, ticket.ticket_id, "build")
-        try:
-            completion = self._call(
+        # A reply that did not parse into files is a formatting mistake, not a
+        # failed implementation, and spending a whole attempt on one buys
+        # nothing: the next attempt re-reads the same spec and the model makes
+        # the same mistake. One ticket lost six of its nine attempts that way,
+        # every one to a fenced block with no path line above it, while the
+        # three that parsed drew specific and answerable review objections it
+        # never got the budget to address.
+        #
+        # So the reply is refused and asked for again inside the attempt, the
+        # way the tester already reprompts a rejected test file. Once only —
+        # a model that cannot follow the format twice will not follow it on the
+        # third ask, and the attempt should end while the evidence is fresh.
+        malformed = ""
+        for remaining in (1, 0):
+            try:
+                completion = self._call(
+                    run_id,
+                    "executor",
+                    build_prompt(
+                        ticket,
+                        failure_context,
+                        retrieved,
+                        sources,
+                        prior_failures=prior_failures,
+                        malformed=malformed,
+                    ),
+                    max_tokens=self._output_budget("executor"),
+                )
+            except ContextOverflow as exc:
+                self.store.end_step(step_id, "failed", str(exc))
+                return StepResult(ok=False, blocked=True, detail=str(exc))
+            except ProviderError as exc:
+                self.store.end_step(step_id, "failed", str(exc))
+                self._record_step(ticket, "build", "failed", {"error": str(exc)})
+                return StepResult(ok=False, detail=f"executor unavailable: {exc}")
+
+            self._record_call(ticket, "build", "executor", completion)
+
+            # A response cut off at the output limit parses cleanly — the fence
+            # the model opened is simply never closed, or closes around half a
+            # function. Applying it writes a file that is syntactically wrong
+            # for a reason no reviewer would guess from the diff, so nothing is
+            # written and the attempt is spent instead. Not reprompted: the
+            # second call gets the same budget and runs out of it the same way.
+            if completion.truncated:
+                detail = (
+                    "Your previous response was cut off at the output limit, so "
+                    "no files were written. Emit the same implementation in "
+                    "fewer output tokens — fewer files per response, no "
+                    "restated context — or reply BLOCKED: if the ticket cannot "
+                    "be implemented within that budget."
+                )
+                self.store.end_step(step_id, "failed", completion.text[:20000])
+                return StepResult(ok=False, detail=detail)
+
+            parsed = parse_output(completion.text)
+            malformed = self._malformed_reply(parsed, completion.text)
+            if not malformed or not remaining:
+                break
+            self.store.log(
                 run_id,
-                "executor",
-                build_prompt(
-                    ticket,
-                    failure_context,
-                    retrieved,
-                    sources,
-                    prior_failures=prior_failures,
-                ),
-                max_tokens=self._output_budget("executor"),
+                f"{ticket.ticket_id}: the executor's reply did not parse into "
+                f"files; asking again before the attempt is spent.",
+                level="warn",
+                kind="ticket",
+                data={"complaint": malformed[:400]},
             )
-        except ContextOverflow as exc:
-            self.store.end_step(step_id, "failed", str(exc))
-            return StepResult(ok=False, blocked=True, detail=str(exc))
-        except ProviderError as exc:
-            self.store.end_step(step_id, "failed", str(exc))
-            self._record_step(ticket, "build", "failed", {"error": str(exc)})
-            return StepResult(ok=False, detail=f"executor unavailable: {exc}")
-
-        self._record_call(ticket, "build", "executor", completion)
-
-        # A response cut off at the output limit parses cleanly — the fence the
-        # model opened is simply never closed, or closes around half a
-        # function. Applying it writes a file that is syntactically wrong for a
-        # reason no reviewer would guess from the diff, so nothing is written
-        # and the attempt is spent instead.
-        if completion.truncated:
-            detail = (
-                "Your previous response was cut off at the output limit, so no "
-                "files were written. Emit the same implementation in fewer "
-                "output tokens — fewer files per response, no restated context "
-                "— or reply BLOCKED: if the ticket cannot be implemented "
-                "within that budget."
-            )
-            self.store.end_step(step_id, "failed", completion.text[:20000])
-            return StepResult(ok=False, detail=detail)
 
         self.store.end_step(step_id, "ok", completion.text[:20000])
 
-        parsed = parse_output(completion.text)
         if parsed.is_blocked:
             return StepResult(ok=False, blocked=True, detail=parsed.blocked_reason)
 
-        # A file whose wrapping fence was closed from inside itself: what
-        # survived the match is a prefix, and writing a prefix over a working
-        # file looks like a successful apply. It cost a `build.sh`, which came
-        # back as 57 bytes of somebody else's markdown.
-        #
-        # Only the truncated files are withheld. The blocks that closed where
-        # they were meant to are unambiguous, and holding them back leaves a
-        # ticket that can never recover: one response carried a correct
-        # `build.sh` and `build.ps1` alongside a truncated README, and refusing
-        # all three meant the corrupt `build.sh` already on disk could not be
-        # replaced. This is the opposite of `duplicate_paths`, where two blocks
-        # claim one path and there is no way to tell which was meant.
-        if parsed.truncated and not parsed.edits:
-            return StepResult(ok=False, detail=self._fence_guidance(parsed.truncated))
+        # Still unreadable after being told exactly what was wrong with it.
+        if malformed:
+            return StepResult(ok=False, detail=malformed)
 
-        # An empty parse is two different situations. A reply carrying file
-        # content the parser could not read is a failure, and the complaint says
-        # which shape it was. A reply carrying no file content at all may simply
-        # be a ticket whose work is already on disk — the executor is shown the
-        # current files, so "there is nothing to change" is sometimes the honest
-        # answer, and spending an attempt punishing it is how a finished ticket
-        # failed three times a cycle.
-        wrote_nothing = False
-        if parsed.is_empty:
-            complaint = describe_unparsed(completion.text)
-            if complaint:
-                return StepResult(ok=False, detail=complaint)
-            wrote_nothing = True
-
-        # Two blocks for one path means the response did not parse into the
-        # files it describes, and applying it would write the wrong one last.
-        # Nothing goes to disk until the executor sends a coherent answer.
-        repeated = duplicate_paths(parsed)
-        if repeated:
-            return StepResult(
-                ok=False,
-                detail=(
-                    "Your response contained more than one block for the same "
-                    "file, so nothing was written:\n"
-                    + "\n".join(f"- {path}" for path in repeated)
-                    + "\n\nThe usual cause is a fence, not a mistake in the "
-                    "code. A file whose own contents contain ``` closes its "
-                    "wrapping fence early, and the rest of that file is then "
-                    "read as further files named after whatever paths appear "
-                    "in its prose. Wrap any such file in a longer fence — four "
-                    "backticks or five — and emit each file exactly once."
-                ),
-            )
+        # Everything that could not be read has already been refused above. What
+        # is left is a reply that parsed — possibly into no files at all, which
+        # is not the same thing. A ticket whose work is already on disk has
+        # nothing to write, and the executor is shown the current files, so
+        # "there is nothing to change" is sometimes the honest answer. Spending
+        # an attempt punishing it is how a finished ticket failed three times a
+        # cycle.
+        wrote_nothing = parsed.is_empty
 
         # --- APPLY ---------------------------------------------------
         written: list[str] = []
