@@ -156,9 +156,12 @@ class Orchestrator:
         # Tickets that got a test file, and tickets that were told they should
         # not have one. Individually a skip is routine; every ticket in a run
         # skipping is a misconfiguration, and it presents as a quiet `info`
-        # line per ticket rather than as anything wrong. See `_finish`.
-        self._tests_authored = 0
-        self._tests_skipped = 0
+        # line per ticket rather than as anything wrong. Held as ids rather
+        # than counts because a ticket that ends green having authored nothing
+        # was checked by reading rather than by running, and `_finish` says
+        # which ones those were. See `_report_test_coverage`.
+        self._tests_authored: set[str] = set()
+        self._tests_skipped: set[str] = set()
 
     # ------------------------------------------------------------------
     # Project memory
@@ -744,18 +747,57 @@ class Orchestrator:
         routine `info` line per ticket. A run once degraded to review-only
         after its second ticket and said nothing that read as wrong.
         """
+        self._report_unexecuted(run_id)
         if not self.config.commands.get("test") or self._tests_authored:
             return
         if not self._tests_skipped:
             return
         self.store.log(
             run_id,
-            f"No ticket in this run authored tests ({self._tests_skipped} "
+            f"No ticket in this run authored tests ({len(self._tests_skipped)} "
             f"skipped) while a test command is configured. Verification ran on "
             f"review alone. Check that `commands.test` and the files the "
             f"tickets write are the same language.",
             level="warn",
             kind="lifecycle",
+        )
+
+    def _report_unexecuted(self, run_id: int) -> None:
+        """Name the tickets that went green without anything being run.
+
+        A ticket that authors no tests is checked at review, against its
+        criteria — and criteria for a browser shell are often satisfiable by a
+        text search. One read `web/main.js` calls `WebAssembly.instantiateStreaming`,
+        which was true of code that threw on the next line: the backlog was
+        green, the suite was 36 tests, and the page loaded to an empty board.
+        Nothing in the pipeline could have caught it, and nothing said so.
+
+        This does not test anything new. It says what the green did not cover,
+        which is what would have pointed a human at the two files worth opening
+        by hand.
+        """
+        review_only = self._tests_skipped - self._tests_authored
+        if not review_only:
+            return
+        named = sorted(
+            ticket.ticket_id
+            for ticket in self.store.list_tickets(run_id)
+            if ticket.status == TICKET_DONE and ticket.ticket_id in review_only
+        )
+        if not named:
+            return
+        subject = "It authored" if len(named) == 1 else "None of them authored"
+        them = "it" if len(named) == 1 else "them"
+        self.store.log(
+            run_id,
+            f"{', '.join(named)} passed on review alone. {subject} no tests and "
+            f"nothing the test command runs covers {them}, so the criteria were "
+            f"checked by reading the diff rather than by running anything. A "
+            f"criterion a text search can satisfy is also satisfied by code that "
+            f"never executes — open {them} by hand before trusting this run.",
+            level="warn",
+            kind="lifecycle",
+            data={"review_only": named},
         )
 
     def _reopen_stale(self, run_id: int) -> list[str]:
@@ -1712,9 +1754,9 @@ class Orchestrator:
             # launder the previous attempt's mistakes into a rule.
             example = self._example_test(written + [test_path], suffix)
         if ticket.criteria and test_path:
-            self._tests_authored += 1
+            self._tests_authored.add(ticket.ticket_id)
         if ticket.criteria and no_tests_because:
-            self._tests_skipped += 1
+            self._tests_skipped.add(ticket.ticket_id)
         if ticket.criteria and no_tests_because:
             # Not a failure. The criteria are still checked at review, which is
             # the right place for "the build script takes a --release flag" or

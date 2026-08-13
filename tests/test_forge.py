@@ -4238,7 +4238,7 @@ class TestTheTestCommandDecidesTheLanguage(unittest.TestCase):
     def test_a_run_that_authored_no_tests_at_all_says_so(self):
         orch, _root = self._orch("cargo test")
         run_id = orch.store.create_run("g")
-        orch._tests_skipped = 4
+        orch._tests_skipped = {"T-1", "T-2", "T-3", "T-4"}
 
         orch._finish(run_id)
 
@@ -4248,12 +4248,66 @@ class TestTheTestCommandDecidesTheLanguage(unittest.TestCase):
     def test_a_run_with_some_tests_stays_quiet(self):
         orch, _root = self._orch("cargo test")
         run_id = orch.store.create_run("g")
-        orch._tests_skipped, orch._tests_authored = 2, 3
+        orch._tests_skipped = {"T-1", "T-2"}
+        orch._tests_authored = {"T-3", "T-4", "T-5"}
 
         orch._finish(run_id)
 
         messages = " ".join(e["message"] for e in orch.store.events_after(0))
         self.assertNotIn("No ticket in this run authored tests", messages)
+
+
+class TestAGreenTicketMayHaveRunNothing(unittest.TestCase):
+    """A backlog went green — six tickets done, lint and typecheck clean, 36
+    tests passing — and the page loaded to an empty board. TT-005's criteria
+    were all token-presence checks ("`web/main.js` calls
+    `WebAssembly.instantiateStreaming`"), every one of them true of code that
+    threw on the next line. It authored no tests, and `cargo test` runs no
+    JavaScript, so its criteria were checked by reading. Nothing in the
+    pipeline could have caught that. What it can do is say so."""
+
+    def _orch(self, done: list[str], skipped: set[str], authored: set[str] = frozenset()):
+        orch, _root, run_id = _stub_orchestrator({"test": "cargo test"})
+        orch.store.add_tickets(
+            run_id,
+            [Ticket(ticket_id, status=TICKET_DONE) for ticket_id in done],
+        )
+        orch._tests_skipped = set(skipped)
+        orch._tests_authored = set(authored)
+        orch._finish(run_id)
+        return " ".join(e["message"] for e in orch.store.events_after(0))
+
+    def test_a_ticket_verified_by_reading_is_named_at_run_end(self):
+        messages = self._orch(
+            done=["TT-004", "TT-005"], skipped={"TT-005"}, authored={"TT-004"}
+        )
+
+        self.assertIn("TT-005 passed on review alone", messages)
+        self.assertIn("rather than by running anything", messages)
+        self.assertNotIn("TT-004 passed on review alone", messages)
+
+    def test_several_are_named_together(self):
+        messages = self._orch(
+            done=["TT-004", "TT-005", "TT-006"],
+            skipped={"TT-005", "TT-006"},
+            authored={"TT-004"},
+        )
+        self.assertIn("TT-005, TT-006 passed on review alone", messages)
+
+    def test_a_ticket_that_authored_tests_on_a_later_attempt_is_not_named(self):
+        # Skipping on the attempt that wrote nothing and authoring on the one
+        # that did is ordinary. What matters is whether the ticket ended up
+        # covered, not whether it was ever briefly uncovered.
+        messages = self._orch(
+            done=["TT-004"], skipped={"TT-004"}, authored={"TT-004"}
+        )
+        self.assertNotIn("passed on review alone", messages)
+
+    def test_a_ticket_that_never_passed_is_not_named(self):
+        # The claim is about what a green ticket proved. A failed one makes no
+        # claim to undercut.
+        messages = self._orch(done=[], skipped={"TT-005"}, authored={"TT-004"})
+        self.assertNotIn("passed on review alone", messages)
 
 
 class TestOrphanedTestsNeverOutliveTheirTicket(unittest.TestCase):

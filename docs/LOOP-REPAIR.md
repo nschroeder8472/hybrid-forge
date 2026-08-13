@@ -17,7 +17,7 @@ verified against surviving data that is said plainly.
 `fix/protect-plan-authored-context`, unverified against a run — they were
 written from run 5's evidence and are covered by tests, not by a replay.
 
-Still open: 3.1, 3.6, and the conditional 2.4 and 4.1. A clean
+Still open: 3.1, and the conditional 2.4 and 4.1. A clean
 run from an empty repository — no drifted specs carried over — is the validation
 that has not been done yet.
 
@@ -1079,7 +1079,20 @@ commentary.
 
 ---
 
-### 3.6 A ticket can be verified by reading rather than by running — **open**
+### 3.6 A ticket can be verified by reading rather than by running — **done**
+
+`_tests_authored` and `_tests_skipped` hold ticket ids rather than counts, and
+`_report_unexecuted` names at run end every ticket that reached `done` while
+skipping test authoring and never authoring any. A ticket that skipped on the
+attempt that wrote nothing and authored on the one that did is not named — what
+matters is whether it ended covered. Neither is a ticket that failed: the claim
+is about what a green ticket proved.
+
+No new dependency, no browser driving, and nothing new is tested. The run says
+what its green did not cover, which is the thing that would have pointed at the
+two files worth opening by hand.
+
+The original write-up follows.
 
 **Found by opening the finished game in a browser.** The backlog was green — all
 six tickets `done`, lint and typecheck clean, 36 tests passing — and the page
@@ -1172,9 +1185,9 @@ land too — one branch to push when the backlog is green.
 | — | 3.2, 3.5 | Done — context anchored, marked decisions protected |
 | — | 2.3 | Done — history is its own droppable message, capped at three |
 | — | 3.3 | Done — both lists seeded from the step log on a retry cycle |
-| 1 | 3.6 | Reporting only — says what a green ticket did not prove |
-| 2 | 3.1 | Deliberately loosens a guard; wants a stable baseline |
-| 3 | 2.4, 4.1 | Conditional and experimental |
+| — | 3.6 | Done — a review-only ticket is named at run end |
+| 1 | 3.1 | Deliberately loosens a guard; wants a stable baseline |
+| 2 | 2.4, 4.1 | Conditional and experimental |
 
 1.6 is a decision, not a code change, and should be settled before the next
 baseline run.
