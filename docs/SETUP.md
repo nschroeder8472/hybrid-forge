@@ -637,6 +637,42 @@ it approves a 90k prompt for a 32k server, which truncates from the *front*,
 taking the system prompt and the spec with it. What comes back then reads as a
 weak model rather than a truncated request.
 
+### Sampling
+
+Five knobs are settable per model block, and an unset one is left off the
+request entirely — a model's own shipped recipe survives rather than being
+overwritten with a default nobody chose:
+
+```json
+"local-code": {
+  "kind": "openai", "baseUrl": "...", "model": "forge-code",
+  "temperature": 0.7, "topP": 0.8,
+  "topK": 20, "minP": 0, "presencePenalty": 1.5
+}
+```
+
+`temperature` here overrides the per-role value the loop asks for, for every
+role this model plays. That is coarser than the loop's own defaults, which
+differ by role — worth knowing before setting it on a model that plays three.
+
+**The loop's temperatures are low on purpose, and that has a cost.** Retries
+assume the next attempt samples differently; at 0.0–0.2 with an unchanged
+prompt, it does not. One run had the tester reproduce the same unused variable
+across 36 attempts, and the automatic retry cycle stops precisely when it
+detects that nothing is varying. Models that ship a recommended sampling
+recipe — most current open-weights families do — are usually better run near
+it. `qwen3-coder` ships `temperature 0.7, top_p 0.8`; `gpt-oss` ships
+`temperature 1.0`. Check with `ollama show <model>` before overriding.
+
+Keep the reviewer tighter than the rest. Its verdict has to parse, and a
+verdict that does not is treated as a rejection.
+
+**State it rather than discovering it.** `/api/ps` reports nothing until a
+model is resident, so the first probe of a run can read the architectural
+maximum and cache it for the whole run — a race whose outcome depends on
+whether something happened to load the model first. Setting `contextWindow`
+explicitly per model removes it.
+
 Raise the server instead if you want the rest of the window:
 `OLLAMA_CONTEXT_LENGTH=131072`, or `num_ctx` in the Modelfile. A larger
 `num_ctx` allocates a larger KV cache, so check it still fits in VRAM — `forge
@@ -654,6 +690,71 @@ thinking plus the file. 8192 is a reasonable starting point for a 32k window.
 
 `forge doctor` prints the resulting `prompt_budget` next to both, and warns when
 it drops below a third of the window.
+
+### Where each setting has to live
+
+Ollama takes the same setting from three places, and they do not agree. Which
+one wins is not obvious, and getting it wrong is silent:
+
+| Setting | Modelfile | `config.json` | `OLLAMA_CONTEXT_LENGTH` | Ollama app settings |
+|---|---|---|---|---|
+| `num_ctx` | **wins** | — | applies when no Modelfile pins it | overridden by the env var |
+| `temperature` | ignored by forge | **wins** | — | — |
+| `top_p` | ignored by forge | **wins** | — | — |
+| `top_k` | **only place it works** | sent, discarded | — | — |
+| `min_p` | **only place it works** | sent, discarded | — | — |
+| models directory | — | — | `OLLAMA_MODELS` | used when the env var is unset |
+
+Three consequences worth stating plainly.
+
+**`top_k` and `min_p` do not reach the model through the OpenAI endpoint.**
+Measured against Ollama 0.32: `top_p 0.01` collapses six samples to one, while
+`top_k 1` leaves all six distinct. The shim accepts both and applies only the
+OpenAI-standard ones. Set them in the Modelfile; `forge doctor` warns if it
+finds them in config against an Ollama endpoint.
+
+**A Modelfile `PARAMETER temperature` is inert for forge**, which sends an
+explicit temperature on every request — 0.0 for the reviewer and planner, 0.1
+for the tester, 0.2 for the executor. It only applies when something other
+than forge calls the model.
+
+**`OLLAMA_CONTEXT_LENGTH` is one number for every model.** A per-model pin in
+a Modelfile is the only way to give a 24B reviewer and a 35B executor different
+windows, and the global silently overrides the desktop app's own setting. If
+you pin per model, unset the global — otherwise you are maintaining two
+sources of truth for one value and only one of them is in effect.
+
+The models directory has the same shape. The desktop app stores its own path
+in `%LOCALAPPDATA%\Ollama\db.sqlite`, and `OLLAMA_MODELS` overrides it. When
+they disagree, whichever launched the server decides — a tray-launched server
+and a hand-started `ollama serve` can read different directories, and the
+symptom is every model vanishing at once. Make them agree.
+
+### Generating the Modelfiles
+
+`forge models` writes one per Ollama-backed model into
+`.hybridforge/models/`, using each model's real numbers rather than a
+remembered default:
+
+```
+$ forge models
+Wrote 4 Modelfile(s) in .hybridforge/models:
+  local-code   ollama create forge-code -f ".../Modelfile.local-code"
+  ...
+```
+
+It reads the trained maximum from `/api/show`, keeps the base model's own
+sampling recipe where it ships one, and pins `contextWindow` when config
+states it. `forge init` runs it too, so a new project starts with the right
+file instead of a copied one.
+
+The files are written; `ollama create` is not run. Building takes minutes and
+changes something outside the repository.
+
+One detail it handles that is easy to get wrong by hand: when config names a
+base model directly, the generated file is `FROM` those weights, and building
+it under the same name would *replace the model it derives from*. In that case
+a new name is proposed and the output says which config key to update.
 
 ### Thinking models answer last
 
@@ -1213,6 +1314,10 @@ dashboard is bound off loopback; treat it as a reminder, not a permission slip.
 | "could not build the planner model" during detection | Detection runs on the planner role, which is configured one question earlier. A failed probe there leaves nothing to ask |
 | `memory: FAIL` in doctor | Under `command`, the report carries the server's own stderr — read that first; a wrong subcommand shows up as an immediate exit. Under `url`, wrong address or no proxy running |
 | Memory connects but retrieves nothing | Wrong tool auto-selected, or wrong `room`. Doctor prints the chosen tool and every available name; set `memory.searchTool` |
+| Every model vanishes at once (`/api/tags` empty) | The server is reading a different models directory than the one holding them. `OLLAMA_MODELS` and the desktop app's own setting disagree; whichever launched the server won. See §"Where each setting has to live" |
+| `prompt_budget` is negative | Not a ticket that is too large, whatever the blocked note says: `maxOutputTokens` exceeds the window. Either the window collapsed to a default because discovery failed, or the two were set independently |
+| `topK` / `minP` in config appear to do nothing | They do nothing. Ollama's OpenAI endpoint accepts and discards them — put them in the Modelfile, and run `forge models` to generate one |
+| Every retry produces byte-identical output | Temperature is too low for retries to explore. See §Sampling |
 | Every ticket blocks on context overflow | The model's window is too small for these tickets. Split them, or raise `contextWindow` if it was set too low by hand |
 | "planner did not return usable JSON:" with nothing after the colon | A thinking model spent its whole output budget reasoning and returned empty `content`. Raise `maxOutputTokens` or set `"extraBody": {"reasoning_effort": "none"}` — see §"Thinking models answer last" |
 | Builds truncate mid-file, `finish_reason: length` | `maxOutputTokens` too small for a whole-file reply. It defaults to 4096, which a thinking model half-spends before writing any code |
