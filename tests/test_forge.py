@@ -4150,6 +4150,71 @@ class TestEmptyDiffShowsState(unittest.TestCase):
         self.assertIn("what is actually on disk", seen[0])
 
 
+class TestTheBaselineExcuseStopsAtTheTicketsScope(unittest.TestCase):
+    """Amnesty covers what a ticket cannot fix, and nothing else.
+
+    Nothing reverts a failed ticket, so a retry starts with the previous
+    cycle's breakage on disk — and used to collect a baseline that forgave it.
+    One ticket left four clippy errors in `src/board.rs`, was requeued, and
+    passed its lint step on the grounds that the errors pre-dated the attempt.
+    They did. It wrote them.
+    """
+
+    LINT = (
+        "error: casting to the same type is unnecessary (`i32` -> `i32`)\n"
+        "  --> src/board.rs:64:48\n"
+        "   |\n"
+        "error[E0308]: mismatched types\n"
+        "  --> web/main.js:12:3\n"
+        "   |\n"
+    )
+
+    def _baseline(self, allowed):
+        orch, _root, run_id = _stub_orchestrator(
+            commands={"lint": "cargo clippy", "typecheck": "", "test": ""}
+        )
+        orch._shell = lambda *_a, **_k: StepResult(ok=False, detail=self.LINT)
+        return orch._baseline_failures(
+            run_id, Ticket("T-1", allowed_files=allowed)
+        ).get("lint", set())
+
+    def test_breakage_in_a_file_the_ticket_may_write_is_not_excused(self):
+        excused = self._baseline(["src/board.rs"])
+
+        self.assertEqual(len(excused), 1)
+        self.assertNotIn("board.rs", " ".join(excused))
+
+    def test_breakage_outside_the_scope_is_still_excused(self):
+        # The chain the baseline exists to break: an error in a file the ticket
+        # cannot open must not spend its three attempts.
+        excused = self._baseline(["web/main.js"])
+
+        self.assertEqual(len(excused), 1)
+        self.assertIn("board.rs", " ".join(excused))
+
+    def test_a_ticket_owning_everything_is_excused_nothing(self):
+        self.assertEqual(self._baseline(["src/board.rs", "web/main.js"]), set())
+
+    def test_a_glob_scope_still_claims_its_files(self):
+        self.assertNotIn("board.rs", " ".join(self._baseline(["src/**"])))
+
+    def test_scope_matching_folds_case(self):
+        # `signatures` lowercases, so a `Cargo.toml` in allowed_files would
+        # otherwise never match the `cargo.toml` in its own diagnostic.
+        self.assertTrue(
+            Orchestrator._signature_scope(
+                "error: invalid manifest --> cargo.toml:3:1", ["Cargo.toml"]
+            )
+        )
+
+    def test_a_signature_with_no_location_stays_excusable(self):
+        # Nothing to attribute it to, and blaming a ticket for a diagnostic
+        # that names no file is the wrong direction to guess in.
+        self.assertFalse(
+            Orchestrator._signature_scope("error: linking failed", ["src/board.rs"])
+        )
+
+
 class TestBaselineVerifyIsOptional(unittest.TestCase):
     def test_it_is_on_by_default(self):
         self.assertTrue(LoopSettings().baseline_verify)

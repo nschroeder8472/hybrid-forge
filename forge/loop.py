@@ -452,6 +452,27 @@ class Orchestrator:
     # The verify steps, in the order a failure is cheapest to diagnose.
     _VERIFY_STEPS = ("lint", "typecheck", "test")
 
+    @staticmethod
+    def _signature_scope(signature: str, allowed: list[str]) -> bool:
+        """Whether a diagnostic points at a file this ticket may write.
+
+        Signatures carry their location — `error: ... --> src/board.rs:21:19` —
+        so the file a complaint is about can be compared against the ticket's
+        own scope. Matching is lowercased because `signatures` folds case, and
+        `Cargo.toml` would otherwise never match `cargo.toml`.
+
+        A signature with no parseable location answers False, which leaves the
+        failure excusable. That is the safe direction: the alternative blames a
+        ticket for something it may have no authority to touch.
+        """
+        patterns = [pattern.lower() for pattern in allowed]
+        for match in re.finditer(r"-->\s*(\S+)", signature):
+            # Trim the `:line:col` the compiler appends to the path.
+            location = re.sub(r"(?::\d+)+$", "", match.group(1))
+            if location and matches_any(location, patterns):
+                return True
+        return False
+
     def _baseline_failures(self, run_id: int, ticket: Ticket) -> dict[str, set[str]]:
         """Which verify steps were already failing before this ticket started.
 
@@ -467,6 +488,15 @@ class Orchestrator:
         Recording what was already broken is what breaks that chain: a failure
         present before the ticket ran is reported as pre-existing and does not
         count against it.
+
+        The excuse stops at the edge of the ticket's own scope. A failure in a
+        file the ticket may write is one it is able to fix, and on a retry it is
+        usually one the ticket *caused* — nothing reverts a failed ticket, so
+        the next cycle starts with its own breakage on disk and would otherwise
+        collect a baseline that forgives it. That happened: a ticket left four
+        clippy errors in `src/board.rs`, was requeued, and passed its lint step
+        on the grounds that the errors pre-dated the attempt. They did. It wrote
+        them.
         """
         known: dict[str, set[str]] = {}
         for name in self._VERIFY_STEPS:
@@ -482,15 +512,35 @@ class Orchestrator:
                 # Leaving it out means the ticket is judged on this step
                 # normally, which is the safe direction to be wrong in.
                 continue
-            known[name] = found
+
+            owned = {
+                signature
+                for signature in found
+                if self._signature_scope(signature, ticket.allowed_files)
+            }
+            if owned:
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: {len(owned)} pre-existing {name} "
+                    f"error(s) are in files this ticket may write, so they are "
+                    f"its to fix and are not excused.",
+                    level="warn",
+                    kind="verify",
+                    data={"step": name, "signatures": sorted(owned)[:20]},
+                )
+
+            inherited = found - owned
+            if not inherited:
+                continue
+            known[name] = inherited
             self.store.log(
                 run_id,
                 f"{ticket.ticket_id}: {name} was already failing before this "
-                f"ticket started ({len(found)} error(s)); it will not be "
-                "blamed for them.",
+                f"ticket started ({len(inherited)} error(s)) outside its scope; "
+                "it will not be blamed for them.",
                 level="warn",
                 kind="verify",
-                data={"step": name, "signatures": sorted(found)[:20]},
+                data={"step": name, "signatures": sorted(inherited)[:20]},
             )
         return known
 

@@ -352,7 +352,7 @@ attempts — supplied the revisions that kept the brake off.
 
 ---
 
-### 1.5 A failed ticket's work is grandfathered into the baseline
+### 1.5 A failed ticket's work is grandfathered into the baseline — **done**
 
 **New in run 2.** Nothing reverts a failed ticket's edits, and `baselineVerify`
 then reclassifies its breakage as pre-existing for every ticket that follows.
@@ -379,17 +379,68 @@ ticket touched, and exclude errors in those files from the pre-existing set for
 later tickets in the same run. At minimum, name the owner in the log: *"N of
 these errors were introduced by TT-002, which failed."*
 
-**Files.** `forge/loop.py` (`_baseline_failures`, and the `pre_existing`
-capture at `:1114-1118`).
+---
 
-**Tests.**
+**What was actually implemented, and why it differs.**
 
-- `test_a_failed_tickets_breakage_is_not_pre_existing_for_the_next_ticket`
-- `test_genuinely_pre_existing_breakage_is_still_excused`
+Two claims above did not survive checking, and the fix changed shape as a
+result.
 
-**Risk.** Moderate. Tightening this makes later tickets fail that currently
-pass, which is correct but will look like a regression on the first run after
-it lands. Land it with 0.1 re-run evidence in hand.
+*"Any real lint regression a later ticket introduces in those same files would
+also be excused"* — **false**. `introduced` is a set difference over
+*signatures*, not over files, and a signature carries its own `--> path:line`.
+A new error in an already-broken file produces a new signature and is still
+attributed. Verified directly against `signatures()`.
+
+*"Exclude errors in files a failed ticket touched from the pre-existing set for
+later tickets"* — **would have been harmful**. TT-005 cannot fix
+`src/board.rs`; it is not in its scope. Blaming it would spend three attempts on
+work it has no authority to do, which is the exact chain `_baseline_failures`
+was written to break — its own docstring says so.
+
+The real defect is narrower and sharper: **a ticket was being excused breakage
+it caused itself.** Nothing reverts a failed ticket, so a retry starts with its
+own damage on disk, and `_baseline_failures` runs per ticket per cycle — so the
+damage became that ticket's own baseline. Run 2, event 73: *"TT-002: lint still
+failing, but only on errors that pre-date this ticket; not counted against it."*
+The four errors were in `src/board.rs`. TT-002 wrote them.
+
+So the rule implemented is neither of the above: **amnesty covers only what the
+ticket cannot fix.** A diagnostic pointing at a file in the ticket's
+`allowed_files` is never excused — it is in scope, the ticket is the only party
+that can fix it, and on a retry it is usually the ticket's own. Everything
+outside that scope is excused exactly as before.
+
+This needs no attempt counters and no tracking of who broke what, because
+ownership is a property of scope rather than of history. It also closes the
+cross-run case for free: breakage left on disk by a failed run is owned by
+whichever ticket's scope covers it, whenever that ticket next runs.
+
+Replayed against the baseline TT-002 was actually handed on its final cycle:
+
+| ticket | scope | not excused | excused |
+|---|---|---|---|
+| TT-002 | `src/board.rs`, `src/lib.rs` | 4 | 0 |
+| TT-005 | `web/*` | 0 | 4 |
+| TT-006 | `build.sh`, `build.ps1`, `README.md` | 0 | 4 |
+
+**Landed as.** `Orchestrator._signature_scope`, and the owned/inherited split in
+`_baseline_failures` (`forge/loop.py`). A signature with no parseable location
+stays excusable — the safe direction.
+
+**Tests.** `TestTheBaselineExcuseStopsAtTheTicketsScope` — six cases covering
+in-scope, out-of-scope, whole-scope, glob scope, case folding, and the
+no-location fallback.
+
+**Risk.** Moderate, as predicted, but narrower than feared. A ticket that
+*inherits* breakage in a file it owns now has to fix it. That is correct — it
+has the authority and nobody else does — but it will look like a regression on
+the first run after it lands.
+
+**Still open.** `_finish` runs its final verify only when nothing is blocked
+(`forge/loop.py:753-763`), so a blocked run never reports the state of the tree.
+Lower value now that ownership is attributed per ticket, but it is the last
+place a dirty tree can leave without comment.
 
 ---
 
@@ -716,7 +767,7 @@ land too — one branch to push when the backlog is green.
 | — | 0.1 | Done. Reviewer confirmed good; two new failure modes exposed |
 | — | 1.0 | Done — `308fb6a` |
 | — | 1.1, 1.3, 1.4, 3.4 | Done — `88ed838` |
-| 1 | 1.5 | Stops "done" being reported over a crate that does not lint |
+| — | 1.5 | Done — amnesty now stops at the ticket's own scope |
 | 2 | 2.1, 2.2 | Prompt-only; cheap insurance against the next weak reviewer |
 | 3 | 1.2 | Only meaningful once 1.0 can tell empty from unparseable |
 | 4 | 2.3 | Prerequisite for 3.3 |
