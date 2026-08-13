@@ -27,7 +27,7 @@ from pathlib import Path
 
 from .patch import normalize_path
 from .providers import Message, Provider
-from .state import Ticket
+from .state import TICKET_FEATURE, Ticket
 
 # A ticket section: "## IM-014: Add PNG export" or "# IM-014 — Add PNG export".
 _TICKET_HEADER = re.compile(
@@ -43,6 +43,11 @@ _FIELD = {
     ),
     "context": re.compile(r"^#{1,4}\s*Context.*$", re.MULTILINE | re.IGNORECASE),
 }
+
+# "**Kind:** bug" — a ticket the loop must reproduce before it may fix it. Only
+# written when it is not the ordinary kind, so a plan a human wrote by hand
+# does not have to say "feature" on every section.
+_KIND = re.compile(r"^\*\*Kind:\*\*\s*(?P<kind>bug|feature)", re.MULTILINE | re.IGNORECASE)
 
 _ROUTE = re.compile(r"^\*\*Route:\*\*\s*(?P<route>delegate|claude-only)", re.MULTILINE | re.IGNORECASE)
 
@@ -400,11 +405,15 @@ def parse_plan(text: str) -> list[Ticket]:
         needs_match = _NEEDS.search(body)
         needs = _ids(needs_match.group("needs")) if needs_match else []
 
+        kind_match = _KIND.search(body)
+        kind = kind_match.group("kind").lower() if kind_match else TICKET_FEATURE
+
         tickets.append(
             Ticket(
                 ticket_id=header.group("id"),
                 title=header.group("title").strip(),
                 route=route,
+                kind=kind,
                 position=index,
                 spec=_section(body, found["spec"], boundaries),
                 allowed_files=_bullets(_section(body, found["allowed"], boundaries)),
@@ -550,6 +559,12 @@ def render_ticket(ticket: Ticket) -> str:
         "",
         f"**Route:** {ticket.route}",
     ]
+    # Emitted only when it is not the ordinary kind. A bug ticket is read
+    # differently by the loop — it has to reproduce the fault first — and a
+    # ticket file that does not say so is a file that lies about what will
+    # happen to it.
+    if ticket.kind != TICKET_FEATURE:
+        lines.append(f"**Kind:** {ticket.kind}")
     # Emitted whenever present, including when ingest derived it: an edge a
     # human never typed is exactly the one worth showing them.
     if ticket.needs:

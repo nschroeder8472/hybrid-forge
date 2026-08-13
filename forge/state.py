@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     ticket_id     TEXT NOT NULL,
     title         TEXT NOT NULL DEFAULT '',
     route         TEXT NOT NULL DEFAULT 'delegate',
+    kind          TEXT NOT NULL DEFAULT 'feature',
     status        TEXT NOT NULL DEFAULT 'pending',
     position      INTEGER NOT NULL DEFAULT 0,
     attempts      INTEGER NOT NULL DEFAULT 0,
@@ -128,6 +129,11 @@ def _criterion_key(criterion: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", criterion.lower())
 
 
+# What a ticket is for. `bug` earns the reproduce-before-fix path; everything
+# else is ordinary forward work.
+TICKET_FEATURE = "feature"
+TICKET_BUG = "bug"
+
 TICKET_PENDING = "pending"
 TICKET_RUNNING = "running"
 TICKET_DONE = "done"
@@ -141,6 +147,15 @@ class Ticket:
     ticket_id: str
     title: str = ""
     route: str = "delegate"
+    # What kind of work this is. `feature` tickets describe work that does not
+    # exist yet and are verified against their criteria. A `bug` ticket
+    # describes something that already misbehaves, and the loop treats it
+    # differently in one decisive way: it must reproduce the fault before it is
+    # allowed to fix it, and the ticket is only done when the test that proved
+    # the fault passes. Criteria alone cannot carry that — a criterion is
+    # satisfied the moment the code reads right, and both bugs shipped by one
+    # green run read right.
+    kind: str = TICKET_FEATURE
     status: str = TICKET_PENDING
     position: int = 0
     attempts: int = 0
@@ -228,6 +243,7 @@ class Ticket:
             "ticket_id": self.ticket_id,
             "title": self.title,
             "route": self.route,
+            "kind": self.kind,
             "status": self.status,
             "position": self.position,
             "attempts": self.attempts,
@@ -252,6 +268,7 @@ class Ticket:
             ticket_id=row["ticket_id"],
             title=row["title"],
             route=row["route"],
+            kind=row["kind"],
             status=row["status"],
             position=row["position"],
             attempts=row["attempts"],
@@ -297,6 +314,7 @@ class Store:
         ("tickets", "original_spec", "TEXT NOT NULL DEFAULT ''"),
         ("tickets", "original_criteria", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "original_context", "TEXT NOT NULL DEFAULT ''"),
+        ("tickets", "kind", "TEXT NOT NULL DEFAULT 'feature'"),
         ("tickets", "needs", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "dep_stamp", "TEXT NOT NULL DEFAULT '{}'"),
         ("tickets", "baseline_tree", "TEXT NOT NULL DEFAULT ''"),
@@ -414,12 +432,12 @@ class Store:
                 row["original_context"] = ticket.original_context or ticket.context
                 connection.execute(
                     "INSERT OR REPLACE INTO tickets "
-                    "(run_id, ticket_id, title, route, status, position, attempts, "
+                    "(run_id, ticket_id, title, route, kind, status, position, attempts, "
                     " attempt_base, spec, allowed_files, reference_files, criteria, needs, dep_stamp, "
                     " baseline_tree, context, "
                     " blocked_note, original_spec, original_criteria, original_context, "
                     " updated_at) "
-                    "VALUES (:run_id, :ticket_id, :title, :route, :status, :position, "
+                    "VALUES (:run_id, :ticket_id, :title, :route, :kind, :status, :position, "
                     ":attempts, :attempt_base, :spec, :allowed_files, :reference_files, "
                     ":criteria, :needs, :dep_stamp, :baseline_tree, :context, "
                     ":blocked_note, :original_spec, :original_criteria, :original_context, :now)",
@@ -471,7 +489,7 @@ class Store:
         # is judged against, and an anchor that any caller can move is not one.
         with self._write() as connection:
             connection.execute(
-                "UPDATE tickets SET status = :status, attempts = :attempts, "
+                "UPDATE tickets SET status = :status, kind = :kind, attempts = :attempts, "
                 "attempt_base = :attempt_base, spec = :spec, "
                 "allowed_files = :allowed_files, reference_files = :reference_files, "
                 "criteria = :criteria, needs = :needs, dep_stamp = :dep_stamp, "
@@ -602,6 +620,27 @@ class Store:
             seen.add(key)
             failures.append({"name": row["name"], "detail": detail})
         return failures[-limit:]
+
+    def reproduced(self, run_id: int, ticket_id: str) -> str:
+        """The output that proved this bug, or "" if it was never reproduced.
+
+        The `reproduce` step is recorded `ok` when the test the loop wrote
+        *failed* — that failure is the proof, and it is the one place in the
+        pipeline where a red suite is the desired outcome.
+
+        Durable because the fix erases the evidence. Once the bug is fixed the
+        test passes, and a retry cycle re-running reproduction would find
+        nothing wrong and park a ticket whose work is already done. Asking the
+        step log instead answers the only question that matters on a second
+        pass: was this fault ever real.
+        """
+        row = self._connection.execute(
+            "SELECT detail FROM steps "
+            "WHERE run_id = ? AND ticket_id = ? AND name = 'reproduce' "
+            "AND status = 'ok' ORDER BY id DESC LIMIT 1",
+            (run_id, ticket_id),
+        ).fetchone()
+        return row["detail"] if row else ""
 
     def ticket_turns(
         self, run_id: int, ticket_id: str, limit: int = 2

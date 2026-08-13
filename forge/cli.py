@@ -8,6 +8,7 @@
                                    (-1: until it is clean or you stop it)
     forge status                   one-shot summary
     forge retry [--respec]         put failed tickets back on the backlog
+    forge bug "<report>"           reproduce a bug, then fix it
     forge criteria [ID --accept N] adopt a criterion respec proposed and lost
     forge prune [--keep N]         delete the artifact trees of old runs
     forge models                   write Modelfiles pinning what config cannot
@@ -24,13 +25,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 import time
 import webbrowser
 from pathlib import Path
 
-from . import modelfiles, respec, wizard
+from . import evidence, modelfiles, respec, wizard
 from .artifacts import ARTIFACTS_DIR
 from .config import Config, ConfigError, default_config
 from .ingest import ingest as ingest_document
@@ -44,15 +46,19 @@ from .loop import (
     retries_key,
 )
 from .memory import MemoryClient
+from .patch import matches_any
+from .prompts import bug_prompt, parse_bug
 from .profile import Profile
 from .providers import ProviderError
 from .state import (
     RUN_IDLE,
     TICKET_BLOCKED,
+    TICKET_BUG,
     TICKET_DONE,
     TICKET_FAILED,
     TICKET_SKIPPED,
     Store,
+    Ticket,
 )
 from .tokens import format_tokens
 from .ui import server as ui_server
@@ -737,6 +743,133 @@ def cmd_retry(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bug(args: argparse.Namespace) -> int:
+    """Turn a prose bug report into one ticket the loop can reproduce and fix.
+
+    Separate from `ingest` because the shapes differ at the root. Ingest turns
+    a document into a backlog and takes the author's acceptance criteria as the
+    contract; a report is one symptom, its file scope is unknown, and its
+    contract is written afterwards by a test that has to fail first.
+    """
+    report = _read_report(args)
+    if not report.strip():
+        sys.exit("error: the report is empty. Say what you saw and what you expected.")
+
+    config = _load(args.root)
+    store = _store(config)
+
+    try:
+        provider = config.provider_for("planner")
+    except (ConfigError, ValueError) as exc:
+        sys.exit(f"error: {exc}")
+
+    # Gathered here rather than asked of the model: the planner has no
+    # filesystem, and the file that needs changing is the thing being looked
+    # for. See forge/evidence.py.
+    found = evidence.gather(config.root, report)
+    if not found:
+        print(
+            "warning: no repository evidence could be gathered — this may not "
+            "be a git checkout. The ticket will be scoped from the report alone."
+        )
+
+    print("Reading the report against the repository...")
+    try:
+        completion = provider.complete(
+            bug_prompt(report, found),
+            max_tokens=max(2048, provider.capabilities().max_output_tokens // 4),
+            temperature=0.1,
+        )
+        fields = parse_bug(completion.text)
+    except (ProviderError, ValueError) as exc:
+        sys.exit(f"error: {exc}")
+
+    ticket_id = args.id or _next_bug_id(store)
+    ticket = Ticket(
+        ticket_id=ticket_id,
+        title=fields["title"] or "Bug report",
+        kind=TICKET_BUG,
+        # Never delegated blindly: a bug in code the project marked off-limits
+        # is exactly the kind that wants a person.
+        route="claude-only"
+        if any(matches_any(p, config.never_delegate) for p in fields["allowed_files"])
+        else "delegate",
+        spec=fields["spec"],
+        allowed_files=fields["allowed_files"],
+        reference_files=fields["reference_files"],
+        criteria=fields["criteria"],
+        # What the reproduction should assert, read by the tester before it
+        # writes anything and by the executor as the shape of the fix.
+        context=fields["reproduce"],
+    )
+
+    run_id = store.create_run(f"bug: {ticket.title}", source=report[:2000])
+    store.add_tickets(run_id, [ticket])
+    store.log(
+        run_id,
+        f"{ticket.ticket_id}: filed from a bug report. It must be reproduced "
+        f"before anything is allowed to fix it.",
+        kind="ticket",
+        data={"report": report[:2000]},
+    )
+
+    try:
+        write_tickets(config.tickets_dir, [ticket])
+    except OSError as exc:
+        print(f"warning: could not write the ticket file ({exc}).")
+
+    print(f"\nRun {run_id} — {ticket.ticket_id}: {ticket.title}")
+    print(f"  scope     {', '.join(ticket.allowed_files) or '(none named)'}")
+    if ticket.reference_files:
+        print(f"  reads     {', '.join(ticket.reference_files)}")
+    if ticket.context:
+        print(f"  reproduce {ticket.context}")
+    print(f"\n{ticket.spec}\n")
+    if ticket.route != "delegate":
+        print(
+            "Routed claude-only: the scope touches a neverDelegate path, so the "
+            "loop will leave it for you."
+        )
+
+    if args.go:
+        return cmd_go(
+            argparse.Namespace(
+                root=args.root, plan="", goal="", no_ui=args.no_ui, open=False,
+                retries=None, no_respec=False, wait=None,
+            )
+        )
+    print("Read the scope above, then: forge go")
+    return 0
+
+
+def _read_report(args: argparse.Namespace) -> str:
+    """The report itself, from an argument, a file, or stdin."""
+    if args.file:
+        try:
+            return Path(args.file).read_text(encoding="utf-8")
+        except OSError as exc:
+            sys.exit(f"error: cannot read {args.file} ({exc})")
+    if args.report == "-":
+        return sys.stdin.read()
+    return args.report or ""
+
+
+def _next_bug_id(store: Store) -> str:
+    """The next free `BUG-nnn`, counting across every run in this repository.
+
+    Across runs rather than within one, because the id names a test file and
+    two runs reusing `BUG-001` would have the second overwrite the first's
+    reproduction — throwing away the evidence for a bug nobody said was fixed.
+    """
+    used = set()
+    for run in store.list_runs(limit=200):
+        for ticket in store.list_tickets(int(run["id"])):
+            match = re.fullmatch(r"BUG-(\d+)", ticket.ticket_id)
+            if match:
+                used.add(int(match.group(1)))
+    return f"BUG-{max(used) + 1 if used else 1:03d}"
+
+
 def cmd_criteria(args: argparse.Namespace) -> int:
     """Show the criteria respec proposed and refused, and adopt one.
 
@@ -982,6 +1115,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="list what would be removed and stop"
     )
     p.set_defaults(func=cmd_prune)
+
+    p = sub.add_parser(
+        "bug", help="turn a bug report into a ticket the loop must reproduce first"
+    )
+    p.add_argument(
+        "report",
+        nargs="?",
+        default="",
+        help="the report itself, or - to read it from stdin",
+    )
+    p.add_argument("--file", default="", metavar="PATH", help="read the report from a file")
+    p.add_argument("--id", default="", metavar="ID", help="ticket id (default: the next BUG-nnn)")
+    p.add_argument("--go", action="store_true", help="start the loop straight after")
+    p.add_argument("--no-ui", action="store_true", help="with --go, skip the dashboard")
+    p.set_defaults(func=cmd_bug)
 
     p = sub.add_parser(
         "criteria",

@@ -149,6 +149,11 @@ as passing tests.
 even if that stalls the backlog. Auth, concurrency, migrations, and public API
 surface stay with Claude.
 
+**A bug is never fixed on faith.** `forge bug` writes a test that asserts the
+correct behavior and requires it to *fail* before any fix is attempted. A fault
+that cannot be demonstrated parks for a human rather than being fixed against a
+guess — see [docs/BUG-LOOP.md](docs/BUG-LOOP.md).
+
 **A `BLOCKED:` never retries.** An underspecified spec does not improve by being
 asked again — the run parks the ticket and says what was ambiguous.
 
@@ -176,6 +181,7 @@ forge go --retries N        # requeue and respec what did not land, N more
                             # times; -1 = until clean or stopped
 forge status                # one-shot summary
 forge retry [--respec]      # requeue failed tickets, optionally re-specced
+forge bug "<report>"        # reproduce a bug, then fix it
 forge criteria [ID --accept N]
                             # adopt a criterion the loop proposed and refused
 forge pause | resume | stop # applied after the current step, never mid-patch
@@ -222,6 +228,10 @@ first `forge init`. [docs/SETUP.md](docs/SETUP.md) is the reference behind it:
 every option, every alternative, and the full security discussion. The daemon is
 stdlib-only Python 3.10+ — a failed `pip install` is a bad way to discover that
 an overnight run never started.
+
+[docs/BUG-LOOP.md](docs/BUG-LOOP.md) covers `forge bug` — the loop that has to
+reproduce a fault before it is allowed to fix it, and what it refuses to do when
+it cannot.
 
 [docs/CONFIG.md](docs/CONFIG.md) is the key-by-key reference for
 `.hybridforge/config.json`, with a populated example at

@@ -24,7 +24,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from types import SimpleNamespace
 
-from forge import cli, modelfiles, respec
+from forge import cli, evidence, modelfiles, respec
 from forge.artifacts import Artifacts
 from forge.budget import BudgetGate, ContextOverflow, RateLimitPolicy
 from forge.config import ROLES, Config, ConfigError, LoopSettings, UISettings
@@ -54,6 +54,9 @@ from forge.patch import (
 )
 from forge.failures import distill, errors_naming, signatures
 from forge.prompts import (
+    bug_prompt,
+    parse_bug,
+    repro_prompt,
     build_prompt,
     parse_respec,
     parse_verdict,
@@ -79,6 +82,8 @@ from forge.providers.claude_cli import (
     parse_reset_time,
 )
 from forge.state import (
+    TICKET_BLOCKED,
+    TICKET_BUG,
     TICKET_DONE,
     TICKET_PENDING,
     TICKET_FAILED,
@@ -3580,6 +3585,136 @@ class TestACriterionTheSpecAlreadyStatesIsNotARatchet(unittest.TestCase):
         self.assertNotIn("the plan is what needs changing", messages)
 
 
+class TestFilingABugFromTheCommandLine(unittest.TestCase):
+    """`forge bug` is separate from `ingest` because the shapes differ at the
+    root: ingest turns a document into a backlog and takes its criteria as the
+    contract, while a report is one symptom whose file scope is unknown and
+    whose contract is written afterwards, by a test that has to fail first."""
+
+    REPLY = json.dumps(
+        {
+            "title": "tick locks three pieces",
+            "spec": "Game.tick should lock at most one piece per call",
+            "allowed_files": ["src/game.py"],
+            "reference_files": ["src/board.py"],
+            "reproduce": "tick(3000) locks at most one piece",
+        }
+    )
+
+    class _Planner(Provider):
+        kind = "stub"
+        reply = ""
+
+        def complete(self, messages, *, max_tokens, temperature=0.2, timeout=600):
+            type(self).seen = _joined(messages)
+            return Completion(text=self.reply, usage=Usage(), finish_reason="stop")
+
+        def capabilities(self):
+            return Capabilities(context_window=32768, max_output_tokens=8192)
+
+    def _project(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x"}},
+                    "roles": {r: "m" for r in ("planner", "executor", "tester", "reviewer")},
+                    "commands": {"test": "pytest -q"},
+                    "neverDelegate": ["src/auth/**"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return root
+
+    def _run(self, root, *argv, reply=None):
+        planner = self._Planner("planner", {})
+        type(planner).reply = reply or self.REPLY
+        parsed = cli.build_parser().parse_args(["--root", str(root), "bug", *argv])
+        out = io.StringIO()
+        with unittest.mock.patch.object(Config, "provider_for", lambda self, role: planner):
+            with contextlib.redirect_stdout(out):
+                parsed.func(parsed)
+        return out.getvalue()
+
+    def _ticket(self, root):
+        store = Store(Config.load(root).db_path)
+        try:
+            return store.list_tickets(int(store.latest_run()["id"]))[0]
+        finally:
+            store.close()
+
+    def test_a_report_becomes_one_bug_ticket(self):
+        root = self._project()
+
+        printed = self._run(root, "pieces drop three at once after a tab switch")
+
+        ticket = self._ticket(root)
+        self.assertEqual(ticket.kind, TICKET_BUG)
+        self.assertEqual(ticket.ticket_id, "BUG-001")
+        self.assertEqual(ticket.allowed_files, ["src/game.py"])
+        # What the reproduction has to assert, read by the tester first and by
+        # the executor as the shape of the fix.
+        self.assertIn("locks at most one piece", ticket.context)
+        self.assertIn("BUG-001", printed)
+
+    def test_the_report_reaches_the_planner_with_the_repository(self):
+        root = self._project()
+        (root / "src").mkdir()
+
+        self._run(root, "pieces drop three at once")
+
+        self.assertIn("pieces drop three at once", self._Planner.seen)
+
+    def test_the_ids_do_not_collide_across_runs(self):
+        # The id names the reproduction's filename, so a second run reusing
+        # BUG-001 would overwrite the first one's evidence.
+        root = self._project()
+        self._run(root, "first report")
+        self._run(root, "second report")
+
+        self.assertEqual(self._ticket(root).ticket_id, "BUG-002")
+
+    def test_a_bug_in_a_never_delegate_path_is_left_for_a_human(self):
+        root = self._project()
+        reply = json.dumps(
+            {"title": "t", "spec": "s", "allowed_files": ["src/auth/session.py"]}
+        )
+
+        printed = self._run(root, "login sometimes drops the session", reply=reply)
+
+        self.assertEqual(self._ticket(root).route, "claude-only")
+        self.assertIn("claude-only", printed)
+
+    def test_a_report_the_planner_cannot_place_stops_there(self):
+        root = self._project()
+        reply = json.dumps({"unclear": "nothing here matches that description"})
+
+        with self.assertRaises(SystemExit) as caught:
+            self._run(root, "the printer is on fire", reply=reply)
+
+        self.assertIn("nothing here matches", str(caught.exception))
+
+    def test_the_ticket_file_says_it_is_a_bug(self):
+        # The file is what a human reads before spending anything, and a bug
+        # ticket is read differently by the loop — it has to reproduce the
+        # fault first. A file that does not say so lies about what happens next.
+        root = self._project()
+        self._run(root, "pieces drop three at once")
+
+        written = (Config.load(root).tickets_dir / "BUG-001.md").read_text(encoding="utf-8")
+
+        self.assertIn("**Kind:** bug", written)
+        self.assertEqual(parse_plan(written)[0].kind, TICKET_BUG)
+
+    def test_an_empty_report_is_refused_before_any_model_is_called(self):
+        root = self._project()
+        with self.assertRaises(SystemExit) as caught:
+            self._run(root, "")
+        self.assertIn("report is empty", str(caught.exception))
+
+
 class TestAdoptingACriterionRespecWasRefused(unittest.TestCase):
     """Respec may not add to the standard it is judged against — it runs on a
     ticket that has just failed, and a ticket that keeps failing does not need
@@ -4711,6 +4846,108 @@ class TestOrphanedTestsNeverOutliveTheirTicket(unittest.TestCase):
         self.assertNotIn(True, seen, "verify saw the orphan still on disk")
 
 
+class TestEvidenceForABugReport(unittest.TestCase):
+    """A plan says which files a ticket may write. A report does not — the file
+    that needs changing is the thing being looked for. The harness gathers the
+    evidence rather than the model, so it works behind every adapter and needs
+    no tool grant."""
+
+    REPORT = (
+        "Pieces sometimes drop three at once after I switch tabs. Looks like "
+        "`SoftDrop` in src/game.rs, maybe Game::tick."
+    )
+
+    def _repo(self) -> Path:
+        root = Path(tempfile.mkdtemp())
+        (root / "src").mkdir()
+        (root / "src" / "game.rs").write_text(
+            "pub fn tick() {}\n// SoftDrop locks the piece\n", encoding="utf-8"
+        )
+        (root / "target").mkdir()
+        (root / "target" / "junk.rs").write_text("noise\n", encoding="utf-8")
+        (root / ".gitignore").write_text("target/\n", encoding="utf-8")
+        for args in (["init", "-q"], ["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]):
+            subprocess.run(["git", *args], cwd=root, capture_output=True, check=False)
+        return root
+
+    def test_the_searchable_terms_are_the_specific_ones(self):
+        found = evidence.terms(self.REPORT)
+
+        self.assertIn("SoftDrop", found)
+        self.assertIn("src/game.rs", found)
+        self.assertIn("Game::tick", found)
+        # Prose matches everything and locates nothing.
+        self.assertNotIn("sometimes", found)
+
+    def test_the_same_word_in_two_cases_is_searched_once(self):
+        self.assertEqual(evidence.terms("`SoftDrop` and softdrop"), ["SoftDrop"])
+
+    def test_it_lists_tracked_files_and_where_the_words_appear(self):
+        gathered = evidence.gather(self._repo(), self.REPORT)
+
+        self.assertIn("src/game.rs", gathered)
+        self.assertIn("SoftDrop", gathered)
+        # git ls-files honours .gitignore, so build output never reaches the
+        # prompt — a planner scoped to target/junk.rs writes a useless ticket.
+        self.assertNotIn("junk.rs", gathered)
+
+    def test_a_directory_that_is_not_a_checkout_yields_nothing(self):
+        # An honest empty block. A planner told "here is the evidence" over an
+        # invented tree scopes a ticket to files that do not exist.
+        self.assertEqual(evidence.gather(Path(tempfile.mkdtemp()), self.REPORT), "")
+
+
+class TestPlanningFromABugReport(unittest.TestCase):
+    def test_the_planner_is_given_the_report_and_the_repository(self):
+        body = bug_prompt("pieces drop three at once", "### Files\nsrc/game.rs")[-1].content
+
+        self.assertIn("pieces drop three at once", body)
+        self.assertIn("src/game.rs", body)
+        self.assertIn("every path you name", body)
+
+    def test_a_ticket_is_parsed_out_of_the_reply(self):
+        fields = parse_bug(
+            json.dumps(
+                {
+                    "title": "tick locks three pieces",
+                    "spec": "Game::tick drains its accumulator with a loop",
+                    "allowed_files": ["src/game.rs"],
+                    "reference_files": ["src/lib.rs"],
+                    "reproduce": "tick(3000) locks at most one piece",
+                }
+            )
+        )
+
+        self.assertEqual(fields["allowed_files"], ["src/game.rs"])
+        self.assertEqual(fields["reproduce"], "tick(3000) locks at most one piece")
+
+    def test_a_report_the_planner_cannot_place_is_not_turned_into_a_ticket(self):
+        # Better than a plausible ticket scoped to files that do not exist.
+        with self.assertRaises(ValueError) as caught:
+            parse_bug(json.dumps({"unclear": "nothing in this repo matches"}))
+        self.assertIn("nothing in this repo matches", str(caught.exception))
+
+    def test_a_reply_with_no_spec_is_refused(self):
+        with self.assertRaises(ValueError):
+            parse_bug(json.dumps({"title": "t", "allowed_files": ["a.py"]}))
+
+    def test_the_tester_is_told_to_write_a_test_that_fails(self):
+        body = repro_prompt(
+            Ticket("BUG-001", title="t", spec="tick locks three pieces"),
+            test_path="tests/bug_001_test.py",
+            reproduce="tick(3000) locks at most one piece",
+        )[-1].content
+        system = repro_prompt(
+            Ticket("BUG-001"), test_path="tests/bug_001_test.py"
+        )[0].content
+
+        self.assertIn("tick(3000) locks at most one piece", body)
+        self.assertIn("must FAIL", system)
+        self.assertIn("Assert the CORRECT behavior", system)
+        # The failure has to be the assertion, not a broken file.
+        self.assertIn("`assert False`", system)
+
+
 def _stub_orchestrator(commands: dict[str, str] | None = None):
     """An Orchestrator over a temp repo with every shell command disabled."""
     root = Path(tempfile.mkdtemp())
@@ -5053,6 +5290,247 @@ class TestConversationalExecutorIsOffUntilAskedFor(unittest.TestCase):
         assistants = [m.content for m in second if m.role == "assistant"]
         self.assertEqual(assistants, ["src/a.py\n```python\nx = 1\n```"])
         self.assertIn("the error path is swallowed", second[-1].content)
+
+
+class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
+    """The loop verifies what the criteria say, so a defect nobody wrote a
+    criterion for survives the whole pipeline. Two shipped that way in one
+    green run. A bug ticket inverts the order: a test that asserts the correct
+    behavior is written first and must fail, and the fix is not done until that
+    same test passes."""
+
+    REPRO = "tests/bug_001_test.py"
+    TEST_FAILURE = (
+        "tests/bug_001_test.py::test_one_piece_per_tick FAILED\n"
+        "assert 3 == 1  # three pieces locked in one tick"
+    )
+
+    def _orch(self, *, commands=None, ticket=None):
+        orch, root, run_id = _stub_orchestrator(
+            commands or {"lint": "", "typecheck": "", "test": "pytest -q"}
+        )
+        orch.config.loop.max_attempts = 2
+        orch.store.add_tickets(
+            run_id,
+            [
+                ticket
+                or Ticket(
+                    "BUG-001",
+                    title="tick locks three pieces",
+                    kind=TICKET_BUG,
+                    spec="Game.tick should lock at most one piece per call",
+                    allowed_files=["src/a.py"],
+                    context="tick(3000) locks at most one piece",
+                )
+            ],
+        )
+        return orch, root, run_id
+
+    def _shell_until_fixed(self, root: Path):
+        """The suite fails while the bug is on disk and passes once it is not."""
+
+        def shell(_run_id, name, command):
+            if not command.strip():
+                return StepResult(ok=True, detail="")
+            source = root / "src" / "a.py"
+            fixed = source.exists() and "fixed" in source.read_text(encoding="utf-8")
+            if fixed:
+                return StepResult(ok=True, detail="1 passed")
+            return StepResult(ok=False, detail=self.TEST_FAILURE)
+
+        return shell
+
+    def _calls(self, orch, *, tester: str, executor: str):
+        seen: dict[str, list[str]] = {}
+
+        def call(_run_id, role, messages, **_kwargs):
+            seen.setdefault(role, []).append(_joined(messages))
+            text = {"tester": tester, "executor": executor}.get(role, "ACCEPT")
+            return Completion(text=text, usage=Usage(), finish_reason="stop")
+
+        orch._call = call
+        return seen
+
+    _GOOD_TEST = (
+        "tests/bug_001_test.py\n```python\ndef test_one_piece_per_tick():\n"
+        "    assert locked(3000) == 1\n```"
+    )
+    _FIX = "src/a.py\n```python\n# fixed\ndef tick():\n    pass\n```"
+
+    def test_the_reproduction_is_written_first_and_has_to_fail(self):
+        orch, root, run_id = self._orch()
+        orch._shell = self._shell_until_fixed(root)
+        seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertEqual(orch.store.list_tickets(run_id)[0].status, TICKET_DONE)
+        # The proof is durable, and it is the failure the test produced.
+        self.assertIn("three pieces locked", orch.store.reproduced(run_id, "BUG-001"))
+        self.assertTrue((root / self.REPRO).exists())
+        # The executor is told what failed and that it cannot edit the proof.
+        self.assertIn("three pieces locked", seen["executor"][0])
+        self.assertIn("outside this ticket's scope", seen["executor"][0])
+
+    def test_no_further_tests_are_authored_for_a_bug_ticket(self):
+        # The contract was written before the fix, by a role that could not see
+        # it. Authoring more now would let the party being judged add to it.
+        orch, root, run_id = self._orch()
+        orch._shell = self._shell_until_fixed(root)
+        self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        names = [
+            row["name"]
+            for row in orch.store._connection.execute(
+                "SELECT name FROM steps WHERE ticket_id = 'BUG-001'"
+            )
+        ]
+        self.assertIn("reproduce", names)
+        self.assertNotIn("tests", names)
+
+    def test_the_reviewer_is_shown_the_red_to_green_evidence(self):
+        orch, root, run_id = self._orch()
+        orch._shell = self._shell_until_fixed(root)
+        seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        review = seen["reviewer"][-1]
+        self.assertIn("reproduced before it was fixed", review)
+        self.assertIn("three pieces locked", review)
+        self.assertIn("fixes the *cause*", review)
+
+    def test_a_reproduction_that_passes_proves_nothing_and_parks(self):
+        orch, _root, run_id = self._orch()
+        orch._shell = lambda _r, _n, command: StepResult(ok=True, detail="1 passed")
+        seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        stored = orch.store.list_tickets(run_id)[0]
+        self.assertEqual(stored.status, TICKET_BLOCKED)
+        self.assertIn("could not be reproduced", stored.blocked_note)
+        # Asked twice with the passing output quoted back, then parked. The
+        # executor is never reached: there is nothing to fix on faith.
+        self.assertEqual(len(seen["tester"]), 2)
+        self.assertNotIn("executor", seen)
+        self.assertIn("proved nothing", seen["tester"][1])
+
+    def test_a_report_too_vague_to_assert_is_handed_back(self):
+        orch, _root, run_id = self._orch()
+        orch._shell = lambda _r, _n, _c: StepResult(ok=False, detail=self.TEST_FAILURE)
+        seen = self._calls(
+            orch,
+            tester="BLOCKED: the report does not say what value was expected",
+            executor=self._FIX,
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        stored = orch.store.list_tickets(run_id)[0]
+        self.assertEqual(stored.status, TICKET_BLOCKED)
+        self.assertIn("cannot be turned into a test", stored.blocked_note)
+        self.assertEqual(len(seen["tester"]), 1, "a refusal is an answer, not a retry")
+
+    def test_the_fix_cannot_edit_its_own_proof(self):
+        orch, root, run_id = self._orch()
+        orch._shell = self._shell_until_fixed(root)
+        self._calls(
+            orch,
+            tester=self._GOOD_TEST,
+            executor=self._FIX
+            + f"\n\n{self.REPRO}\n```python\ndef test_one_piece_per_tick():\n    assert True\n```",
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        kept = (root / self.REPRO).read_text(encoding="utf-8")
+        self.assertIn("locked(3000) == 1", kept)
+        self.assertNotIn("assert True", kept)
+
+    def test_the_reproduction_survives_a_ticket_that_never_passed(self):
+        # An unverified feature test is deleted, because it fails every later
+        # ticket and none of them can reach it. A reproduction is the opposite:
+        # it is the one assertion here demonstrated against real behavior, and
+        # it is half of what the ticket was for.
+        orch, root, run_id = self._orch()
+        orch._shell = lambda _r, _n, _c: StepResult(ok=False, detail=self.TEST_FAILURE)
+        self._calls(
+            orch, tester=self._GOOD_TEST, executor="src/a.py\n```python\n# no fix\n```"
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+        orch._sweep_orphan_tests(run_id)
+
+        self.assertEqual(orch.store.list_tickets(run_id)[0].status, TICKET_FAILED)
+        self.assertTrue((root / self.REPRO).exists(), "the evidence must outlive the ticket")
+
+    def test_a_reproduction_that_does_not_build_is_not_evidence(self):
+        # A test that will not import fails the command for a reason that has
+        # nothing to do with the bug, and the executor cannot fix it — the file
+        # is outside its scope. Distinct from a failing assertion, which names
+        # the same file and *is* the evidence.
+        orch, _root, run_id = self._orch()
+        broken = (
+            "ImportError: cannot import name 'locked'\n"
+            "tests/bug_001_test.py:1: in <module>\n"
+        )
+        orch._shell = lambda _r, _n, _c: StepResult(ok=False, detail=broken)
+        seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        stored = orch.store.list_tickets(run_id)[0]
+        self.assertEqual(stored.status, TICKET_BLOCKED)
+        self.assertIn("does not build", stored.blocked_note)
+        self.assertEqual(len(seen["tester"]), 2)
+        self.assertIn("errors are in the file you are about to write", seen["tester"][1])
+
+    def test_a_second_cycle_does_not_reproduce_it_again(self):
+        # Once the fix lands the test passes, so re-running reproduction would
+        # find nothing wrong and park a ticket whose work is nearly done.
+        orch, root, run_id = self._orch()
+        orch._shell = self._shell_until_fixed(root)
+        step = orch.store.start_step(run_id, "BUG-001", "reproduce")
+        orch.store.end_step(step, "ok", self.TEST_FAILURE)
+        seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertNotIn("tester", seen)
+        self.assertIn("three pieces locked", seen["executor"][0])
+
+    def test_a_project_with_no_test_command_cannot_prove_anything(self):
+        orch, _root, run_id = self._orch(commands={"lint": "", "typecheck": "", "test": ""})
+        self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        stored = orch.store.list_tickets(run_id)[0]
+        self.assertEqual(stored.status, TICKET_BLOCKED)
+        self.assertIn("no test command", stored.blocked_note)
+
+    def test_the_baseline_never_excuses_the_reproduction(self):
+        # The hole this closes: on a retry cycle the reproduction is already on
+        # disk and already failing, so it pre-dates the attempt by every
+        # measure the amnesty uses.
+        orch, _root, run_id = self._orch()
+        failure = (
+            "error[E0001]: assertion failed\n"
+            "  --> tests/bug_001_test.rs:3:1\n"
+        )
+        orch._shell = lambda _r, _n, _c: StepResult(ok=False, detail=failure)
+        ticket = orch.store.list_tickets(run_id)[0]
+
+        excused = orch._baseline_failures(run_id, ticket)
+        not_excused = orch._baseline_failures(
+            run_id, ticket, extra_scope=["tests/bug_001_test.rs"]
+        )
+
+        self.assertTrue(excused.get("test"), "an unrelated failure is still excused")
+        self.assertEqual(not_excused, {})
 
 
 class TestARetryCycleRemembersWhatFailed(unittest.TestCase):
