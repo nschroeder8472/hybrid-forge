@@ -799,6 +799,14 @@ Rules:
   to fix, and a spec that contradicts the harness makes the ticket impossible:
   one told the executor not to use code fences, when a fence is the only thing
   the parser can read. Say it in the rationale instead.
+- A spec may state a decision as well as a requirement — "randomness is a
+  xorshift32 seeded from JavaScript", under a heading saying it is settled.
+  Copy every such sentence back into the revised spec, in its own words. They
+  are not criteria, so nothing downstream checks them: drop one and the ticket
+  goes green against a choice nobody made. If the failures show a decision is
+  the problem, say so in the rationale — that is a human's call, not yours.
+- `context` is appended to the plan's, never written over it. It carries rules
+  the executor needs on every attempt, and they are not yours to retire.
 - If the failures show the work simply was not finished — no recurring theme,
   no ambiguity, nothing the spec could have prevented — say so by returning
   the ticket essentially unchanged with a rationale explaining why.
@@ -885,6 +893,14 @@ should undo rather than build on.
 
 ### Original acceptance criteria
 {_criteria_block(ticket, ticket.original_criteria)}
+"""
+        if ticket.original_context.strip():
+            body += f"""
+### Original context
+This paragraph is the plan's, and it is kept whatever you return: anything you
+write in `context` is appended to it, not put in its place.
+
+{ticket.original_context.strip()}
 """
 
     if sources:

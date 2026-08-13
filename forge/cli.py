@@ -512,6 +512,18 @@ def _respec(
             )
             for criterion in result.refused_criteria:
                 print(f"      kept: {criterion}")
+        if result.refused_decisions:
+            print(
+                f"  {ticket.ticket_id:<10} dropped {len(result.refused_decisions)} "
+                f"decision(s) the plan settled; the spec revision was refused."
+            )
+            for decision in result.refused_decisions:
+                print(f"      kept: {decision}")
+        if result.restored_context:
+            print(
+                f"  {ticket.ticket_id:<10} replaced the plan's context; put back, "
+                f"with the revision appended to it."
+            )
         if not result.revised:
             # The rationale is the content of this outcome: "kept as written"
             # only says the planner declined to act, not why.

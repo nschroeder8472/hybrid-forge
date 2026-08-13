@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     blocked_note  TEXT NOT NULL DEFAULT '',
     original_spec     TEXT NOT NULL DEFAULT '',
     original_criteria TEXT NOT NULL DEFAULT '[]',
+    original_context  TEXT NOT NULL DEFAULT '',
     updated_at    REAL NOT NULL,
     UNIQUE(run_id, ticket_id)
 );
@@ -169,6 +170,11 @@ class Ticket:
     # of the plan's, and every party downstream believed the drift.
     original_spec: str = ""
     original_criteria: list[str] = field(default_factory=list)
+    # The plan's context paragraph, kept for the same reason. `context` is a
+    # full replacement with no provenance of its own, and respec used it as a
+    # rationale scratchpad: five tickets lost the plan's bare-path-line rule to
+    # a sentence about why the executor keeps omitting scaffold files.
+    original_context: str = ""
 
     @property
     def drifted(self) -> bool:
@@ -181,6 +187,8 @@ class Ticket:
         if not self.original_spec:
             return False
         if self.spec != self.original_spec:
+            return True
+        if self.original_context and self.context != self.original_context:
             return True
         return bool(self.original_criteria) and self.criteria != self.original_criteria
 
@@ -223,6 +231,7 @@ class Ticket:
             "blocked_note": self.blocked_note,
             "original_spec": self.original_spec,
             "original_criteria": json.dumps(self.original_criteria),
+            "original_context": self.original_context,
         }
 
     @classmethod
@@ -246,6 +255,7 @@ class Ticket:
             blocked_note=row["blocked_note"],
             original_spec=row["original_spec"],
             original_criteria=json.loads(row["original_criteria"]),
+            original_context=row["original_context"],
         )
 
 
@@ -274,6 +284,7 @@ class Store:
         ("tickets", "reference_files", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "original_spec", "TEXT NOT NULL DEFAULT ''"),
         ("tickets", "original_criteria", "TEXT NOT NULL DEFAULT '[]'"),
+        ("tickets", "original_context", "TEXT NOT NULL DEFAULT ''"),
         ("tickets", "needs", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "dep_stamp", "TEXT NOT NULL DEFAULT '{}'"),
         ("tickets", "baseline_tree", "TEXT NOT NULL DEFAULT ''"),
@@ -388,17 +399,18 @@ class Store:
                 row["original_criteria"] = json.dumps(
                     ticket.original_criteria or ticket.criteria
                 )
+                row["original_context"] = ticket.original_context or ticket.context
                 connection.execute(
                     "INSERT OR REPLACE INTO tickets "
                     "(run_id, ticket_id, title, route, status, position, attempts, "
                     " attempt_base, spec, allowed_files, reference_files, criteria, needs, dep_stamp, "
                     " baseline_tree, context, "
-                    " blocked_note, original_spec, original_criteria, "
+                    " blocked_note, original_spec, original_criteria, original_context, "
                     " updated_at) "
                     "VALUES (:run_id, :ticket_id, :title, :route, :status, :position, "
                     ":attempts, :attempt_base, :spec, :allowed_files, :reference_files, "
                     ":criteria, :needs, :dep_stamp, :baseline_tree, :context, "
-                    ":blocked_note, :original_spec, :original_criteria, :now)",
+                    ":blocked_note, :original_spec, :original_criteria, :original_context, :now)",
                     {**row, "run_id": run_id, "now": now},
                 )
 
@@ -442,9 +454,9 @@ class Store:
         return [Ticket.from_row(row) for row in rows]
 
     def update_ticket(self, run_id: int, ticket: Ticket) -> None:
-        # `original_spec` and `original_criteria` are deliberately absent from
-        # this statement. They are the anchor a respec is judged against, and
-        # an anchor that any caller can move is not one.
+        # `original_spec`, `original_criteria` and `original_context` are
+        # deliberately absent from this statement. They are the anchor a respec
+        # is judged against, and an anchor that any caller can move is not one.
         with self._write() as connection:
             connection.execute(
                 "UPDATE tickets SET status = :status, attempts = :attempts, "

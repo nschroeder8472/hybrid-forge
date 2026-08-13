@@ -30,6 +30,7 @@ from forge.ingest import (
     graph_problems,
     looks_like_plan,
     parse_plan,
+    plan_decisions,
     plan_with_model,
     render_ticket,
     shared_file_conflicts,
@@ -1500,6 +1501,235 @@ class TestTheOriginalTicketIsAnAnchor(unittest.TestCase):
         run_id = reopened.create_run("goal")
         reopened.add_tickets(run_id, [Ticket("T-1", spec="s")])
         self.assertEqual(reopened.list_tickets(run_id)[0].original_spec, "s")
+
+    def test_the_context_is_anchored_too(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(run_id, [Ticket("T-1", spec="s", context="the plan's rule")])
+
+        ticket = store.list_tickets(run_id)[0]
+        self.assertEqual(ticket.original_context, "the plan's rule")
+
+        ticket.context = "something a revision wrote"
+        ticket.original_context = "a rewritten history"
+        store.update_ticket(run_id, ticket)
+        self.assertEqual(
+            store.list_tickets(run_id)[0].original_context, "the plan's rule"
+        )
+
+    def test_a_context_only_change_counts_as_drift(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(run_id, [Ticket("T-1", spec="s", context="the plan's rule")])
+
+        ticket = store.list_tickets(run_id)[0]
+        self.assertFalse(ticket.drifted)
+        ticket.context = "a revision's paragraph"
+        self.assertTrue(ticket.drifted)
+
+
+class TestThePlansContextSurvivesARespec(unittest.TestCase):
+    """`context` was the one plan-authored field with no provenance rule.
+
+    Respec returns a whole new string, so the plan's paragraph was simply gone:
+    in one run five of six tickets lost the executor's bare-path-line rule and
+    the do-not-write-tests rule to a sentence of the planner's own reasoning
+    about why scaffold files keep being omitted. The system prompt still
+    carried both rules, so this was degradation rather than deletion — but the
+    redundancy holding a weak local model to format is what got deleted.
+    """
+
+    PLAN_CONTEXT = "Write each file as a bare path line, then the contents."
+
+    def _store(self, context=PLAN_CONTEXT):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(
+            run_id, [Ticket("T-1", spec="old", context=context, status="failed")]
+        )
+        step = store.start_step(run_id, "T-1", "review")
+        store.end_step(step, "failed", "REJECT: nope")
+        return store, run_id
+
+    def _reply(self, **payload):
+        def call(_messages, _budget):
+            return Completion(text=json.dumps(payload), usage=Usage())
+
+        return call
+
+    def test_respec_cannot_delete_the_plans_context(self):
+        store, run_id = self._store()
+        ticket = store.list_tickets(run_id)[0]
+
+        respec.revise(
+            store,
+            run_id,
+            ticket,
+            call=self._reply(spec="a revised spec", context="The board is 10x20."),
+            budget=1024,
+        )
+
+        stored = store.list_tickets(run_id)[0].context
+        self.assertIn(self.PLAN_CONTEXT, stored)
+        self.assertIn("The board is 10x20", stored)
+
+    def test_a_revision_that_kept_the_paragraph_is_not_given_it_twice(self):
+        store, run_id = self._store()
+        ticket = store.list_tickets(run_id)[0]
+
+        respec.revise(
+            store,
+            run_id,
+            ticket,
+            call=self._reply(
+                spec="a revised spec",
+                context=f"{self.PLAN_CONTEXT}\n\nThe board is 10x20.",
+            ),
+            budget=1024,
+        )
+
+        stored = store.list_tickets(run_id)[0].context
+        self.assertEqual(stored.count(self.PLAN_CONTEXT), 1)
+
+    def test_the_restoration_reaches_the_run_log(self):
+        store, run_id = self._store()
+        ticket = store.list_tickets(run_id)[0]
+
+        respec.revise(
+            store,
+            run_id,
+            ticket,
+            call=self._reply(spec="a revised spec", context="only mine"),
+            budget=1024,
+        )
+
+        messages = [row["message"] for row in store.events_after(0)]
+        self.assertTrue(
+            any("put back" in message for message in messages),
+            "a context the loop restored must be visible to a human",
+        )
+
+    def test_a_ticket_the_plan_gave_no_context_is_left_to_the_planner(self):
+        # Nothing to protect, so nothing is prepended — the planner's paragraph
+        # stands alone rather than being appended to an empty anchor.
+        store, run_id = self._store(context="")
+        ticket = store.list_tickets(run_id)[0]
+
+        respec.revise(
+            store,
+            run_id,
+            ticket,
+            call=self._reply(spec="a revised spec", context="the whole story"),
+            budget=1024,
+        )
+
+        self.assertEqual(store.list_tickets(run_id)[0].context, "the whole story")
+
+
+class TestADecisionInSpecProseIsProtected(unittest.TestCase):
+    """A plan can state a decision as well as a requirement, and the criteria
+    ratchet never covered it.
+
+    One plan opened with "Design decisions, already made — implement them, do
+    not revisit them", and one of them was that randomness is a xorshift32.
+    Respec observed that the criteria only require determinism and revised the
+    spec to "an internal deterministic PRNG". A Numerical Recipes LCG shipped,
+    every criterion passed, and the reviewer accepted it correctly because no
+    criterion named xorshift. The ticket was green and the decision was gone.
+    """
+
+    DECISION = "Randomness is a xorshift32 seeded from JavaScript."
+    SPEC = (
+        "Implement Game::tick.\n"
+        "\n"
+        "### Design decisions, already made\n"
+        "\n"
+        f"{DECISION}\n"
+    )
+
+    def _store(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(
+            run_id, [Ticket("T-1", spec=self.SPEC, criteria=["ticks"], status="failed")]
+        )
+        step = store.start_step(run_id, "T-1", "review")
+        store.end_step(step, "failed", "REJECT: nope")
+        return store, run_id
+
+    def _reply(self, **payload):
+        def call(_messages, _budget):
+            return Completion(text=json.dumps(payload), usage=Usage())
+
+        return call
+
+    def test_a_marked_decision_is_read_out_of_the_plans_prose(self):
+        self.assertEqual(plan_decisions(self.SPEC), [self.DECISION])
+
+    def test_a_line_may_mark_itself_where_there_is_no_room_for_a_section(self):
+        found = plan_decisions(
+            "- **Decision:** the store is SQLite, not Postgres.\n"
+            "The board is ten columns wide.\n"
+        )
+        self.assertEqual(found, ["- **Decision:** the store is SQLite, not Postgres."])
+
+    def test_a_spec_revision_that_drops_a_decision_is_refused(self):
+        store, run_id = self._store()
+        ticket = store.list_tickets(run_id)[0]
+
+        respec.revise(
+            store,
+            run_id,
+            ticket,
+            call=self._reply(
+                spec="Implement Game::tick with an internal deterministic PRNG.",
+                context="the executor should start here",
+            ),
+            budget=1024,
+        )
+
+        stored = store.list_tickets(run_id)[0]
+        self.assertEqual(stored.spec, self.SPEC)
+        # Only the spec is refused; the rest of the revision still lands.
+        self.assertIn("the executor should start here", stored.context)
+
+    def test_the_refusal_reaches_the_run_log(self):
+        store, run_id = self._store()
+        ticket = store.list_tickets(run_id)[0]
+
+        respec.revise(
+            store, run_id, ticket, call=self._reply(spec="a deterministic PRNG"), budget=1024
+        )
+
+        messages = [row["message"] for row in store.events_after(0)]
+        self.assertTrue(any("marked as settled" in message for message in messages))
+
+    def test_a_revision_that_keeps_the_decision_goes_through(self):
+        store, run_id = self._store()
+        ticket = store.list_tickets(run_id)[0]
+        revised = f"Implement Game::tick and Game::lock.\n\n{self.DECISION}"
+
+        respec.revise(store, run_id, ticket, call=self._reply(spec=revised), budget=1024)
+
+        self.assertEqual(store.list_tickets(run_id)[0].spec, revised)
+
+    def test_unmarked_prose_stays_freely_revisable(self):
+        # This protects what the plan labelled, not prose in general. A spec
+        # with no decisions section is revised exactly as before.
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(
+            run_id, [Ticket("T-1", spec="Implement Game::tick.", status="failed")]
+        )
+        step = store.start_step(run_id, "T-1", "review")
+        store.end_step(step, "failed", "REJECT: nope")
+        ticket = store.list_tickets(run_id)[0]
+
+        respec.revise(
+            store, run_id, ticket, call=self._reply(spec="Implement Game::step."), budget=1024
+        )
+
+        self.assertEqual(store.list_tickets(run_id)[0].spec, "Implement Game::step.")
 
 
 class TestTheDashboardOutlivesTheRun(unittest.TestCase):

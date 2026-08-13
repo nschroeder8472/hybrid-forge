@@ -13,7 +13,11 @@ what unblocks what, not by severity.
 below records what it was replayed against, and where a fix could not be
 verified against surviving data that is said plainly.
 
-Still open: 2.3, 3.1, 3.2, 3.3, 3.5, 3.6, and the conditional 2.4 and 4.1. A clean
+3.2 and 3.5 have since landed together on
+`fix/protect-plan-authored-context`, unverified against a run — they were
+written from run 5's evidence and are covered by tests, not by a replay.
+
+Still open: 2.3, 3.1, 3.3, 3.6, and the conditional 2.4 and 4.1. A clean
 run from an empty repository — no drifted specs carried over — is the validation
 that has not been done yet.
 
@@ -837,7 +841,21 @@ after Phase 1 and only with the audit log.
 
 ---
 
-### 3.2 Protect plan-authored context
+### 3.2 Protect plan-authored context — **done**
+
+`original_context` is recorded at ingest beside `original_spec` and
+`original_criteria`, and is absent from `update_ticket` for the same reason they
+are: an anchor any caller can move is not one. A revised `context` is appended
+to the plan's paragraph rather than written over it, skipped when the revision
+already contains it, and the restoration is logged and printed by `forge retry
+--respec`. `_refuse_protocol_edits` now anchors `context` on the original too,
+so a formatting phrase the plan never used is still judged as introduced after
+a revision has rewritten what it is compared against. A context-only change now
+counts as drift, which is what puts the ingested text in front of the planner.
+
+Ticket text that predates the column has no anchor, and is left to the planner
+exactly as before — the guard protects a paragraph a human wrote, and reports no
+paragraph rather than inventing one.
 
 **Problem.** `context` is a full replacement with no equivalent of
 `original_criteria`. Respec used it as a rationale scratchpad and deleted the
@@ -977,7 +995,29 @@ planner/tester/reviewer single-turn. Compare against the same backlog.
 
 ---
 
-### 3.5 A design decision in spec prose has no protection — **open**
+### 3.5 A design decision in spec prose has no protection — **done**
+
+Landed with 3.2. `ingest.plan_decisions` reads the sentences a plan marked as
+settled out of `original_spec` — everything under a heading about decisions
+("Design decisions, already made", "do not revisit", "non-negotiable"), plus any
+single line that marks itself (`**Decision:** ...`) for a spec with no room for
+a section. A revised spec that no longer states one of them is refused whole and
+the dropped sentence named, in the run log and in `forge retry --respec`.
+
+Three deliberate limits. It protects what the plan *labelled*, not prose in
+general: an unmarked sentence stays freely revisable, because a guard over all
+prose would refuse every genuine clarification. Matching is on a normalised form
+— punctuation and backticks may change, the words may not — which is the bar the
+prompt now asks for and the one a human can check by reading. And a decision
+whose normalised text is under 24 characters is skipped, because containment
+proves nothing at that length.
+
+The whole spec revision is refused rather than the sentence stitched back in: a
+spec revised around a dropped decision has already reasoned from its absence,
+and restoring the sentence into that reasoning produces a spec contradicting
+itself.
+
+The original write-up follows.
 
 **Found in run 5, in a backlog that passed.** `plan.md` opens with a section
 headed *"Design decisions, already made — implement them, do not revisit them"*,
@@ -1108,11 +1148,12 @@ land too — one branch to push when the backlog is green.
 | — | 1.7 | Done — respec cannot describe the reply format |
 | — | 1.8 | Done — unreadable reply reprompted once |
 | — | 1.9 | Done — heading-decorated path line read |
-| 1 | 3.2 | Now also covers spec prose — see 3.5 |
-| 2 | 2.3 | Prerequisite for 3.3 |
-| 5 | 3.3, 3.2 | Information architecture; 3.2 carries a migration |
-| 6 | 3.1 | Deliberately loosens a guard; wants a stable baseline |
-| 7 | 2.4, 4.1 | Conditional and experimental |
+| — | 3.2, 3.5 | Done — context anchored, marked decisions protected |
+| 1 | 2.3 | Prerequisite for 3.3 |
+| 2 | 3.3 | Information architecture; wants 2.3's caps first |
+| 3 | 3.6 | Reporting only — says what a green ticket did not prove |
+| 4 | 3.1 | Deliberately loosens a guard; wants a stable baseline |
+| 5 | 2.4, 4.1 | Conditional and experimental |
 
 1.6 is a decision, not a code change, and should be settled before the next
 baseline run.

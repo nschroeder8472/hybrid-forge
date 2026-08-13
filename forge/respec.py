@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from .ingest import derive_needs, whole_file_claims
+from .ingest import derive_needs, plan_decisions, whole_file_claims
 from .patch import is_safe_path
 from .prompts import parse_respec, respec_prompt
 from .providers import Completion, Message, ProviderError
@@ -48,6 +48,12 @@ class Revision:
     # locked: respec runs on a ticket that has just failed, and its job is
     # to make that ticket satisfiable rather than harder.
     minted_criteria: list[str] = field(default_factory=list)
+    # Decisions the plan marked as settled that a revised spec dropped. The
+    # spec revision was refused whole; these say which sentence cost it.
+    refused_decisions: list[str] = field(default_factory=list)
+    # Whether the plan's context paragraph had to be put back in front of a
+    # revision that replaced it.
+    restored_context: bool = False
     # The planner's report that no revision can make this ticket satisfiable.
     # A complete answer, not a failure to answer — the ticket parks for a human
     # rather than spending another full attempt budget.
@@ -160,7 +166,10 @@ def _refuse_protocol_edits(ticket: Ticket, revision: dict) -> list[tuple[str, st
     talks about fences — a markdown tool, a docs generator — can still be
     revised. Returns the fields dropped, with the phrase that cost them.
     """
-    anchors = {"spec": ticket.original_spec or ticket.spec, "context": ticket.context}
+    anchors = {
+        "spec": ticket.original_spec or ticket.spec,
+        "context": ticket.original_context or ticket.context,
+    }
     dropped: list[tuple[str, str]] = []
     for field_name, anchor in anchors.items():
         if field_name not in revision:
@@ -170,6 +179,58 @@ def _refuse_protocol_edits(ticket: Ticket, revision: dict) -> list[tuple[str, st
             revision.pop(field_name)
             dropped.append((field_name, sorted(introduced)[0]))
     return dropped
+
+
+def _normalise(text: str) -> str:
+    """Text reduced to what it says, for asking whether it is still there."""
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+# A decision short enough to appear inside an unrelated sentence by accident.
+# Below this, containment proves nothing and the guard would fire on noise.
+_DECISION_FLOOR = 24
+
+
+def _dropped_decisions(ticket: Ticket, proposed: str) -> list[str]:
+    """Decisions the plan marked as settled that a revised spec no longer states.
+
+    Compared on a normalised form, so punctuation and backticks are free to
+    change; the words are not. That is the bar the prompt asks for — copy the
+    sentence back — and the one a human can check by reading.
+    """
+    anchor = ticket.original_spec or ticket.spec
+    kept = _normalise(proposed)
+    return [
+        decision
+        for decision in plan_decisions(anchor)
+        if len(_normalise(decision)) >= _DECISION_FLOOR
+        and _normalise(decision) not in kept
+    ]
+
+
+def _preserve_plan_context(ticket: Ticket, revision: dict) -> bool:
+    """Fold a revised `context` into the plan's rather than over it.
+
+    `context` is the one field with no provenance rule: respec returns a whole
+    new string and the plan's paragraph is simply gone. It went that way on
+    five of six tickets in one run, replaced by a sentence of the planner's
+    reasoning — the executor's path-line rule and the do-not-write-tests rule
+    with it. The system prompt still carries both, so this was degradation
+    rather than deletion, but the redundancy holding a weak local model to
+    format was what got deleted.
+
+    Appending keeps both halves and costs a paragraph. The plan's text leads,
+    because it is what a human wrote and what the executor should read first.
+    Returns whether anything was restored, for reporting.
+    """
+    anchor = (ticket.original_context or "").strip()
+    if not anchor or "context" not in revision:
+        return False
+    proposed = (revision["context"] or "").strip()
+    if _normalise(anchor) in _normalise(proposed):
+        return False
+    revision["context"] = f"{anchor}\n\n{proposed}".strip()
+    return True
 
 
 def _drop_whole_file_claims(
@@ -405,6 +466,40 @@ def revise(
             kind="ticket",
         )
 
+    # A decision is not a criterion, so the ratchet never covered it. Refused
+    # whole: a spec revised around a dropped decision has already reasoned from
+    # its absence, and keeping the sentence while keeping the rest of that
+    # reasoning would produce a spec that contradicts itself.
+    dropped: list[str] = []
+    if "spec" in revision:
+        dropped = _dropped_decisions(ticket, revision["spec"])
+        if dropped:
+            revision.pop("spec")
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: respec dropped {len(dropped)} decision(s) "
+                f"the plan marked as settled; the spec revision was refused. A "
+                f"decision is not a criterion, so nothing downstream would have "
+                f"noticed — the ticket would have gone green against a choice "
+                f"nobody made:\n"
+                + "\n".join(f"  - {decision}" for decision in dropped[:5]),
+                level="warn",
+                kind="ticket",
+                data={"decisions": dropped},
+            )
+
+    restored_context = _preserve_plan_context(ticket, revision)
+    if restored_context:
+        store.log(
+            run_id,
+            f"{ticket.ticket_id}: respec replaced the plan's context; the "
+            f"plan's paragraph was put back and the revision appended to it. "
+            f"Context is where the plan states rules the executor needs every "
+            f"attempt — put your reasoning in the rationale instead.",
+            level="warn",
+            kind="ticket",
+        )
+
     # Instruction-following is not an access control, so provenance is enforced
     # here rather than merely described in the prompt.
     refused: list[str] = []
@@ -468,6 +563,8 @@ def revise(
             note="planner kept the ticket as written",
             refused_criteria=refused,
             minted_criteria=minted,
+            refused_decisions=dropped,
+            restored_context=restored_context,
         )
 
     for field_name, value in revision.items():
@@ -501,4 +598,6 @@ def revise(
         rationale=rationale,
         refused_criteria=refused,
         minted_criteria=minted,
+        refused_decisions=dropped,
+        restored_context=restored_context,
     )
