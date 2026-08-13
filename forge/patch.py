@@ -18,9 +18,19 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# A path line followed by a fenced block. The path may be bare, backticked, or
-# a `File: x` / `path/to/x:` label — models vary, and rejecting a correct
-# implementation over label punctuation is a bad trade.
+# A path line followed by a fenced block. The path may be bare, backticked,
+# bold, a markdown heading, or a `File: x` / `path/to/x:` label — models vary,
+# and rejecting a correct implementation over label punctuation is a bad trade.
+#
+# The heading form is not hypothetical. One ticket spent thirteen replies across
+# four cycles emitting `#### src/game.rs` above a correct implementation, and
+# being told the path line was missing changed nothing: the model does not
+# experience `#### src/game.rs` as a missing path. Decorations around the path
+# are the harness's problem to absorb, not the executor's to get right.
+#
+# A heading that happens to name a file — `## README.md` in a document — is a
+# risk this widens, but only inside prose being rescanned after a fence closed
+# early, and that text is withheld rather than applied.
 #
 # The closing fence must be at least as long as the opening one, which is the
 # CommonMark rule and the only way a file whose own contents contain fences can
@@ -33,7 +43,8 @@ from pathlib import Path
 # defect the executor never made. `_fence_is_too_short` catches it after the
 # match, because by then it is the only place the two lengths can be compared.
 _BLOCK = re.compile(
-    r"^[ \t]*(?:(?:File|Path)\s*:\s*)?[`'\"]?(?P<path>[\w./\\+-]+\.[\w+]+)[`'\"]?[ \t]*:?[ \t]*\n"
+    r"^[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*)?(?:(?:File|Path)\s*:\s*)?[`'\"]?"
+    r"(?P<path>[\w./\\+-]+\.[\w+]+)[`'\"]?(?:\*\*)?[ \t]*:?[ \t]*\n"
     r"(?P<fence>`{3,})[^\n]*\n"
     r"(?P<body>.*?)"
     r"^(?P=fence)`*[ \t]*$",

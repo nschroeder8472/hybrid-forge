@@ -132,6 +132,24 @@ class TestPatchParsing(unittest.TestCase):
         self.assertEqual([e.path for e in parsed.edits], ["README.md"])
         self.assertEqual(parsed.edits[0].content, readme)
 
+    def test_a_path_under_a_markdown_heading_is_still_a_path(self):
+        # Thirteen replies across four cycles, all `#### src/game.rs` above a
+        # correct implementation. Telling the model its path line was missing
+        # changed nothing — it does not experience that line as missing.
+        parsed = parse_output("#### src/game.rs\n```rust\npub struct Game;\n```")
+
+        self.assertEqual([e.path for e in parsed.edits], ["src/game.rs"])
+        self.assertEqual(parsed.edits[0].content, "pub struct Game;\n")
+
+    def test_a_bold_path_is_still_a_path(self):
+        parsed = parse_output("**src/game.rs**\n```rust\nx\n```")
+        self.assertEqual([e.path for e in parsed.edits], ["src/game.rs"])
+
+    def test_a_heading_that_is_not_a_path_is_not_one(self):
+        # The widened rule must not turn ordinary prose into a file.
+        parsed = parse_output("### Using build.ps1 (Windows)\n```powershell\nx\n```")
+        self.assertEqual(parsed.edits, [])
+
     def _tt_006_response(self):
         """Verbatim shape of the response that broke TT-006.
 
