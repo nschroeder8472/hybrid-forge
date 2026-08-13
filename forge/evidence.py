@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from collections import Counter
 from pathlib import Path
 
 # Enough of a tree to locate work in a normal repository, and few enough paths
@@ -104,6 +105,111 @@ def terms(report: str, limit: int = MAX_TERMS) -> list[str]:
     return found[:limit]
 
 
+# Words that carry no location. A report is mostly these, and grepping them
+# returns every file in the project, which is the same as returning none.
+_STOPWORDS = frozenset(
+    """a about after again all also always am an and any are as at back be
+    because been before being between both but by can cannot could did do does
+    doing done down during each either else even ever every few first for from
+    get gets getting go goes going got had happen happens has have having he
+    her here hers him his how i if in into is it its just keep like little look
+    looks made make makes many may maybe me more most much must my never new no
+    nor not now of off often on once one only or other our out over put
+    really same saw say says see seems seen she should show shows since so some
+    something sometimes still such sure take than that the their them then
+    there these they thing things this those though through time to too try
+    trying two under until up us use used using very want was way we well were
+    what when where whether which while who why will with without work works
+    would you your""".split()
+)
+
+_WORD = re.compile(r"[A-Za-z][A-Za-z0-9]{2,}")
+
+
+def prose_terms(report: str, limit: int = MAX_TERMS) -> list[str]:
+    """Content words from a report that named nothing specific.
+
+    The report a person actually files is "the score sometimes stops updating",
+    with no identifier, no path and nothing in backticks. `terms` finds nothing
+    in it, and a planner handed only a file tree is picking by filename.
+
+    Domain words survive into code — a score is usually near something called
+    `score` — so the words themselves are worth grepping even though they are
+    prose. Ordered by how often the report repeats them, because a word the
+    reporter used three times is what the report is about.
+    """
+    counts: Counter[str] = Counter()
+    for match in _WORD.finditer(report):
+        word = match.group(0).lower()
+        if word not in _STOPWORDS:
+            counts[word] += 1
+    return [word for word, _ in counts.most_common(limit)]
+
+
+# What a definition looks like in the languages this loop is likely to meet,
+# written as POSIX ERE because `git grep -E` is what runs it. Deliberately
+# shallow: this is an index for a model to read, not a parser, and a wrong
+# index is worse than a thin one.
+_DEFINITION = (
+    r"^[[:space:]]*(pub |export |public |private |protected |static |async )*"
+    r"(def|fn|func|function|class|struct|enum|trait|interface|impl|type)"
+    r"[[:space:]]+[A-Za-z_]"
+)
+
+MAX_SYMBOLS = 300
+
+# Extensions where a line matching the definition pattern is prose or markup
+# rather than a definition.
+_NOT_SOURCE = frozenset(
+    """.md .markdown .txt .rst .json .yaml .yml .toml .ini .cfg .lock .csv
+    .html .xml .svg .css .scss""".split()
+)
+
+
+def symbol_index(root: Path, limit: int = MAX_SYMBOLS) -> list[str]:
+    """Every definition line in tracked source, as `path:line: text`.
+
+    The bridge between a report's words and the code's names. "The score stops
+    updating" does not match `fn commit_lines`, but a reader — including a
+    model — can see that `commit_lines` is where lines and score meet. Grepped
+    rather than parsed, because a wrong index is worse than a shallow one.
+    """
+    found = []
+    for line in _git(root, "grep", "-n", "-I", "-E", "--", _DEFINITION):
+        path = line.split(":", 1)[0]
+        # `class` and `type` are ordinary words in prose and markup. Filtered
+        # here rather than by pathspec so the same call works whatever the
+        # project is written in.
+        if Path(path).suffix.lower() in _NOT_SOURCE:
+            continue
+        found.append(line[:LINE_LIMIT])
+        if len(found) >= limit:
+            break
+    return found
+
+
+def read_files(root: Path, paths: list[str], per_file: int = 12_000) -> dict[str, str]:
+    """Contents of the files a survey pass asked to see. Never raises.
+
+    Bounded per file, because this goes into a prompt beside the report and the
+    tree. A file too long to show whole is shown from the top: the definitions
+    a reader is looking for are rarely at the bottom.
+    """
+    found: dict[str, str] = {}
+    for path in paths:
+        candidate = (root / path).resolve()
+        try:
+            if not candidate.is_file() or root.resolve() not in candidate.parents:
+                continue
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if len(text) > per_file:
+            text = text[:per_file] + f"\n[truncated at {per_file} characters]\n"
+        found[path] = text
+    return found
+
+
 def hits(root: Path, term: str, limit: int = MAX_HITS) -> list[str]:
     """Where a term appears in tracked source, as `path:line: text`.
 
@@ -137,15 +243,42 @@ def gather(root: Path, report: str) -> str:
         )
         sections.append(f"### Files in this repository\n{listing}{note}")
 
-    matched: list[str] = []
-    for term in terms(report):
-        found = hits(root, term)
-        if found:
-            matched.append(f"#### `{term}`\n" + "\n".join(found))
+    named = terms(report)
+    matched = _matches(root, named)
+
+    # A report that named nothing specific is the ordinary case — "the score
+    # sometimes stops updating" has no identifier, no path, nothing in
+    # backticks. Falling back to its content words finds the domain: a score is
+    # usually near something called `score`. Only when the specific terms found
+    # nothing, because a report that *did* name a symbol has already told us
+    # more than any word frequency will.
+    if not matched:
+        matched = _matches(root, prose_terms(report))
+
     if matched:
         sections.append(
             "### Where the report's own words appear in the code\n"
             + "\n\n".join(matched)
         )
 
+    # The bridge from a report's words to the code's names, and worth its space
+    # exactly when the words themselves did not land: "the score stops
+    # updating" matches no line in a codebase that calls it `commit_lines`, but
+    # a reader can see where lines and score meet.
+    if not named:
+        symbols = symbol_index(root)
+        if symbols:
+            sections.append(
+                "### Every definition in this repository\n" + "\n".join(symbols)
+            )
+
     return "\n\n".join(sections)
+
+
+def _matches(root: Path, wanted: list[str]) -> list[str]:
+    found = []
+    for term in wanted:
+        lines = hits(root, term)
+        if lines:
+            found.append(f"#### `{term}`\n" + "\n".join(lines))
+    return found

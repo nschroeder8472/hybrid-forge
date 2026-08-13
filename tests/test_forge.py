@@ -55,7 +55,9 @@ from forge.patch import (
 from forge.failures import distill, errors_naming, signatures
 from forge.prompts import (
     bug_prompt,
+    locate_prompt,
     parse_bug,
+    parse_locate,
     repro_prompt,
     build_prompt,
     parse_respec,
@@ -3603,11 +3605,13 @@ class TestFilingABugFromTheCommandLine(unittest.TestCase):
 
     class _Planner(Provider):
         kind = "stub"
-        reply = ""
+        replies: list[str] = []
+        seen: list[str] = []
 
         def complete(self, messages, *, max_tokens, temperature=0.2, timeout=600):
-            type(self).seen = _joined(messages)
-            return Completion(text=self.reply, usage=Usage(), finish_reason="stop")
+            type(self).seen.append(_joined(messages))
+            text = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
+            return Completion(text=text, usage=Usage(), finish_reason="stop")
 
         def capabilities(self):
             return Capabilities(context_window=32768, max_output_tokens=8192)
@@ -3628,9 +3632,10 @@ class TestFilingABugFromTheCommandLine(unittest.TestCase):
         )
         return root
 
-    def _run(self, root, *argv, reply=None):
+    def _run(self, root, *argv, reply=None, replies=None):
         planner = self._Planner("planner", {})
-        type(planner).reply = reply or self.REPLY
+        type(planner).replies = list(replies or [reply or self.REPLY])
+        type(planner).seen = []
         parsed = cli.build_parser().parse_args(["--root", str(root), "bug", *argv])
         out = io.StringIO()
         with unittest.mock.patch.object(Config, "provider_for", lambda self, role: planner):
@@ -3665,7 +3670,7 @@ class TestFilingABugFromTheCommandLine(unittest.TestCase):
 
         self._run(root, "pieces drop three at once")
 
-        self.assertIn("pieces drop three at once", self._Planner.seen)
+        self.assertIn("pieces drop three at once", self._Planner.seen[-1])
 
     def test_the_ids_do_not_collide_across_runs(self):
         # The id names the reproduction's filename, so a second run reusing
@@ -3695,6 +3700,50 @@ class TestFilingABugFromTheCommandLine(unittest.TestCase):
             self._run(root, "the printer is on fire", reply=reply)
 
         self.assertIn("nothing here matches", str(caught.exception))
+
+    def _checkout(self):
+        """A project that is also a git checkout, so evidence can be gathered."""
+        root = self._project()
+        (root / "src").mkdir()
+        (root / "src" / "game.py").write_text(
+            "def tick(dt):\n    while dt > 0:\n        lock()\n", encoding="utf-8"
+        )
+        for args in (["init", "-q"], ["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]):
+            subprocess.run(["git", *args], cwd=root, capture_output=True, check=False)
+        return root
+
+    def test_a_vague_report_is_located_before_the_ticket_is_written(self):
+        # Two passes: the first decides what to read, the second writes the
+        # ticket against the contents. One pass would be choosing scope from a
+        # list of filenames, which is what a report naming nothing leaves it.
+        root = self._checkout()
+        reply = json.dumps(
+            {"title": "t", "spec": "tick locks in a loop", "allowed_files": ["src/game.py"]}
+        )
+
+        printed = self._run(
+            root,
+            "sometimes several pieces lock at once",
+            replies=[json.dumps({"candidates": ["src/game.py"]}), reply],
+        )
+
+        self.assertEqual(len(self._Planner.seen), 2)
+        self.assertIn("Name the files to read", self._Planner.seen[0])
+        # The ticket was written with the code in front of it.
+        self.assertIn("while dt > 0", self._Planner.seen[1])
+        self.assertIn("reading src/game.py", printed)
+
+    def test_a_survey_that_answers_nothing_useful_still_files_the_ticket(self):
+        # Best effort: the second pass keeps the file list and the grep hits,
+        # which is what it had before the survey existed.
+        root = self._checkout()
+        reply = json.dumps({"title": "t", "spec": "s", "allowed_files": ["src/game.py"]})
+
+        self._run(
+            root, "sometimes several pieces lock at once", replies=["not json at all", reply]
+        )
+
+        self.assertEqual(self._ticket(root).allowed_files, ["src/game.py"])
 
     def test_the_ticket_file_says_it_is_a_bug(self):
         # The file is what a human reads before spending anything, and a bug
@@ -4895,6 +4944,94 @@ class TestEvidenceForABugReport(unittest.TestCase):
         # An honest empty block. A planner told "here is the evidence" over an
         # invented tree scopes a ticket to files that do not exist.
         self.assertEqual(evidence.gather(Path(tempfile.mkdtemp()), self.REPORT), "")
+
+
+class TestLocatingAVagueReport(unittest.TestCase):
+    """The report a person actually files names no function and no file: "the
+    score sometimes stops updating". Specific terms find nothing in it, and a
+    planner handed only a file tree is choosing scope by filename."""
+
+    VAGUE = "The score sometimes stops updating after I clear a line."
+
+    def _repo(self) -> Path:
+        root = Path(tempfile.mkdtemp())
+        (root / "src").mkdir()
+        (root / "src" / "scoring.py").write_text(
+            "def commit_lines(count):\n    return count * 100\n", encoding="utf-8"
+        )
+        (root / "src" / "render.py").write_text(
+            "def draw():\n    pass\n", encoding="utf-8"
+        )
+        for args in (["init", "-q"], ["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]):
+            subprocess.run(["git", *args], cwd=root, capture_output=True, check=False)
+        return root
+
+    def test_a_report_naming_nothing_specific_yields_no_terms(self):
+        self.assertEqual(evidence.terms(self.VAGUE), [])
+
+    def test_its_content_words_are_searched_instead(self):
+        found = evidence.prose_terms(self.VAGUE)
+
+        self.assertIn("score", found)
+        self.assertIn("line", found)
+        # Grepping these returns the whole project, which locates nothing.
+        for word in ("sometimes", "after", "the"):
+            self.assertNotIn(word, found)
+
+    def test_the_words_a_report_repeats_come_first(self):
+        found = evidence.prose_terms("The board is wrong. The board draws twice.")
+        self.assertEqual(found[0], "board")
+
+    def test_a_vague_report_still_finds_the_code(self):
+        gathered = evidence.gather(self._repo(), self.VAGUE)
+
+        # "score" is not in scoring.py's text, but it is in its name, and
+        # "line" reaches commit_lines.
+        self.assertIn("commit_lines", gathered)
+        # With nothing specific named, the definitions are worth their space:
+        # they are the bridge from the report's words to the code's names.
+        self.assertIn("Every definition in this repository", gathered)
+
+    def test_a_report_that_named_a_symbol_gets_no_definition_dump(self):
+        # It has already told us more than any word frequency will.
+        gathered = evidence.gather(self._repo(), "`commit_lines` returns twice the score")
+        self.assertNotIn("Every definition in this repository", gathered)
+
+    def test_the_survey_asks_which_files_to_open(self):
+        body = locate_prompt(self.VAGUE, "### Files\nsrc/scoring.py")[-1].content
+
+        self.assertIn(self.VAGUE, body)
+        self.assertIn("src/scoring.py", body)
+        self.assertIn("Name the files to read", body)
+
+    def test_candidates_are_filtered_to_files_that_exist(self):
+        # A path the model invented would be read as nothing, and the ticket
+        # then written as though the file had been read and found irrelevant.
+        chosen = parse_locate(
+            json.dumps({"candidates": ["src/scoring.py", "src/imagined.py"]}),
+            known=["src/scoring.py", "src/render.py"],
+        )
+        self.assertEqual(chosen, ["src/scoring.py"])
+
+    def test_an_unreadable_survey_reply_costs_nothing(self):
+        self.assertEqual(parse_locate("I think it is in the scorer.", known=["a.py"]), [])
+
+    def test_the_chosen_files_are_read_whole(self):
+        root = self._repo()
+        read = evidence.read_files(root, ["src/scoring.py"])
+        self.assertIn("commit_lines", read["src/scoring.py"])
+
+    def test_a_path_outside_the_project_is_not_read(self):
+        root = self._repo()
+        self.assertEqual(evidence.read_files(root, ["../../etc/passwd"]), {})
+
+    def test_the_ticket_is_written_against_the_contents(self):
+        body = bug_prompt(
+            self.VAGUE, "### Files\nsrc/scoring.py", {"src/scoring.py": "def commit_lines(): ..."}
+        )[-1].content
+
+        self.assertIn("def commit_lines()", body)
+        self.assertIn("State the defect in terms of what", body)
 
 
 class TestPlanningFromABugReport(unittest.TestCase):

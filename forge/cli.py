@@ -47,7 +47,7 @@ from .loop import (
 )
 from .memory import MemoryClient
 from .patch import matches_any
-from .prompts import bug_prompt, parse_bug
+from .prompts import bug_prompt, locate_prompt, parse_bug, parse_locate
 from .profile import Profile
 from .providers import ProviderError
 from .state import (
@@ -773,12 +773,34 @@ def cmd_bug(args: argparse.Namespace) -> int:
             "be a git checkout. The ticket will be scoped from the report alone."
         )
 
-    print("Reading the report against the repository...")
+    budget = max(2048, provider.capabilities().max_output_tokens // 4)
+
+    # Two passes, because one is not enough for the report a person actually
+    # files. "The score sometimes stops updating" names no function and no
+    # file, so a single call would be choosing scope from a list of filenames.
+    # The first pass spends a little context deciding what to read; the second
+    # writes the ticket against the contents.
+    sources: dict[str, str] = {}
+    if found:
+        print("Looking for where the problem lives...")
+        try:
+            located = provider.complete(
+                locate_prompt(report, found), max_tokens=budget, temperature=0.0
+            )
+            candidates = parse_locate(located.text, evidence.tracked_files(config.root))
+        except (ProviderError, ValueError) as exc:
+            # Best effort by design: the second pass still has the file list
+            # and the grep hits, which is what it had before this existed.
+            print(f"warning: could not narrow the search ({exc}); reading nothing first.")
+            candidates = []
+        if candidates:
+            sources = evidence.read_files(config.root, candidates)
+            print(f"  reading {', '.join(sources)}")
+
+    print("Writing the ticket...")
     try:
         completion = provider.complete(
-            bug_prompt(report, found),
-            max_tokens=max(2048, provider.capabilities().max_output_tokens // 4),
-            temperature=0.1,
+            bug_prompt(report, found, sources), max_tokens=budget, temperature=0.1
         )
         fields = parse_bug(completion.text)
     except (ProviderError, ValueError) as exc:

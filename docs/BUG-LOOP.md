@@ -43,17 +43,39 @@ A plan states which files a ticket may write. A report does not — the file tha
 needs changing is exactly what is being looked for, and "pieces drop three at
 once" names none of it.
 
-So the harness gathers the evidence before the planner sees anything: the
-repository's tracked files (`git ls-files`, so build output and vendored
-directories never reach the prompt), and every place the report's own words
-appear in the code. Words means the specific ones — a backticked span, a path, a
-`CamelCase` or `snake_case` identifier, a `Type::method`. Prose is not searched,
-because "sometimes" matches everything and locates nothing.
+So the harness gathers evidence first, and the report decides what kind.
 
-The planner reads that, names `allowed_files` and `reference_files`, and states
-what the code should do instead. It gathers here rather than in the model for
-the same reason `toolchain.py` does: it works identically behind every adapter,
-sends exactly what we can name, and needs no tool grant.
+**A report that names something.** `Game::tick`, `src/game.rs`, a backticked
+span — those are grepped directly, because a reporter who named a symbol has
+already said more than any heuristic will work out.
+
+**A report that names nothing.** "The score sometimes stops updating after I
+clear a line" contains no identifier and no path, and this is the ordinary case.
+Two things fill the gap. Its *content words* are grepped instead — stopwords
+dropped, ordered by how often the report repeats them, because a score is
+usually near something called `score`. And the definitions in the project are
+listed, which is the bridge from the report's words to the code's names: "score
+stops updating" matches no line in a codebase that calls it `commit_lines`, but
+a reader can see where lines and score meet.
+
+Either way the tracked file list comes too, from `git ls-files`, so build output
+and vendored directories never reach the prompt.
+
+**Then it reads.** A first pass hands the planner that evidence and asks one
+question: which files are worth opening? The harness reads the ones it names —
+filtered to paths that actually exist, so an invented one cannot be silently
+read as nothing — and the *second* pass writes the ticket with those files in
+front of it. That is the difference between a ticket scoped from filenames and
+one scoped from the code, and it is why the spec can describe the defect rather
+than restating the symptom.
+
+The survey is best effort: a planner that answers with nothing usable costs a
+call, and the ticket is still written from the file list and the grep hits.
+
+The planner names `allowed_files` and `reference_files` and states what the code
+should do instead. All of it is gathered by the harness rather than by a model
+with tools, for the same reason `toolchain.py` does it: it works identically
+behind every adapter, sends exactly what we can name, and needs no tool grant.
 
 A report the planner cannot place in the repository at all stops there, rather
 than becoming a plausible ticket scoped to files that do not exist.
@@ -99,9 +121,11 @@ ticket says so rather than proceeding: there would be nothing to run the proof,
 and the fix would be checked by reading. See
 [CONFIG.md](CONFIG.md#commands).
 
-A report with **something specific in it**. The reproduction has to assert a
-value, a count, an ordering. "It feels slow" cannot be turned into a test by
-anyone. What was the input, what happened, what should have happened.
+A report with **something checkable in it** — though not a location. Naming the
+file is welcome and never required; that is what the survey pass is for. What
+cannot be worked around is a symptom no test could assert: the reproduction has
+to compare a value, a count, an ordering. "It feels slow" defeats it. "The score
+stays at zero when I clear a line" does not.
 
 ---
 

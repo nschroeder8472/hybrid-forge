@@ -634,7 +634,9 @@ function is an ordinary function of its own language.
     ]
 
 
-def bug_prompt(report: str, evidence: str = "") -> list[Message]:
+def bug_prompt(
+    report: str, evidence: str = "", sources: dict[str, str] | None = None
+) -> list[Message]:
     """Ask the planner to turn a prose bug report into one ticket.
 
     `evidence` is gathered by the harness — the file list and where the
@@ -660,11 +662,104 @@ Nothing could be gathered — this may not be a git checkout. Name files only if
 the report itself names them, and say so in `unclear` if you cannot.
 """
 
+    if sources:
+        # The files a survey pass asked for, read by the harness. This is the
+        # difference between a ticket written from filenames and one written
+        # from the code: the defect is usually visible here, and the spec
+        # should describe *it* rather than the symptom that led to it.
+        body += f"""
+## The code itself
+These are the files worth reading, in full. State the defect in terms of what
+is actually here — the function, the condition, the value it produces — rather
+than restating the report. If none of this can produce the reported behavior,
+say so in `unclear` instead of picking the nearest plausible file.
+
+{_sources_block(sources)}
+"""
+
     body += "\nWrite the ticket now."
     return [
         Message(role="system", content=BUG_PLANNER_SYSTEM),
         Message(role="user", content=body),
     ]
+
+
+LOCATE_SYSTEM = """You are finding where a reported problem lives.
+
+You are given a bug report and what the harness could gather from the
+repository: its files, every place the report's words appear, and — when the
+report named nothing specific — the definitions in the project. You cannot open
+files yourself, so this pass exists to ask for the ones worth reading.
+
+Name the files most likely to contain the fault. Prefer few: the point is to
+read them properly, not to skim the project. Six is plenty and two is often
+right. Reason from what the code is *for* rather than from the words alone — a
+report about a score that stops updating belongs wherever scoring happens, even
+if the word "score" appears nowhere near it.
+
+Every path must come from the evidence exactly as written there. A path you
+invent is a file that will not be read, and this pass will have found nothing.
+
+Reply with JSON and nothing else:
+
+{"candidates": ["src/game.rs", "src/board.rs"],
+ "reasoning": "one sentence on why these"}
+"""
+
+
+def locate_prompt(report: str, evidence: str) -> list[Message]:
+    """Ask which files to open before any ticket is written.
+
+    The pass that makes a vague report workable. A report naming a function is
+    already located; "it sometimes drops inputs" is not, and a planner given
+    only a file tree picks by filename. So the first call spends nothing but a
+    little context deciding what to read, and the ticket is then written
+    against the real contents of those files.
+    """
+    return [
+        Message(role="system", content=LOCATE_SYSTEM),
+        Message(
+            role="user",
+            content=f"""## The report
+{report.strip()}
+
+## What the harness found
+{evidence.strip() or "(nothing — this may not be a git checkout)"}
+
+Name the files to read.""",
+        ),
+    ]
+
+
+def parse_locate(text: str, known: Sequence[str], limit: int = 6) -> list[str]:
+    """Candidate paths from a locate reply, filtered to files that exist.
+
+    A path the model invented is dropped rather than passed on: reading it
+    would fail silently, and the ticket would then be written as though the
+    file had been read and found irrelevant.
+    """
+    candidate = (text or "").strip()
+    fence = re.search(r"```(?:json)?\s*\n(.*?)\n```", candidate, re.DOTALL)
+    if fence:
+        candidate = fence.group(1)
+    else:
+        first, last = candidate.find("{"), candidate.rfind("}")
+        if first != -1 and last > first:
+            candidate = candidate[first : last + 1]
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    tracked = {str(path).replace("\\", "/"): str(path) for path in known}
+    chosen: list[str] = []
+    for raw in data.get("candidates", []) or []:
+        path = str(raw).strip().replace("\\", "/").lstrip("./")
+        if path in tracked and tracked[path] not in chosen:
+            chosen.append(tracked[path])
+    return chosen[:limit]
 
 
 def parse_bug(text: str) -> dict[str, Any]:
