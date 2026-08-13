@@ -103,12 +103,35 @@ def _section(body: str, start: re.Match[str] | None, next_starts: list[int]) -> 
     return body[begin : min(ends)].strip() if ends else body[begin:].strip()
 
 
+def _unwrap_code_span(item: str) -> str:
+    """Drop the backticks around a bullet that is nothing but a code span.
+
+    A file path is usually written `` `src/piece.rs` `` and wants the backticks
+    gone. A criterion usually *opens and closes* with code spans of its own —
+    "`piece::cells(kind, rotation)` returns 4 offsets for every `kind` in
+    `0..7`" — and stripping the outer character off each end takes the opening
+    backtick of the first span and the closing backtick of the last, leaving
+    unbalanced markdown in every prompt that renders it. Worse, it invites the
+    planner to "reword" the criterion at respec time by repairing the
+    punctuation, which the provenance check then reads as an attempt to change
+    a criterion a human wrote.
+
+    So the pair comes off only when there is exactly one span: no backtick
+    survives between the two being removed.
+    """
+    if len(item) > 1 and item.startswith("`") and item.endswith("`"):
+        inner = item[1:-1]
+        if "`" not in inner:
+            return inner.strip()
+    return item
+
+
 def _bullets(text: str) -> list[str]:
     items = []
     for line in text.splitlines():
         line = line.strip()
         if line.startswith(("- ", "* ", "+ ")):
-            items.append(line[2:].strip().strip("`"))
+            items.append(_unwrap_code_span(line[2:].strip()))
     return items
 
 
