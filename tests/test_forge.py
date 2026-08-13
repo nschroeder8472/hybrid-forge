@@ -3365,7 +3365,8 @@ class TestRespecMayNotRaiseTheBar(unittest.TestCase):
         self._revise(store, run_id, ["a", "b", "a bar nobody asked for"])
 
         messages = " ".join(e["message"] for e in store.events_after(0))
-        self.assertIn("the plan does not state", messages)
+        self.assertIn("the plan states nowhere", messages)
+        self.assertIn("a bar nobody asked for", messages)
         self.assertIn("a bar nobody asked for", messages)
 
     def test_unlocking_the_criteria_restores_the_old_behaviour(self):
@@ -3391,6 +3392,112 @@ class TestRespecMayNotRaiseTheBar(unittest.TestCase):
         )
 
         self.assertFalse(result.revised)
+
+
+class TestACriterionTheSpecAlreadyStatesIsNotARatchet(unittest.TestCase):
+    """The reviewer is given the spec and told to reject work that contradicts
+    it, so the bar it enforces is spec ∪ criteria — while the ratchet tested
+    novelty against the criteria alone. The planner was therefore forbidden
+    from writing down a requirement the reviewer was required to enforce. One
+    run spent three cycles on that gap over a single line: the planner proposed
+    the `set -eu` criterion and was refused twice, the reviewer rejected the
+    ticket for exactly that requirement twice, and the spec stated it all
+    along."""
+
+    SPEC = (
+        "build.sh begins with #!/usr/bin/env sh then set -eu.\n"
+        "src/lib.rs declares pub mod piece."
+    )
+    STATED = "build.sh must start with #!/usr/bin/env sh and set -eu"
+
+    def _store(self, spec=SPEC, original_spec=""):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        ticket = Ticket(
+            "T-1",
+            spec=spec,
+            criteria=["the plan's bar"],
+            original_criteria=["the plan's bar"],
+            status="failed",
+        )
+        store.add_tickets(run_id, [ticket])
+        if original_spec:
+            # As if a later revision had rewritten the spec: the anchor keeps
+            # what was ingested, which is what entailment is judged against.
+            store._connection.execute(
+                "UPDATE tickets SET original_spec = ? WHERE run_id = ?",
+                (original_spec, run_id),
+            )
+            store._connection.commit()
+        step = store.start_step(run_id, "T-1", "review")
+        store.end_step(step, "failed", "REJECT: nope")
+        return store, run_id
+
+    def _revise(self, store, run_id, criteria, spec=SPEC):
+        def call(_messages, _budget):
+            return Completion(
+                text=json.dumps({"spec": spec, "criteria": criteria}), usage=Usage()
+            )
+
+        return respec.revise(
+            store, run_id, store.list_tickets(run_id)[0], call=call, budget=1024
+        )
+
+    def test_a_criterion_restating_the_spec_is_not_treated_as_a_new_demand(self):
+        store, run_id = self._store()
+
+        result = self._revise(store, run_id, ["the plan's bar", self.STATED])
+
+        self.assertIn(self.STATED, store.list_tickets(run_id)[0].criteria)
+        self.assertEqual(result.admitted_criteria, [self.STATED])
+        self.assertEqual(result.minted_criteria, [])
+
+    def test_the_allowance_is_logged_so_the_heuristic_can_be_audited(self):
+        store, run_id = self._store()
+
+        self._revise(store, run_id, ["the plan's bar", self.STATED])
+
+        messages = [row["message"] for row in store.events_after(0)]
+        self.assertTrue(any("restate the spec" in message for message in messages))
+
+    def test_a_criterion_absent_from_the_spec_is_still_refused(self):
+        store, run_id = self._store()
+        invented = "the page includes an element with id hint"
+
+        result = self._revise(store, run_id, ["the plan's bar", invented])
+
+        self.assertEqual(store.list_tickets(run_id)[0].criteria, ["the plan's bar"])
+        self.assertEqual(result.minted_criteria, [invented])
+
+    def test_a_criterion_too_short_to_judge_is_refused(self):
+        # Overlap on three words is coincidence, and a false positive here lets
+        # the loop raise its own bar — the regression the ratchet exists to stop.
+        store, run_id = self._store()
+
+        result = self._revise(store, run_id, ["the plan's bar", "src/lib.rs declares"])
+
+        self.assertEqual(result.minted_criteria, ["src/lib.rs declares"])
+
+    def test_entailment_is_judged_against_the_ingested_spec(self):
+        # Otherwise the loop could rewrite the spec and then mint criteria out
+        # of the sentence it had just written.
+        store, run_id = self._store(original_spec="a spec that says none of this")
+
+        result = self._revise(store, run_id, ["the plan's bar", self.STATED])
+
+        self.assertEqual(result.minted_criteria, [self.STATED])
+        self.assertEqual(result.admitted_criteria, [])
+
+    def test_the_refusal_no_longer_claims_the_plan_is_silent(self):
+        # The old message read "if these are things it genuinely must do, the
+        # plan is what needs changing" — false when the plan does state them,
+        # in the spec, which is the case this whole guard exists for.
+        store, run_id = self._store()
+
+        self._revise(store, run_id, ["the plan's bar", "an element with id hint"])
+
+        messages = " ".join(row["message"] for row in store.events_after(0))
+        self.assertNotIn("the plan is what needs changing", messages)
 
 
 class TestRespecCannotPinASharedFile(unittest.TestCase):

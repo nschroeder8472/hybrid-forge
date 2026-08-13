@@ -17,7 +17,7 @@ verified against surviving data that is said plainly.
 `fix/protect-plan-authored-context`, unverified against a run — they were
 written from run 5's evidence and are covered by tests, not by a replay.
 
-Still open: 3.1, and the conditional 2.4 and 4.1. A clean
+Still open: 3.1's promotion path, and the conditional 2.4 and 4.1. A clean
 run from an empty repository — no drifted specs carried over — is the validation
 that has not been done yet.
 
@@ -789,7 +789,26 @@ fabricates.
 
 ## Phase 3 — Close the gap between the reviewer's bar and the planner's
 
-### 3.1 Allow criteria the spec already states
+### 3.1 Allow criteria the spec already states — **done, except the promotion path**
+
+`_spec_entailed` compares a proposed criterion's content words against each
+sentence of `original_spec` — the ingested one, so the loop cannot rewrite the
+spec and then mint criteria out of what it just wrote. A criterion is admitted
+when one sentence covers 80% of its content words and it has at least five of
+them; below that floor, overlap is coincidence. Admissions are logged at `info`
+with the criteria named, so the heuristic is auditable rather than merely
+plausible, and `forge retry --respec` prints them.
+
+The refusal message no longer claims the plan is silent. It now says the
+criterion appears neither in the criteria nor in the spec — the two places that
+are enforced — and points at re-ingesting the plan.
+
+**Not built: the promotion path.** A criterion that is genuinely new still
+needs a human to edit `plan.md` and re-ingest; there is no `forge` command that
+accepts one in place. That wants a CLI surface for editing a ticket's contract,
+including its anchor, and an anchor any caller can move is the thing
+`update_ticket` deliberately refuses — so it is a design question, not a
+follow-up patch.
 
 **Problem.** `REVIEWER_SYSTEM:98` instructs the reviewer to reject when *"a
 criterion is unmet **or the diff does something the spec did not ask for**"*, and
@@ -1186,7 +1205,8 @@ land too — one branch to push when the backlog is green.
 | — | 2.3 | Done — history is its own droppable message, capped at three |
 | — | 3.3 | Done — both lists seeded from the step log on a retry cycle |
 | — | 3.6 | Done — a review-only ticket is named at run end |
-| 1 | 3.1 | Deliberately loosens a guard; wants a stable baseline |
+| — | 3.1 | Done bar the promotion path — spec-entailed criteria admitted |
+| 1 | 3.1's promotion path | Needs a way to edit a ticket's anchor; a design question |
 | 2 | 2.4, 4.1 | Conditional and experimental |
 
 1.6 is a decision, not a code change, and should be settled before the next

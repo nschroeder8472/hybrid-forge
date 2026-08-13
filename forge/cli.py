@@ -512,6 +512,13 @@ def _respec(
             )
             for criterion in result.refused_criteria:
                 print(f"      kept: {criterion}")
+        if result.admitted_criteria:
+            print(
+                f"  {ticket.ticket_id:<10} added {len(result.admitted_criteria)} "
+                f"criterion(s) restating the spec; kept."
+            )
+            for criterion in result.admitted_criteria:
+                print(f"      added: {criterion}")
         if result.refused_decisions:
             print(
                 f"  {ticket.ticket_id:<10} dropped {len(result.refused_decisions)} "

@@ -968,9 +968,13 @@ applied to it:
   put back, and the attempt to change it reported.
 - Criteria under **Added by an earlier revision** are the loop's own. Revise
   them, or leave them out to retire them, if the evidence says they were wrong.
-- Anything else you list is added. Add a criterion when the failures show
-  behavior nobody asked for, or when the spec requires something no criterion
-  checks. Never add one to describe a bug the attempts happened to produce.
+- Anything else you list is added. A criterion that restates a sentence of the
+  spec is kept: the reviewer is given the spec and enforces it either way, so
+  writing it down raises no bar, it only makes an existing demand checkable.
+  Quote the spec's own wording when you do that — the closer the two are, the
+  more reliably it is recognised as a restatement rather than a new demand.
+  A criterion the spec does not state is refused. Never add one to describe a
+  bug the attempts happened to produce.
 
 Omit `criteria` entirely to leave them exactly as they are.
 
