@@ -92,13 +92,30 @@ def sources_for(root: Path, ticket: Ticket) -> dict[str, str]:
     return found
 
 
+# The provenance note the respec prompt puts beside a criterion, in either the
+# emphasised or bare spelling, wherever a planner has echoed it back.
+_PROVENANCE_NOTE = re.compile(
+    r"_?\((?:from the plan|added by an earlier revision)[^)]*\)_?",
+    re.IGNORECASE,
+)
+
+
 def _key(criterion: str) -> str:
     """A criterion reduced to what it asserts, for comparing two spellings.
 
     Backticks, punctuation and case are presentation; a planner that changes
     only those has reworded the same demand, not raised a new one.
+
+    The provenance note comes off first. The prompt asks the planner to return
+    plan-authored criteria verbatim, and a planner that does so may carry the
+    note with them — which is not a rewording of anything, but survives
+    normalisation as `fromtheplanyoumaynotchangethis` and makes the copy match
+    nothing. One run reported nine criteria dropped and eleven invented on a
+    reply that had changed neither: the nine, echoed with their notes, counted
+    once as missing and once as new. Instruction-following is not an access
+    control, and it is not a comparison key either.
     """
-    return re.sub(r"[^a-z0-9]+", "", criterion.lower())
+    return re.sub(r"[^a-z0-9]+", "", _PROVENANCE_NOTE.sub("", criterion).lower())
 
 
 def _drop_whole_file_claims(
@@ -252,6 +269,16 @@ def revise(
     what it could not decide, and no step was ever logged as failed.
     """
     failures = store.ticket_failures(run_id, ticket.ticket_id)
+    # A ticket that never ran has nothing to learn from, and its `blocked_note`
+    # says only which dependency was missing. Passed to the planner that reads
+    # as evidence — filed under "what happened, oldest attempt first", answered
+    # by a schema whose only move is to revise the ticket — and it will rewrite
+    # a spec no executor has yet read. Three untried tickets were rewritten
+    # twice each that way, acquiring a fabricated xorshift constant and a
+    # `lib.rs must contain exactly` clause that contradicted their successors.
+    if not failures and not ticket.attempts:
+        return Revision(ticket.ticket_id, note="the ticket has not run yet")
+
     note = (gave_up_note or "").strip()
     if note:
         failures = failures + [{"name": "gave up", "detail": note}]

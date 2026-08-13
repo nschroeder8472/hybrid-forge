@@ -912,12 +912,28 @@ class Orchestrator:
         # to retry has to be known before the tickets are reset, not after.
         if self.config.loop.respec_on_retry:
             by_id = {ticket.ticket_id: ticket for ticket in tickets}
-            revised, asked, parked = self._respec(
-                run_id, [by_id[ticket_id] for ticket_id in eligible], notes
-            )
+            # Requeueing a skipped ticket is right — it must run once its
+            # dependency lands. Respec'ing one is not. It has no attempts, so
+            # the only evidence is `dependency not met: TT-002`, and the planner
+            # is handed that under a heading reading "what happened, oldest
+            # attempt first" and told to revise the ticket so the next attempt
+            # succeeds. It complies, because that is the only answer the schema
+            # allows: three untried tickets had their human-authored specs
+            # rewritten twice each, one of them acquiring a fabricated xorshift
+            # constant and another a `lib.rs must contain exactly` clause that
+            # contradicted the two tickets after it.
+            attempted = [
+                by_id[ticket_id]
+                for ticket_id in eligible
+                if by_id[ticket_id].attempts > 0
+            ]
+            revised, asked, parked = self._respec(run_id, attempted, notes)
             # A ticket the planner has just called unsatisfiable stays parked.
             eligible = [ticket_id for ticket_id in eligible if ticket_id not in parked]
-            if not revised:
+            # Nothing ran this cycle, so there is nothing for a respec to have
+            # learned from and no revision to require before going round again.
+            # Requeueing the skipped work is the whole point of the cycle.
+            if attempted and not revised:
                 self.store.log(
                     run_id,
                     (

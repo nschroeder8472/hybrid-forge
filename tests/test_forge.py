@@ -443,6 +443,27 @@ Rotate them.
         self.assertTrue(looks_like_plan(self.PLAN))
         self.assertFalse(looks_like_plan("Please add PNG export at some point."))
 
+    def test_a_bullet_that_is_one_code_span_loses_its_backticks(self):
+        # What the stripping is for: a file path is written `src/piece.rs` and
+        # the backticks are punctuation, not part of the name.
+        self.assertEqual(parse_plan(self.PLAN)[0].allowed_files, ["a.py"])
+
+    def test_a_criterion_that_opens_and_closes_with_code_spans_keeps_both(self):
+        # Taking one character off each end of a criterion that begins and ends
+        # with inline code removes the *opening* backtick of the first span and
+        # the *closing* backtick of the last, leaving unbalanced markdown in
+        # every prompt that renders it — and inviting the planner to "reword"
+        # the criterion at respec time by repairing the punctuation, which the
+        # provenance check then reads as tampering with a human's contract.
+        plan = self.PLAN.replace(
+            "- returns 1 for input 0",
+            "- `piece::WIDTH` is 10 and `piece::HEIGHT` is 20",
+        )
+        self.assertEqual(
+            parse_plan(plan)[0].criteria,
+            ["`piece::WIDTH` is 10 and `piece::HEIGHT` is 20"],
+        )
+
     def test_parses_verbatim_without_a_model(self):
         tickets = parse_plan(self.PLAN)
         self.assertEqual([t.ticket_id for t in tickets], ["AB-001", "AB-002"])
@@ -952,6 +973,61 @@ class TestAutomaticRetryCycles(unittest.TestCase):
         written = sorted(p.name for p in orchestrator.config.tickets_dir.glob("*.md"))
         self.assertEqual(written, ["T-1.md"])
 
+    def test_a_skipped_ticket_is_requeued_but_not_respecced(self):
+        # It never ran, so the only evidence is which dependency was missing.
+        # Handed that under "what happened, oldest attempt first", the planner
+        # rewrote three untried specs twice each — one acquiring a fabricated
+        # xorshift constant, another a `lib.rs must contain exactly` clause that
+        # contradicted the two tickets after it.
+        orchestrator, store, run_id = self._orchestrator(
+            tickets=[
+                Ticket("T-1", status="failed", spec="old spec", attempts=3),
+                Ticket("T-2", status="skipped", spec="untouched", needs=["T-1"]),
+            ],
+            retry_cycles=1,
+            respec_on_retry=True,
+        )
+        step = store.start_step(run_id, "T-1", "review")
+        store.end_step(step, "failed", "REJECT: the spec never said which file")
+
+        seen: list[str] = []
+
+        def call(_run_id, _role, messages, **_kwargs):
+            asked = "\n".join(m.content for m in messages)
+            seen.append("T-2" if "T-2" in asked else "T-1")
+            return Completion(text=json.dumps({"spec": "new spec"}), usage=Usage())
+
+        orchestrator._call = call
+        self.assertIs(orchestrator._retry_cycle(run_id, "blocked"), True)
+
+        self.assertEqual(seen, ["T-1"])
+        by_id = {t.ticket_id: t for t in store.list_tickets(run_id)}
+        self.assertEqual(by_id["T-2"].spec, "untouched")
+        # Still requeued — it has to run once its dependency lands.
+        self.assertEqual(by_id["T-2"].status, "pending")
+
+    def test_revising_a_never_run_ticket_does_not_buy_another_cycle(self):
+        # The brake at `not revised` exists to stop a cycle that would hand the
+        # executor an unchanged ticket. Revisions to tickets that never ran used
+        # to satisfy it, so two further cycles were bought on work nothing had
+        # learned anything from.
+        orchestrator, store, run_id = self._orchestrator(
+            tickets=[
+                Ticket("T-1", status="failed", spec="old spec", attempts=3),
+                Ticket("T-2", status="skipped", spec="untouched", needs=["T-1"]),
+            ],
+            retry_cycles=2,
+            respec_on_retry=True,
+        )
+        step = store.start_step(run_id, "T-1", "review")
+        store.end_step(step, "failed", "REJECT: nope")
+
+        # The planner says the failing ticket is right as written.
+        orchestrator._call = lambda *_a, **_k: Completion(
+            text=json.dumps({"spec": "old spec"}), usage=Usage()
+        )
+        self.assertIs(orchestrator._retry_cycle(run_id, "blocked"), False)
+
     def test_a_respec_that_could_not_run_stops_rather_than_retrying_blind(self):
         # respecOnRetry was asked for and did not happen, so the cycle would be
         # a plain re-run of a ticket that already failed. The run stops with
@@ -1084,8 +1160,12 @@ class TestRespecHasGroundTruth(unittest.TestCase):
         section = body[body.index("What you may do to the acceptance criteria") :]
         plan_line = section.index("the plan's bar")
         added_line = section.index("invented by an earlier respec")
-        self.assertIn("you may not change this", section[plan_line:added_line])
-        self.assertIn("you may revise or retire it", section[added_line:])
+        # Grouped under headings rather than tagged per line: the planner is
+        # asked to copy these back verbatim, and a per-line tag is part of the
+        # line it copies.
+        self.assertIn("you may not change these", section[:plan_line])
+        self.assertIn("you may revise or retire these", section[plan_line:added_line])
+        self.assertNotIn("you may not change", section[added_line:])
 
     def test_the_impossible_escape_route_is_offered(self):
         body = respec_prompt(self._ticket(), self.FAILURES)[-1].content
@@ -1283,7 +1363,8 @@ class TestAnImpossibleTicketParksInsteadOfRetrying(unittest.TestCase):
         store = Store(Path(tempfile.mkdtemp()) / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(
-            run_id, [Ticket("T-1", spec="old", criteria=["yields [6,3,5,7,4]"])]
+            run_id,
+            [Ticket("T-1", spec="old", criteria=["yields [6,3,5,7,4]"], attempts=3)],
         )
         step = store.start_step(run_id, "T-1", "review")
         store.end_step(step, "failed", "REJECT: sequence mismatch")
@@ -3228,6 +3309,63 @@ class TestCriteriaAreMatchedByWhatTheyAssert(unittest.TestCase):
         self.assertEqual(len(merged), 2)
         self.assertNotIn("`level` starts at 1", merged)
         self.assertEqual(minted, ["`level` starts at 1"])
+
+    def test_a_criterion_returned_with_its_provenance_note_is_not_counted_as_new(self):
+        """The observed regression, in the other direction.
+
+        The prompt asks for plan-authored criteria back verbatim and marks each
+        one. A planner that copies the mark with the criterion has changed
+        nothing, but the note survived normalisation, so the same thirteen
+        counted once as dropped and once as invented — a reply doing exactly as
+        it was told, reported as gutting the contract and raising the bar at
+        once.
+        """
+        plan = [f"`f{i}()` returns {i}" for i in range(13)]
+        ticket = Ticket("TT-003", criteria=list(plan), original_criteria=list(plan))
+        echoed = [
+            f"{c}\n  _(from the plan — you may not change this)_" for c in plan
+        ]
+        merged, refused, minted = _merge_criteria(ticket, echoed)
+
+        self.assertEqual(merged, plan)
+        self.assertEqual(refused, [])
+        self.assertEqual(minted, [])
+
+    def test_the_note_is_stripped_in_its_inline_spelling_too(self):
+        plan = ["`WIDTH` is 10"]
+        ticket = Ticket("TT-003", criteria=list(plan), original_criteria=list(plan))
+        _merged, refused, minted = _merge_criteria(
+            ticket, ["`WIDTH` is 10 (from the plan — you may not change this)"]
+        )
+
+        self.assertEqual((refused, minted), ([], []))
+
+    def test_a_note_on_a_revision_authored_criterion_is_stripped_as_well(self):
+        ticket = Ticket(
+            "TT-003",
+            criteria=["from the plan", "minted earlier"],
+            original_criteria=["from the plan"],
+        )
+        merged, refused, minted = _merge_criteria(
+            ticket,
+            [
+                "from the plan",
+                "minted earlier _(added by an earlier revision — you may revise or retire it)_",
+            ],
+        )
+
+        self.assertEqual(merged, ["from the plan", "minted earlier"])
+        self.assertEqual((refused, minted), ([], []))
+
+    def test_a_genuinely_new_criterion_is_still_refused(self):
+        # The note is presentation, not a passphrase: attaching it to something
+        # the ticket never had must not launder it through.
+        ticket = Ticket("TT-003", criteria=["a"], original_criteria=["a"])
+        _merged, _refused, minted = _merge_criteria(
+            ticket, ["a", "b _(from the plan — you may not change this)_"]
+        )
+
+        self.assertEqual(len(minted), 1)
 
     def test_thirteen_criteria_reworded_stay_thirteen(self):
         """The observed regression: a plan stating 13 reached 27 in one pass."""

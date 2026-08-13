@@ -140,26 +140,47 @@ def _criteria_block(ticket: Ticket, criteria: Sequence[str] | None = None) -> st
 
 
 def _criteria_provenance_block(ticket: Ticket) -> str:
-    """The criteria, each marked with who wrote it.
+    """The criteria, grouped by who wrote them.
 
     Provenance is the whole distinction: a criterion a human put in the plan
     outranks the planner revising the ticket, and one an earlier revision
     invented does not. Without the marks the planner cannot tell which of its
     own past inventions it is allowed to take back.
+
+    Grouped under headings rather than tagged line by line, because the planner
+    is asked to return these criteria *verbatim* and a per-line tag is part of
+    the line it copies. One run returned all thirteen of a ticket's criteria
+    exactly as written, each carrying `_(from the plan — you may not change
+    this)_` on the end, and the provenance check scored the same thirteen as
+    both dropped and newly invented — a planner doing precisely as it was told,
+    reported as trying to gut the contract and raise the bar at once. A heading
+    is not part of any line, so there is nothing to carry.
     """
     original = set(ticket.original_criteria)
-    lines = []
-    for criterion in ticket.criteria:
-        # No anchor recorded — a run ingested before originals were kept.
-        # Everything is treated as the plan's, which errs toward leaving a
-        # human's contract alone.
-        if not ticket.original_criteria or criterion in original:
-            lines.append(f"- {criterion}\n  _(from the plan — you may not change this)_")
-        else:
-            lines.append(
-                f"- {criterion}\n  _(added by an earlier revision — you may revise or retire it)_"
-            )
-    return "\n".join(lines) or "- (none stated)"
+    # No anchor recorded — a run ingested before originals were kept. Everything
+    # is treated as the plan's, which errs toward leaving a human's contract
+    # alone.
+    if not ticket.original_criteria:
+        plan_stated, revision_added = list(ticket.criteria), []
+    else:
+        plan_stated = [c for c in ticket.criteria if c in original]
+        revision_added = [c for c in ticket.criteria if c not in original]
+
+    if not plan_stated and not revision_added:
+        return "- (none stated)"
+
+    sections = []
+    if plan_stated:
+        sections.append(
+            "### From the plan — you may not change these\n"
+            + "\n".join(f"- {c}" for c in plan_stated)
+        )
+    if revision_added:
+        sections.append(
+            "### Added by an earlier revision — you may revise or retire these\n"
+            + "\n".join(f"- {c}" for c in revision_added)
+        )
+    return "\n\n".join(sections)
 
 
 def _files_block(ticket: Ticket) -> str:
@@ -816,9 +837,10 @@ say which one you are changing and why.
 Return `criteria` as the complete list you want the ticket to have. The rules
 applied to it:
 
-- Criteria marked **from the plan** are a human's contract. Drop or reword one
-  and it will be put back, and the attempt to change it reported.
-- Criteria marked **added by an earlier revision** are the loop's own. Revise
+- Criteria under **From the plan** are a human's contract. Copy each one back
+  exactly as written, with nothing appended. Drop or reword one and it will be
+  put back, and the attempt to change it reported.
+- Criteria under **Added by an earlier revision** are the loop's own. Revise
   them, or leave them out to retire them, if the evidence says they were wrong.
 - Anything else you list is added. Add a criterion when the failures show
   behavior nobody asked for, or when the spec requires something no criterion
