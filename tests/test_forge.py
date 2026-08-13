@@ -38,6 +38,7 @@ from forge.ingest import ingest as ingest_document
 from forge.respec import _merge_criteria
 from forge.loop import Orchestrator, StepResult
 from forge.patch import (
+    describe_unparsed,
     duplicate_paths,
     enforce_scope,
     foreign_bindings,
@@ -129,14 +130,17 @@ class TestPatchParsing(unittest.TestCase):
         self.assertEqual([e.path for e in parsed.edits], ["README.md"])
         self.assertEqual(parsed.edits[0].content, readme)
 
-    def test_a_short_fence_around_fenced_content_is_caught_as_a_duplicate(self):
-        # Verbatim shape of the response that broke TT-006: the README closes
-        # its own fence early, and its remaining prose — a path on its own line
-        # ahead of a fence — parses as one more file. The parse cannot be
-        # salvaged, but it must not reach disk: the spurious block is last, so
-        # apply_edits lets it win over the real build.sh.
+    def _tt_006_response(self):
+        """Verbatim shape of the response that broke TT-006.
+
+        The README is wrapped in three backticks and contains three-backtick
+        fences of its own, so its block ends at the first one. Its remaining
+        prose — a path on its own line ahead of a fence — then parses as one
+        more file, and `apply_edits` is last-write-wins, so that fragment
+        overwrote the real `build.sh`.
+        """
         f = "`" * 3
-        body = (
+        return (
             f"build.sh\n{f}sh\ncargo build --release\n{f}\n\n"
             f"README.md\n{f}\n"
             "# Tetris\n\n"
@@ -148,13 +152,41 @@ class TestPatchParsing(unittest.TestCase):
             f"{f}powershell\n.\\build.ps1\n{f}\n"
             f"{f}\n"
         )
+
+    def test_a_file_cut_short_by_its_own_fence_never_becomes_an_edit(self):
+        parsed = parse_output(self._tt_006_response())
+
+        # Only the file whose block genuinely closed where it was meant to.
+        self.assertEqual([e.path for e in parsed.edits], ["build.sh"])
+        self.assertEqual(parsed.truncated, ["README.md", "./build.sh"])
+
+    def test_the_phantom_alone_is_still_refused(self):
+        # The case that actually reached disk. Told about the duplicate, the
+        # model restructured until only the invented block parsed — nothing
+        # collided, nothing was caught, and `build.sh` came back as 57 bytes of
+        # somebody else's markdown while two files were never written at all.
+        f = "`" * 3
+        body = (
+            f"README.md\n{f}\n"
+            "# Tetris\n\n"
+            f"{f}sh\nrustup target add wasm32-unknown-unknown\n{f}\n\n"
+            "### PowerShell\n\n"
+            f"{f}powershell\n.\\build.ps1\n{f}\n"
+        )
         parsed = parse_output(body)
 
-        self.assertEqual([e.path for e in parsed.edits], ["build.sh", "README.md", "./build.sh"])
-        self.assertEqual(duplicate_paths(parsed), ["build.sh"])
-        # The corrupting block is the later one, which is why last-write-wins
-        # turned a working script into a fragment of markdown.
-        self.assertIn("### PowerShell", parsed.edits[-1].content)
+        self.assertEqual(parsed.edits, [])
+        self.assertIn("README.md", parsed.truncated)
+
+    def test_a_file_whose_fences_are_shorter_than_its_wrapper_is_kept(self):
+        # The shape the executor is asked for, and the one the check must not
+        # flag: nothing inside can close a fence longer than itself.
+        inner, outer = "`" * 3, "`" * 4
+        readme = f"# Title\n\n{inner}sh\n./build.sh\n{inner}\n\n## More\n\ndone\n"
+        parsed = parse_output(f"README.md\n{outer}md\n{readme}{outer}\n")
+
+        self.assertEqual(parsed.truncated, [])
+        self.assertEqual(parsed.edits[0].content, readme)
 
     def test_distinct_paths_are_not_duplicates(self):
         fence = "`" * 3
@@ -165,6 +197,49 @@ class TestPatchParsing(unittest.TestCase):
         fence = "`" * 3
         parsed = parse_output(f"build.sh\n{fence}\nx\n{fence}\n\n./build.sh\n{fence}\ny\n{fence}\n")
         self.assertEqual(duplicate_paths(parsed), ["build.sh"])
+
+
+class TestUnparsedOutput(unittest.TestCase):
+    """Why a reply produced no edits.
+
+    "No file edits" is true of a model that decided there was nothing to do, of
+    one that wrote a whole file and forgot the path line, and of one that put
+    the path line inside the fence. Reporting all three identically sent a
+    respec looking for defects in the spec when the fix was a header line.
+    """
+
+    def test_a_fenced_block_with_no_path_line_says_so(self):
+        # TT-002: five consecutive attempts, each carrying a complete and valid
+        # src/board.rs, none of them named.
+        fence = "`" * 3
+        message = describe_unparsed(f"{fence}rust\nfn main() {{}}\n{fence}\n")
+        self.assertIn("no file path", message)
+
+    def test_a_path_line_inside_the_fence_says_so(self):
+        fence = "`" * 3
+        message = describe_unparsed(
+            f"{fence}\nbuild.sh\n#!/usr/bin/env sh\nset -eu\n{fence}\n"
+        )
+        self.assertIn("inside the fenced block", message)
+
+    def test_a_path_line_with_unfenced_contents_says_so(self):
+        message = describe_unparsed(
+            "build.sh\n#!/usr/bin/env sh\nset -eu\n\nbuild.ps1\nCopy-Item a b\n"
+        )
+        self.assertIn("did not fence their contents", message)
+
+    def test_a_reply_with_nothing_in_it_is_reported_plainly(self):
+        self.assertEqual(
+            describe_unparsed("I have reviewed the files and they look correct."),
+            "executor returned no file edits",
+        )
+
+    def test_a_reply_that_parsed_is_not_second_guessed(self):
+        fence = "`" * 3
+        self.assertEqual(
+            describe_unparsed(f"a.rs\n{fence}\nx\n{fence}\n"),
+            "executor returned no file edits",
+        )
 
 
 class TestScopeEnforcement(unittest.TestCase):
@@ -2265,6 +2340,31 @@ class TestTruncatedResponses(unittest.TestCase):
         orch._attempt(run_id, Ticket("T-1", allowed_files=["app.py"]), "")
 
         self.assertEqual((root / "app.py").read_text(encoding="utf-8").strip(), "x = 1")
+
+    def test_a_file_cut_short_by_its_own_fence_never_reaches_disk(self):
+        # TT-006 in full. `build.sh` was on disk and correct; the README's block
+        # closed inside itself, and the fragment parsed out of its remaining
+        # prose was written over the script. The step logged `apply ok`, the
+        # file came back as 57 bytes of markdown, and the two files the ticket
+        # actually needed were never written.
+        orch, root, run_id = self._orchestrator()
+        script = "#!/usr/bin/env sh\nset -eu\n"
+        (root / "build.sh").write_text(script, encoding="utf-8")
+        f = "`" * 3
+        orch._call = lambda *a, **k: self._completion(
+            f"README.md\n{f}\n# Tetris\n\n"
+            f"{f}sh\nrustup target add wasm32-unknown-unknown\n{f}\n\n"
+            f"### PowerShell\n\n{f}powershell\n.\\build.ps1\n{f}\n",
+            "stop",
+        )
+
+        result = orch._attempt(
+            run_id, Ticket("T-1", allowed_files=["build.sh", "README.md"]), ""
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("LONGER fence", result.detail)
+        self.assertEqual((root / "build.sh").read_text(encoding="utf-8"), script)
 
     def test_truncated_tests_are_discarded_without_failing_the_ticket(self):
         orch, root, run_id = self._orchestrator()

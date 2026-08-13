@@ -24,11 +24,14 @@ from pathlib import Path
 #
 # The closing fence must be at least as long as the opening one, which is the
 # CommonMark rule and the only way a file whose own contents contain fences can
-# be transported at all. A README wrapped in three backticks ends at the first
-# fence *inside* the README: the file is written truncated, and everything
-# after it is re-parsed as though it were more files. That is not theoretical —
-# it silently replaced a working `build.sh` with a fragment of markdown and
-# failed the ticket three times for a defect the executor never made.
+# be transported at all. That puts the burden on the *opening* fence being long
+# enough, and a model that opens a README with three backticks has already lost
+# the information: the block ends at the first fence inside the README, the
+# remainder is re-read as though it were more files, and paths lifted out of its
+# prose become edits. That is not theoretical — it silently replaced a working
+# `build.sh` with a fragment of markdown and failed the ticket three times for a
+# defect the executor never made. `_fence_is_too_short` catches it after the
+# match, because by then it is the only place the two lengths can be compared.
 _BLOCK = re.compile(
     r"^[ \t]*(?:(?:File|Path)\s*:\s*)?[`'\"]?(?P<path>[\w./\\+-]+\.[\w+]+)[`'\"]?[ \t]*:?[ \t]*\n"
     r"(?P<fence>`{3,})[^\n]*\n"
@@ -41,6 +44,37 @@ BLOCKED_PREFIX = "BLOCKED:"
 
 # A fence line on its own — an opener with an optional language, or a closer.
 _FENCE_LINE = re.compile(r"^[ \t]*```[^\n]*$")
+
+# Any fence line, with its backtick run captured so it can be measured against
+# the fence that is supposed to be containing it.
+_FENCE_RUN = re.compile(r"^[ \t]*(?P<ticks>`{3,})[^\n]*$", re.MULTILINE)
+
+# A line that is nothing but a path — what the protocol asks for, and what a
+# reply that buried it inside the fence has put in the wrong place.
+_BARE_PATH = re.compile(r"^[ \t]*[`'\"]?[\w./\\+-]+\.[\w+]+[`'\"]?[ \t]*:?[ \t]*$")
+
+
+def _fence_is_too_short(fence: str, body: str) -> bool:
+    """Whether `body` holds a fence that could have closed its own wrapper.
+
+    CommonMark closes a fenced block at the first line of at least as many
+    backticks, so a file whose contents contain ``` cannot survive a ```
+    wrapper: the block ends inside the file, the rest of that file is re-read as
+    though it were more files, and paths pulled out of its prose become edits.
+
+    The parser cannot repair this — by the time the text arrives the wrapper is
+    already ambiguous, and guessing which of two readings the model meant is how
+    a `build.sh` ends up holding a fragment of a README. What it can do is
+    notice, and it is a purely local check: a captured body containing a fence
+    run at least as long as its wrapper is one that was cut short.
+
+    A body whose fences are all shorter than the wrapper is unambiguous and
+    passes, which is exactly the case the executor is asked to produce.
+    """
+    return any(
+        len(match.group("ticks")) >= len(fence)
+        for match in _FENCE_RUN.finditer(body)
+    )
 
 
 def _unwrap_double_fence(body: str) -> str:
@@ -83,6 +117,11 @@ class ParsedOutput:
     blocked_reason: str = ""
     # Paths the model tried to write that its ticket did not allow.
     rejected: list[str] = field(default_factory=list)
+    # Paths whose fenced block was closed by a fence inside the file itself, so
+    # what was captured is a prefix of the real content. Never written: the rest
+    # of the file has already been re-read as further edits by the time anyone
+    # looks, and applying the prefix is what destroys the file.
+    truncated: list[str] = field(default_factory=list)
 
     @property
     def is_blocked(self) -> bool:
@@ -105,14 +144,73 @@ def parse_output(text: str) -> ParsedOutput:
     if marker and not _BLOCK.search(text):
         return ParsedOutput(blocked_reason=marker.group("reason").strip())
 
-    edits = [
-        FileEdit(
-            path=match.group("path").replace("\\", "/"),
-            content=_unwrap_double_fence(match.group("body")),
+    edits: list[FileEdit] = []
+    truncated: list[str] = []
+    for match in _BLOCK.finditer(text):
+        path = match.group("path").replace("\\", "/")
+        body = _unwrap_double_fence(match.group("body"))
+        if _fence_is_too_short(match.group("fence"), body):
+            truncated.append(path)
+            continue
+        edits.append(FileEdit(path=path, content=body))
+    return ParsedOutput(edits=edits, truncated=truncated)
+
+
+def describe_unparsed(text: str) -> str:
+    """Why a reply yielded no edits, in terms the executor can act on.
+
+    "No file edits" is true of a model that decided there was nothing to do, of
+    one that wrote a whole file and forgot the path line, and of one that put
+    the path line inside the fence. Those need three different corrections, and
+    reporting them identically sent a respec looking for defects in the spec
+    when the fix was a missing header line.
+    """
+    if list(_BLOCK.finditer(text)):
+        # The caller asked about a reply that did parse. Nothing to add.
+        return "executor returned no file edits"
+
+    lines = text.split("\n")
+    fenced = any(_FENCE_RUN.match(line) for line in lines)
+
+    # A fenced block whose own first line is the path: the header is present but
+    # inside the block, where it would be written into the file rather than
+    # naming it. Checked first — such a reply also looks like a path line with
+    # no fence after it, and this is the more specific reading.
+    for index, line in enumerate(lines[:-1]):
+        if _FENCE_RUN.match(line) and _BARE_PATH.match(lines[index + 1]):
+            return (
+                "Your response put the file path inside the fenced block, so no "
+                "file was written. The path must be on its own line BEFORE the "
+                "opening fence, and the block must contain only the file's "
+                "contents."
+            )
+
+    # A path line with the file's contents following it raw. Common enough to
+    # name on its own: the reply is otherwise correct, and saying "no file
+    # edits" sends the next attempt rewriting code that was already right.
+    for index, line in enumerate(lines[:-1]):
+        if not _BARE_PATH.match(line):
+            continue
+        following = next(
+            (later for later in lines[index + 1 :] if later.strip()), ""
         )
-        for match in _BLOCK.finditer(text)
-    ]
-    return ParsedOutput(edits=edits)
+        if following and not _FENCE_RUN.match(following):
+            return (
+                "Your response named files but did not fence their contents, so "
+                "nothing was written. After each path line, the whole file must "
+                "follow inside a fenced code block — and a file whose own "
+                "contents use fences needs a longer one, four backticks or five."
+            )
+
+    if fenced:
+        return (
+            "Your response contained a fenced code block with no file path "
+            "before it, so nothing was written. Every block must be preceded by "
+            "its path on a line of its own — no bold, no backticks, no "
+            "surrounding fence."
+        )
+
+    return "executor returned no file edits"
 
 
 def duplicate_paths(parsed: ParsedOutput) -> list[str]:

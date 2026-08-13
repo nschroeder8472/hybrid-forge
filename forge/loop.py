@@ -45,6 +45,7 @@ from .ingest import write_tickets
 from .memory import MemoryClient, MemoryRefused, MemoryUnavailable, ticket_query
 from .patch import (
     apply_edits,
+    describe_unparsed,
     duplicate_paths,
     enforce_scope,
     foreign_bindings,
@@ -1405,8 +1406,30 @@ class Orchestrator:
         parsed = parse_output(completion.text)
         if parsed.is_blocked:
             return StepResult(ok=False, blocked=True, detail=parsed.blocked_reason)
+
+        # A file whose wrapping fence was closed from inside itself. Checked
+        # before anything else about the parse, because the damage is silent:
+        # what survived the match is a prefix, and writing a prefix over a
+        # working file looks like a successful apply. It cost a `build.sh`,
+        # which came back as 57 bytes of somebody else's markdown while
+        # `build.ps1` and `README.md` were never written at all.
+        if parsed.truncated:
+            return StepResult(
+                ok=False,
+                detail=(
+                    "Nothing was written. These files are wrapped in a fence no "
+                    "longer than one they contain, so the block ends inside the "
+                    "file:\n"
+                    + "\n".join(f"- {path}" for path in parsed.truncated)
+                    + "\n\nA ``` inside a file closes a ``` wrapper. Wrap any "
+                    "file whose own contents use fences — README.md and most "
+                    "other markdown — in a LONGER fence: four backticks, or "
+                    "five. Emit each file exactly once."
+                ),
+            )
+
         if parsed.is_empty:
-            return StepResult(ok=False, detail="executor returned no file edits")
+            return StepResult(ok=False, detail=describe_unparsed(completion.text))
 
         # Two blocks for one path means the response did not parse into the
         # files it describes, and applying it would write the wrong one last.
