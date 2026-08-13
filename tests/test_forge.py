@@ -19,6 +19,7 @@ import unittest
 import unittest.mock
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from types import SimpleNamespace
 
 from forge import cli, modelfiles, respec
 from forge.artifacts import Artifacts
@@ -35,9 +36,10 @@ from forge.ingest import (
     tickets_from_json,
 )
 from forge.ingest import ingest as ingest_document
-from forge.respec import _merge_criteria
+from forge.respec import _merge_criteria, _refuse_protocol_edits
 from forge.loop import Orchestrator, StepResult
 from forge.patch import (
+    describe_unparsed,
     duplicate_paths,
     enforce_scope,
     foreign_bindings,
@@ -53,6 +55,7 @@ from forge.prompts import (
     parse_verdict,
     respec_prompt,
     review_prompt,
+    strip_prompt_echo,
     tests_prompt,
 )
 from forge.providers.base import (
@@ -129,14 +132,35 @@ class TestPatchParsing(unittest.TestCase):
         self.assertEqual([e.path for e in parsed.edits], ["README.md"])
         self.assertEqual(parsed.edits[0].content, readme)
 
-    def test_a_short_fence_around_fenced_content_is_caught_as_a_duplicate(self):
-        # Verbatim shape of the response that broke TT-006: the README closes
-        # its own fence early, and its remaining prose — a path on its own line
-        # ahead of a fence — parses as one more file. The parse cannot be
-        # salvaged, but it must not reach disk: the spurious block is last, so
-        # apply_edits lets it win over the real build.sh.
+    def test_a_path_under_a_markdown_heading_is_still_a_path(self):
+        # Thirteen replies across four cycles, all `#### src/game.rs` above a
+        # correct implementation. Telling the model its path line was missing
+        # changed nothing — it does not experience that line as missing.
+        parsed = parse_output("#### src/game.rs\n```rust\npub struct Game;\n```")
+
+        self.assertEqual([e.path for e in parsed.edits], ["src/game.rs"])
+        self.assertEqual(parsed.edits[0].content, "pub struct Game;\n")
+
+    def test_a_bold_path_is_still_a_path(self):
+        parsed = parse_output("**src/game.rs**\n```rust\nx\n```")
+        self.assertEqual([e.path for e in parsed.edits], ["src/game.rs"])
+
+    def test_a_heading_that_is_not_a_path_is_not_one(self):
+        # The widened rule must not turn ordinary prose into a file.
+        parsed = parse_output("### Using build.ps1 (Windows)\n```powershell\nx\n```")
+        self.assertEqual(parsed.edits, [])
+
+    def _tt_006_response(self):
+        """Verbatim shape of the response that broke TT-006.
+
+        The README is wrapped in three backticks and contains three-backtick
+        fences of its own, so its block ends at the first one. Its remaining
+        prose — a path on its own line ahead of a fence — then parses as one
+        more file, and `apply_edits` is last-write-wins, so that fragment
+        overwrote the real `build.sh`.
+        """
         f = "`" * 3
-        body = (
+        return (
             f"build.sh\n{f}sh\ncargo build --release\n{f}\n\n"
             f"README.md\n{f}\n"
             "# Tetris\n\n"
@@ -148,13 +172,41 @@ class TestPatchParsing(unittest.TestCase):
             f"{f}powershell\n.\\build.ps1\n{f}\n"
             f"{f}\n"
         )
+
+    def test_a_file_cut_short_by_its_own_fence_never_becomes_an_edit(self):
+        parsed = parse_output(self._tt_006_response())
+
+        # Only the file whose block genuinely closed where it was meant to.
+        self.assertEqual([e.path for e in parsed.edits], ["build.sh"])
+        self.assertEqual(parsed.truncated, ["README.md", "./build.sh"])
+
+    def test_the_phantom_alone_is_still_refused(self):
+        # The case that actually reached disk. Told about the duplicate, the
+        # model restructured until only the invented block parsed — nothing
+        # collided, nothing was caught, and `build.sh` came back as 57 bytes of
+        # somebody else's markdown while two files were never written at all.
+        f = "`" * 3
+        body = (
+            f"README.md\n{f}\n"
+            "# Tetris\n\n"
+            f"{f}sh\nrustup target add wasm32-unknown-unknown\n{f}\n\n"
+            "### PowerShell\n\n"
+            f"{f}powershell\n.\\build.ps1\n{f}\n"
+        )
         parsed = parse_output(body)
 
-        self.assertEqual([e.path for e in parsed.edits], ["build.sh", "README.md", "./build.sh"])
-        self.assertEqual(duplicate_paths(parsed), ["build.sh"])
-        # The corrupting block is the later one, which is why last-write-wins
-        # turned a working script into a fragment of markdown.
-        self.assertIn("### PowerShell", parsed.edits[-1].content)
+        self.assertEqual(parsed.edits, [])
+        self.assertIn("README.md", parsed.truncated)
+
+    def test_a_file_whose_fences_are_shorter_than_its_wrapper_is_kept(self):
+        # The shape the executor is asked for, and the one the check must not
+        # flag: nothing inside can close a fence longer than itself.
+        inner, outer = "`" * 3, "`" * 4
+        readme = f"# Title\n\n{inner}sh\n./build.sh\n{inner}\n\n## More\n\ndone\n"
+        parsed = parse_output(f"README.md\n{outer}md\n{readme}{outer}\n")
+
+        self.assertEqual(parsed.truncated, [])
+        self.assertEqual(parsed.edits[0].content, readme)
 
     def test_distinct_paths_are_not_duplicates(self):
         fence = "`" * 3
@@ -165,6 +217,48 @@ class TestPatchParsing(unittest.TestCase):
         fence = "`" * 3
         parsed = parse_output(f"build.sh\n{fence}\nx\n{fence}\n\n./build.sh\n{fence}\ny\n{fence}\n")
         self.assertEqual(duplicate_paths(parsed), ["build.sh"])
+
+
+class TestUnparsedOutput(unittest.TestCase):
+    """Why a reply produced no edits.
+
+    "No file edits" is true of a model that decided there was nothing to do, of
+    one that wrote a whole file and forgot the path line, and of one that put
+    the path line inside the fence. Reporting all three identically sent a
+    respec looking for defects in the spec when the fix was a header line.
+    """
+
+    def test_a_fenced_block_with_no_path_line_says_so(self):
+        # TT-002: five consecutive attempts, each carrying a complete and valid
+        # src/board.rs, none of them named.
+        fence = "`" * 3
+        message = describe_unparsed(f"{fence}rust\nfn main() {{}}\n{fence}\n")
+        self.assertIn("no file path", message)
+
+    def test_a_path_line_inside_the_fence_says_so(self):
+        fence = "`" * 3
+        message = describe_unparsed(
+            f"{fence}\nbuild.sh\n#!/usr/bin/env sh\nset -eu\n{fence}\n"
+        )
+        self.assertIn("inside the fenced block", message)
+
+    def test_a_path_line_with_unfenced_contents_says_so(self):
+        message = describe_unparsed(
+            "build.sh\n#!/usr/bin/env sh\nset -eu\n\nbuild.ps1\nCopy-Item a b\n"
+        )
+        self.assertIn("did not fence their contents", message)
+
+    def test_a_reply_carrying_no_file_content_raises_no_complaint(self):
+        # Not a formatting failure — there is nothing here that was meant to be
+        # a file. The caller judges it against the criteria instead of spending
+        # an attempt on it.
+        self.assertEqual(
+            describe_unparsed("I have reviewed the files and they look correct."), ""
+        )
+
+    def test_a_reply_that_parsed_is_not_second_guessed(self):
+        fence = "`" * 3
+        self.assertEqual(describe_unparsed(f"a.rs\n{fence}\nx\n{fence}\n"), "")
 
 
 class TestScopeEnforcement(unittest.TestCase):
@@ -367,6 +461,27 @@ Rotate them.
     def test_recognizes_a_plan(self):
         self.assertTrue(looks_like_plan(self.PLAN))
         self.assertFalse(looks_like_plan("Please add PNG export at some point."))
+
+    def test_a_bullet_that_is_one_code_span_loses_its_backticks(self):
+        # What the stripping is for: a file path is written `src/piece.rs` and
+        # the backticks are punctuation, not part of the name.
+        self.assertEqual(parse_plan(self.PLAN)[0].allowed_files, ["a.py"])
+
+    def test_a_criterion_that_opens_and_closes_with_code_spans_keeps_both(self):
+        # Taking one character off each end of a criterion that begins and ends
+        # with inline code removes the *opening* backtick of the first span and
+        # the *closing* backtick of the last, leaving unbalanced markdown in
+        # every prompt that renders it — and inviting the planner to "reword"
+        # the criterion at respec time by repairing the punctuation, which the
+        # provenance check then reads as tampering with a human's contract.
+        plan = self.PLAN.replace(
+            "- returns 1 for input 0",
+            "- `piece::WIDTH` is 10 and `piece::HEIGHT` is 20",
+        )
+        self.assertEqual(
+            parse_plan(plan)[0].criteria,
+            ["`piece::WIDTH` is 10 and `piece::HEIGHT` is 20"],
+        )
 
     def test_parses_verbatim_without_a_model(self):
         tickets = parse_plan(self.PLAN)
@@ -877,6 +992,61 @@ class TestAutomaticRetryCycles(unittest.TestCase):
         written = sorted(p.name for p in orchestrator.config.tickets_dir.glob("*.md"))
         self.assertEqual(written, ["T-1.md"])
 
+    def test_a_skipped_ticket_is_requeued_but_not_respecced(self):
+        # It never ran, so the only evidence is which dependency was missing.
+        # Handed that under "what happened, oldest attempt first", the planner
+        # rewrote three untried specs twice each — one acquiring a fabricated
+        # xorshift constant, another a `lib.rs must contain exactly` clause that
+        # contradicted the two tickets after it.
+        orchestrator, store, run_id = self._orchestrator(
+            tickets=[
+                Ticket("T-1", status="failed", spec="old spec", attempts=3),
+                Ticket("T-2", status="skipped", spec="untouched", needs=["T-1"]),
+            ],
+            retry_cycles=1,
+            respec_on_retry=True,
+        )
+        step = store.start_step(run_id, "T-1", "review")
+        store.end_step(step, "failed", "REJECT: the spec never said which file")
+
+        seen: list[str] = []
+
+        def call(_run_id, _role, messages, **_kwargs):
+            asked = "\n".join(m.content for m in messages)
+            seen.append("T-2" if "T-2" in asked else "T-1")
+            return Completion(text=json.dumps({"spec": "new spec"}), usage=Usage())
+
+        orchestrator._call = call
+        self.assertIs(orchestrator._retry_cycle(run_id, "blocked"), True)
+
+        self.assertEqual(seen, ["T-1"])
+        by_id = {t.ticket_id: t for t in store.list_tickets(run_id)}
+        self.assertEqual(by_id["T-2"].spec, "untouched")
+        # Still requeued — it has to run once its dependency lands.
+        self.assertEqual(by_id["T-2"].status, "pending")
+
+    def test_revising_a_never_run_ticket_does_not_buy_another_cycle(self):
+        # The brake at `not revised` exists to stop a cycle that would hand the
+        # executor an unchanged ticket. Revisions to tickets that never ran used
+        # to satisfy it, so two further cycles were bought on work nothing had
+        # learned anything from.
+        orchestrator, store, run_id = self._orchestrator(
+            tickets=[
+                Ticket("T-1", status="failed", spec="old spec", attempts=3),
+                Ticket("T-2", status="skipped", spec="untouched", needs=["T-1"]),
+            ],
+            retry_cycles=2,
+            respec_on_retry=True,
+        )
+        step = store.start_step(run_id, "T-1", "review")
+        store.end_step(step, "failed", "REJECT: nope")
+
+        # The planner says the failing ticket is right as written.
+        orchestrator._call = lambda *_a, **_k: Completion(
+            text=json.dumps({"spec": "old spec"}), usage=Usage()
+        )
+        self.assertIs(orchestrator._retry_cycle(run_id, "blocked"), False)
+
     def test_a_respec_that_could_not_run_stops_rather_than_retrying_blind(self):
         # respecOnRetry was asked for and did not happen, so the cycle would be
         # a plain re-run of a ticket that already failed. The run stops with
@@ -1009,8 +1179,12 @@ class TestRespecHasGroundTruth(unittest.TestCase):
         section = body[body.index("What you may do to the acceptance criteria") :]
         plan_line = section.index("the plan's bar")
         added_line = section.index("invented by an earlier respec")
-        self.assertIn("you may not change this", section[plan_line:added_line])
-        self.assertIn("you may revise or retire it", section[added_line:])
+        # Grouped under headings rather than tagged per line: the planner is
+        # asked to copy these back verbatim, and a per-line tag is part of the
+        # line it copies.
+        self.assertIn("you may not change these", section[:plan_line])
+        self.assertIn("you may revise or retire these", section[plan_line:added_line])
+        self.assertNotIn("you may not change", section[added_line:])
 
     def test_the_impossible_escape_route_is_offered(self):
         body = respec_prompt(self._ticket(), self.FAILURES)[-1].content
@@ -1208,7 +1382,8 @@ class TestAnImpossibleTicketParksInsteadOfRetrying(unittest.TestCase):
         store = Store(Path(tempfile.mkdtemp()) / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(
-            run_id, [Ticket("T-1", spec="old", criteria=["yields [6,3,5,7,4]"])]
+            run_id,
+            [Ticket("T-1", spec="old", criteria=["yields [6,3,5,7,4]"], attempts=3)],
         )
         step = store.start_step(run_id, "T-1", "review")
         store.end_step(step, "failed", "REJECT: sequence mismatch")
@@ -2266,6 +2441,79 @@ class TestTruncatedResponses(unittest.TestCase):
 
         self.assertEqual((root / "app.py").read_text(encoding="utf-8").strip(), "x = 1")
 
+    def test_a_file_cut_short_by_its_own_fence_never_reaches_disk(self):
+        # TT-006 in full. `build.sh` was on disk and correct; the README's block
+        # closed inside itself, and the fragment parsed out of its remaining
+        # prose was written over the script. The step logged `apply ok`, the
+        # file came back as 57 bytes of markdown, and the two files the ticket
+        # actually needed were never written.
+        orch, root, run_id = self._orchestrator()
+        script = "#!/usr/bin/env sh\nset -eu\n"
+        (root / "build.sh").write_text(script, encoding="utf-8")
+        f = "`" * 3
+        orch._call = lambda *a, **k: self._completion(
+            f"README.md\n{f}\n# Tetris\n\n"
+            f"{f}sh\nrustup target add wasm32-unknown-unknown\n{f}\n\n"
+            f"### PowerShell\n\n{f}powershell\n.\\build.ps1\n{f}\n",
+            "stop",
+        )
+
+        result = orch._attempt(
+            run_id, Ticket("T-1", allowed_files=["build.sh", "README.md"]), ""
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("LONGER fence", result.detail)
+        self.assertEqual((root / "build.sh").read_text(encoding="utf-8"), script)
+
+    def test_the_files_that_parsed_cleanly_are_written_anyway(self):
+        # The recovery path. One real response carried a correct build.sh and
+        # build.ps1 beside a truncated README; refusing all three left the
+        # corrupt build.sh already on disk with no way to be replaced, and the
+        # ticket could not finish no matter what the executor sent.
+        orch, root, run_id = self._orchestrator()
+        (root / "build.sh").write_text("### stale markdown fragment\n", encoding="utf-8")
+        f = "`" * 3
+        orch._call = lambda *a, **k: self._completion(
+            f"build.sh\n{f}sh\ncargo build --release\n{f}\n\n"
+            f"build.ps1\n{f}powershell\ncargo build\n{f}\n\n"
+            f"README.md\n{f}\n# Tetris\n\n{f}sh\nrustup target add wasm32\n{f}\n\n"
+            f"### PowerShell\n\n{f}powershell\n.\\build.ps1\n{f}\n",
+            "stop",
+        )
+
+        result = orch._attempt(
+            run_id,
+            Ticket("T-1", allowed_files=["build.sh", "build.ps1", "README.md"]),
+            "",
+        )
+
+        # Incomplete, so the attempt still fails — but it made progress.
+        self.assertFalse(result.ok)
+        self.assertIn(
+            "cargo build --release", (root / "build.sh").read_text(encoding="utf-8")
+        )
+        self.assertTrue((root / "build.ps1").exists())
+        self.assertFalse((root / "README.md").exists())
+
+    def test_the_failure_names_what_landed_and_what_did_not(self):
+        orch, root, run_id = self._orchestrator()
+        f = "`" * 3
+        orch._call = lambda *a, **k: self._completion(
+            f"build.sh\n{f}sh\ncargo build --release\n{f}\n\n"
+            f"README.md\n{f}\n# T\n\n{f}sh\nx\n{f}\n\n## More\n\ndone\n{f}\n",
+            "stop",
+        )
+
+        result = orch._attempt(
+            run_id, Ticket("T-1", allowed_files=["build.sh", "README.md"]), ""
+        )
+
+        self.assertIn("README.md", result.detail)
+        self.assertIn("LONGER fence", result.detail)
+        self.assertIn("is on disk", result.detail)
+        self.assertIn("build.sh", result.detail)
+
     def test_truncated_tests_are_discarded_without_failing_the_ticket(self):
         orch, root, run_id = self._orchestrator()
 
@@ -3129,6 +3377,111 @@ class TestCriteriaAreMatchedByWhatTheyAssert(unittest.TestCase):
         self.assertNotIn("`level` starts at 1", merged)
         self.assertEqual(minted, ["`level` starts at 1"])
 
+    def test_a_spec_that_takes_up_the_reply_format_is_dropped(self):
+        # Verbatim from a real revision. Respec read an unparseable response as
+        # a formatting problem and wrote the cure into the spec — and the cure
+        # was the one thing that guarantees nothing parses, since a fence is
+        # what the parser matches on.
+        ticket = Ticket("TT-006", spec="Document and script the build.",
+                        original_spec="Document and script the build.")
+        revision = {
+            "spec": (
+                "Create exactly three files. Output their raw contents directly "
+                "in your response, prefixed by the filename. Do not wrap file "
+                "contents in markdown code fences."
+            )
+        }
+
+        dropped = _refuse_protocol_edits(ticket, revision)
+
+        self.assertNotIn("spec", revision)
+        self.assertEqual([field for field, _phrase in dropped], ["spec"])
+
+    def test_the_context_is_guarded_the_same_way(self):
+        ticket = Ticket("TT-006", spec="s", original_spec="s", context="")
+        revision = {"context": "Emit each file with the path on its own line."}
+
+        _refuse_protocol_edits(ticket, revision)
+
+        self.assertNotIn("context", revision)
+
+    def test_an_ordinary_revision_is_untouched(self):
+        ticket = Ticket("TT-006", spec="old", original_spec="old")
+        revision = {"spec": "build.sh must start with a POSIX shebang."}
+
+        self.assertEqual(_refuse_protocol_edits(ticket, revision), [])
+        self.assertIn("spec", revision)
+
+    def test_a_ticket_whose_plan_already_talks_about_fences_stays_revisable(self):
+        # A markdown tool legitimately has fences in its spec. The guard is
+        # about what a revision *introduces*, not about the subject matter.
+        ticket = Ticket(
+            "TT-009",
+            spec="Render each code fence as a <pre>.",
+            original_spec="Render each code fence as a <pre>.",
+        )
+        revision = {"spec": "Render each code fence as a <pre>, preserving the language."}
+
+        self.assertEqual(_refuse_protocol_edits(ticket, revision), [])
+        self.assertIn("spec", revision)
+
+    def test_a_criterion_returned_with_its_provenance_note_is_not_counted_as_new(self):
+        """The observed regression, in the other direction.
+
+        The prompt asks for plan-authored criteria back verbatim and marks each
+        one. A planner that copies the mark with the criterion has changed
+        nothing, but the note survived normalisation, so the same thirteen
+        counted once as dropped and once as invented — a reply doing exactly as
+        it was told, reported as gutting the contract and raising the bar at
+        once.
+        """
+        plan = [f"`f{i}()` returns {i}" for i in range(13)]
+        ticket = Ticket("TT-003", criteria=list(plan), original_criteria=list(plan))
+        echoed = [
+            f"{c}\n  _(from the plan — you may not change this)_" for c in plan
+        ]
+        merged, refused, minted = _merge_criteria(ticket, echoed)
+
+        self.assertEqual(merged, plan)
+        self.assertEqual(refused, [])
+        self.assertEqual(minted, [])
+
+    def test_the_note_is_stripped_in_its_inline_spelling_too(self):
+        plan = ["`WIDTH` is 10"]
+        ticket = Ticket("TT-003", criteria=list(plan), original_criteria=list(plan))
+        _merged, refused, minted = _merge_criteria(
+            ticket, ["`WIDTH` is 10 (from the plan — you may not change this)"]
+        )
+
+        self.assertEqual((refused, minted), ([], []))
+
+    def test_a_note_on_a_revision_authored_criterion_is_stripped_as_well(self):
+        ticket = Ticket(
+            "TT-003",
+            criteria=["from the plan", "minted earlier"],
+            original_criteria=["from the plan"],
+        )
+        merged, refused, minted = _merge_criteria(
+            ticket,
+            [
+                "from the plan",
+                "minted earlier _(added by an earlier revision — you may revise or retire it)_",
+            ],
+        )
+
+        self.assertEqual(merged, ["from the plan", "minted earlier"])
+        self.assertEqual((refused, minted), ([], []))
+
+    def test_a_genuinely_new_criterion_is_still_refused(self):
+        # The note is presentation, not a passphrase: attaching it to something
+        # the ticket never had must not launder it through.
+        ticket = Ticket("TT-003", criteria=["a"], original_criteria=["a"])
+        _merged, _refused, minted = _merge_criteria(
+            ticket, ["a", "b _(from the plan — you may not change this)_"]
+        )
+
+        self.assertEqual(len(minted), 1)
+
     def test_thirteen_criteria_reworded_stay_thirteen(self):
         """The observed regression: a plan stating 13 reached 27 in one pass."""
         plan = [f"`f{i}()` returns {i}" for i in range(13)]
@@ -3870,6 +4223,266 @@ class TestFailureHistoryReachesBothRoles(unittest.TestCase):
         self.assertEqual(len(rejections), 1)
         self.assertIn("missing the error path", rejections[0])
 
+    def test_the_reviewer_must_cite_what_it_looked_at(self):
+        # Reviewers reject work that is plainly present — one said a canvas
+        # "does not specify a width of 240 and a height of 480" about a file
+        # whose second line said exactly that, three times running.
+        system = review_prompt(Ticket("T-1", spec="s"), "diff")[0].content
+
+        self.assertIn("EVERY objection must cite", system)
+        self.assertIn("name the exact text", system)
+
+    def test_a_verdict_that_echoes_the_prompt_is_not_fed_back(self):
+        # Observed: the reviewer copied the prompt's own headings into its
+        # verdict, which was then quoted into the next attempt's prompt and
+        # offered for copying again. The block nested on itself every round.
+        orch, _, run_id = _stub_orchestrator()
+        echoed = (
+            "REJECT\nthe error path is swallowed\n\n"
+            "## You have already rejected this ticket\n"
+            "### Attempt 1\n"
+            "REJECT\nsomething else entirely\n\n"
+            "Read these before deciding.\n"
+        )
+        orch._call = _replies("src/a.py\n```python\nx = 1\n```", echoed)
+        rejections: list[str] = []
+
+        orch._attempt(
+            run_id, Ticket("T-1", allowed_files=["src/a.py"]), "", rejections=rejections
+        )
+
+        self.assertEqual(rejections, ["REJECT\nthe error path is swallowed"])
+        self.assertNotIn("already rejected", rejections[0])
+
+
+class TestAnUnreadableReplyIsAskedForAgain(unittest.TestCase):
+    """A reply that did not parse is a formatting mistake, not a failed
+    implementation, and spending a whole attempt on one buys nothing — the next
+    attempt re-reads the same spec and the model repeats itself. One ticket lost
+    six of its nine attempts to a fenced block with no path line above it, while
+    the three that parsed drew specific review objections it never had the
+    budget left to answer."""
+
+    GOOD = "src/game.rs\n```rust\npub struct Game;\n```"
+    NO_PATH = "Looking at the error, I can see the issue:\n\n```rust\npub struct Game;\n```"
+
+    def _orchestrator(self):
+        orch, root, run_id = _stub_orchestrator()
+        return orch, root, run_id
+
+    def test_a_second_ask_inside_the_attempt_recovers_the_work(self):
+        orch, root, run_id = self._orchestrator()
+        replies = iter([self.NO_PATH, self.GOOD])
+        asked: list[str] = []
+
+        def call(_run_id, role, messages, **_kwargs):
+            if role != "executor":
+                return Completion(text="ACCEPT\nfine", usage=Usage())
+            asked.append("\n".join(m.content for m in messages))
+            return Completion(text=next(replies), usage=Usage())
+
+        orch._call = call
+        result = orch._attempt(run_id, Ticket("T-1", allowed_files=["src/game.rs"]), "")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(asked), 2)
+        # The second ask carries the complaint, and tells it not to rewrite.
+        self.assertIn("could not be read", asked[1])
+        self.assertIn("no file path", asked[1])
+        self.assertIn("code was never the problem", asked[1])
+        self.assertEqual(
+            (root / "src" / "game.rs").read_text(encoding="utf-8").strip(),
+            "pub struct Game;",
+        )
+
+    def test_a_readable_reply_is_never_asked_twice(self):
+        orch, _root, run_id = self._orchestrator()
+        builds = []
+
+        def call(_run_id, role, _messages, **_kwargs):
+            if role != "executor":
+                return Completion(text="ACCEPT\nfine", usage=Usage())
+            builds.append(1)
+            return Completion(text=self.GOOD, usage=Usage())
+
+        orch._call = call
+        orch._attempt(run_id, Ticket("T-1", allowed_files=["src/game.rs"]), "")
+
+        self.assertEqual(len(builds), 1)
+
+    def test_twice_unreadable_spends_the_attempt(self):
+        orch, _root, run_id = self._orchestrator()
+        builds = []
+
+        def call(_run_id, _role, _messages, **_kwargs):
+            builds.append(1)
+            return Completion(text=self.NO_PATH, usage=Usage())
+
+        orch._call = call
+        result = orch._attempt(run_id, Ticket("T-1", allowed_files=["src/game.rs"]), "")
+
+        self.assertFalse(result.ok)
+        self.assertIn("no file path", result.detail)
+        self.assertEqual(len(builds), 2)
+
+    def test_a_blocked_reply_is_a_decision_not_a_formatting_mistake(self):
+        orch, _root, run_id = self._orchestrator()
+        builds = []
+
+        def call(_run_id, _role, _messages, **_kwargs):
+            builds.append(1)
+            return Completion(text="BLOCKED: two criteria contradict", usage=Usage())
+
+        orch._call = call
+        result = orch._attempt(run_id, Ticket("T-1", allowed_files=["src/game.rs"]), "")
+
+        self.assertTrue(result.blocked)
+        self.assertEqual(len(builds), 1)
+
+    def test_a_reply_with_no_file_content_is_not_asked_again(self):
+        # The 1.2 case: nothing to write may be the honest answer, and asking
+        # again would talk a finished ticket into inventing an edit.
+        orch, _root, run_id = self._orchestrator()
+        builds = []
+
+        def call(_run_id, role, _messages, **_kwargs):
+            if role != "executor":
+                return Completion(text="ACCEPT\nalready satisfied", usage=Usage())
+            builds.append(1)
+            return Completion(text="The files already implement the spec.", usage=Usage())
+
+        orch._call = call
+        orch._attempt(run_id, Ticket("T-1", allowed_files=["src/game.rs"]), "")
+
+        self.assertEqual(len(builds), 1)
+
+    def test_a_partly_readable_reply_is_kept_rather_than_risked(self):
+        # Something parsed, so it is written and the attempt reports what is
+        # missing. Asking again could trade a partial answer for a worse one.
+        orch, root, run_id = self._orchestrator()
+        f = "`" * 3
+        builds = []
+
+        def call(_run_id, _role, _messages, **_kwargs):
+            builds.append(1)
+            return Completion(
+                text=f"build.sh\n{f}sh\ncargo build\n{f}\n\n"
+                f"README.md\n{f}\n# T\n\n{f}sh\nx\n{f}\n\n## More\n\ndone\n{f}\n",
+                usage=Usage(),
+            )
+
+        orch._call = call
+        orch._attempt(
+            run_id, Ticket("T-1", allowed_files=["build.sh", "README.md"]), ""
+        )
+
+        self.assertEqual(len(builds), 1)
+        self.assertTrue((root / "build.sh").exists())
+
+
+class TestAnExecutorThatWritesNothing(unittest.TestCase):
+    """Disk is never reverted between attempts and the executor is shown the
+    current files, so "there is nothing to change" is sometimes the honest
+    answer. Failing the attempt for it is how a finished ticket failed three
+    times a cycle — one reply read "Looking at the files provided, I can see
+    they already implement the spec correctly." It did."""
+
+    NOTHING = "Looking at the files provided, they already implement the spec."
+
+    def test_an_empty_reply_is_reviewed_against_disk_instead_of_failing(self):
+        orch, root, run_id = _stub_orchestrator()
+        (root / "src").mkdir(parents=True, exist_ok=True)
+        (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        seen: list[str] = []
+
+        def call(_run_id, role, messages, **_kwargs):
+            seen.append(role)
+            if role == "reviewer":
+                return Completion(
+                    text="ACCEPT\nalready satisfied on disk", usage=Usage()
+                )
+            return Completion(text=self.NOTHING, usage=Usage())
+
+        orch._call = call
+        result = orch._attempt(run_id, Ticket("T-1", allowed_files=["src/a.py"]), "")
+
+        self.assertTrue(result.ok)
+        self.assertIn("reviewer", seen)
+
+    def test_the_file_already_there_is_left_alone(self):
+        orch, root, run_id = _stub_orchestrator()
+        (root / "src").mkdir(parents=True, exist_ok=True)
+        (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        orch._call = lambda _r, role, *_a, **_k: Completion(
+            text="ACCEPT\nfine" if role == "reviewer" else self.NOTHING, usage=Usage()
+        )
+
+        orch._attempt(run_id, Ticket("T-1", allowed_files=["src/a.py"]), "")
+
+        self.assertEqual(
+            (root / "src" / "a.py").read_text(encoding="utf-8"), "x = 1\n"
+        )
+
+    def test_no_test_file_is_authored_for_an_attempt_that_wrote_nothing(self):
+        # A test on disk for an attempt that changed nothing is the orphan the
+        # fixed-path rule exists to prevent.
+        orch, _root, run_id = _stub_orchestrator()
+        roles: list[str] = []
+
+        def call(_run_id, role, *_a, **_k):
+            roles.append(role)
+            return Completion(
+                text="ACCEPT\nfine" if role == "reviewer" else self.NOTHING,
+                usage=Usage(),
+            )
+
+        orch._call = call
+        orch._attempt(
+            run_id, Ticket("T-1", allowed_files=["src/a.py"], criteria=["c"]), ""
+        )
+
+        self.assertNotIn("tester", roles)
+
+    def test_a_reply_the_parser_could_not_read_still_fails(self):
+        # The distinction 1.0 drew: content that was meant to be a file, and
+        # arrived unreadable, is a failure and says which shape it was.
+        orch, _root, run_id = _stub_orchestrator()
+        fence = "`" * 3
+        orch._call = _replies(f"{fence}python\nx = 1\n{fence}\n")
+
+        result = orch._attempt(run_id, Ticket("T-1", allowed_files=["src/a.py"]), "")
+
+        self.assertFalse(result.ok)
+        self.assertIn("no file path", result.detail)
+
+
+class TestStrippingThePromptEcho(unittest.TestCase):
+    """What the reviewer wrote survives; what it copied does not."""
+
+    def test_a_clean_verdict_is_untouched(self):
+        verdict = "REJECT\n- `main.js:12` calls game_input(' ') rather than 4."
+        self.assertEqual(strip_prompt_echo(verdict), verdict)
+
+    def test_stripping_is_idempotent(self):
+        once = strip_prompt_echo("ACCEPT\nfine\n\n### Attempt 1\nold\n")
+        self.assertEqual(strip_prompt_echo(once), once)
+
+    def test_a_quoted_heading_inside_a_citation_survives(self):
+        # 2.1 asks the reviewer to quote what it looked at, and what it looked
+        # at may be a README. An ordinary markdown heading in a citation is not
+        # an echo of the prompt.
+        verdict = "REJECT\nREADME.md line 8 reads:\n  ## Building\nwhich never mentions rustup."
+        self.assertEqual(strip_prompt_echo(verdict), verdict)
+
+    def test_a_wholesale_copy_of_the_prompt_keeps_only_the_verdict(self):
+        self.assertEqual(
+            strip_prompt_echo("ACCEPT\nlooks right\n\n## Spec\nbuild the thing\n"),
+            "ACCEPT\nlooks right",
+        )
+
+    def test_an_empty_verdict_survives_the_trip(self):
+        self.assertEqual(strip_prompt_echo(""), "")
+
 
 class TestEmptyDiffShowsState(unittest.TestCase):
     """A ticket can pass verification having changed nothing. Handed
@@ -3910,6 +4523,71 @@ class TestEmptyDiffShowsState(unittest.TestCase):
 
         self.assertEqual(len(seen), 1)
         self.assertIn("what is actually on disk", seen[0])
+
+
+class TestTheBaselineExcuseStopsAtTheTicketsScope(unittest.TestCase):
+    """Amnesty covers what a ticket cannot fix, and nothing else.
+
+    Nothing reverts a failed ticket, so a retry starts with the previous
+    cycle's breakage on disk — and used to collect a baseline that forgave it.
+    One ticket left four clippy errors in `src/board.rs`, was requeued, and
+    passed its lint step on the grounds that the errors pre-dated the attempt.
+    They did. It wrote them.
+    """
+
+    LINT = (
+        "error: casting to the same type is unnecessary (`i32` -> `i32`)\n"
+        "  --> src/board.rs:64:48\n"
+        "   |\n"
+        "error[E0308]: mismatched types\n"
+        "  --> web/main.js:12:3\n"
+        "   |\n"
+    )
+
+    def _baseline(self, allowed):
+        orch, _root, run_id = _stub_orchestrator(
+            commands={"lint": "cargo clippy", "typecheck": "", "test": ""}
+        )
+        orch._shell = lambda *_a, **_k: StepResult(ok=False, detail=self.LINT)
+        return orch._baseline_failures(
+            run_id, Ticket("T-1", allowed_files=allowed)
+        ).get("lint", set())
+
+    def test_breakage_in_a_file_the_ticket_may_write_is_not_excused(self):
+        excused = self._baseline(["src/board.rs"])
+
+        self.assertEqual(len(excused), 1)
+        self.assertNotIn("board.rs", " ".join(excused))
+
+    def test_breakage_outside_the_scope_is_still_excused(self):
+        # The chain the baseline exists to break: an error in a file the ticket
+        # cannot open must not spend its three attempts.
+        excused = self._baseline(["web/main.js"])
+
+        self.assertEqual(len(excused), 1)
+        self.assertIn("board.rs", " ".join(excused))
+
+    def test_a_ticket_owning_everything_is_excused_nothing(self):
+        self.assertEqual(self._baseline(["src/board.rs", "web/main.js"]), set())
+
+    def test_a_glob_scope_still_claims_its_files(self):
+        self.assertNotIn("board.rs", " ".join(self._baseline(["src/**"])))
+
+    def test_scope_matching_folds_case(self):
+        # `signatures` lowercases, so a `Cargo.toml` in allowed_files would
+        # otherwise never match the `cargo.toml` in its own diagnostic.
+        self.assertTrue(
+            Orchestrator._signature_scope(
+                "error: invalid manifest --> cargo.toml:3:1", ["Cargo.toml"]
+            )
+        )
+
+    def test_a_signature_with_no_location_stays_excusable(self):
+        # Nothing to attribute it to, and blaming a ticket for a diagnostic
+        # that names no file is the wrong direction to guess in.
+        self.assertFalse(
+            Orchestrator._signature_scope("error: linking failed", ["src/board.rs"])
+        )
 
 
 class TestBaselineVerifyIsOptional(unittest.TestCase):
@@ -4591,6 +5269,46 @@ class TestThinkingModelsThatNeverAnswer(unittest.TestCase):
     def test_a_thinking_model_that_finishes_returns_its_answer(self):
         provider = self._provider(self._payload('{"ok":1}', "stop", reasoning=self.THOUGHT))
         self.assertEqual(self._complete(provider).text, '{"ok":1}')
+
+
+class TestRecorderOutputBudget(unittest.TestCase):
+    """The recorder's answer is tiny, but the budget is the configured one.
+
+    A cap is not an allocation — a model replying `NOTHING` spends five tokens
+    whatever it is allowed — while a thinking model handed a small cap spends
+    all of it before writing anything, then reports an output budget the
+    operator never set and cannot find. Observed as "forge-plan spent its
+    entire 1,024-token output budget on hidden reasoning" on a model configured
+    for 65,536.
+    """
+
+    def test_the_recorder_gets_the_configured_budget(self):
+        orch, _root, run_id = _stub_orchestrator()
+        # Distinct from the old hard-coded ceiling, or the assertion passes for
+        # the wrong reason — the stub's own budget is 1,024.
+        orch.config.models["m"]["maxOutputTokens"] = 65536
+        orch.memory = SimpleNamespace(
+            settings=SimpleNamespace(write=True),
+            remember=lambda *a, **k: None,
+        )
+        asked: list[int] = []
+
+        def call(_run_id, _role, _messages, *, max_tokens, **_kwargs):
+            asked.append(max_tokens)
+            return Completion(text="NOTHING", usage=Usage())
+
+        orch._call = call
+        orch._record_outcome(
+            run_id,
+            Ticket("T-1"),
+            diff="d",
+            review="ACCEPT",
+            corrections="",
+            retrieved="",
+        )
+
+        self.assertEqual(asked, [orch._output_budget(orch.config.record_role)])
+        self.assertNotEqual(asked, [1024])
 
 
 class TestPlannerOutputBudget(unittest.TestCase):

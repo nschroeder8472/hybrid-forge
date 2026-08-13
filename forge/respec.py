@@ -92,13 +92,84 @@ def sources_for(root: Path, ticket: Ticket) -> dict[str, str]:
     return found
 
 
+# The provenance note the respec prompt puts beside a criterion, in either the
+# emphasised or bare spelling, wherever a planner has echoed it back.
+_PROVENANCE_NOTE = re.compile(
+    r"_?\((?:from the plan|added by an earlier revision)[^)]*\)_?",
+    re.IGNORECASE,
+)
+
+
 def _key(criterion: str) -> str:
     """A criterion reduced to what it asserts, for comparing two spellings.
 
     Backticks, punctuation and case are presentation; a planner that changes
     only those has reworded the same demand, not raised a new one.
+
+    The provenance note comes off first. The prompt asks the planner to return
+    plan-authored criteria verbatim, and a planner that does so may carry the
+    note with them — which is not a rewording of anything, but survives
+    normalisation as `fromtheplanyoumaynotchangethis` and makes the copy match
+    nothing. One run reported nine criteria dropped and eleven invented on a
+    reply that had changed neither: the nine, echoed with their notes, counted
+    once as missing and once as new. Instruction-following is not an access
+    control, and it is not a comparison key either.
     """
-    return re.sub(r"[^a-z0-9]+", "", criterion.lower())
+    return re.sub(r"[^a-z0-9]+", "", _PROVENANCE_NOTE.sub("", criterion).lower())
+
+
+# Ways of describing the executor's reply format. That format is the harness's
+# contract — stated in the executor's own system prompt and parsed on the way
+# back — so a ticket has no business restating it, and every restatement is a
+# chance to contradict it.
+_PROTOCOL_PHRASES = (
+    "code fence",
+    "fenced code",
+    "fenced block",
+    "code block",
+    "backtick",
+    "in your response",
+    "in your reply",
+    "your output",
+    "path on its own line",
+    "prefixed by the filename",
+    "raw contents",
+    "markdown prose",
+)
+
+
+def _protocol_language(text: str) -> set[str]:
+    lowered = (text or "").lower()
+    return {phrase for phrase in _PROTOCOL_PHRASES if phrase in lowered}
+
+
+def _refuse_protocol_edits(ticket: Ticket, revision: dict) -> list[tuple[str, str]]:
+    """Drop a revised `spec` or `context` that has taken up formatting rules.
+
+    Respec sees a ticket that failed and reaches for the nearest cause. When the
+    failure was the executor's output not parsing, the nearest cause looks like
+    the output format — so it writes formatting instructions into the spec, and
+    those instructions are guesses about a contract it was never shown. One
+    revision told the executor to emit "raw contents ... not wrapped in markdown
+    code fences", which is the one thing that guarantees the parser finds
+    nothing at all: a fence is what it matches on. The ticket became impossible
+    by construction, and the criteria guard did not cover it because none of it
+    was a criterion.
+
+    Judged by what the revision *introduces*, so a ticket whose plan legitimately
+    talks about fences — a markdown tool, a docs generator — can still be
+    revised. Returns the fields dropped, with the phrase that cost them.
+    """
+    anchors = {"spec": ticket.original_spec or ticket.spec, "context": ticket.context}
+    dropped: list[tuple[str, str]] = []
+    for field_name, anchor in anchors.items():
+        if field_name not in revision:
+            continue
+        introduced = _protocol_language(revision[field_name]) - _protocol_language(anchor)
+        if introduced:
+            revision.pop(field_name)
+            dropped.append((field_name, sorted(introduced)[0]))
+    return dropped
 
 
 def _drop_whole_file_claims(
@@ -252,6 +323,16 @@ def revise(
     what it could not decide, and no step was ever logged as failed.
     """
     failures = store.ticket_failures(run_id, ticket.ticket_id)
+    # A ticket that never ran has nothing to learn from, and its `blocked_note`
+    # says only which dependency was missing. Passed to the planner that reads
+    # as evidence — filed under "what happened, oldest attempt first", answered
+    # by a schema whose only move is to revise the ticket — and it will rewrite
+    # a spec no executor has yet read. Three untried tickets were rewritten
+    # twice each that way, acquiring a fabricated xorshift constant and a
+    # `lib.rs must contain exactly` clause that contradicted their successors.
+    if not failures and not ticket.attempts:
+        return Revision(ticket.ticket_id, note="the ticket has not run yet")
+
     note = (gave_up_note or "").strip()
     if note:
         failures = failures + [{"name": "gave up", "detail": note}]
@@ -309,6 +390,20 @@ def revise(
     # backlog had already ordered. Edges are added below, from scope, where
     # the whole backlog is in view.
     revision.pop("needs", None)
+
+    # Same reason as the criteria guard below: the prompt forbids it, and the
+    # prompt is not an access control.
+    for field_name, phrase in _refuse_protocol_edits(ticket, revision):
+        store.log(
+            run_id,
+            f"{ticket.ticket_id}: respec rewrote {field_name} to describe the "
+            f"executor's reply format ({phrase!r}); dropped. How the executor "
+            f"formats its answer is fixed by the harness — a ticket that "
+            f"restates it can only contradict it, and one that told the "
+            f"executor not to use code fences made itself unparseable.",
+            level="warn",
+            kind="ticket",
+        )
 
     # Instruction-following is not an access control, so provenance is enforced
     # here rather than merely described in the prompt.

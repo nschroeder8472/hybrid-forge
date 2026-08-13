@@ -93,9 +93,25 @@ Check specifically:
 - No silent scope creep, dropped error handling, or swallowed exceptions.
 - Nothing contradicts the established project context, when any is supplied.
 
+EVERY objection must cite what you looked at. Quote the line you are objecting
+to, or — when you are objecting that something is missing — name the exact text
+you searched for and did not find. An objection with neither is not a finding,
+and you must not raise it.
+
+This is not a formality. Reviewers reject work that is plainly present: one
+said a canvas "does not specify a width of 240 and a height of 480" about a
+file whose second line read `<canvas id="board" width="240" height="480">`, and
+said it three times. Quoting first is what catches that before you send it.
+Search the material you were given for the thing you are about to call missing,
+and if you find it, you have no objection.
+
 Begin your reply with exactly one word on its own line: ACCEPT or REJECT.
-Then give your reasoning, shortest decisive point first. Reject when a
-criterion is unmet or the diff does something the spec did not ask for.
+Then give your reasoning, shortest decisive point first, each point carrying
+its citation. Reject when a criterion is unmet or the diff does something the
+spec did not ask for.
+
+Write only your verdict and your reasoning. Do not restate the sections you
+were given — no `## Spec`, no `## Diff`, no repetition of earlier attempts.
 """
 
 
@@ -140,26 +156,47 @@ def _criteria_block(ticket: Ticket, criteria: Sequence[str] | None = None) -> st
 
 
 def _criteria_provenance_block(ticket: Ticket) -> str:
-    """The criteria, each marked with who wrote it.
+    """The criteria, grouped by who wrote them.
 
     Provenance is the whole distinction: a criterion a human put in the plan
     outranks the planner revising the ticket, and one an earlier revision
     invented does not. Without the marks the planner cannot tell which of its
     own past inventions it is allowed to take back.
+
+    Grouped under headings rather than tagged line by line, because the planner
+    is asked to return these criteria *verbatim* and a per-line tag is part of
+    the line it copies. One run returned all thirteen of a ticket's criteria
+    exactly as written, each carrying `_(from the plan — you may not change
+    this)_` on the end, and the provenance check scored the same thirteen as
+    both dropped and newly invented — a planner doing precisely as it was told,
+    reported as trying to gut the contract and raise the bar at once. A heading
+    is not part of any line, so there is nothing to carry.
     """
     original = set(ticket.original_criteria)
-    lines = []
-    for criterion in ticket.criteria:
-        # No anchor recorded — a run ingested before originals were kept.
-        # Everything is treated as the plan's, which errs toward leaving a
-        # human's contract alone.
-        if not ticket.original_criteria or criterion in original:
-            lines.append(f"- {criterion}\n  _(from the plan — you may not change this)_")
-        else:
-            lines.append(
-                f"- {criterion}\n  _(added by an earlier revision — you may revise or retire it)_"
-            )
-    return "\n".join(lines) or "- (none stated)"
+    # No anchor recorded — a run ingested before originals were kept. Everything
+    # is treated as the plan's, which errs toward leaving a human's contract
+    # alone.
+    if not ticket.original_criteria:
+        plan_stated, revision_added = list(ticket.criteria), []
+    else:
+        plan_stated = [c for c in ticket.criteria if c in original]
+        revision_added = [c for c in ticket.criteria if c not in original]
+
+    if not plan_stated and not revision_added:
+        return "- (none stated)"
+
+    sections = []
+    if plan_stated:
+        sections.append(
+            "### From the plan — you may not change these\n"
+            + "\n".join(f"- {c}" for c in plan_stated)
+        )
+    if revision_added:
+        sections.append(
+            "### Added by an earlier revision — you may revise or retire these\n"
+            + "\n".join(f"- {c}" for c in revision_added)
+        )
+    return "\n\n".join(sections)
 
 
 def _files_block(ticket: Ticket) -> str:
@@ -210,6 +247,7 @@ def build_prompt(
     sources: dict[str, str] | None = None,
     *,
     prior_failures: Sequence[str] = (),
+    malformed: str = "",
 ) -> list[Message]:
     messages = [Message(role="system", content=EXECUTOR_SYSTEM)]
 
@@ -272,6 +310,21 @@ changes are undoing each other, and you need a third approach that satisfies
 both rather than alternating between them.
 
 {earlier}
+"""
+
+    if malformed:
+        # Not a failed attempt — the same answer, rejected before it reached
+        # disk because the harness could not read it. Worth its own heading
+        # rather than being folded in with the verification failures above: the
+        # implementation may be perfectly good and nothing about it should
+        # change, which is the opposite of what "your attempt failed" invites.
+        body += f"""
+## Your last answer could not be read, and nothing was written
+{malformed}
+
+Send the same implementation again in the format above. Do not rewrite the
+code to fix this — the code was never the problem, and changing it now loses
+work that may already have been correct.
 """
 
     body += "\nImplement this now."
@@ -524,6 +577,48 @@ saying it in those words is what gets that noticed.
     return messages
 
 
+# The headings `review_prompt` writes into its own body. Listed here so
+# `strip_prompt_echo` cannot drift from the prompt it is cleaning up after.
+#
+# Split by how much of a line has to match. The long ones are sentences no
+# reviewer writes by accident, so a prefix is safe. The short ones are ordinary
+# markdown a reviewer might legitimately quote out of a README it is reviewing,
+# so they only count as an echo when the line is nothing else.
+_ECHOED_SECTIONS = (
+    "## The diff is empty",
+    "## Written by this attempt",
+    "## You have already rejected this ticket",
+    "### Attempt ",
+)
+_ECHOED_EXACTLY = ("## Spec", "## Acceptance criteria", "## Diff")
+
+
+def strip_prompt_echo(verdict: str) -> str:
+    """Cut a verdict at the first heading the reviewer copied out of its prompt.
+
+    A rejection is fed back to the next attempt as a prior verdict, so anything
+    left in it is quoted into the following prompt and offered for copying
+    again. One reviewer echoed `## You have already rejected this ticket`,
+    complete with the attempt it was shown and the paragraph telling it not to
+    invent fresh objections; the block then nested on itself every round.
+
+    Only the tail is dropped, and only from the copy used as a prompt. The
+    verdict itself comes first — the format requires the ACCEPT/REJECT line at
+    the top — so cutting at the first heading keeps every word the reviewer
+    actually wrote about the code. The raw completion is kept whole in the step
+    log regardless.
+    """
+    lines = (verdict or "").splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        echoed = stripped in _ECHOED_EXACTLY or any(
+            stripped.startswith(heading) for heading in _ECHOED_SECTIONS
+        )
+        if echoed:
+            return "\n".join(lines[:index]).strip()
+    return (verdict or "").strip()
+
+
 def parse_verdict(text: str) -> tuple[bool, str]:
     """Read a reviewer's reply as (approved, reason).
 
@@ -697,6 +792,13 @@ Rules:
 - Write each criterion in the calling convention the language actually uses. A
   criterion stated as a bare C symbol invites a test that declares an `extern`
   binding, which fails to link instead of failing to assert.
+- Never write anything about how the executor should format its reply. Fences,
+  backticks, where the file path goes, whether contents are "raw" — all of that
+  is fixed by the harness, which states it to the executor directly and parses
+  what comes back. A failure that looks like a formatting problem is not yours
+  to fix, and a spec that contradicts the harness makes the ticket impossible:
+  one told the executor not to use code fences, when a fence is the only thing
+  the parser can read. Say it in the rationale instead.
 - If the failures show the work simply was not finished — no recurring theme,
   no ambiguity, nothing the spec could have prevented — say so by returning
   the ticket essentially unchanged with a rationale explaining why.
@@ -816,9 +918,10 @@ say which one you are changing and why.
 Return `criteria` as the complete list you want the ticket to have. The rules
 applied to it:
 
-- Criteria marked **from the plan** are a human's contract. Drop or reword one
-  and it will be put back, and the attempt to change it reported.
-- Criteria marked **added by an earlier revision** are the loop's own. Revise
+- Criteria under **From the plan** are a human's contract. Copy each one back
+  exactly as written, with nothing appended. Drop or reword one and it will be
+  put back, and the attempt to change it reported.
+- Criteria under **Added by an earlier revision** are the loop's own. Revise
   them, or leave them out to retire them, if the evidence says they were wrong.
 - Anything else you list is added. Add a criterion when the failures show
   behavior nobody asked for, or when the spec requires something no criterion

@@ -44,7 +44,9 @@ from .failures import distill, errors_naming, signatures
 from .ingest import write_tickets
 from .memory import MemoryClient, MemoryRefused, MemoryUnavailable, ticket_query
 from .patch import (
+    ParsedOutput,
     apply_edits,
+    describe_unparsed,
     duplicate_paths,
     enforce_scope,
     foreign_bindings,
@@ -68,6 +70,7 @@ from .prompts import (
     parse_verdict,
     record_prompt,
     review_prompt,
+    strip_prompt_echo,
     tests_prompt,
 )
 from .state import (
@@ -218,6 +221,15 @@ class Orchestrator:
         Most tickets should record nothing, and the recorder is told so. This
         step exists for the minority that settle a decision or produce a
         correction worth generalizing.
+
+        The answer wanted here is tiny — `NOTHING`, or a title and three
+        sentences — but the budget is still the configured one rather than a
+        ceiling picked to match. A cap is not an allocation: a model that
+        replies `NOTHING` spends five tokens whatever it is allowed. A thinking
+        model handed a small cap spends all of it before writing anything, and
+        then reports that its output budget is too small — naming a number the
+        operator never configured and cannot find, having already set
+        `maxOutputTokens` to sixty-four times it.
         """
         if self.memory is None or not self.memory.settings.write:
             return
@@ -235,7 +247,7 @@ class Orchestrator:
                     corrections=corrections,
                     retrieved=retrieved,
                 ),
-                max_tokens=1024,
+                max_tokens=self._output_budget(self.config.record_role),
                 temperature=0.0,
             )
         except ProviderError as exc:
@@ -451,6 +463,84 @@ class Orchestrator:
     # The verify steps, in the order a failure is cheapest to diagnose.
     _VERIFY_STEPS = ("lint", "typecheck", "test")
 
+    @staticmethod
+    def _fence_guidance(truncated: list[str], written: Sequence[str] = ()) -> str:
+        """What to tell an executor whose fence was shorter than its content."""
+        detail = (
+            "These files are wrapped in a fence no longer than one they "
+            "contain, so the block ends inside the file and they were not "
+            "written:\n"
+            + "\n".join(f"- {path}" for path in truncated)
+            + "\n\nA ``` inside a file closes a ``` wrapper. Wrap any file "
+            "whose own contents use fences — README.md and most other markdown "
+            "— in a LONGER fence: four backticks, or five."
+        )
+        if written:
+            detail += (
+                "\n\nThe rest of your response was written and is on disk:\n"
+                + "\n".join(f"- {path}" for path in written)
+                + "\nSend only the files listed above as missing. Emit each "
+                "file exactly once."
+            )
+        else:
+            detail += " Emit each file exactly once."
+        return detail
+
+    @staticmethod
+    def _duplicate_guidance(repeated: list[str]) -> str:
+        return (
+            "Your response contained more than one block for the same file, so "
+            "nothing was written:\n"
+            + "\n".join(f"- {path}" for path in repeated)
+            + "\n\nThe usual cause is a fence, not a mistake in the code. A "
+            "file whose own contents contain ``` closes its wrapping fence "
+            "early, and the rest of that file is then read as further files "
+            "named after whatever paths appear in its prose. Wrap any such "
+            "file in a longer fence — four backticks or five — and emit each "
+            "file exactly once."
+        )
+
+    def _malformed_reply(self, parsed: ParsedOutput, text: str) -> str:
+        """Why a reply did not parse into files, or `""` if it did.
+
+        Only formatting. A `BLOCKED:` reply is a decision, and a reply carrying
+        no file content at all may be a ticket whose work is already done —
+        neither is malformed, and neither is worth asking again about.
+
+        A reply that parsed *some* files is not malformed either. Those are
+        written, and the attempt reports what is still missing; asking again
+        would risk trading a partial answer for a worse one.
+        """
+        if parsed.is_blocked:
+            return ""
+        if parsed.truncated and not parsed.edits:
+            return self._fence_guidance(parsed.truncated)
+        if parsed.is_empty:
+            return describe_unparsed(text)
+        repeated = duplicate_paths(parsed)
+        return self._duplicate_guidance(repeated) if repeated else ""
+
+    @staticmethod
+    def _signature_scope(signature: str, allowed: list[str]) -> bool:
+        """Whether a diagnostic points at a file this ticket may write.
+
+        Signatures carry their location — `error: ... --> src/board.rs:21:19` —
+        so the file a complaint is about can be compared against the ticket's
+        own scope. Matching is lowercased because `signatures` folds case, and
+        `Cargo.toml` would otherwise never match `cargo.toml`.
+
+        A signature with no parseable location answers False, which leaves the
+        failure excusable. That is the safe direction: the alternative blames a
+        ticket for something it may have no authority to touch.
+        """
+        patterns = [pattern.lower() for pattern in allowed]
+        for match in re.finditer(r"-->\s*(\S+)", signature):
+            # Trim the `:line:col` the compiler appends to the path.
+            location = re.sub(r"(?::\d+)+$", "", match.group(1))
+            if location and matches_any(location, patterns):
+                return True
+        return False
+
     def _baseline_failures(self, run_id: int, ticket: Ticket) -> dict[str, set[str]]:
         """Which verify steps were already failing before this ticket started.
 
@@ -466,6 +556,15 @@ class Orchestrator:
         Recording what was already broken is what breaks that chain: a failure
         present before the ticket ran is reported as pre-existing and does not
         count against it.
+
+        The excuse stops at the edge of the ticket's own scope. A failure in a
+        file the ticket may write is one it is able to fix, and on a retry it is
+        usually one the ticket *caused* — nothing reverts a failed ticket, so
+        the next cycle starts with its own breakage on disk and would otherwise
+        collect a baseline that forgives it. That happened: a ticket left four
+        clippy errors in `src/board.rs`, was requeued, and passed its lint step
+        on the grounds that the errors pre-dated the attempt. They did. It wrote
+        them.
         """
         known: dict[str, set[str]] = {}
         for name in self._VERIFY_STEPS:
@@ -481,15 +580,35 @@ class Orchestrator:
                 # Leaving it out means the ticket is judged on this step
                 # normally, which is the safe direction to be wrong in.
                 continue
-            known[name] = found
+
+            owned = {
+                signature
+                for signature in found
+                if self._signature_scope(signature, ticket.allowed_files)
+            }
+            if owned:
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: {len(owned)} pre-existing {name} "
+                    f"error(s) are in files this ticket may write, so they are "
+                    f"its to fix and are not excused.",
+                    level="warn",
+                    kind="verify",
+                    data={"step": name, "signatures": sorted(owned)[:20]},
+                )
+
+            inherited = found - owned
+            if not inherited:
+                continue
+            known[name] = inherited
             self.store.log(
                 run_id,
                 f"{ticket.ticket_id}: {name} was already failing before this "
-                f"ticket started ({len(found)} error(s)); it will not be "
-                "blamed for them.",
+                f"ticket started ({len(inherited)} error(s)) outside its scope; "
+                "it will not be blamed for them.",
                 level="warn",
                 kind="verify",
-                data={"step": name, "signatures": sorted(found)[:20]},
+                data={"step": name, "signatures": sorted(inherited)[:20]},
             )
         return known
 
@@ -911,12 +1030,28 @@ class Orchestrator:
         # to retry has to be known before the tickets are reset, not after.
         if self.config.loop.respec_on_retry:
             by_id = {ticket.ticket_id: ticket for ticket in tickets}
-            revised, asked, parked = self._respec(
-                run_id, [by_id[ticket_id] for ticket_id in eligible], notes
-            )
+            # Requeueing a skipped ticket is right — it must run once its
+            # dependency lands. Respec'ing one is not. It has no attempts, so
+            # the only evidence is `dependency not met: TT-002`, and the planner
+            # is handed that under a heading reading "what happened, oldest
+            # attempt first" and told to revise the ticket so the next attempt
+            # succeeds. It complies, because that is the only answer the schema
+            # allows: three untried tickets had their human-authored specs
+            # rewritten twice each, one of them acquiring a fabricated xorshift
+            # constant and another a `lib.rs must contain exactly` clause that
+            # contradicted the two tickets after it.
+            attempted = [
+                by_id[ticket_id]
+                for ticket_id in eligible
+                if by_id[ticket_id].attempts > 0
+            ]
+            revised, asked, parked = self._respec(run_id, attempted, notes)
             # A ticket the planner has just called unsatisfiable stays parked.
             eligible = [ticket_id for ticket_id in eligible if ticket_id not in parked]
-            if not revised:
+            # Nothing ran this cycle, so there is nothing for a respec to have
+            # learned from and no revision to require before going round again.
+            # Requeueing the skipped work is the whole point of the cycle.
+            if attempted and not revised:
                 self.store.log(
                     run_id,
                     (
@@ -1361,111 +1496,148 @@ class Orchestrator:
             return StepResult(ok=False, blocked=True, detail=detail)
 
         step_id = self.store.start_step(run_id, ticket.ticket_id, "build")
-        try:
-            completion = self._call(
+        # A reply that did not parse into files is a formatting mistake, not a
+        # failed implementation, and spending a whole attempt on one buys
+        # nothing: the next attempt re-reads the same spec and the model makes
+        # the same mistake. One ticket lost six of its nine attempts that way,
+        # every one to a fenced block with no path line above it, while the
+        # three that parsed drew specific and answerable review objections it
+        # never got the budget to address.
+        #
+        # So the reply is refused and asked for again inside the attempt, the
+        # way the tester already reprompts a rejected test file. Once only —
+        # a model that cannot follow the format twice will not follow it on the
+        # third ask, and the attempt should end while the evidence is fresh.
+        malformed = ""
+        for remaining in (1, 0):
+            try:
+                completion = self._call(
+                    run_id,
+                    "executor",
+                    build_prompt(
+                        ticket,
+                        failure_context,
+                        retrieved,
+                        sources,
+                        prior_failures=prior_failures,
+                        malformed=malformed,
+                    ),
+                    max_tokens=self._output_budget("executor"),
+                )
+            except ContextOverflow as exc:
+                self.store.end_step(step_id, "failed", str(exc))
+                return StepResult(ok=False, blocked=True, detail=str(exc))
+            except ProviderError as exc:
+                self.store.end_step(step_id, "failed", str(exc))
+                self._record_step(ticket, "build", "failed", {"error": str(exc)})
+                return StepResult(ok=False, detail=f"executor unavailable: {exc}")
+
+            self._record_call(ticket, "build", "executor", completion)
+
+            # A response cut off at the output limit parses cleanly — the fence
+            # the model opened is simply never closed, or closes around half a
+            # function. Applying it writes a file that is syntactically wrong
+            # for a reason no reviewer would guess from the diff, so nothing is
+            # written and the attempt is spent instead. Not reprompted: the
+            # second call gets the same budget and runs out of it the same way.
+            if completion.truncated:
+                detail = (
+                    "Your previous response was cut off at the output limit, so "
+                    "no files were written. Emit the same implementation in "
+                    "fewer output tokens — fewer files per response, no "
+                    "restated context — or reply BLOCKED: if the ticket cannot "
+                    "be implemented within that budget."
+                )
+                self.store.end_step(step_id, "failed", completion.text[:20000])
+                return StepResult(ok=False, detail=detail)
+
+            parsed = parse_output(completion.text)
+            malformed = self._malformed_reply(parsed, completion.text)
+            if not malformed or not remaining:
+                break
+            self.store.log(
                 run_id,
-                "executor",
-                build_prompt(
-                    ticket,
-                    failure_context,
-                    retrieved,
-                    sources,
-                    prior_failures=prior_failures,
-                ),
-                max_tokens=self._output_budget("executor"),
+                f"{ticket.ticket_id}: the executor's reply did not parse into "
+                f"files; asking again before the attempt is spent.",
+                level="warn",
+                kind="ticket",
+                data={"complaint": malformed[:400]},
             )
-        except ContextOverflow as exc:
-            self.store.end_step(step_id, "failed", str(exc))
-            return StepResult(ok=False, blocked=True, detail=str(exc))
-        except ProviderError as exc:
-            self.store.end_step(step_id, "failed", str(exc))
-            self._record_step(ticket, "build", "failed", {"error": str(exc)})
-            return StepResult(ok=False, detail=f"executor unavailable: {exc}")
-
-        self._record_call(ticket, "build", "executor", completion)
-
-        # A response cut off at the output limit parses cleanly — the fence the
-        # model opened is simply never closed, or closes around half a
-        # function. Applying it writes a file that is syntactically wrong for a
-        # reason no reviewer would guess from the diff, so nothing is written
-        # and the attempt is spent instead.
-        if completion.truncated:
-            detail = (
-                "Your previous response was cut off at the output limit, so no "
-                "files were written. Emit the same implementation in fewer "
-                "output tokens — fewer files per response, no restated context "
-                "— or reply BLOCKED: if the ticket cannot be implemented "
-                "within that budget."
-            )
-            self.store.end_step(step_id, "failed", completion.text[:20000])
-            return StepResult(ok=False, detail=detail)
 
         self.store.end_step(step_id, "ok", completion.text[:20000])
 
-        parsed = parse_output(completion.text)
         if parsed.is_blocked:
             return StepResult(ok=False, blocked=True, detail=parsed.blocked_reason)
-        if parsed.is_empty:
-            return StepResult(ok=False, detail="executor returned no file edits")
 
-        # Two blocks for one path means the response did not parse into the
-        # files it describes, and applying it would write the wrong one last.
-        # Nothing goes to disk until the executor sends a coherent answer.
-        repeated = duplicate_paths(parsed)
-        if repeated:
-            return StepResult(
-                ok=False,
-                detail=(
-                    "Your response contained more than one block for the same "
-                    "file, so nothing was written:\n"
-                    + "\n".join(f"- {path}" for path in repeated)
-                    + "\n\nThe usual cause is a fence, not a mistake in the "
-                    "code. A file whose own contents contain ``` closes its "
-                    "wrapping fence early, and the rest of that file is then "
-                    "read as further files named after whatever paths appear "
-                    "in its prose. Wrap any such file in a longer fence — four "
-                    "backticks or five — and emit each file exactly once."
-                ),
-            )
+        # Still unreadable after being told exactly what was wrong with it.
+        if malformed:
+            return StepResult(ok=False, detail=malformed)
+
+        # Everything that could not be read has already been refused above. What
+        # is left is a reply that parsed — possibly into no files at all, which
+        # is not the same thing. A ticket whose work is already on disk has
+        # nothing to write, and the executor is shown the current files, so
+        # "there is nothing to change" is sometimes the honest answer. Spending
+        # an attempt punishing it is how a finished ticket failed three times a
+        # cycle.
+        wrote_nothing = parsed.is_empty
 
         # --- APPLY ---------------------------------------------------
-        scoped = enforce_scope(parsed, ticket.allowed_files, self.config.never_delegate)
-        if scoped.rejected:
-            self.store.log(
-                run_id,
-                f"{ticket.ticket_id}: rejected out-of-scope edits: "
-                f"{'; '.join(scoped.rejected)}",
-                level="warn",
-                kind="scope",
+        written: list[str] = []
+        scope_note = ""
+        if not wrote_nothing:
+            scoped = enforce_scope(
+                parsed, ticket.allowed_files, self.config.never_delegate
             )
-        if not scoped.edits:
-            return StepResult(
-                ok=False,
-                detail=self._scope_guidance(ticket, scoped.rejected, total_loss=True),
+            if scoped.rejected:
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: rejected out-of-scope edits: "
+                    f"{'; '.join(scoped.rejected)}",
+                    level="warn",
+                    kind="scope",
+                )
+            if not scoped.edits:
+                return StepResult(
+                    ok=False,
+                    detail=self._scope_guidance(
+                        ticket, scoped.rejected, total_loss=True
+                    ),
+                )
+
+            step_id = self.store.start_step(run_id, ticket.ticket_id, "apply")
+            try:
+                written = apply_edits(self.config.root, scoped.edits)
+            except ValueError as exc:
+                self.store.end_step(step_id, "failed", str(exc))
+                return StepResult(ok=False, blocked=True, detail=str(exc))
+            self.store.end_step(step_id, "ok", "\n".join(written))
+            self._record_step(
+                ticket,
+                "apply",
+                "ok",
+                {"written": written, "rejected": scoped.rejected},
+            )
+            # A partial rejection used to be logged and then dropped. The
+            # executor saw a successful apply, lint failed on the piece that
+            # never landed, and it had no way to connect the two — so it re-sent
+            # the same edit every attempt. Carry the rejection forward as
+            # verification evidence.
+            scope_note = (
+                self._scope_guidance(ticket, scoped.rejected, total_loss=False)
+                if scoped.rejected
+                else ""
             )
 
-        step_id = self.store.start_step(run_id, ticket.ticket_id, "apply")
-        try:
-            written = apply_edits(self.config.root, scoped.edits)
-        except ValueError as exc:
-            self.store.end_step(step_id, "failed", str(exc))
-            return StepResult(ok=False, blocked=True, detail=str(exc))
-        self.store.end_step(step_id, "ok", "\n".join(written))
-        self._record_step(
-            ticket,
-            "apply",
-            "ok",
-            {"written": written, "rejected": scoped.rejected},
-        )
-        # A partial rejection used to be logged and then dropped. The executor
-        # saw a successful apply, lint failed on the piece that never landed,
-        # and it had no way to connect the two — so it re-sent the same edit
-        # every attempt. Carry the rejection forward as verification evidence.
-        scope_note = (
-            self._scope_guidance(ticket, scoped.rejected, total_loss=False)
-            if scoped.rejected
-            else ""
-        )
+        # The clean files are on disk now, so the next attempt only has to send
+        # the ones that were cut short. Stopping here rather than carrying on to
+        # review: the response is known to be incomplete, and asking a reviewer
+        # to judge a diff the harness already knows is missing a file spends two
+        # model calls to be told so.
+        if parsed.truncated:
+            return StepResult(
+                ok=False, detail=self._fence_guidance(parsed.truncated, written)
+            )
 
         # --- TESTS ---------------------------------------------------
         # The criteria come from the ticket, never from the executor's own
@@ -1480,6 +1652,15 @@ class Orchestrator:
         test_path, no_tests_because = self._test_target(
             ticket, written, example, suffix
         )
+        if wrote_nothing:
+            # Nothing was written this attempt, so there is no new behavior to
+            # assert against — and authoring a file here would put a test on
+            # disk for an attempt that changed nothing. Whatever this ticket
+            # wrote earlier is still present and still runs at verify.
+            test_path, no_tests_because = "", (
+                "the attempt wrote no files, so there is nothing new to assert "
+                "against"
+            )
         if test_path:
             # On a retry the ticket's own test file is already on disk, and a
             # fixed path makes that the common case rather than the rare one.
@@ -1773,7 +1954,12 @@ class Orchestrator:
 
         if not approved:
             if rejections is not None:
-                rejections.append(verdict)
+                # Stripped on the way in, not on the way out: this list is
+                # quoted into the next attempt's prompt, and a verdict carrying
+                # the prompt's own headings gets offered back for copying again.
+                # The raw completion stays in `steps.detail` either way — that
+                # is the durable record.
+                rejections.append(strip_prompt_echo(verdict))
             return StepResult(ok=False, detail=f"review rejected the diff:\n{verdict}")
 
         self.store.log(
