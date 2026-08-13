@@ -776,6 +776,13 @@ Rules:
 - Write each criterion in the calling convention the language actually uses. A
   criterion stated as a bare C symbol invites a test that declares an `extern`
   binding, which fails to link instead of failing to assert.
+- Never write anything about how the executor should format its reply. Fences,
+  backticks, where the file path goes, whether contents are "raw" — all of that
+  is fixed by the harness, which states it to the executor directly and parses
+  what comes back. A failure that looks like a formatting problem is not yours
+  to fix, and a spec that contradicts the harness makes the ticket impossible:
+  one told the executor not to use code fences, when a fence is the only thing
+  the parser can read. Say it in the rationale instead.
 - If the failures show the work simply was not finished — no recurring theme,
   no ambiguity, nothing the spec could have prevented — say so by returning
   the ticket essentially unchanged with a rationale explaining why.

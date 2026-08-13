@@ -454,6 +454,29 @@ class Orchestrator:
     _VERIFY_STEPS = ("lint", "typecheck", "test")
 
     @staticmethod
+    def _fence_guidance(truncated: list[str], written: Sequence[str] = ()) -> str:
+        """What to tell an executor whose fence was shorter than its content."""
+        detail = (
+            "These files are wrapped in a fence no longer than one they "
+            "contain, so the block ends inside the file and they were not "
+            "written:\n"
+            + "\n".join(f"- {path}" for path in truncated)
+            + "\n\nA ``` inside a file closes a ``` wrapper. Wrap any file "
+            "whose own contents use fences — README.md and most other markdown "
+            "— in a LONGER fence: four backticks, or five."
+        )
+        if written:
+            detail += (
+                "\n\nThe rest of your response was written and is on disk:\n"
+                + "\n".join(f"- {path}" for path in written)
+                + "\nSend only the files listed above as missing. Emit each "
+                "file exactly once."
+            )
+        else:
+            detail += " Emit each file exactly once."
+        return detail
+
+    @staticmethod
     def _signature_scope(signature: str, allowed: list[str]) -> bool:
         """Whether a diagnostic points at a file this ticket may write.
 
@@ -1474,26 +1497,20 @@ class Orchestrator:
         if parsed.is_blocked:
             return StepResult(ok=False, blocked=True, detail=parsed.blocked_reason)
 
-        # A file whose wrapping fence was closed from inside itself. Checked
-        # before anything else about the parse, because the damage is silent:
-        # what survived the match is a prefix, and writing a prefix over a
-        # working file looks like a successful apply. It cost a `build.sh`,
-        # which came back as 57 bytes of somebody else's markdown while
-        # `build.ps1` and `README.md` were never written at all.
-        if parsed.truncated:
-            return StepResult(
-                ok=False,
-                detail=(
-                    "Nothing was written. These files are wrapped in a fence no "
-                    "longer than one they contain, so the block ends inside the "
-                    "file:\n"
-                    + "\n".join(f"- {path}" for path in parsed.truncated)
-                    + "\n\nA ``` inside a file closes a ``` wrapper. Wrap any "
-                    "file whose own contents use fences — README.md and most "
-                    "other markdown — in a LONGER fence: four backticks, or "
-                    "five. Emit each file exactly once."
-                ),
-            )
+        # A file whose wrapping fence was closed from inside itself: what
+        # survived the match is a prefix, and writing a prefix over a working
+        # file looks like a successful apply. It cost a `build.sh`, which came
+        # back as 57 bytes of somebody else's markdown.
+        #
+        # Only the truncated files are withheld. The blocks that closed where
+        # they were meant to are unambiguous, and holding them back leaves a
+        # ticket that can never recover: one response carried a correct
+        # `build.sh` and `build.ps1` alongside a truncated README, and refusing
+        # all three meant the corrupt `build.sh` already on disk could not be
+        # replaced. This is the opposite of `duplicate_paths`, where two blocks
+        # claim one path and there is no way to tell which was meant.
+        if parsed.truncated and not parsed.edits:
+            return StepResult(ok=False, detail=self._fence_guidance(parsed.truncated))
 
         # An empty parse is two different situations. A reply carrying file
         # content the parser could not read is a failure, and the complaint says
@@ -1574,6 +1591,16 @@ class Orchestrator:
                 self._scope_guidance(ticket, scoped.rejected, total_loss=False)
                 if scoped.rejected
                 else ""
+            )
+
+        # The clean files are on disk now, so the next attempt only has to send
+        # the ones that were cut short. Stopping here rather than carrying on to
+        # review: the response is known to be incomplete, and asking a reviewer
+        # to judge a diff the harness already knows is missing a file spends two
+        # model calls to be told so.
+        if parsed.truncated:
+            return StepResult(
+                ok=False, detail=self._fence_guidance(parsed.truncated, written)
             )
 
         # --- TESTS ---------------------------------------------------

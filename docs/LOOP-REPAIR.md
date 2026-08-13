@@ -144,10 +144,68 @@ spec corruption, through a reviewer that was telling the truth.
 **Risk.** Low, and strictly protective — item 1 only ever refuses work it
 currently applies wrongly.
 
-**Open question for review.** When a response mixes good and truncated blocks
-(steps 57, 79), the whole attempt is refused rather than applying the files that
-parsed cleanly. That matches the `duplicate_paths` convention and avoids leaving
-a ticket half-done, but partial application is defensible and was not tried.
+**Open question, since resolved — partial application.** 1.0 originally refused
+a whole response when any block was truncated, on the `duplicate_paths`
+precedent. Run 3 showed that was wrong, and that the precedent does not apply:
+duplicates mean one path has two candidate contents and there is no way to tell
+which was meant, while the *non*-truncated blocks of a mixed response are
+unambiguous.
+
+The cost was concrete. TT-006 steps 126 and 127 each carried a correct
+`build.sh` and `build.ps1` beside a truncated README. Refusing all three left
+the 61-byte corrupt `build.sh` — written before 1.0 landed — with no way to be
+replaced, so the ticket could not finish whatever the executor sent. 1.0
+prevents new corruption but cannot heal old corruption, and all-or-nothing
+removed the only route back.
+
+Now only the truncated paths are withheld; the clean ones are written and the
+attempt fails naming both halves, so the next attempt sends only what is
+missing. It stops after apply rather than continuing to review — the response is
+known to be incomplete, and asking a reviewer to confirm that costs two model
+calls.
+
+---
+
+### 1.7 Respec must not write the executor's reply format — **done**
+
+**Found in run 3.** TT-006's spec, after respec:
+
+> "Output their raw contents directly in your response, one per file, prefixed
+> by the filename. **Do not wrap file contents in markdown code fences** or
+> surround them with prose."
+
+`EXECUTOR_SYSTEM` requires a fenced block after each path line and `_BLOCK`
+cannot match without one, so the spec instructed the executor to guarantee that
+nothing parses. Meanwhile 1.0's Mode D message told it the opposite. The ticket
+was unsatisfiable by construction, and the criteria guard did not cover any of
+it because none of it was a criterion.
+
+The mechanism is the same one behind the run-2 misdiagnosis, one level worse.
+Respec sees a ticket that failed and reaches for the nearest cause; when the
+failure is "your output did not parse", the nearest cause looks like the output
+format. But the format is the harness's contract — stated to the executor
+directly, parsed on the way back — and respec has never been shown it, so every
+sentence it writes about it is a guess that can only contradict.
+
+**Landed as.** A rule in `RESPEC_SYSTEM` saying the reply format is not the
+planner's to describe, and `_refuse_protocol_edits` in `forge/respec.py`
+enforcing it — because the prompt is not an access control, the same reasoning
+that put the criteria guard in code.
+
+Judged on what a revision *introduces*, measured against `original_spec`, so a
+ticket whose plan legitimately discusses fences — a markdown renderer, a docs
+generator — stays revisable. The offending field is dropped and the previous
+value kept, matching how a refused criterion is handled.
+
+Replayed against the spec respec actually wrote in run 3: both `spec` and
+`context` dropped, on `'code fence'` and `'markdown prose'`.
+
+**Tests.** The real spec dropped, context guarded the same way, an ordinary
+revision untouched, and a fence-flavoured plan still revisable.
+
+**Risk.** Low-moderate. The phrase list is a heuristic and will not catch every
+paraphrase. It is a floor, not a proof — the prompt rule is what carries the
+common case.
 
 ---
 
@@ -816,6 +874,7 @@ land too — one branch to push when the backlog is green.
 | — | 1.5 | Done — amnesty now stops at the ticket's own scope |
 | — | 2.1, 2.2 | Done — citation required, prompt echo stripped |
 | — | 1.2 | Done — empty reply reviewed against disk |
+| — | 1.7 | Done — respec cannot describe the reply format |
 | 1 | 2.3 | Prerequisite for 3.3 |
 | 5 | 3.3, 3.2 | Information architecture; 3.2 carries a migration |
 | 6 | 3.1 | Deliberately loosens a guard; wants a stable baseline |

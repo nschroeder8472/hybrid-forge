@@ -35,7 +35,7 @@ from forge.ingest import (
     tickets_from_json,
 )
 from forge.ingest import ingest as ingest_document
-from forge.respec import _merge_criteria
+from forge.respec import _merge_criteria, _refuse_protocol_edits
 from forge.loop import Orchestrator, StepResult
 from forge.patch import (
     describe_unparsed,
@@ -2447,6 +2447,54 @@ class TestTruncatedResponses(unittest.TestCase):
         self.assertIn("LONGER fence", result.detail)
         self.assertEqual((root / "build.sh").read_text(encoding="utf-8"), script)
 
+    def test_the_files_that_parsed_cleanly_are_written_anyway(self):
+        # The recovery path. One real response carried a correct build.sh and
+        # build.ps1 beside a truncated README; refusing all three left the
+        # corrupt build.sh already on disk with no way to be replaced, and the
+        # ticket could not finish no matter what the executor sent.
+        orch, root, run_id = self._orchestrator()
+        (root / "build.sh").write_text("### stale markdown fragment\n", encoding="utf-8")
+        f = "`" * 3
+        orch._call = lambda *a, **k: self._completion(
+            f"build.sh\n{f}sh\ncargo build --release\n{f}\n\n"
+            f"build.ps1\n{f}powershell\ncargo build\n{f}\n\n"
+            f"README.md\n{f}\n# Tetris\n\n{f}sh\nrustup target add wasm32\n{f}\n\n"
+            f"### PowerShell\n\n{f}powershell\n.\\build.ps1\n{f}\n",
+            "stop",
+        )
+
+        result = orch._attempt(
+            run_id,
+            Ticket("T-1", allowed_files=["build.sh", "build.ps1", "README.md"]),
+            "",
+        )
+
+        # Incomplete, so the attempt still fails — but it made progress.
+        self.assertFalse(result.ok)
+        self.assertIn(
+            "cargo build --release", (root / "build.sh").read_text(encoding="utf-8")
+        )
+        self.assertTrue((root / "build.ps1").exists())
+        self.assertFalse((root / "README.md").exists())
+
+    def test_the_failure_names_what_landed_and_what_did_not(self):
+        orch, root, run_id = self._orchestrator()
+        f = "`" * 3
+        orch._call = lambda *a, **k: self._completion(
+            f"build.sh\n{f}sh\ncargo build --release\n{f}\n\n"
+            f"README.md\n{f}\n# T\n\n{f}sh\nx\n{f}\n\n## More\n\ndone\n{f}\n",
+            "stop",
+        )
+
+        result = orch._attempt(
+            run_id, Ticket("T-1", allowed_files=["build.sh", "README.md"]), ""
+        )
+
+        self.assertIn("README.md", result.detail)
+        self.assertIn("LONGER fence", result.detail)
+        self.assertIn("is on disk", result.detail)
+        self.assertIn("build.sh", result.detail)
+
     def test_truncated_tests_are_discarded_without_failing_the_ticket(self):
         orch, root, run_id = self._orchestrator()
 
@@ -3309,6 +3357,54 @@ class TestCriteriaAreMatchedByWhatTheyAssert(unittest.TestCase):
         self.assertEqual(len(merged), 2)
         self.assertNotIn("`level` starts at 1", merged)
         self.assertEqual(minted, ["`level` starts at 1"])
+
+    def test_a_spec_that_takes_up_the_reply_format_is_dropped(self):
+        # Verbatim from a real revision. Respec read an unparseable response as
+        # a formatting problem and wrote the cure into the spec — and the cure
+        # was the one thing that guarantees nothing parses, since a fence is
+        # what the parser matches on.
+        ticket = Ticket("TT-006", spec="Document and script the build.",
+                        original_spec="Document and script the build.")
+        revision = {
+            "spec": (
+                "Create exactly three files. Output their raw contents directly "
+                "in your response, prefixed by the filename. Do not wrap file "
+                "contents in markdown code fences."
+            )
+        }
+
+        dropped = _refuse_protocol_edits(ticket, revision)
+
+        self.assertNotIn("spec", revision)
+        self.assertEqual([field for field, _phrase in dropped], ["spec"])
+
+    def test_the_context_is_guarded_the_same_way(self):
+        ticket = Ticket("TT-006", spec="s", original_spec="s", context="")
+        revision = {"context": "Emit each file with the path on its own line."}
+
+        _refuse_protocol_edits(ticket, revision)
+
+        self.assertNotIn("context", revision)
+
+    def test_an_ordinary_revision_is_untouched(self):
+        ticket = Ticket("TT-006", spec="old", original_spec="old")
+        revision = {"spec": "build.sh must start with a POSIX shebang."}
+
+        self.assertEqual(_refuse_protocol_edits(ticket, revision), [])
+        self.assertIn("spec", revision)
+
+    def test_a_ticket_whose_plan_already_talks_about_fences_stays_revisable(self):
+        # A markdown tool legitimately has fences in its spec. The guard is
+        # about what a revision *introduces*, not about the subject matter.
+        ticket = Ticket(
+            "TT-009",
+            spec="Render each code fence as a <pre>.",
+            original_spec="Render each code fence as a <pre>.",
+        )
+        revision = {"spec": "Render each code fence as a <pre>, preserving the language."}
+
+        self.assertEqual(_refuse_protocol_edits(ticket, revision), [])
+        self.assertIn("spec", revision)
 
     def test_a_criterion_returned_with_its_provenance_note_is_not_counted_as_new(self):
         """The observed regression, in the other direction.

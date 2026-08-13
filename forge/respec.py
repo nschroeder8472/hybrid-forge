@@ -118,6 +118,60 @@ def _key(criterion: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", _PROVENANCE_NOTE.sub("", criterion).lower())
 
 
+# Ways of describing the executor's reply format. That format is the harness's
+# contract — stated in the executor's own system prompt and parsed on the way
+# back — so a ticket has no business restating it, and every restatement is a
+# chance to contradict it.
+_PROTOCOL_PHRASES = (
+    "code fence",
+    "fenced code",
+    "fenced block",
+    "code block",
+    "backtick",
+    "in your response",
+    "in your reply",
+    "your output",
+    "path on its own line",
+    "prefixed by the filename",
+    "raw contents",
+    "markdown prose",
+)
+
+
+def _protocol_language(text: str) -> set[str]:
+    lowered = (text or "").lower()
+    return {phrase for phrase in _PROTOCOL_PHRASES if phrase in lowered}
+
+
+def _refuse_protocol_edits(ticket: Ticket, revision: dict) -> list[tuple[str, str]]:
+    """Drop a revised `spec` or `context` that has taken up formatting rules.
+
+    Respec sees a ticket that failed and reaches for the nearest cause. When the
+    failure was the executor's output not parsing, the nearest cause looks like
+    the output format — so it writes formatting instructions into the spec, and
+    those instructions are guesses about a contract it was never shown. One
+    revision told the executor to emit "raw contents ... not wrapped in markdown
+    code fences", which is the one thing that guarantees the parser finds
+    nothing at all: a fence is what it matches on. The ticket became impossible
+    by construction, and the criteria guard did not cover it because none of it
+    was a criterion.
+
+    Judged by what the revision *introduces*, so a ticket whose plan legitimately
+    talks about fences — a markdown tool, a docs generator — can still be
+    revised. Returns the fields dropped, with the phrase that cost them.
+    """
+    anchors = {"spec": ticket.original_spec or ticket.spec, "context": ticket.context}
+    dropped: list[tuple[str, str]] = []
+    for field_name, anchor in anchors.items():
+        if field_name not in revision:
+            continue
+        introduced = _protocol_language(revision[field_name]) - _protocol_language(anchor)
+        if introduced:
+            revision.pop(field_name)
+            dropped.append((field_name, sorted(introduced)[0]))
+    return dropped
+
+
 def _drop_whole_file_claims(
     store: Store, run_id: int, ticket: Ticket, proposed: list[str]
 ) -> tuple[list[str], list[tuple[str, str]]]:
@@ -336,6 +390,20 @@ def revise(
     # backlog had already ordered. Edges are added below, from scope, where
     # the whole backlog is in view.
     revision.pop("needs", None)
+
+    # Same reason as the criteria guard below: the prompt forbids it, and the
+    # prompt is not an access control.
+    for field_name, phrase in _refuse_protocol_edits(ticket, revision):
+        store.log(
+            run_id,
+            f"{ticket.ticket_id}: respec rewrote {field_name} to describe the "
+            f"executor's reply format ({phrase!r}); dropped. How the executor "
+            f"formats its answer is fixed by the harness — a ticket that "
+            f"restates it can only contradict it, and one that told the "
+            f"executor not to use code fences made itself unparseable.",
+            level="warn",
+            kind="ticket",
+        )
 
     # Instruction-following is not an access control, so provenance is enforced
     # here rather than merely described in the prompt.
