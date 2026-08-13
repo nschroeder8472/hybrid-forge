@@ -13,9 +13,10 @@ what unblocks what, not by severity.
 below records what it was replayed against, and where a fix could not be
 verified against surviving data that is said plainly.
 
-3.2 and 3.5 have since landed together on
-`fix/protect-plan-authored-context`, unverified against a run — they were
-written from run 5's evidence and are covered by tests, not by a replay.
+Everything else has since landed on `fix/loop-repair-open-items`: 3.2 and 3.5,
+then 2.3, 3.3, 3.6, 3.1 with its promotion path, and 4.1 behind a flag that is
+off. All of it is unverified against a run — written from run 5's evidence and
+covered by tests, not by a replay.
 
 Still open: the conditional 2.4, and the measurement 4.1 asks for. A clean
 run from an empty repository — no drifted specs carried over — is the validation
