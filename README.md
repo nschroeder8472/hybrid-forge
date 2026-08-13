@@ -176,6 +176,8 @@ forge go --retries N        # requeue and respec what did not land, N more
                             # times; -1 = until clean or stopped
 forge status                # one-shot summary
 forge retry [--respec]      # requeue failed tickets, optionally re-specced
+forge criteria [ID --accept N]
+                            # adopt a criterion the loop proposed and refused
 forge pause | resume | stop # applied after the current step, never mid-patch
 forge ui                    # dashboard without running the loop
 forge ui --host IP --port N # bind it elsewhere, this run only (no auth!)

@@ -8,6 +8,7 @@
                                    (-1: until it is clean or you stop it)
     forge status                   one-shot summary
     forge retry [--respec]         put failed tickets back on the backlog
+    forge criteria [ID --accept N] adopt a criterion respec proposed and lost
     forge prune [--keep N]         delete the artifact trees of old runs
     forge models                   write Modelfiles pinning what config cannot
     forge pause | resume | stop    control a running loop
@@ -519,6 +520,17 @@ def _respec(
             )
             for criterion in result.admitted_criteria:
                 print(f"      added: {criterion}")
+        if result.minted_criteria:
+            # The one refusal a human may want to overturn, so it comes with
+            # the command that overturns it rather than with an instruction to
+            # go and edit the plan.
+            print(
+                f"  {ticket.ticket_id:<10} proposed {len(result.minted_criteria)} "
+                f"criterion(s) the plan states nowhere; refused."
+            )
+            for criterion in result.minted_criteria:
+                print(f"      proposed: {criterion}")
+            print(f"      Adopt one: forge criteria {ticket.ticket_id} --accept N")
         if result.refused_decisions:
             print(
                 f"  {ticket.ticket_id:<10} dropped {len(result.refused_decisions)} "
@@ -725,6 +737,121 @@ def cmd_retry(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_criteria(args: argparse.Namespace) -> int:
+    """Show the criteria respec proposed and refused, and adopt one.
+
+    Respec may not add to the standard it is judged against — it runs on a
+    ticket that has just failed, and a ticket that keeps failing does not need
+    a higher bar. But a refused proposal is sometimes right, and until now
+    accepting one meant editing `plan.md` and re-ingesting the whole backlog:
+    a fresh run, and the work that had already passed done again. This adopts
+    it in place, as the plan's own, so the ratchet protects it from here on.
+    """
+    config = _load(args.root)
+    store = _store(config)
+
+    run = store.get_run(args.run) if args.run else store.latest_run()
+    if run is None:
+        sys.exit("error: no runs yet. Ingest a spec first:\n  forge ingest plan.md")
+    run_id = int(run["id"])
+
+    pending = store.proposed_criteria(run_id)
+    if args.ticket:
+        pending = {k: v for k, v in pending.items() if k == args.ticket}
+
+    if not args.accept and not args.accept_all:
+        return _print_pending(run_id, pending, args.ticket)
+
+    if not args.ticket:
+        sys.exit(
+            "error: name the ticket to accept for.\n"
+            "  forge criteria             list what is outstanding\n"
+            "  forge criteria TT-006 --accept 1"
+        )
+    outstanding = pending.get(args.ticket, [])
+    if not outstanding:
+        sys.exit(
+            f"error: run {run_id} has nothing outstanding for {args.ticket}. "
+            f"List what there is with `forge criteria`."
+        )
+
+    if args.accept_all:
+        chosen = list(outstanding)
+    else:
+        chosen = []
+        for index in args.accept:
+            if not 1 <= index <= len(outstanding):
+                sys.exit(
+                    f"error: {args.ticket} has {len(outstanding)} proposal(s); "
+                    f"there is no {index}."
+                )
+            chosen.append(outstanding[index - 1])
+
+    ticket, adopted = store.promote_criteria(run_id, args.ticket, chosen)
+    if ticket is None:
+        sys.exit(f"error: run {run_id} has no ticket {args.ticket}.")
+    if not adopted:
+        print(f"{args.ticket} already carries every criterion named.")
+        return 0
+
+    store.log(
+        run_id,
+        f"{ticket.ticket_id}: a human adopted {len(adopted)} criterion(s) into "
+        f"the plan's contract. They are plan-authored from here — respec may "
+        f"not drop or reword them.",
+        kind="ticket",
+        data={"adopted": adopted, "ticket": ticket.ticket_id},
+    )
+
+    # The tickets on disk are what a human reads to understand the run, and a
+    # contract that has changed in the database alone makes them lie.
+    try:
+        write_tickets(config.tickets_dir, [ticket])
+    except OSError as exc:
+        print(f"warning: could not rewrite {args.ticket}.md ({exc}).")
+
+    print(f"{ticket.ticket_id}: adopted {len(adopted)} criterion(s) as the plan's.")
+    for criterion in adopted:
+        print(f"      {criterion}")
+    if ticket.status == TICKET_DONE:
+        # Green against the old contract, which no longer exists. Said rather
+        # than done: requeuing a passed ticket without being asked is how a
+        # backlog gets redone underneath someone.
+        print(
+            f"\n{ticket.ticket_id} already passed, under the contract without "
+            f"this. Hold it to the new one with:\n"
+            f"  forge retry --ticket {ticket.ticket_id}"
+        )
+    return 0
+
+
+def _print_pending(
+    run_id: int, pending: dict[str, list[str]], only: str
+) -> int:
+    if not pending:
+        scope = f" for {only}" if only else ""
+        print(
+            f"Run {run_id}: nothing outstanding{scope}. Respec has proposed no "
+            f"criterion the plan states nowhere, or every one has been settled."
+        )
+        return 0
+
+    print(f"Run {run_id}: criteria respec proposed and the loop refused.\n")
+    for ticket_id, criteria in sorted(pending.items()):
+        print(f"{ticket_id}")
+        for index, criterion in enumerate(criteria, start=1):
+            print(f"  {index}  {criterion}")
+        print()
+    first = sorted(pending)[0]
+    print(
+        "Each is something a failing ticket asked to be judged on that nobody "
+        "wrote down. Adopt one — it becomes the plan's, and respec may not "
+        "touch it after that:\n"
+        f"  forge criteria {first} --accept 1"
+    )
+    return 0
+
+
 def cmd_control(args: argparse.Namespace) -> int:
     config = _load(args.root)
     store = _store(config)
@@ -855,6 +982,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="list what would be removed and stop"
     )
     p.set_defaults(func=cmd_prune)
+
+    p = sub.add_parser(
+        "criteria",
+        help="show the criteria respec proposed and refused, and adopt one",
+    )
+    p.add_argument(
+        "ticket",
+        nargs="?",
+        default="",
+        metavar="ID",
+        help="show only this ticket's proposals; required to accept one",
+    )
+    p.add_argument("--run", type=int, default=0, help="run id (default: the latest)")
+    p.add_argument(
+        "--accept",
+        action="append",
+        type=int,
+        default=[],
+        metavar="N",
+        help="adopt the numbered proposal as the plan's own; repeatable",
+    )
+    p.add_argument(
+        "--accept-all",
+        action="store_true",
+        help="adopt every outstanding proposal for the named ticket",
+    )
+    p.set_defaults(func=cmd_criteria)
 
     p = sub.add_parser("retry", help="put failed tickets back on the backlog")
     p.add_argument("--run", type=int, default=0, help="run id (default: the latest)")

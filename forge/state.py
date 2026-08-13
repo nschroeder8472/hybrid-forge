@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -115,6 +116,17 @@ RUN_BLOCKED = "blocked"
 RUN_DONE = "done"
 RUN_FAILED = "failed"
 RUN_STOPPED = "stopped"
+
+def _criterion_key(criterion: str) -> str:
+    """A criterion reduced to what it asserts, for comparing two spellings.
+
+    Backticks, punctuation and case are presentation: a criterion reworded in
+    only those has not become a second demand. `respec._key` strips a
+    provenance note first and then defers to this, so both sides of the
+    ratchet decide sameness the same way.
+    """
+    return re.sub(r"[^a-z0-9]+", "", criterion.lower())
+
 
 TICKET_PENDING = "pending"
 TICKET_RUNNING = "running"
@@ -468,6 +480,92 @@ class Store:
                 "WHERE run_id = :run_id AND ticket_id = :ticket_id",
                 {**ticket.as_row(), "run_id": run_id, "now": time.time()},
             )
+
+    def promote_criteria(
+        self, run_id: int, ticket_id: str, criteria: list[str]
+    ) -> tuple[Ticket | None, list[str]]:
+        """Adopt criteria into the plan's contract on a human's say-so.
+
+        The one path that moves `original_criteria` after ingest, and it exists
+        because the alternative was worse. Respec refuses a criterion the plan
+        states nowhere, which is right — the party being judged does not get to
+        add to the standard — but the refusal left a human editing `plan.md`
+        and re-ingesting the whole backlog to accept a single line, redoing
+        work that had already passed. So a person can adopt one here, and what
+        they adopt becomes plan-authored: protected by the ratchet from the
+        next revision onwards, exactly as if they had written it in the plan.
+
+        Deliberately not reachable from the loop. Every other caller writes
+        through `update_ticket`, which cannot touch the anchor at all.
+
+        Returns `(ticket, adopted)`; `ticket` is None when the id is unknown.
+        Criteria the ticket already carries are skipped rather than duplicated.
+        """
+        matching = [t for t in self.list_tickets(run_id) if t.ticket_id == ticket_id]
+        if not matching:
+            return None, []
+        ticket = matching[0]
+
+        known = {_criterion_key(c) for c in ticket.criteria}
+        adopted = []
+        for criterion in criteria:
+            key = _criterion_key(criterion)
+            if not key or key in known:
+                continue
+            known.add(key)
+            adopted.append(criterion)
+        if not adopted:
+            return ticket, []
+
+        ticket.criteria = ticket.criteria + adopted
+        ticket.original_criteria = ticket.original_criteria + adopted
+        with self._write() as connection:
+            connection.execute(
+                "UPDATE tickets SET criteria = :criteria, "
+                "original_criteria = :original_criteria, updated_at = :now "
+                "WHERE run_id = :run_id AND ticket_id = :ticket_id",
+                {**ticket.as_row(), "run_id": run_id, "now": time.time()},
+            )
+        return ticket, adopted
+
+    def proposed_criteria(self, run_id: int) -> dict[str, list[str]]:
+        """Criteria respec proposed and the loop refused, by ticket.
+
+        Read back out of the run log rather than kept in a table of their own:
+        the refusal is already an event, and a second store of the same fact is
+        a second thing to keep true. Anything the ticket has since acquired —
+        adopted here, or written into the plan and re-ingested — is filtered
+        out, so the list is what is still outstanding rather than a history.
+        """
+        rows = self._connection.execute(
+            "SELECT data FROM events WHERE run_id = ? AND kind = 'ticket' "
+            "AND data LIKE '%\"minted\"%' ORDER BY id",
+            (run_id,),
+        ).fetchall()
+
+        on_ticket = {
+            ticket.ticket_id: {_criterion_key(c) for c in ticket.criteria}
+            for ticket in self.list_tickets(run_id)
+        }
+        pending: dict[str, list[str]] = {}
+        for row in rows:
+            try:
+                data = json.loads(row["data"])
+            except json.JSONDecodeError:
+                continue
+            ticket_id = data.get("ticket", "")
+            if ticket_id not in on_ticket:
+                continue
+            for criterion in data.get("minted", []):
+                key = _criterion_key(criterion)
+                if key in on_ticket[ticket_id]:
+                    continue
+                # A ticket that failed the same way twice proposed the same
+                # criterion twice. It is one outstanding decision, not two.
+                if key in {_criterion_key(c) for c in pending.get(ticket_id, [])}:
+                    continue
+                pending.setdefault(ticket_id, []).append(criterion)
+        return pending
 
     def ticket_failures(
         self, run_id: int, ticket_id: str, limit: int = 6

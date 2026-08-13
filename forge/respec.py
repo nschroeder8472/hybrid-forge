@@ -24,7 +24,7 @@ from .ingest import derive_needs, plan_decisions, whole_file_claims
 from .patch import is_safe_path
 from .prompts import parse_respec, respec_prompt
 from .providers import Completion, Message, ProviderError
-from .state import Store, Ticket
+from .state import Store, Ticket, _criterion_key
 
 # `(messages, max_tokens) -> Completion`. Temperature is the caller's business.
 Caller = Callable[[list[Message], int], Completion]
@@ -126,7 +126,7 @@ def _key(criterion: str) -> str:
     once as missing and once as new. Instruction-following is not an access
     control, and it is not a comparison key either.
     """
-    return re.sub(r"[^a-z0-9]+", "", _PROVENANCE_NOTE.sub("", criterion).lower())
+    return _criterion_key(_PROVENANCE_NOTE.sub("", criterion))
 
 
 # Ways of describing the executor's reply format. That format is the harness's
@@ -631,11 +631,16 @@ def revise(
             f"plan states nowhere — not in the criteria, and not in the spec, "
             f"which the reviewer would have enforced; refused. A ticket that "
             f"keeps failing does not need a higher bar. If these are things it "
-            f"genuinely must do, say so in the plan and re-ingest:\n"
+            f"genuinely must do, adopt one with "
+            f"`forge criteria {ticket.ticket_id} --accept N` and it becomes the "
+            f"plan's:\n"
             + "\n".join(f"  - {criterion}" for criterion in minted[:5]),
             level="warn",
             kind="ticket",
-            data={"minted": minted},
+            # The ticket id is in the message too, but a reader that has to
+            # parse it back out of prose is a reader that breaks when the prose
+            # changes. `forge criteria` reads this.
+            data={"minted": minted, "ticket": ticket.ticket_id},
         )
 
     if not changed:

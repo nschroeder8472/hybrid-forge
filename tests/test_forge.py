@@ -10,6 +10,8 @@ get tests; the HTTP adapters do not, since exercising them needs a live model.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import subprocess
 import sys
@@ -3498,6 +3500,146 @@ class TestACriterionTheSpecAlreadyStatesIsNotARatchet(unittest.TestCase):
 
         messages = " ".join(row["message"] for row in store.events_after(0))
         self.assertNotIn("the plan is what needs changing", messages)
+
+
+class TestAdoptingACriterionRespecWasRefused(unittest.TestCase):
+    """Respec may not add to the standard it is judged against — it runs on a
+    ticket that has just failed, and a ticket that keeps failing does not need
+    a higher bar. But a refused proposal is sometimes right, and accepting one
+    used to mean editing `plan.md` and re-ingesting the whole backlog: a fresh
+    run, and every ticket that had already passed done again."""
+
+    PROPOSED = "clearing four lines at once scores 800"
+
+    def _project(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
+                    "roles": {r: "m" for r in ("planner", "executor", "tester", "reviewer")},
+                }
+            ),
+            encoding="utf-8",
+        )
+        config = Config.load(root)
+        store = Store(config.db_path)
+        run_id = store.create_run("goal")
+        store.add_tickets(
+            run_id,
+            [Ticket("TT-003", spec="s", criteria=["the plan's bar"], status="failed")],
+        )
+        store.log(
+            run_id,
+            "TT-003: respec proposed 1 criterion(s) the plan states nowhere",
+            level="warn",
+            kind="ticket",
+            data={"minted": [self.PROPOSED], "ticket": "TT-003"},
+        )
+        store.close()
+        return root, config
+
+    def _run(self, root, *argv):
+        parsed = cli.build_parser().parse_args(["--root", str(root), "criteria", *argv])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            parsed.func(parsed)
+        return out.getvalue()
+
+    def _tickets(self, config):
+        store = Store(config.db_path)
+        try:
+            return store.list_tickets(int(store.latest_run()["id"]))
+        finally:
+            store.close()
+
+    def test_a_refused_proposal_is_listed_with_the_command_that_adopts_it(self):
+        root, _config = self._project()
+
+        printed = self._run(root)
+
+        self.assertIn(self.PROPOSED, printed)
+        self.assertIn("forge criteria TT-003 --accept 1", printed)
+
+    def test_accepting_one_makes_it_the_plans_own(self):
+        root, config = self._project()
+
+        self._run(root, "TT-003", "--accept", "1")
+
+        ticket = self._tickets(config)[0]
+        self.assertIn(self.PROPOSED, ticket.criteria)
+        # Plan-authored from here: the ratchet protects it from the next
+        # revision exactly as if a human had written it in the plan.
+        self.assertIn(self.PROPOSED, ticket.original_criteria)
+
+    def test_an_adopted_criterion_stops_being_outstanding(self):
+        root, _config = self._project()
+        self._run(root, "TT-003", "--accept", "1")
+
+        printed = self._run(root)
+
+        self.assertIn("nothing outstanding", printed)
+
+    def test_the_ticket_file_is_rewritten_so_it_does_not_lie(self):
+        root, config = self._project()
+
+        self._run(root, "TT-003", "--accept", "1")
+
+        written = (config.tickets_dir / "TT-003.md").read_text(encoding="utf-8")
+        self.assertIn(self.PROPOSED, written)
+
+    def test_the_adoption_is_recorded_in_the_run(self):
+        root, config = self._project()
+
+        self._run(root, "TT-003", "--accept", "1")
+
+        store = Store(config.db_path)
+        messages = " ".join(row["message"] for row in store.events_after(0))
+        store.close()
+        self.assertIn("a human adopted 1 criterion(s)", messages)
+
+    def test_a_number_that_is_not_on_offer_is_refused(self):
+        root, _config = self._project()
+
+        with self.assertRaises(SystemExit) as caught:
+            self._run(root, "TT-003", "--accept", "2")
+
+        self.assertIn("there is no 2", str(caught.exception))
+
+    def test_accepting_without_naming_a_ticket_says_so(self):
+        root, _config = self._project()
+
+        with self.assertRaises(SystemExit) as caught:
+            self._run(root, "--accept", "1")
+
+        self.assertIn("name the ticket", str(caught.exception))
+
+    def test_adopting_the_same_criterion_twice_does_not_duplicate_it(self):
+        # The second call has nothing outstanding to number, so the guard that
+        # fires is the empty-list one — and either way the ticket ends with one.
+        root, config = self._project()
+        self._run(root, "TT-003", "--accept", "1")
+
+        with self.assertRaises(SystemExit):
+            self._run(root, "TT-003", "--accept", "1")
+
+        ticket = self._tickets(config)[0]
+        self.assertEqual(ticket.criteria.count(self.PROPOSED), 1)
+
+    def test_a_ticket_that_already_passed_is_not_requeued_behind_your_back(self):
+        root, config = self._project()
+        store = Store(config.db_path)
+        run_id = int(store.latest_run()["id"])
+        ticket = store.list_tickets(run_id)[0]
+        ticket.status = TICKET_DONE
+        store.update_ticket(run_id, ticket)
+        store.close()
+
+        printed = self._run(root, "TT-003", "--accept", "1")
+
+        self.assertIn("forge retry --ticket TT-003", printed)
+        self.assertEqual(self._tickets(config)[0].status, TICKET_DONE)
 
 
 class TestRespecCannotPinASharedFile(unittest.TestCase):

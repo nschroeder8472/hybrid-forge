@@ -17,7 +17,7 @@ verified against surviving data that is said plainly.
 `fix/protect-plan-authored-context`, unverified against a run — they were
 written from run 5's evidence and are covered by tests, not by a replay.
 
-Still open: 3.1's promotion path, and the conditional 2.4 and 4.1. A clean
+Still open: the conditional 2.4 and 4.1. A clean
 run from an empty repository — no drifted specs carried over — is the validation
 that has not been done yet.
 
@@ -789,7 +789,7 @@ fabricates.
 
 ## Phase 3 — Close the gap between the reviewer's bar and the planner's
 
-### 3.1 Allow criteria the spec already states — **done, except the promotion path**
+### 3.1 Allow criteria the spec already states — **done**
 
 `_spec_entailed` compares a proposed criterion's content words against each
 sentence of `original_spec` — the ingested one, so the loop cannot rewrite the
@@ -803,12 +803,21 @@ The refusal message no longer claims the plan is silent. It now says the
 criterion appears neither in the criteria nor in the spec — the two places that
 are enforced — and points at re-ingesting the plan.
 
-**Not built: the promotion path.** A criterion that is genuinely new still
-needs a human to edit `plan.md` and re-ingest; there is no `forge` command that
-accepts one in place. That wants a CLI surface for editing a ticket's contract,
-including its anchor, and an anchor any caller can move is the thing
-`update_ticket` deliberately refuses — so it is a design question, not a
-follow-up patch.
+**The promotion path.** `forge criteria` lists what respec proposed and the
+loop refused, read back out of the run log — the refusal is already an event,
+and a second store of the same fact is a second thing to keep true.
+`forge criteria TT-006 --accept 1` adopts one: it lands on the ticket *and* on
+`original_criteria`, so it is plan-authored from that moment and the ratchet
+protects it from the next revision exactly as if a human had written it in the
+plan. The ticket file is rewritten so the artifact a human reads does not lie,
+and the adoption is logged.
+
+The anchor stays unwritable everywhere else. `Store.promote_criteria` is its
+only writer after ingest, it is reachable from the CLI alone, and
+`update_ticket` still cannot touch the anchor at all — which is the property
+that made the refusal worth enforcing in the first place. A ticket that has
+already passed is not requeued behind anyone's back; the command prints the
+`forge retry --ticket` line and leaves the call to a human.
 
 **Problem.** `REVIEWER_SYSTEM:98` instructs the reviewer to reject when *"a
 criterion is unmet **or the diff does something the spec did not ask for**"*, and
@@ -1205,9 +1214,8 @@ land too — one branch to push when the backlog is green.
 | — | 2.3 | Done — history is its own droppable message, capped at three |
 | — | 3.3 | Done — both lists seeded from the step log on a retry cycle |
 | — | 3.6 | Done — a review-only ticket is named at run end |
-| — | 3.1 | Done bar the promotion path — spec-entailed criteria admitted |
-| 1 | 3.1's promotion path | Needs a way to edit a ticket's anchor; a design question |
-| 2 | 2.4, 4.1 | Conditional and experimental |
+| — | 3.1 | Done — spec-entailed criteria admitted, `forge criteria` adopts the rest |
+| 1 | 2.4, 4.1 | Conditional and experimental |
 
 1.6 is a decision, not a code change, and should be settled before the next
 baseline run.
