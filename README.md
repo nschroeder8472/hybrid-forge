@@ -178,6 +178,7 @@ forge status                # one-shot summary
 forge retry [--respec]      # requeue failed tickets, optionally re-specced
 forge pause | resume | stop # applied after the current step, never mid-patch
 forge ui                    # dashboard without running the loop
+forge ui --host IP --port N # bind it elsewhere, this run only (no auth!)
 ```
 
 In Claude Code: `/forge-init`, `/forge-plan`, `/forge-ingest`, `/forge-go`,

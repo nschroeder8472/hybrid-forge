@@ -20,7 +20,7 @@ import unittest.mock
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
-from forge import cli, respec
+from forge import cli, modelfiles, respec
 from forge.artifacts import Artifacts
 from forge.budget import BudgetGate, RateLimitPolicy
 from forge.config import Config, ConfigError, LoopSettings, UISettings
@@ -1513,6 +1513,95 @@ class TestDashboardExposure(unittest.TestCase):
         warning = exposure_warning(self._config("192.168.1.10"))
         self.assertIn("192.168.1.10:8799", warning)
         self.assertIn("NO authentication", warning)
+
+
+class TestUiHostAndPortFlags(unittest.TestCase):
+    """A run binds its dashboard at startup and will not rebind, so watching an
+    in-progress run from another machine means a second dashboard on another
+    address. Overrides apply to the invocation only — nothing is written back,
+    because a flag reached for once should not quietly change every later run."""
+
+    def _args(self, root, **overrides):
+        parsed = cli.build_parser().parse_args(["--root", str(root), "ui"])
+        for key, value in overrides.items():
+            setattr(parsed, key, value)
+        return parsed
+
+    def _project(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
+                    "roles": {r: "m" for r in ("planner", "executor", "tester", "reviewer")},
+                    "ui": {"host": "127.0.0.1", "port": 8799},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return root
+
+    def _bound(self, root, **overrides):
+        """Run cmd_ui far enough to see what it would bind, then stop."""
+        seen = {}
+
+        def fake_serve(config, _store):
+            seen["host"] = config.ui.host
+            seen["port"] = config.ui.port
+            raise KeyboardInterrupt  # unwinds before the idle loop
+
+        with unittest.mock.patch.object(cli.ui_server, "serve", fake_serve):
+            try:
+                cli.cmd_ui(self._args(root, **overrides))
+            except KeyboardInterrupt:
+                pass
+        return seen
+
+    def test_the_flags_exist_and_default_to_none(self):
+        parsed = cli.build_parser().parse_args(["ui"])
+        self.assertIsNone(parsed.host)
+        self.assertIsNone(parsed.port)
+
+    def test_without_flags_config_decides(self):
+        root = self._project()
+        self.assertEqual(self._bound(root), {"host": "127.0.0.1", "port": 8799})
+
+    def test_host_overrides_config(self):
+        root = self._project()
+        self.assertEqual(self._bound(root, host="0.0.0.0")["host"], "0.0.0.0")
+
+    def test_port_overrides_config(self):
+        root = self._project()
+        self.assertEqual(self._bound(root, port=8800)["port"], 8800)
+
+    def test_the_override_is_not_written_back(self):
+        root = self._project()
+        self._bound(root, host="0.0.0.0", port=8800)
+
+        saved = json.loads((root / ".hybridforge" / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["ui"], {"host": "127.0.0.1", "port": 8799})
+
+    def test_an_overridden_bind_still_warns(self):
+        """The warning reads `config.ui`, so an override must reach it before
+        `serve` — otherwise `--host 0.0.0.0` exposes the stop button silently."""
+        config = Config(root=Path("."))
+        config.ui = UISettings(host="0.0.0.0", port=8800)
+
+        self.assertIn("NO authentication", exposure_warning(config))
+        self.assertIn("8800", exposure_warning(config))
+
+    def test_a_taken_port_explains_itself(self):
+        root = self._project()
+
+        def refuse(_config, _store):
+            raise OSError(48, "Address already in use")
+
+        with unittest.mock.patch.object(cli.ui_server, "serve", refuse):
+            with self.assertRaises(SystemExit) as caught:
+                cli.cmd_ui(self._args(root, port=8799))
+
+        self.assertIn("--port", str(caught.exception))
 
 
 class TestProviderWorkingDirectory(unittest.TestCase):
@@ -3769,6 +3858,242 @@ class TestHealthProbeNeedsRoomToThink(unittest.TestCase):
 
     def test_a_real_reply_still_passes(self):
         self.assertTrue(self._Stub("OK").health().startswith("ok"))
+
+
+class TestGeneratedModelfiles(unittest.TestCase):
+    """The settings a Modelfile carries are exactly the ones nothing else can
+    reach, so hand-writing them is where the drift lives — one setup carried
+    `num_ctx 32768` across three models trained for eight times that, and
+    nothing reported it."""
+
+    SHOW_ALIAS = {
+        "parameters": 'top_k                 40\ntemperature           0.7\nstop  "<|im_end|>"\n',
+        "details": {"parent_model": "devstral:24b"},
+        "model_info": {"llama.context_length": 131072},
+    }
+    SHOW_BASE = {
+        "parameters": "",
+        "details": {"parent_model": ""},
+        "model_info": {"llama.context_length": 131072},
+    }
+
+    def _config(self, model, contextWindow=None, kind="openai"):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        block = {"kind": kind, "baseUrl": "http://127.0.0.1:11434/v1", "model": model}
+        if contextWindow:
+            block["contextWindow"] = contextWindow
+        (root / ".hybridforge" / "config.json").write_text(json.dumps({
+            "models": {"local": block},
+            "roles": {r: "local" for r in ("planner", "executor", "tester", "reviewer")},
+        }), encoding="utf-8")
+        return Config.load(root)
+
+    def _plan(self, config, show):
+        mod = sys.modules["forge.providers.openai_compat"]
+        with unittest.mock.patch.object(mod, "post_json", lambda *a, **k: show), \
+             unittest.mock.patch.object(mod, "get_json", lambda *a, **k: {"models": []}):
+            return modelfiles.plan(config)
+
+    def test_a_tuned_alias_is_rebuilt_under_its_own_name(self):
+        entries = self._plan(self._config("forge-alt"), self.SHOW_ALIAS)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].create_as, "forge-alt")
+        self.assertFalse(entries[0].rename)
+
+    def test_the_modelfile_is_from_the_real_base_not_the_alias(self):
+        """`FROM forge-alt` on a file used to rebuild `forge-alt` is circular
+        and loses the weights it was derived from."""
+        entries = self._plan(self._config("forge-alt"), self.SHOW_ALIAS)
+
+        self.assertTrue(entries[0].text.startswith("FROM devstral:24b\n"))
+
+    def test_a_base_model_gets_a_new_name_rather_than_being_overwritten(self):
+        """Building under the base's own name replaces the weights the file is
+        FROM — the one outcome this must never produce."""
+        entries = self._plan(self._config("devstral:24b"), self.SHOW_BASE)
+
+        self.assertEqual(entries[0].create_as, "forge-local")
+        self.assertTrue(entries[0].rename)
+        self.assertTrue(entries[0].text.startswith("FROM devstral:24b\n"))
+
+    def test_the_base_models_own_sampling_recipe_is_preserved(self):
+        entries = self._plan(self._config("forge-alt"), self.SHOW_ALIAS)
+
+        self.assertIn("PARAMETER top_k 40", entries[0].text)
+
+    def test_defaults_fill_in_when_the_base_ships_nothing(self):
+        entries = self._plan(self._config("devstral:24b"), self.SHOW_BASE)
+
+        self.assertIn("PARAMETER top_k 20", entries[0].text)
+        self.assertIn("PARAMETER min_p 0", entries[0].text)
+
+    def test_a_configured_window_wins_over_the_trained_maximum(self):
+        entries = self._plan(self._config("forge-alt", contextWindow=65536), self.SHOW_ALIAS)
+
+        self.assertIn("PARAMETER num_ctx 65536", entries[0].text)
+        self.assertIn("trained for 131,072", entries[0].text)
+
+    def test_a_full_window_carries_no_smaller_note(self):
+        entries = self._plan(self._config("forge-alt", contextWindow=131072), self.SHOW_ALIAS)
+
+        self.assertIn("PARAMETER num_ctx 131072", entries[0].text)
+        self.assertNotIn("trained for", entries[0].text)
+
+    def test_non_ollama_endpoints_are_skipped(self):
+        """A Modelfile means nothing to vLLM or OpenRouter, and writing one
+        would imply otherwise."""
+        config = self._config("gpt-4o", kind="anthropic")
+
+        self.assertEqual(modelfiles.plan(config), [])
+
+    def test_writing_puts_them_under_the_project_config_dir(self):
+        config = self._config("forge-alt")
+        mod = sys.modules["forge.providers.openai_compat"]
+        with unittest.mock.patch.object(mod, "post_json", lambda *a, **k: self.SHOW_ALIAS), \
+             unittest.mock.patch.object(mod, "get_json", lambda *a, **k: {"models": []}):
+            written = modelfiles.write(config)
+
+        self.assertEqual(len(written), 1)
+        entry, path = written[0]
+        self.assertEqual(path.name, "Modelfile.local")
+        self.assertEqual(path.parent, config.config_dir / "models")
+        self.assertIn("ollama create forge-alt -f", entry.command)
+
+
+class TestSamplingIsConfigurablePerModel(unittest.TestCase):
+    """A model ships a sampling recipe its authors chose, and the loop's own
+    per-role temperature overrides only that one knob. The rest are settable
+    per model block so a model can be run the way it was meant to be."""
+
+    def _payload(self, config, **call):
+        sent = {}
+        provider = OpenAICompatProvider(
+            "m", {"baseUrl": "http://x/v1", "model": "m", "contextWindow": 8192, **config}
+        )
+        mod = sys.modules["forge.providers.openai_compat"]
+
+        def capture(_url, body, **_kw):
+            sent.update(body)
+            return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+
+        with unittest.mock.patch.object(mod, "post_json", capture):
+            provider.complete([Message(role="user", content="hi")], max_tokens=16, **call)
+        return sent
+
+    def test_nothing_configured_sends_no_sampling_knobs(self):
+        """An unset knob must stay off the wire — sending top_p 1.0 because
+        nobody chose one would overrule the model's own shipped 0.8."""
+        sent = self._payload({})
+
+        for key in ("top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty"):
+            self.assertNotIn(key, sent)
+
+    def test_each_knob_reaches_the_payload_in_its_wire_spelling(self):
+        sent = self._payload({
+            "topP": 0.8, "topK": 20, "minP": 0.05,
+            "presencePenalty": 1.5, "frequencyPenalty": 0.5,
+        })
+
+        self.assertEqual(sent["top_p"], 0.8)
+        self.assertEqual(sent["top_k"], 20)
+        self.assertEqual(sent["min_p"], 0.05)
+        self.assertEqual(sent["presence_penalty"], 1.5)
+        self.assertEqual(sent["frequency_penalty"], 0.5)
+
+    def test_zero_is_a_value_not_an_absence(self):
+        """`min_p: 0` is a real setting and must not be dropped as falsey."""
+        sent = self._payload({"minP": 0, "presencePenalty": 0})
+
+        self.assertEqual(sent["min_p"], 0.0)
+        self.assertEqual(sent["presence_penalty"], 0.0)
+
+    def test_top_k_is_sent_as_an_integer(self):
+        self.assertIsInstance(self._payload({"topK": 20})["top_k"], int)
+
+    def test_configured_temperature_overrides_the_roles_request(self):
+        sent = self._payload({"temperature": 0.6}, temperature=0.0)
+        self.assertEqual(sent["temperature"], 0.6)
+
+    def test_without_config_the_roles_temperature_is_used(self):
+        sent = self._payload({}, temperature=0.1)
+        self.assertEqual(sent["temperature"], 0.1)
+
+    def test_extra_body_still_wins_over_a_named_knob(self):
+        """The escape hatch stays an escape hatch."""
+        sent = self._payload({"topP": 0.8, "extraBody": {"top_p": 0.5}})
+        self.assertEqual(sent["top_p"], 0.5)
+
+
+class TestOllamaModelNamesCarryAnImplicitTag(unittest.TestCase):
+    """`/api/ps` reports `forge-exec:latest`; config writes `forge-exec`,
+    because that is how every `ollama run` example spells it. Comparing them
+    exactly matched nothing, so the served window was always discarded and the
+    budget gate planned against the architectural maximum instead — 262,144
+    for a server holding 32,768, with the overflow truncated off the front of
+    the prompt where the system message and the spec live."""
+
+    LOADED = {
+        "models": [
+            {"name": "forge-exec:latest", "model": "forge-exec:latest",
+             "context_length": 32768, "size": 8, "size_vram": 8}
+        ]
+    }
+    TRAINED = {"model_info": {"qwen35moe.context_length": 262144}}
+
+    def _provider(self, model: str):
+        provider = OpenAICompatProvider(
+            "local", {"baseUrl": "http://x:11434/v1", "model": model}
+        )
+        mod = sys.modules["forge.providers.openai_compat"]
+        self.enterContext(
+            unittest.mock.patch.object(mod, "get_json", lambda *a, **k: self.LOADED)
+        )
+        self.enterContext(
+            unittest.mock.patch.object(mod, "post_json", lambda *a, **k: self.TRAINED)
+        )
+        return provider
+
+    def test_an_untagged_config_name_matches_the_tagged_report(self):
+        provider = self._provider("forge-exec")
+
+        self.assertTrue(provider._ollama_loaded())
+        self.assertEqual(provider._discover_context_window(), 32768)
+
+    def test_a_tagged_config_name_still_matches(self):
+        provider = self._provider("forge-exec:latest")
+
+        self.assertEqual(provider._discover_context_window(), 32768)
+
+    def test_a_different_model_does_not_match(self):
+        provider = self._provider("forge-alt")
+
+        self.assertEqual(provider._ollama_loaded(), {})
+        self.assertEqual(provider._discover_context_window(), 262144)
+
+    def test_a_non_latest_tag_is_not_confused_with_latest(self):
+        """`forge-exec:v2` and `forge-exec:latest` are different models."""
+        provider = self._provider("forge-exec:v2")
+
+        self.assertEqual(provider._ollama_loaded(), {})
+
+    def test_the_diagnostic_about_a_smaller_window_can_now_fire(self):
+        """It is gated on knowing the served size, so the name bug silenced the
+        one warning that would have reported the name bug."""
+        provider = self._provider("forge-exec")
+        provider._caps = None
+        notes = provider.diagnostics()
+
+        self.assertTrue(any("32,768" in note for note in notes), notes)
+
+    def test_tag_normalisation_leaves_a_digest_reference_alone(self):
+        from forge.providers.openai_compat import _tagged
+
+        self.assertEqual(_tagged("forge-exec"), "forge-exec:latest")
+        self.assertEqual(_tagged("forge-exec:latest"), "forge-exec:latest")
+        self.assertEqual(_tagged("forge-exec:v2"), "forge-exec:v2")
+        self.assertEqual(_tagged("m@sha256:abc"), "m@sha256:abc")
 
 
 class TestServedContextBeatsTrainedContext(unittest.TestCase):

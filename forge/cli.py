@@ -9,8 +9,9 @@
     forge status                   one-shot summary
     forge retry [--respec]         put failed tickets back on the backlog
     forge prune [--keep N]         delete the artifact trees of old runs
+    forge models                   write Modelfiles pinning what config cannot
     forge pause | resume | stop    control a running loop
-    forge ui                       serve the dashboard on its own
+    forge ui [--host H] [--port N] serve the dashboard on its own
 
 `ingest` and `go` are separate on purpose: a backlog is reviewable text, and
 the moment before an unattended run starts is the cheapest moment to catch a
@@ -28,7 +29,7 @@ import time
 import webbrowser
 from pathlib import Path
 
-from . import respec, wizard
+from . import modelfiles, respec, wizard
 from .artifacts import ARTIFACTS_DIR
 from .config import Config, ConfigError, default_config
 from .ingest import ingest as ingest_document
@@ -119,6 +120,8 @@ def cmd_init(args: argparse.Namespace) -> int:
             # init that already succeeded — the repo config is the deliverable.
             print(f"(could not save machine profile: {exc})")
 
+    _report_modelfiles(config, wrote_config=True)
+
     print("\nNext:")
     if args.defaults:
         print("  1. Edit `models` and `roles` to point at the models you want.")
@@ -128,6 +131,61 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("  1. `forge doctor` — re-checks every endpoint.")
         print("  2. `forge ingest <spec>` — turn a plan into a reviewable backlog.")
         print("  3. `forge go` — run it.")
+    return 0
+
+
+def _report_modelfiles(config: Config, *, wrote_config: bool) -> int:
+    """Write a Modelfile per Ollama-backed model and say what to do with them.
+
+    Generated rather than remembered. The settings that belong in a Modelfile
+    are exactly the ones nothing else can reach — `num_ctx`, which a global
+    `OLLAMA_CONTEXT_LENGTH` silently overrides, and `top_k`/`min_p`, which the
+    OpenAI-compatible endpoint accepts and discards. Hand-written they drift:
+    one setup carried `num_ctx 32768` across three models trained for eight
+    times that, and nothing reported it.
+
+    The files are written; `ollama create` is not run. Building a model takes
+    minutes and rewrites something outside this repository, which is a
+    decision for whoever is reading the output.
+    """
+    try:
+        written = modelfiles.write(config)
+    except Exception as exc:  # noqa: BLE001 - never fail an init over this
+        print(f"\n(could not generate Modelfiles: {exc})")
+        return 0
+    if not written:
+        return 0
+
+    where = "Also wrote" if wrote_config else "Wrote"
+    print(f"\n{where} {len(written)} Modelfile(s) in {config.config_dir / modelfiles.MODELS_DIR}:")
+    for entry, path in written:
+        print(f'  {entry.alias:<12} {entry.command} "{path}"')
+
+    print(
+        "\nThese pin what config.json cannot: num_ctx, which a global\n"
+        "OLLAMA_CONTEXT_LENGTH would override, and top_k/min_p, which Ollama's\n"
+        "OpenAI endpoint accepts and ignores. Review them, then run the commands\n"
+        "above. Nothing is built for you."
+    )
+
+    # A block naming a base model directly cannot be rebuilt under that name:
+    # the Modelfile is FROM those weights, and building over them replaces the
+    # thing it derives from.
+    renamed = [entry for entry, _ in written if entry.rename]
+    if renamed:
+        print("\nThese build under a new name, so config has to point at it too:")
+        for entry in renamed:
+            print(f"  models.{entry.alias}.model:  {entry.base}  ->  {entry.create_as}")
+    return len(written)
+
+
+def cmd_models(args: argparse.Namespace) -> int:
+    config = _load(args.root)
+    if not _report_modelfiles(config, wrote_config=False):
+        print(
+            "No Ollama-backed models in this config, so there is nothing to pin. "
+            "A Modelfile means nothing to vLLM, OpenRouter or OpenAI."
+        )
     return 0
 
 
@@ -659,7 +717,29 @@ def cmd_control(args: argparse.Namespace) -> int:
 def cmd_ui(args: argparse.Namespace) -> int:
     config = _load(args.root)
     store = _store(config)
-    ui_server.serve(config, store)
+
+    # Overrides for this invocation, never written back. The usual reason to
+    # reach for them is a run already in progress: the loop bound its dashboard
+    # at startup and will not rebind, so a second dashboard on another address
+    # or port is how you watch it from elsewhere without restarting it. Setting
+    # them on `config.ui` before `serve` keeps the exposure warning and the
+    # printed URL describing what actually got bound.
+    if args.host is not None:
+        config.ui.host = args.host
+    if args.port is not None:
+        config.ui.port = args.port
+
+    try:
+        ui_server.serve(config, store)
+    except OSError as exc:
+        # Overwhelmingly a port already taken — most often by the very run this
+        # dashboard was meant to watch, which holds ui.port for its lifetime.
+        sys.exit(
+            f"error: could not serve on {config.ui.host}:{config.ui.port} — {exc}\n"
+            f"If a run is in progress it already holds that port; pick another "
+            f"with --port."
+        )
+
     url = ui_server.url_for(config)
     print(f"Dashboard: {url}  (Ctrl-C to quit)")
     if args.open:
@@ -795,8 +875,29 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=help_text)
         p.set_defaults(func=cmd_control, command=name)
 
+    p = sub.add_parser(
+        "models", help="write Ollama Modelfiles for the configured models"
+    )
+    p.set_defaults(func=cmd_models)
+
     p = sub.add_parser("ui", help="serve the dashboard without running the loop")
     p.add_argument("--open", action="store_true", help="open the dashboard in a browser")
+    p.add_argument(
+        "--host",
+        default=None,
+        help=(
+            "bind address for this invocation only; nothing is written back to "
+            "config. The dashboard has no authentication and its stop button "
+            "ends the run, so anything that can reach a non-loopback address "
+            "can control the daemon"
+        ),
+    )
+    p.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="port for this invocation only (default: ui.port from config)",
+    )
     p.set_defaults(func=cmd_ui)
 
     return parser
