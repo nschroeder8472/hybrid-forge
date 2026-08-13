@@ -13,7 +13,7 @@ what unblocks what, not by severity.
 below records what it was replayed against, and where a fix could not be
 verified against surviving data that is said plainly.
 
-Still open: 2.3, 3.1, 3.2, 3.3, 3.5, and the conditional 2.4 and 4.1. A clean
+Still open: 2.3, 3.1, 3.2, 3.3, 3.5, 3.6, and the conditional 2.4 and 4.1. A clean
 run from an empty repository — no drifted specs carried over — is the validation
 that has not been done yet.
 
@@ -1015,6 +1015,77 @@ Worth noting the ordering problem this exposes. Every guard so far assumed the
 criteria are the contract and the spec explains it. A plan can also put load-
 bearing decisions in the spec, and the harness has no way to tell those from
 commentary.
+
+---
+
+### 3.6 A ticket can be verified by reading rather than by running — **open**
+
+**Found by opening the finished game in a browser.** The backlog was green — all
+six tickets `done`, lint and typecheck clean, 36 tests passing — and the page
+loaded to an empty board that never started.
+
+`web/main.js:13`:
+
+```js
+const instance = await WebAssembly.instantiateStreaming(fetch('./tetris.wasm'), {});
+const { game_new, ... } = instance.exports;   // TypeError
+```
+
+`instantiateStreaming` resolves to `{ module, instance }`, not the instance, so
+`instance.exports` is `undefined` and the next line throws. `run()` was called
+with no `.catch()`, so it became an unhandled rejection: no error on the page, no
+output, an empty canvas. The Rust was correct throughout — driven directly, the
+module spawns, applies gravity, hard-drops and locks exactly as specified.
+
+**Nothing in the pipeline could have caught it.** TT-005's acceptance criteria,
+in full:
+
+- `web/index.html` contains a canvas element with id `board`
+- `web/index.html` contains elements with ids `score`, `lines` and `level`
+- `web/main.js` calls `WebAssembly.instantiateStreaming`
+- `web/main.js` reads the render buffer through a `Uint8Array` over `memory.buffer`
+- `web/main.js` maps all five arrow and space keys to `game_input`
+
+Every one is a token-presence check, and every one is satisfied by code that
+throws on the second line of its own entry point. It *calls*
+`instantiateStreaming`. It *reads* a `Uint8Array` over `memory.buffer`. Both
+statements are true of code that never runs.
+
+The reviewer passed it, correctly, against the contract it was given. And no
+other check applied: the ticket authored no tests — *"TT-005: no tests authored
+— the ticket wrote no .rs file, and this project's test command collects .rs
+tests. Review will check the criteria instead."* — and verification is `cargo
+clippy`, `cargo check`, `cargo test`, none of which executes a line of
+JavaScript. The 36 passing tests cover pieces, board, rules and the wasm exports
+*from the host*. The JS-to-wasm boundary is the one seam no ticket owns, and it
+is the only place the bug could hide.
+
+**Two layers.** The plan wrote acceptance criteria for a browser shell in terms
+a text search can satisfy; `piece::cells(1, 0)` returning four offsets is
+checkable, "main.js calls instantiateStreaming" is grep. And the harness lets
+that pass unremarked: when a ticket authors no tests the loop falls back to
+"review will check the criteria", and when the criteria are textual that
+fallback is a text check too.
+
+`_report_test_coverage` already warns when *no* ticket in a run authored tests.
+Here four did, so it stayed quiet about the two that did not.
+
+**Not a proposal to test JavaScript.** The harness verifies with the project's
+own commands, and that is right — teaching it to drive a browser would be a
+different tool. What is missing is honesty about what a green ticket means. At
+run end, name the tickets that were never executed:
+
+> TT-005 and TT-006 passed on review alone. Neither authored tests and neither
+> is covered by the test command, so their criteria were checked by reading the
+> diff, not by running anything.
+
+That costs nothing, needs no new dependency, and would have pointed straight at
+the two tickets worth opening by hand.
+
+**Related to 3.5**, and the same shape: the run is green, and the green means
+less than it looks. 3.5 is a decision quietly dropped; this is a whole ticket
+quietly unexecuted. Both are cases of the harness reporting more confidence than
+it earned.
 
 ## Suggested landing order
 
