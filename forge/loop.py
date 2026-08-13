@@ -220,6 +220,15 @@ class Orchestrator:
         Most tickets should record nothing, and the recorder is told so. This
         step exists for the minority that settle a decision or produce a
         correction worth generalizing.
+
+        The answer wanted here is tiny — `NOTHING`, or a title and three
+        sentences — but the budget is still the configured one rather than a
+        ceiling picked to match. A cap is not an allocation: a model that
+        replies `NOTHING` spends five tokens whatever it is allowed. A thinking
+        model handed a small cap spends all of it before writing anything, and
+        then reports that its output budget is too small — naming a number the
+        operator never configured and cannot find, having already set
+        `maxOutputTokens` to sixty-four times it.
         """
         if self.memory is None or not self.memory.settings.write:
             return
@@ -237,7 +246,7 @@ class Orchestrator:
                     corrections=corrections,
                     retrieved=retrieved,
                 ),
-                max_tokens=1024,
+                max_tokens=self._output_budget(self.config.record_role),
                 temperature=0.0,
             )
         except ProviderError as exc:

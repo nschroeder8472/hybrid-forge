@@ -19,6 +19,7 @@ import unittest
 import unittest.mock
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from types import SimpleNamespace
 
 from forge import cli, modelfiles, respec
 from forge.artifacts import Artifacts
@@ -5125,6 +5126,46 @@ class TestThinkingModelsThatNeverAnswer(unittest.TestCase):
     def test_a_thinking_model_that_finishes_returns_its_answer(self):
         provider = self._provider(self._payload('{"ok":1}', "stop", reasoning=self.THOUGHT))
         self.assertEqual(self._complete(provider).text, '{"ok":1}')
+
+
+class TestRecorderOutputBudget(unittest.TestCase):
+    """The recorder's answer is tiny, but the budget is the configured one.
+
+    A cap is not an allocation — a model replying `NOTHING` spends five tokens
+    whatever it is allowed — while a thinking model handed a small cap spends
+    all of it before writing anything, then reports an output budget the
+    operator never set and cannot find. Observed as "forge-plan spent its
+    entire 1,024-token output budget on hidden reasoning" on a model configured
+    for 65,536.
+    """
+
+    def test_the_recorder_gets_the_configured_budget(self):
+        orch, _root, run_id = _stub_orchestrator()
+        # Distinct from the old hard-coded ceiling, or the assertion passes for
+        # the wrong reason — the stub's own budget is 1,024.
+        orch.config.models["m"]["maxOutputTokens"] = 65536
+        orch.memory = SimpleNamespace(
+            settings=SimpleNamespace(write=True),
+            remember=lambda *a, **k: None,
+        )
+        asked: list[int] = []
+
+        def call(_run_id, _role, _messages, *, max_tokens, **_kwargs):
+            asked.append(max_tokens)
+            return Completion(text="NOTHING", usage=Usage())
+
+        orch._call = call
+        orch._record_outcome(
+            run_id,
+            Ticket("T-1"),
+            diff="d",
+            review="ACCEPT",
+            corrections="",
+            retrieved="",
+        )
+
+        self.assertEqual(asked, [orch._output_budget(orch.config.record_role)])
+        self.assertNotEqual(asked, [1024])
 
 
 class TestPlannerOutputBudget(unittest.TestCase):
