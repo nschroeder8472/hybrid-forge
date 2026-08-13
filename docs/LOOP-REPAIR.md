@@ -38,11 +38,11 @@ original 1.2 has been rewritten because its premise was wrong.
 
 ## Phase 1 — Unblock the loop
 
-### 1.0 The output parser shreds correct executor output — **done**
+### 1.0 The output parser shreds correct executor output — **done** (`308fb6a`)
 
 **Highest severity item in this document. It loses files silently.**
 
-Implemented on `fix/executor-output-parser`. 448 tests pass. Replayed both
+Replayed both
 parsers over every real executor response in `alllocal` and `alllocal2`: 14
 identical, 6 changed, and all six are the TT-006 corruption — steps 42 and 59
 (the destructive phantom-only parse) now yield no edits, and steps 57, 58, 79,
@@ -93,6 +93,12 @@ no path line before it. Zero edits parsed. Reported as "no file edits."
 **Mode C — path line inside the fence.** Step 81: ` ``` ` / `build.sh` /
 content / ` ``` `. Zero edits parsed. Same message.
 
+**Mode D — path line, contents not fenced at all.** Found while implementing:
+TT-006 steps 40 and 41 name each of the three files on its own line and then
+follow it with the raw file, no fence anywhere. Zero edits parsed, same message
+again. Diagnosed separately, because the reply is otherwise correct and telling
+it "no file edits" sends the next attempt rewriting code that was already right.
+
 **Why this matters beyond the lost files.** The reviewer's rejection (steps 47,
 64) is *accurate about disk* — `build.sh` really does contain markdown. Respec
 read that as a model-behaviour problem and wrote the misdiagnosis into the
@@ -111,34 +117,41 @@ spec corruption, through a reviewer that was telling the truth.
    means the outer fence closed early; fail the attempt with the existing
    four-backtick guidance rather than applying anything. This is mechanical and
    catches Mode A before it reaches disk.
-2. **Prefer the longest fence.** When a path line is followed by a fence, bind
-   to the longest run of backticks available at that position.
+2. ~~**Prefer the longest fence.**~~ Dropped — see the note above.
 3. **Say which failure it was.** Split `"executor returned no file edits"` into
-   distinct messages for *nothing at all*, *content but no path line* (Mode B),
-   and *path line inside the fence* (Mode C), and feed the specific complaint
-   back as `failure_context`. The current message sent respec chasing spec
-   defects that did not exist (events 36, 64) when the fix was a missing header
-   line.
-4. **Optional, once 1-3 land:** when a ticket authorises exactly one file and the
+   distinct messages for *nothing at all*, and for modes B, C and D, and feed
+   the specific complaint back as `failure_context`. The single message sent
+   respec chasing spec defects that did not exist (events 36, 64) when the fix
+   was a missing header line.
+4. **Not done, still open:** when a ticket authorises exactly one file and the
    reply is a single fenced block with no path line, infer the path. Safe for a
-   one-file ticket; do not attempt it for TT-002's two.
+   one-file ticket; do not attempt it for TT-002's two. Left out because mode D
+   turned out to be the commoner shape and a clear message may be enough.
 
-**Files.** `forge/patch.py:32-38`, `:96-115`; `forge/loop.py:1405-1409`;
-`forge/prompts.py:41-47`.
+**Landed as.** `_fence_is_too_short` and `ParsedOutput.truncated` in
+`forge/patch.py`; `describe_unparsed` in the same module; the refusal ahead of
+`duplicate_paths` in `forge/loop.py`.
 
 **Tests.**
 
-- `test_a_markdown_file_with_inner_fences_does_not_spawn_a_phantom_edit`
-- `test_a_parse_whose_body_holds_an_unclosed_fence_is_refused`
-- `test_a_fenced_block_with_no_path_line_says_so`
-- `test_a_path_line_inside_the_fence_says_so`
+- `test_a_file_cut_short_by_its_own_fence_never_becomes_an_edit`
+- `test_the_phantom_alone_is_still_refused`
+- `test_a_file_whose_fences_are_shorter_than_its_wrapper_is_kept`
+- `test_a_file_cut_short_by_its_own_fence_never_reaches_disk` (end to end,
+  asserting the file on disk is byte-identical afterwards)
+- `TestUnparsedOutput`, one case per mode plus the two negatives
 
 **Risk.** Low, and strictly protective — item 1 only ever refuses work it
 currently applies wrongly.
 
+**Open question for review.** When a response mixes good and truncated blocks
+(steps 57, 79), the whole attempt is refused rather than applying the files that
+parsed cleanly. That matches the `duplicate_paths` convention and avoids leaving
+a ticket half-done, but partial application is defensible and was not tried.
+
 ---
 
-### 1.1 The provenance marker leaks into the criterion key
+### 1.1 The provenance marker leaks into the criterion key — **done** (`88ed838`)
 
 **Problem.** `_criteria_provenance_block` (`forge/prompts.py:142-162`) renders
 each criterion as two lines:
@@ -251,7 +264,7 @@ Phase 0 — and on 1.0 landing first.
 
 ---
 
-### 1.3 Never respec a ticket that never ran
+### 1.3 Never respec a ticket that never ran — **done** (`88ed838`)
 
 **Problem.** `forge/loop.py:864-868` builds the respec set from `RETRYABLE`,
 which is `(failed, blocked, skipped)` (`forge/state.py:497`). Requeueing a
@@ -310,7 +323,7 @@ run, or reingest `plan.md`.
 
 ---
 
-### 1.4 Phantom revisions must not satisfy the retry brake
+### 1.4 Phantom revisions must not satisfy the retry brake — **done** (`88ed838`)
 
 **Problem.** `forge/loop.py:919` ends the retries when `not revised` — the
 guard against handing the executor an unchanged ticket and hoping for a
@@ -617,7 +630,7 @@ more likely, so land 2.3 first.
 
 ---
 
-### 3.4 Minor — ingest mangles criteria backticks
+### 3.4 Minor — ingest mangles criteria backticks — **done** (`88ed838`)
 
 `forge/ingest.py:111` applies `.strip("`")` to the whole criterion line. On a
 criterion that both opens and closes with inline code, that removes the opening
@@ -695,16 +708,21 @@ currently manufacturing the evidence that everything downstream reasons from.
 
 | Order | Items | Why here |
 |---|---|---|
+All completed work lives on `fix/loop-repair`, which is where the rest should
+land too — one branch to push when the backlog is green.
+
+| Order | Items | Why here |
+|---|---|---|
 | — | 0.1 | Done. Reviewer confirmed good; two new failure modes exposed |
-| — | 1.0 | Done, on `fix/executor-output-parser` |
-| 2 | 1.1, 1.3, 1.4, 3.4 | Pure bug fixes, strictly remove wrong behaviour, low risk |
-| 3 | 1.5 | Stops "done" being reported over a crate that does not lint |
-| 4 | 2.1, 2.2 | Prompt-only; cheap insurance against the next weak reviewer |
-| 5 | 1.2 | Only meaningful once 1.0 can tell empty from unparseable |
-| 6 | 2.3 | Prerequisite for 3.3 |
-| 7 | 3.3, 3.2 | Information architecture; 3.2 carries a migration |
-| 8 | 3.1 | Deliberately loosens a guard; wants a stable baseline |
-| 9 | 2.4, 4.1 | Conditional and experimental |
+| — | 1.0 | Done — `308fb6a` |
+| — | 1.1, 1.3, 1.4, 3.4 | Done — `88ed838` |
+| 1 | 1.5 | Stops "done" being reported over a crate that does not lint |
+| 2 | 2.1, 2.2 | Prompt-only; cheap insurance against the next weak reviewer |
+| 3 | 1.2 | Only meaningful once 1.0 can tell empty from unparseable |
+| 4 | 2.3 | Prerequisite for 3.3 |
+| 5 | 3.3, 3.2 | Information architecture; 3.2 carries a migration |
+| 6 | 3.1 | Deliberately loosens a guard; wants a stable baseline |
+| 7 | 2.4, 4.1 | Conditional and experimental |
 
 1.6 is a decision, not a code change, and should be settled before the next
 baseline run.
