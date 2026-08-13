@@ -505,6 +505,30 @@ class Store:
             failures.append({"name": row["name"], "detail": detail})
         return failures[-limit:]
 
+    def ticket_rejections(
+        self, run_id: int, ticket_id: str, limit: int = 3
+    ) -> list[str]:
+        """Verdicts the reviewer has already rejected this ticket with, oldest first.
+
+        The attempt loop keeps these in memory, and a retry cycle calls into it
+        fresh — so a second cycle's reviewer met a ticket it had already
+        rejected three times as though for the first time, and re-raised the
+        same objections from scratch. The nudge that a repeated rejection means
+        the spec is wrong could never fire, because the list it reads was
+        always empty at the moment it mattered.
+
+        Kept whole rather than distilled: a verdict is prose the reviewer wrote
+        for its own successor, and `distill` is built for compiler output.
+        """
+        rows = self._connection.execute(
+            "SELECT detail FROM steps "
+            "WHERE run_id = ? AND ticket_id = ? AND name = 'review' "
+            "AND status = 'failed' AND detail != '' "
+            "ORDER BY id DESC LIMIT ?",
+            (run_id, ticket_id, limit),
+        ).fetchall()
+        return [row["detail"] for row in reversed(rows)]
+
     # Statuses a retry reopens by default: work that stopped without landing.
     RETRYABLE = (TICKET_FAILED, TICKET_BLOCKED, TICKET_SKIPPED)
 

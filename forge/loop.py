@@ -1280,6 +1280,29 @@ class Orchestrator:
         history: list[str] = []
         rejections: list[str] = []
 
+        # Seeded from the step log on a retry cycle. Both lists are locals, and
+        # a cycle enters here fresh — so cycle 2's reviewer met a ticket it had
+        # already rejected three times as though for the first time, re-raised
+        # the same objections, and the "a rejection that repeats means the spec
+        # is wrong" nudge never fired, because `prior_verdicts` was empty
+        # exactly when it mattered. Same for the executor and its own failures.
+        if ticket.attempt_base:
+            history = [
+                f"Earlier cycle, {item['name']} failed:\n{item['detail']}"
+                for item in self.store.ticket_failures(
+                    run_id, ticket.ticket_id, limit=self._PRIOR_FAILURES
+                )
+            ]
+            # Stripped on the way in for the same reason the live list is: this
+            # goes straight into the next reviewer's prompt, and a verdict
+            # carrying the prompt's own headings offers them back for copying.
+            rejections = [
+                strip_prompt_echo(verdict)
+                for verdict in self.store.ticket_rejections(
+                    run_id, ticket.ticket_id, limit=self._PRIOR_VERDICTS
+                )
+            ]
+
         while ticket.attempts < self.config.loop.max_attempts:
             ticket.attempts += 1
             self.store.update_ticket(run_id, ticket)

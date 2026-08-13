@@ -4513,6 +4513,64 @@ class TestHistoryIsTrimmedRatherThanBlocking(unittest.TestCase):
         self.assertNotIn("objection 0", shown)
 
 
+class TestARetryCycleRemembersWhatFailed(unittest.TestCase):
+    """`history` and `rejections` are locals in the attempt loop, and a retry
+    cycle enters it fresh. So cycle 2's reviewer met a ticket it had already
+    rejected three times as though for the first time and re-raised the same
+    objections, while the one nudge designed to notice a third identical
+    objection — "a rejection that repeats is evidence the spec is wrong" —
+    could never fire, because the list it reads was empty exactly when it
+    mattered. Both records were durable in the step log the whole time."""
+
+    def _seeded(self, attempt_base: int):
+        orch, root, run_id = _stub_orchestrator()
+        orch.config.loop.max_attempts = 1
+
+        step = orch.store.start_step(run_id, "TT-001", "review")
+        orch.store.end_step(step, "failed", "REJECT: the error path is swallowed")
+        step = orch.store.start_step(run_id, "TT-001", "lint")
+        orch.store.end_step(step, "failed", "error[E0433]: unresolved import")
+
+        seen: dict[str, str] = {}
+
+        def call(_run_id, role, messages, **_kwargs):
+            seen[role] = _joined(messages)
+            return {
+                "executor": "src/game.rs\n```rust\npub fn go() {}\n```",
+                "tester": "tests/tt_001_test.rs\n```rust\n#[test]\nfn a() {}\n```",
+            }.get(role, "ACCEPT")
+
+        orch._call = lambda run_id, role, messages, **kw: Completion(
+            text=call(run_id, role, messages, **kw), usage=Usage(), finish_reason="stop"
+        )
+        orch._work_ticket(
+            run_id,
+            Ticket(
+                "TT-001",
+                allowed_files=["src/game.rs"],
+                criteria=["go() exists"],
+                attempt_base=attempt_base,
+            ),
+        )
+        return seen
+
+    def test_a_second_cycle_reviewer_sees_the_first_cycles_rejections(self):
+        seen = self._seeded(attempt_base=3)
+        self.assertIn("the error path is swallowed", seen["reviewer"])
+        self.assertIn("do not replace it with a fresh objection", seen["reviewer"])
+
+    def test_a_second_cycle_executor_sees_the_first_cycles_failures(self):
+        seen = self._seeded(attempt_base=3)
+        self.assertIn("E0433", seen["executor"])
+
+    def test_a_first_cycle_starts_with_nothing_to_remember(self):
+        # The step log is per ticket, not per cycle. Seeding unconditionally
+        # would show a ticket its own current cycle back to itself.
+        seen = self._seeded(attempt_base=0)
+        self.assertNotIn("already rejected", seen["reviewer"])
+        self.assertNotIn("Earlier attempts on this ticket", seen["executor"])
+
+
 class TestFailureHistoryReachesBothRoles(unittest.TestCase):
     """`failure_context` carries only the newest failure, which is what lets an
     executor oscillate — fix A breaks B, fix B brings A back — for its whole

@@ -17,7 +17,7 @@ verified against surviving data that is said plainly.
 `fix/protect-plan-authored-context`, unverified against a run — they were
 written from run 5's evidence and are covered by tests, not by a replay.
 
-Still open: 3.1, 3.3, 3.6, and the conditional 2.4 and 4.1. A clean
+Still open: 3.1, 3.6, and the conditional 2.4 and 4.1. A clean
 run from an empty repository — no drifted specs carried over — is the validation
 that has not been done yet.
 
@@ -901,7 +901,20 @@ is gone, and what replaced it is false.
 
 ---
 
-### 3.3 Carry rejection history across cycles
+### 3.3 Carry rejection history across cycles — **done**
+
+`_work_ticket` seeds both lists from the step log when `attempt_base > 0`:
+failures through `ticket_failures`, verdicts through a new
+`Store.ticket_rejections`, which reads failed `review` steps whole rather than
+distilled — a verdict is prose the reviewer wrote for its own successor, and
+`distill` is built for compiler output. Seeded verdicts go through
+`strip_prompt_echo` on the way in, for the same reason the live list does. The
+2.3 caps apply to both, so a fourth cycle seeds three verdicts rather than
+twelve.
+
+Seeding is conditional on `attempt_base` because the step log is per ticket,
+not per cycle: unconditional, the first cycle would show a ticket its own
+current attempts back to itself.
 
 **Problem.** `history` and `rejections` are locals in `_run_ticket`
 (`forge/loop.py:1129-1130`). A retry cycle calls `_run_ticket` fresh, so both
@@ -1158,10 +1171,10 @@ land too — one branch to push when the backlog is green.
 | — | 1.9 | Done — heading-decorated path line read |
 | — | 3.2, 3.5 | Done — context anchored, marked decisions protected |
 | — | 2.3 | Done — history is its own droppable message, capped at three |
-| 1 | 3.3 | Information architecture; wants 2.3's caps first |
-| 2 | 3.6 | Reporting only — says what a green ticket did not prove |
-| 3 | 3.1 | Deliberately loosens a guard; wants a stable baseline |
-| 4 | 2.4, 4.1 | Conditional and experimental |
+| — | 3.3 | Done — both lists seeded from the step log on a retry cycle |
+| 1 | 3.6 | Reporting only — says what a green ticket did not prove |
+| 2 | 3.1 | Deliberately loosens a guard; wants a stable baseline |
+| 3 | 2.4, 4.1 | Conditional and experimental |
 
 1.6 is a decision, not a code change, and should be settled before the next
 baseline run.
