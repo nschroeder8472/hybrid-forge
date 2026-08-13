@@ -223,6 +223,26 @@ class BudgetGate:
         if needed <= budget:
             return messages
 
+        # A budget at or below zero is not a tight fit, it is an arithmetic
+        # impossibility: the output reserve alone exceeds the window. No ticket
+        # of any size fits, so blaming the one in hand sends the reader off to
+        # split tickets that were never the problem. One run reported six
+        # tickets of 1-3k tokens as "too large for this model" while the real
+        # cause was a context window that had collapsed to a default because
+        # the model was missing from the server entirely.
+        if budget <= 0:
+            raise ContextOverflow(
+                f"{provider.name} has no room for a prompt of any size: a "
+                f"{format_tokens(caps.context_window)} context window with "
+                f"{format_tokens(max_output)} reserved for output leaves "
+                f"{budget:,} tokens. This is a configuration or discovery "
+                f"failure, not a ticket that is too large — lower "
+                f"maxOutputTokens, raise contextWindow, or run `forge doctor` "
+                f"to see whether the model is answering at all.",
+                needed=needed,
+                available=budget,
+            )
+
         if droppable is None:
             raise ContextOverflow(
                 f"prompt needs {format_tokens(needed)} tokens but {provider.name} allows "

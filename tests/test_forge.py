@@ -22,7 +22,7 @@ from pathlib import Path
 
 from forge import cli, modelfiles, respec
 from forge.artifacts import Artifacts
-from forge.budget import BudgetGate, RateLimitPolicy
+from forge.budget import BudgetGate, ContextOverflow, RateLimitPolicy
 from forge.config import Config, ConfigError, LoopSettings, UISettings
 from forge.ingest import (
     derive_needs,
@@ -594,7 +594,11 @@ class TestAutomaticRetryCycles(unittest.TestCase):
             commands={"lint": "", "typecheck": "", "test": ""},
             # Off unless a test asks for it: respec is a model call, and most of
             # these tests are about the cycle counting around it.
-            loop=LoopSettings(**{"respec_on_retry": False, **loop_settings}),
+            # Pre-flight is startup behaviour and these endpoints are stubs; the
+            # cycle counting under test begins after it.
+            loop=LoopSettings(
+                **{"respec_on_retry": False, "preflight": False, **loop_settings}
+            ),
         )
         # The real location, so a test can hand the same run to the CLI.
         store = Store(config.db_path)
@@ -1081,13 +1085,19 @@ class TestCriteriaAreScopedByProvenance(unittest.TestCase):
         logged = [r["message"] for r in store.events_after(0) if "put back" in r["message"]]
         self.assertTrue(logged, "the restoration must reach the run log")
 
-    def test_a_new_criterion_is_accepted(self):
-        # The genuine gap: a plan that specifies scoring in the spec and states
-        # no criterion for it. Adding one cannot lower the bar.
+    def test_a_new_criterion_is_refused_while_the_criteria_are_locked(self):
+        # This used to be allowed, on the reasoning that a plan can specify
+        # something in prose and state no criterion for it, and that adding one
+        # cannot lower the bar. Lowering was never the failure. Respec runs on
+        # a ticket that has just exhausted its attempts, so the bar only ever
+        # rose: one ticket went from nine criteria to sixteen across six
+        # cycles, and what blocked it at the end was invented in cycle four.
+        # An under-specified plan is now reported instead — see the refusal
+        # message — and `respecCriteria: true` restores the old behaviour.
         store, run_id = self._store()
         ticket = store.list_tickets(run_id)[0]
 
-        respec.revise(
+        result = respec.revise(
             store,
             run_id,
             ticket,
@@ -1097,10 +1107,8 @@ class TestCriteriaAreScopedByProvenance(unittest.TestCase):
             budget=1024,
         )
 
-        self.assertEqual(
-            store.list_tickets(run_id)[0].criteria,
-            ["the plan's bar", "clearing one line scores 100"],
-        )
+        self.assertEqual(store.list_tickets(run_id)[0].criteria, ["the plan's bar"])
+        self.assertEqual(result.minted_criteria, ["clearing one line scores 100"])
 
     def test_a_criterion_an_earlier_revision_added_can_be_retired(self):
         # The trap the blanket freeze created: `[6, 3, 5, 7, 4]` was invented by
@@ -1140,9 +1148,13 @@ class TestCriteriaAreScopedByProvenance(unittest.TestCase):
 
         self.assertEqual(
             store.list_tickets(run_id)[0].criteria,
-            ["a criterion the human wrote by hand", "and one addition"],
+            ["a criterion the human wrote by hand"],
         )
+        # The point of this test: the plan's own removed criterion stays
+        # removed. The addition is refused separately, and that is the
+        # ratchet rule rather than this one.
         self.assertEqual(result.refused_criteria, [])
+        self.assertEqual(result.minted_criteria, ["and one addition"])
 
     def test_a_run_with_no_anchor_treats_every_criterion_as_the_plans(self):
         # Ingested before originals were recorded: provenance is unknown, so
@@ -2791,6 +2803,118 @@ class TestRespecMayWidenScopeButNotTheGraph(unittest.TestCase):
         self.assertTrue(result.revised)
 
 
+class TestRespecMayNotRaiseTheBar(unittest.TestCase):
+    """Respec runs on a ticket that has just exhausted its attempts, and its
+    job is to produce one the next attempt can satisfy. Adding criteria there
+    cannot serve that, and left open the bar only ever rose: one ticket went
+    from the plan's nine to sixteen across six cycles, and the criterion
+    blocking it at the end had been invented two cycles earlier."""
+
+    def _store(self, criteria=("a", "b"), added=()):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(run_id, [
+            Ticket("T-1", spec="old", criteria=list(criteria), status="failed",
+                   original_criteria=list(criteria)),
+        ])
+        if added:
+            ticket = store.list_tickets(run_id)[0]
+            ticket.criteria = list(criteria) + list(added)
+            store.update_ticket(run_id, ticket)
+        step = store.start_step(run_id, "T-1", "review")
+        store.end_step(step, "failed", "REJECT: nope")
+        return store, run_id
+
+    def _revise(self, store, run_id, criteria, locked=True):
+        def call(_messages, _budget):
+            return Completion(
+                text=json.dumps({"spec": "revised", "criteria": criteria}), usage=Usage()
+            )
+
+        return respec.revise(
+            store, run_id, store.list_tickets(run_id)[0],
+            call=call, budget=1024, criteria_locked=locked,
+        )
+
+    def _criteria(self, store, run_id):
+        return store.list_tickets(run_id)[0].criteria
+
+    def test_an_invented_criterion_does_not_land(self):
+        store, run_id = self._store()
+        result = self._revise(store, run_id, ["a", "b", "and something new"])
+
+        self.assertEqual(self._criteria(store, run_id), ["a", "b"])
+        self.assertEqual(result.minted_criteria, ["and something new"])
+
+    def test_the_plans_criteria_are_still_restored_when_dropped(self):
+        store, run_id = self._store()
+        result = self._revise(store, run_id, ["a"])
+
+        self.assertEqual(self._criteria(store, run_id), ["a", "b"])
+        self.assertEqual(result.refused_criteria, ["b"])
+
+    def test_a_criterion_an_earlier_revision_added_can_still_be_retired(self):
+        """The loop may take its own back — that is how a ticket already
+        inflated returns to the plan's bar."""
+        store, run_id = self._store(added=["invented earlier"])
+        self._revise(store, run_id, ["a", "b"])
+
+        self.assertEqual(self._criteria(store, run_id), ["a", "b"])
+
+    def test_an_inflated_ticket_unwinds_on_the_next_revision(self):
+        """Nine to sixteen, back to nine — no migration, no new command."""
+        plan = [f"criterion {i}" for i in range(9)]
+        store, run_id = self._store(
+            criteria=plan, added=[f"minted {i}" for i in range(7)]
+        )
+        self.assertEqual(len(self._criteria(store, run_id)), 16)
+
+        self._revise(store, run_id, plan)
+
+        self.assertEqual(self._criteria(store, run_id), plan)
+
+    def test_a_reword_of_a_plan_criterion_is_not_treated_as_new(self):
+        """`0..7` against `0..=6` is how the duplication got past the earlier
+        normalised matcher; as a proposal it must not count as a mint."""
+        store, run_id = self._store(criteria=["`f()` returns 0"])
+        result = self._revise(store, run_id, ["f() returns 0"])
+
+        self.assertEqual(self._criteria(store, run_id), ["`f()` returns 0"])
+        self.assertEqual(result.minted_criteria, [])
+
+    def test_the_refusal_is_reported_with_what_it_refused(self):
+        store, run_id = self._store()
+        self._revise(store, run_id, ["a", "b", "a bar nobody asked for"])
+
+        messages = " ".join(e["message"] for e in store.events_after(0))
+        self.assertIn("the plan does not state", messages)
+        self.assertIn("a bar nobody asked for", messages)
+
+    def test_unlocking_the_criteria_restores_the_old_behaviour(self):
+        """`respecCriteria: true` is the escape hatch for anyone who wants it."""
+        store, run_id = self._store()
+        self._revise(store, run_id, ["a", "b", "and something new"], locked=False)
+
+        self.assertIn("and something new", self._criteria(store, run_id))
+
+    def test_a_revision_that_only_mints_changes_nothing(self):
+        """It must not count as a revision, or the retry cycle would keep
+        going on the strength of a change that was refused."""
+        store, run_id = self._store()
+
+        def call(_messages, _budget):
+            return Completion(
+                text=json.dumps({"spec": "old", "criteria": ["a", "b", "new"]}),
+                usage=Usage(),
+            )
+
+        result = respec.revise(
+            store, run_id, store.list_tickets(run_id)[0], call=call, budget=1024
+        )
+
+        self.assertFalse(result.revised)
+
+
 class TestRespecCannotPinASharedFile(unittest.TestCase):
     """Ingest refuses a whole-file claim outright, because there a human can
     restate it for free. Mid-run there is nobody to ask, so the offending
@@ -2821,7 +2945,13 @@ class TestRespecCannotPinASharedFile(unittest.TestCase):
             )
 
         ticket = store.list_tickets(run_id)[0]
-        return respec.revise(store, run_id, ticket, call=call, budget=1024)
+        # Unlocked, because that is the only setting where this check still
+        # decides anything. With the criteria locked, a proposed criterion the
+        # ticket does not already have is refused as a mint before it reaches
+        # the shared-file rule — a stricter gate that happens to subsume it.
+        return respec.revise(
+            store, run_id, ticket, call=call, budget=1024, criteria_locked=False
+        )
 
     def test_a_minted_whole_file_claim_is_dropped(self):
         store, run_id = self._store()
@@ -2967,7 +3097,7 @@ class TestCriteriaAreMatchedByWhatTheyAssert(unittest.TestCase):
 
     def test_a_reworded_criterion_replaces_its_original(self):
         ticket = self._ticket()
-        merged, refused = _merge_criteria(
+        merged, refused, _minted = _merge_criteria(
             ticket,
             ["Game::new(0) does not panic", "tick(0) leaves y unchanged"],
         )
@@ -2977,31 +3107,33 @@ class TestCriteriaAreMatchedByWhatTheyAssert(unittest.TestCase):
 
     def test_the_plans_wording_is_the_one_that_survives(self):
         ticket = self._ticket()
-        merged, _ = _merge_criteria(ticket, ["Game::new(0) does not panic"])
+        merged, _refused, _minted = _merge_criteria(ticket, ["Game::new(0) does not panic"])
 
         self.assertIn("`Game::new(0)` does not panic", merged)
 
     def test_a_genuinely_dropped_criterion_is_still_restored_and_reported(self):
         ticket = self._ticket()
-        merged, refused = _merge_criteria(ticket, ["`Game::new(0)` does not panic"])
+        merged, refused, _minted = _merge_criteria(ticket, ["`Game::new(0)` does not panic"])
 
         self.assertEqual(len(merged), 2)
         self.assertEqual(refused, ["`tick(0)` leaves `y` unchanged"])
 
-    def test_a_genuinely_new_criterion_is_still_added(self):
+    def test_a_genuinely_new_criterion_is_refused(self):
+        """Adding is the ratchet. See TestRespecMayNotRaiseTheBar."""
         ticket = self._ticket()
-        merged, _ = _merge_criteria(
+        merged, _refused, minted = _merge_criteria(
             ticket, [*ticket.criteria, "`level` starts at 1"]
         )
 
-        self.assertEqual(len(merged), 3)
-        self.assertIn("`level` starts at 1", merged)
+        self.assertEqual(len(merged), 2)
+        self.assertNotIn("`level` starts at 1", merged)
+        self.assertEqual(minted, ["`level` starts at 1"])
 
     def test_thirteen_criteria_reworded_stay_thirteen(self):
         """The observed regression: a plan stating 13 reached 27 in one pass."""
         plan = [f"`f{i}()` returns {i}" for i in range(13)]
         ticket = Ticket("TT-003", criteria=list(plan), original_criteria=list(plan))
-        merged, refused = _merge_criteria(
+        merged, refused, _minted = _merge_criteria(
             ticket, [c.replace("`", "") for c in plan]
         )
 
@@ -3858,6 +3990,154 @@ class TestHealthProbeNeedsRoomToThink(unittest.TestCase):
 
     def test_a_real_reply_still_passes(self):
         self.assertTrue(self._Stub("OK").health().startswith("ok"))
+
+
+class TestAnImpossibleBudgetBlamesTheConfig(unittest.TestCase):
+    """`input_budget = window - output - margin` can come out at or below zero,
+    and then no prompt of any size fits. Reporting that as a ticket too large
+    to run sends the reader off to split tickets that were never the problem —
+    one run said exactly that about six tickets of 1-3k tokens while the real
+    cause was a model missing from the server."""
+
+    class _Model(Provider):
+        kind = "stub"
+
+        def __init__(self, window: int, output: int):
+            super().__init__("local", {})
+            self._window, self._output = window, output
+
+        def complete(self, messages, *, max_tokens, temperature=0.2, timeout=600):
+            raise NotImplementedError
+
+        def capabilities(self):
+            return Capabilities(context_window=self._window, max_output_tokens=self._output)
+
+        def count_tokens(self, messages):
+            return sum(len(m.content) for m in messages)
+
+    def _fit(self, window, output, text="x" * 400, droppable=None):
+        gate = BudgetGate(Store(Path(tempfile.mkdtemp()) / "t.db"), {})
+        return gate.fit(
+            self._Model(window, output),
+            [Message(role="user", content=text)],
+            max_output=output,
+            droppable=droppable,
+        )
+
+    def test_a_negative_budget_names_the_configuration(self):
+        with self.assertRaises(ContextOverflow) as caught:
+            self._fit(window=8192, output=65536)
+        message = str(caught.exception)
+
+        self.assertIn("no room for a prompt of any size", message)
+        self.assertIn("configuration or discovery failure", message)
+        # Says so outright rather than leaving the reader to infer it — the
+        # advice this replaces was "split it", which cannot help.
+        self.assertIn("not a ticket that is too large", message)
+        self.assertNotIn("Split the ticket", message)
+
+    def test_it_reports_both_numbers_that_produced_it(self):
+        with self.assertRaises(ContextOverflow) as caught:
+            self._fit(window=8192, output=65536)
+        message = str(caught.exception)
+
+        self.assertIn("8.2k", message)
+        self.assertIn("65.5k", message)
+
+    def test_it_fires_before_any_optional_context_is_dropped(self):
+        """Dropping memory to fit an impossible budget is wasted work, and the
+        message it would produce afterwards is the wrong one."""
+        seen = []
+
+        with self.assertRaises(ContextOverflow) as caught:
+            self._fit(window=8192, output=65536,
+                      droppable=lambda m: seen.append(m) or True)
+
+        self.assertEqual(seen, [])
+        self.assertIn("no room for a prompt of any size", str(caught.exception))
+
+    def test_a_genuinely_oversized_ticket_still_says_so(self):
+        """The ordinary case has to keep its own advice."""
+        with self.assertRaises(ContextOverflow) as caught:
+            self._fit(window=4096, output=1024, text="x" * 90_000)
+
+        self.assertIn("Split the ticket", str(caught.exception))
+
+    def test_a_prompt_that_fits_is_untouched(self):
+        kept = self._fit(window=131072, output=8192, text="x" * 400)
+        self.assertEqual(len(kept), 1)
+
+
+class TestTheLoopProbesBeforeItSpends(unittest.TestCase):
+    """`forge doctor` catches a dead endpoint in two seconds. `forge go` did
+    not ask, so a missing model produced a full backlog of blocked tickets, a
+    respec over each, and a stop — every message describing the symptom rather
+    than the cause."""
+
+    def _orchestrator(self, preflight=True, model="stub"):
+        root = Path(tempfile.mkdtemp())
+        config = Config(
+            root=root,
+            models={"m": {"kind": "openai", "baseUrl": "http://127.0.0.1:1/v1",
+                          "model": model, "contextWindow": 8192,
+                          "maxOutputTokens": 1024}},
+            roles={r: "m" for r in ("planner", "executor", "tester", "reviewer")},
+            commands={"lint": "", "typecheck": "", "test": ""},
+        )
+        config.loop.preflight = preflight
+        store = Store(config.db_path)
+        run_id = store.create_run("goal")
+        store.add_tickets(run_id, [Ticket("T-1")])
+        return Orchestrator(config, store), store, run_id
+
+    def test_an_unreachable_model_stops_the_run_before_any_ticket(self):
+        orch, store, run_id = self._orchestrator()
+        worked = []
+        orch._work_ticket = lambda *a, **k: worked.append(a)
+
+        outcome = orch.run(run_id)
+
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(worked, [])
+        self.assertEqual(store.list_tickets(run_id)[0].status, TICKET_PENDING)
+
+    def test_it_says_which_role_and_that_nothing_was_spent(self):
+        orch, store, run_id = self._orchestrator()
+        orch._work_ticket = lambda *a, **k: None
+
+        orch.run(run_id)
+
+        messages = " ".join(e["message"] for e in store.events_after(0))
+        self.assertIn("Cannot start", messages)
+        self.assertIn("Nothing has been spent", messages)
+        self.assertIn("forge doctor", messages)
+
+    def test_each_model_is_probed_once_not_each_role(self):
+        """Four roles on one model is the common config; it should cost one
+        call, not four."""
+        orch, _store, run_id = self._orchestrator()
+        calls = []
+
+        def health(self):
+            calls.append(self.name)
+            return "ok"
+
+        orch._work_ticket = lambda *a, **k: None
+        with unittest.mock.patch.object(OpenAICompatProvider, "health", health):
+            orch._preflight(run_id)
+
+        self.assertEqual(calls, ["m"])
+
+    def test_a_reachable_model_lets_the_run_proceed(self):
+        orch, _store, run_id = self._orchestrator()
+        with unittest.mock.patch.object(
+            OpenAICompatProvider, "health", lambda self: "ok name=m"
+        ):
+            self.assertEqual(orch._preflight(run_id), [])
+
+    def test_the_probe_can_be_turned_off(self):
+        orch, _store, run_id = self._orchestrator(preflight=False)
+        self.assertEqual(orch._preflight(run_id), [])
 
 
 class TestGeneratedModelfiles(unittest.TestCase):

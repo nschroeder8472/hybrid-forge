@@ -90,6 +90,13 @@ class LoopSettings:
     # backlog after one respec, and on local models that is minutes per
     # ticket. Turn it off to be warned instead.
     reopen_stale_dependents: bool = True
+    # Probe every configured model before the first ticket. `forge doctor`
+    # has always caught a dead endpoint in two seconds; without this the
+    # loop found out one ticket at a time and reported the symptom rather
+    # than the cause. Off is for a run started immediately after a doctor
+    # that already passed, or a model slow enough that loading it twice is
+    # worth avoiding.
+    preflight: bool = True
     # Seconds between control-channel checks while waiting.
     poll_seconds: float = 2.0
     # Cap on unattended wall-clock time. 0 disables.
@@ -174,6 +181,7 @@ class Config:
             reopen_stale_dependents=bool(
                 loop.get("reopenStaleDependents", True)
             ),
+            preflight=bool(loop.get("preflight", True)),
             poll_seconds=float(loop.get("pollSeconds", 2.0)),
             max_runtime_seconds=int(loop.get("maxRuntimeSeconds", 0)),
             baseline_verify=bool(loop.get("baselineVerify", True)),
@@ -287,6 +295,7 @@ class Config:
                 "respecOnRetry": self.loop.respec_on_retry,
                 "respecCriteria": self.loop.respec_criteria,
                 "reopenStaleDependents": self.loop.reopen_stale_dependents,
+                "preflight": self.loop.preflight,
                 "pollSeconds": self.loop.poll_seconds,
                 "maxRuntimeSeconds": self.loop.max_runtime_seconds,
                 "baselineVerify": self.loop.baseline_verify,
