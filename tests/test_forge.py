@@ -6071,6 +6071,90 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         self.assertEqual(not_excused, {})
 
 
+class TestEveryLanguageIsVerified(unittest.TestCase):
+    """Verification was one command per step, so a project's second language
+    was never run at all — and unrun reads as fine everywhere downstream."""
+
+    def _orch(self, commands, files=("src/a.rs", "web/main.js")):
+        orch, root, run_id = _stub_orchestrator(commands)
+        for name in files:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x\n", encoding="utf-8")
+        return orch, root, run_id
+
+    def test_both_languages_run(self):
+        orch, _root, _run_id = self._orch(
+            {"lint": "", "typecheck": "", "test": {".rs": "cargo test", ".js": "node --test"}}
+        )
+
+        self.assertEqual(
+            orch._verify_plan(), [("test[.js]", "node --test"), ("test[.rs]", "cargo test")]
+        )
+
+    def test_a_language_the_project_does_not_have_is_not_run(self):
+        # A JavaScript runner in a repo with no JavaScript has nothing to say,
+        # and running it fails on an empty match.
+        orch, _root, _run_id = self._orch(
+            {"lint": "", "typecheck": "", "test": {".rs": "cargo test", ".js": "node --test"}},
+            files=("src/a.rs",),
+        )
+
+        self.assertEqual(orch._verify_plan(), [("test", "cargo test")])
+
+    def test_a_ticket_that_writes_the_first_file_of_a_language_activates_it(self):
+        # Read per attempt rather than cached: the verify step after the one
+        # that created `web/main.js` is the first place the JS runner matters.
+        orch, root, _run_id = self._orch(
+            {"lint": "", "typecheck": "", "test": {".rs": "cargo test", ".js": "node --test"}},
+            files=("src/a.rs",),
+        )
+        (root / "web").mkdir()
+        (root / "web" / "main.js").write_text("x\n", encoding="utf-8")
+
+        self.assertIn(("test[.js]", "node --test"), orch._verify_plan())
+
+    def test_one_command_keeps_its_plain_name(self):
+        # A one-language project's step log and dashboard read exactly as
+        # before; only a project that genuinely has two gets the suffix.
+        orch, _root, _run_id = self._orch({"lint": "", "typecheck": "", "test": "cargo test"})
+
+        self.assertEqual(orch._verify_plan(), [("test", "cargo test")])
+
+    def test_the_same_command_under_two_keys_runs_once(self):
+        orch, _root, _run_id = self._orch(
+            {"lint": "", "typecheck": "", "test": {".rs": "make check", ".js": "make check"}}
+        )
+
+        self.assertEqual(orch._verify_plan(), [("test", "make check")])
+
+    def test_each_language_is_attributed_to_its_own_step(self):
+        # The amnesty compares a step's failures against that same step's
+        # baseline. Two languages sharing one step name would forgive each
+        # other's breakage.
+        orch, _root, run_id = self._orch(
+            {"lint": "", "typecheck": "", "test": {".rs": "cargo test", ".js": "node --test"}}
+        )
+        ran: list[str] = []
+
+        def shell(_run_id, name, command):
+            ran.append(name)
+            failing = name.endswith("[.js]")
+            return StepResult(
+                ok=not failing,
+                detail="error: boom\n  --> web/main.js:1:1\n" if failing else "",
+            )
+
+        orch._shell = shell
+        ticket = Ticket("T-1", allowed_files=["src/a.rs"])
+
+        baseline = orch._baseline_failures(run_id, ticket)
+
+        self.assertEqual(ran, ["baseline-test[.js]", "baseline-test[.rs]"])
+        self.assertIn("test[.js]", baseline)
+        self.assertNotIn("test[.rs]", baseline)
+
+
 class TestARetryCycleRemembersWhatFailed(unittest.TestCase):
     """`history` and `rejections` are locals in the attempt loop, and a retry
     cycle enters it fresh. So cycle 2's reviewer met a ticket it had already

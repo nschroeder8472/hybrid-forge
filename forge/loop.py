@@ -41,7 +41,7 @@ from . import respec
 from . import evidence
 from .artifacts import Artifacts
 from .budget import BudgetGate, Wait
-from .config import Config, ConfigError
+from .config import ANY_LANGUAGE, Config, ConfigError
 from .failures import distill, errors_naming, signatures
 from .ingest import write_tickets
 from .memory import MemoryClient, MemoryRefused, MemoryUnavailable, ticket_query
@@ -521,6 +521,54 @@ class Orchestrator:
     # The verify steps, in the order a failure is cheapest to diagnose.
     _VERIFY_STEPS = ("lint", "typecheck", "test")
 
+    def _verify_plan(self) -> list[tuple[str, str]]:
+        """Every verify command to run, as `(step name, command)`.
+
+        One command per step assumed a repository is one language. With a map
+        there is one per language, and all of them run: verification stays
+        whole-project, which is what the baseline amnesty, the orphan sweep and
+        "you broke this, not the ticket before you" all rest on. A language
+        with no files in the tree is skipped — a JavaScript runner in a repo
+        that has no JavaScript yet has nothing to say, and running it would
+        fail on an empty match.
+
+        Identical commands under two keys run once. A step with a single
+        command keeps its plain name, so a one-language project's step log and
+        dashboard read exactly as before; only a project that genuinely has two
+        gets `test[.js]`.
+        """
+        present = self._languages_present()
+        plan: list[tuple[str, str]] = []
+        for kind in self._VERIFY_STEPS:
+            commands = self.config.commands_for(kind)
+            wanted = {
+                suffix: command
+                for suffix, command in commands.items()
+                if suffix == ANY_LANGUAGE or suffix in present
+            }
+            seen: dict[str, str] = {}
+            for suffix, command in sorted(wanted.items()):
+                if command in seen.values():
+                    continue
+                seen[suffix] = command
+            for suffix, command in seen.items():
+                label = kind if len(seen) == 1 else f"{kind}[{suffix}]"
+                plan.append((label, command))
+        return plan
+
+    def _languages_present(self) -> set[str]:
+        """Extensions of the source files this project actually has.
+
+        Read per call rather than cached: a ticket that writes the project's
+        first `.js` file has just made the JavaScript runner relevant, and the
+        verify step that follows it is the first place that matters.
+        """
+        return {
+            suffix
+            for path in evidence.repo_files(self.config.root, limit=4000)
+            if (suffix := Path(path).suffix.lower())
+        }
+
     @staticmethod
     def _fence_guidance(truncated: list[str], written: Sequence[str] = ()) -> str:
         """What to tell an executor whose fence was shorter than its content."""
@@ -627,10 +675,7 @@ class Orchestrator:
         them.
         """
         known: dict[str, set[str]] = {}
-        for name in self._VERIFY_STEPS:
-            command = self.config.commands.get(name, "")
-            if not command.strip():
-                continue
+        for name, command in self._verify_plan():
             result = self._shell(run_id, f"baseline-{name}", command)
             if result.ok:
                 continue
@@ -804,7 +849,7 @@ class Orchestrator:
         after its second ticket and said nothing that read as wrong.
         """
         self._report_unexecuted(run_id)
-        if not self.config.commands.get("test") or self._tests_authored:
+        if not self.config.commands_for("test") or self._tests_authored:
             return
         if not self._tests_skipped:
             return
@@ -1001,8 +1046,7 @@ class Orchestrator:
         # that nobody owns a breakage nobody introduced, so the run has to
         # check for one itself rather than report a green backlog over a red
         # build.
-        for name in self._VERIFY_STEPS:
-            command = self.config.commands.get(name, "")
+        for name, command in self._verify_plan():
             result = self._shell(run_id, f"final-{name}", command)
             if result.ok:
                 continue
@@ -1940,7 +1984,7 @@ class Orchestrator:
                         # own file renames it on every retry and leaves the
                         # previous one running forever.
                         test_path=test_path,
-                        test_command=self.config.commands.get("test", ""),
+                        test_command=self.config.command_for("test", test_path),
                         example_test=example,
                         # The executor already gets this. Without it here, a
                         # tester that wrote one wrong assertion rewrites the
@@ -2060,8 +2104,7 @@ class Orchestrator:
 
         # --- VERIFY --------------------------------------------------
         inherited = pre_existing or {}
-        for name in self._VERIFY_STEPS:
-            command = self.config.commands.get(name, "")
+        for name, command in self._verify_plan():
             result = self._shell(run_id, name, command)
             already = inherited.get(name, set())
             introduced = signatures(result.detail) - already if already else set()
@@ -2424,13 +2467,13 @@ class Orchestrator:
     def _runner_suffixes(self) -> tuple[str, ...]:
         """Extensions the configured test command can collect, if it names a
         runner this knows. Empty when there is no command or no match."""
-        command = (self.config.commands.get("test") or "").lower()
-        if not command:
-            return ()
-        for needle, suffixes in self._RUNNER_SUFFIXES:
-            if needle in command:
-                return suffixes
-        return ()
+        found: list[str] = []
+        for command in self.config.commands_for("test").values():
+            lowered = command.lower()
+            for needle, suffixes in self._RUNNER_SUFFIXES:
+                if needle in lowered:
+                    found.extend(suffixes)
+        return tuple(dict.fromkeys(found))
 
     def _repo_test_suffixes(self, exclude: list[str]) -> Counter[str]:
         """How many test files of each extension the repo already has."""
@@ -2628,7 +2671,7 @@ class Orchestrator:
         )
         if not others:
             return ""
-        command = self.config.commands.get("test", "the test command")
+        command = self.config.command_for("test", test_path) or "the test command"
         return (
             f"\n\nBefore sharpening it, consider where the fault is: the suite "
             f"is written in {suite} and `{command}` runs nothing else, while "
@@ -2781,7 +2824,7 @@ class Orchestrator:
         would mean exactly as much as the green that shipped the two defects
         this whole path exists to catch.
         """
-        command = self.config.commands.get("test", "")
+        command = self.config.command_for("test", test_path)
         sources = self._sources_for(ticket)[0]
         example = self._example_test([test_path], Path(test_path).suffix.lower())
         own_file_errors: list[str] = []
