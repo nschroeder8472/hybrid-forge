@@ -70,6 +70,12 @@ extensions through one table, so `"python"`, `"py"` and `".py"` are the same
 key. A string is read as `{"*": "..."}`, so every config that exists today
 keeps working unchanged and means exactly what it meant.
 
+A language may also be declared as needing no runner at all, with `false` or
+`"skip"`. A shell wrapper and a PowerShell build script have no behavior a unit
+test could assert, and the gate exists to catch a language nobody thought about
+— not to stall a backlog over `build.sh`. The distinction it draws is between a
+decision on the record and an oversight, and only the second is worth blocking.
+
 `typecheck` legitimately has no entry for some languages. That is a covered
 language with no type checker, not a gap — the gate below is about `test`.
 

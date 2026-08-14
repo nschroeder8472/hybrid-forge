@@ -290,11 +290,16 @@ def _report_coverage(config: Config) -> list[str]:
     for suffix, count in sorted(census.items(), key=lambda item: (-item[1], item[0])):
         test, how = config.covering("test", suffix)
         lint, _ = config.covering("lint", suffix)
-        if not test:
+        if not test and not config.exempt("test", suffix):
             uncovered.append(suffix)
         # A catch-all that cannot run the language is worse than none: it reads
         # as coverage in every report and proves nothing about the files.
-        shown = test or ("(no test command" + (f" — the one configured {how})" if how else ")"))
+        if config.exempt("test", suffix):
+            shown = "(none — declared)"
+        else:
+            shown = test or (
+                "(no test command" + (f" — the one configured {how})" if how else ")")
+            )
         print(
             f"  {suffix:<{max(width, 8)}}  {count:>5}  {shown}"
             + ("  (catch-all)" if how == "catch-all" else "")
@@ -1012,6 +1017,12 @@ def cmd_toolchain(args: argparse.Namespace) -> int:
     suffixes = normalize_language(args.language)
     kind = args.kind
 
+    if args.skip:
+        # On the record, and readable as one: `false` cannot be mistaken for a
+        # command, and the gate stops asking about a language somebody has
+        # already decided about.
+        return _write_command(config, kind, language, False, suffixes=suffixes)
+
     if args.set:
         return _write_command(config, kind, language, args.set, suffixes=suffixes)
 
@@ -1054,7 +1065,7 @@ def cmd_toolchain(args: argparse.Namespace) -> int:
 
 
 def _write_command(
-    config: Config, kind: str, language: str, command: str, suffixes=()
+    config: Config, kind: str, language: str, command: str | bool, suffixes=()
 ) -> int:
     """Put one language's command into config, turning a string into a map.
 
@@ -1076,6 +1087,11 @@ def _write_command(
 
     written = config.write()
     print(f"\nWrote {written}")
+    if command is False:
+        print(f"  commands.{kind}[{language}] = false  (nothing runs it, on purpose)")
+        print("\nTickets writing it are no longer blocked. Their work is checked")
+        print("at review rather than by running anything, and the run says so.")
+        return 0
     print(f'  commands.{kind}[{language}] = "{command}"')
     print("\nCheck it runs, then requeue whatever was blocked:")
     print("  forge doctor")
@@ -1349,6 +1365,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--accept", action="store_true", help="write the detected command to config"
+    )
+    p.add_argument(
+        "--skip",
+        action="store_true",
+        help="declare that nothing runs this language, so tickets writing it "
+        "stop being blocked (build scripts, shell wrappers)",
     )
     p.set_defaults(func=cmd_toolchain)
 

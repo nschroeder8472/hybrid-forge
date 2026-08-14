@@ -1276,6 +1276,33 @@ class TestCommandsAreKeyedByLanguage(unittest.TestCase):
         self.assertEqual(config.commands_for("test"), {})
         self.assertFalse(config.covers("lint", ".rs"))
 
+    def test_a_language_can_be_declared_as_needing_no_runner(self):
+        # A shell wrapper and a PowerShell build script have no behavior a unit
+        # test could assert. The gate is for a language nobody thought about,
+        # not for stalling a backlog over build.sh.
+        config = self._config({"test": {".rs": "cargo test", ".sh": False}})
+
+        self.assertTrue(config.exempt("test", ".sh"))
+        self.assertFalse(config.covers("test", ".sh"))
+        self.assertEqual(config.covering("test", ".sh")[1], "declared as needing none")
+
+    def test_the_spellings_people_type_are_accepted(self):
+        for value in (False, "skip", "none", "no"):
+            with self.subTest(value=value):
+                self.assertTrue(self._config({"test": {".sh": value}}).exempt("test", ".sh"))
+
+    def test_an_exemption_is_not_a_command(self):
+        config = self._config({"test": {".rs": "cargo test", ".sh": False}})
+
+        self.assertEqual(config.commands_for("test"), {".rs": "cargo test"})
+        self.assertEqual(config.command_for("test", "build.sh"), "")
+
+    def test_exempting_by_language_name_covers_its_extensions(self):
+        config = self._config({"test": {".rs": "cargo test", "shell": False}})
+
+        self.assertTrue(config.exempt("test", ".sh"))
+        self.assertTrue(config.exempt("test", ".bash"))
+
     def test_the_map_survives_a_write(self):
         config = self._config({"test": {".rs": "cargo test", ".js": "node --test"}})
         config.write()
@@ -3838,6 +3865,17 @@ class TestSettingUpARunnerForALanguage(unittest.TestCase):
 
         self.assertTrue(Config.load(root).covers("test", ".js"))
 
+    def test_a_language_can_be_declared_as_needing_nothing(self):
+        root = self._project()
+
+        printed = self._run(root, "--language", ".sh", "--skip")
+
+        self.assertIn("on purpose", printed)
+        config = Config.load(root)
+        self.assertTrue(config.exempt("test", ".sh"))
+        # And it stops being reported as a gap.
+        self.assertNotIn(".sh", self._run(root))
+
     def test_a_command_that_cannot_run_the_language_is_refused_before_it_is_written(self):
         root = self._project()
 
@@ -6318,6 +6356,30 @@ class TestATicketNothingCanRunDoesNotRun(unittest.TestCase):
 
         self.assertNotEqual(orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED)
         self.assertTrue(called)
+
+    def test_a_declared_language_does_not_block(self):
+        # The decision is on the record, so the gate stops asking.
+        orch, run_id, _ticket, called = self._orch(
+            {"lint": "", "typecheck": "", "test": {".rs": "cargo test", ".sh": False}},
+            allowed=("build.sh",),
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertNotEqual(orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED)
+        self.assertTrue(called)
+
+    def test_a_declared_language_is_not_reported_as_unlinted_either(self):
+        orch, run_id, _ticket, _called = self._orch(
+            {"lint": {".rs": "cargo clippy"}, "typecheck": "", "test": {".rs": "cargo test", ".sh": False}},
+            allowed=("build.sh",),
+        )
+        (orch.config.root / "build.sh").write_text("echo hi\n", encoding="utf-8")
+
+        orch._report_unlinted(run_id)
+
+        messages = " ".join(row["message"] for row in orch.store.events_after(0))
+        self.assertNotIn(".sh", messages)
 
     def test_a_project_with_no_test_command_at_all_is_left_alone(self):
         # A project without tests is a different situation, already reported at

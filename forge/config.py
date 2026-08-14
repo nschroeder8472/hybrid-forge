@@ -131,6 +131,17 @@ _RUNNER_LANGUAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
 # map, and it is a legal key in its own right for a runner that covers the lot.
 ANY_LANGUAGE = "*"
 
+# What a config writes to say "nothing runs this language, on purpose". `false`
+# is unambiguous in JSON and cannot be mistaken for a command; "skip" and
+# "none" are accepted because they are what people type.
+_EXEMPTIONS = frozenset({"skip", "none", "false", "no"})
+
+
+def _is_exemption(value: object) -> bool:
+    if value is False:
+        return True
+    return isinstance(value, str) and value.strip().lower() in _EXEMPTIONS
+
 
 def _named_runners(command: str) -> list[tuple[str, ...]]:
     """The languages of every runner this command names.
@@ -377,6 +388,8 @@ class Config:
                 )
             if isinstance(raw, dict):
                 for key, value in raw.items():
+                    if _is_exemption(value):
+                        continue
                     if not isinstance(value, str):
                         raise ConfigError(
                             f"commands.{kind}.{key} is {type(value).__name__}; "
@@ -438,6 +451,8 @@ class Config:
             return {ANY_LANGUAGE: raw.strip()} if raw.strip() else {}
         found: dict[str, str] = {}
         for key, value in (raw or {}).items():
+            if _is_exemption(value):
+                continue
             command = str(value or "").strip()
             if not command:
                 continue
@@ -454,6 +469,25 @@ class Config:
         commands = self.commands_for(kind)
         suffix = Path(path).suffix.lower() if path else ""
         return commands.get(suffix) or commands.get(ANY_LANGUAGE, "")
+
+    def exempt(self, kind: str, suffix: str) -> bool:
+        """Whether this language is declared as one nothing needs to run.
+
+        The third state, and it earns its place. A shell wrapper and a
+        PowerShell build script have no behavior a unit test could assert, and
+        the gate is meant to catch a language nobody thought about — not to
+        stall a backlog over `build.sh`. Saying so in config is a decision on
+        the record; leaving the key out is an oversight, and those are exactly
+        what this feature exists to surface.
+        """
+        raw = self.commands.get(kind, "")
+        if isinstance(raw, str):
+            return False
+        wanted = suffix.lower()
+        for key, value in (raw or {}).items():
+            if _is_exemption(value) and wanted in normalize_language(str(key)):
+                return True
+        return False
 
     def covers(self, kind: str, suffix: str) -> bool:
         """Whether this step has something that genuinely runs the extension.
@@ -472,6 +506,8 @@ class Config:
         coverage report are both asking about. A catch-all that cannot run the
         language answers empty and says why in `how`.
         """
+        if self.exempt(kind, suffix):
+            return "", "declared as needing none"
         commands = self.commands_for(kind)
         suffix = suffix.lower()
         exact = commands.get(suffix)

@@ -876,7 +876,11 @@ class Orchestrator:
             return
         present = self._languages_present() & self._CODE_SUFFIXES
         missing = sorted(
-            suffix for suffix in present if not self.config.covers("lint", suffix)
+            suffix
+            for suffix in present
+            if not self.config.covers("lint", suffix)
+            and not self.config.exempt("lint", suffix)
+            and not self.config.exempt("test", suffix)
         )
         if not missing:
             return
@@ -2664,6 +2668,9 @@ class Orchestrator:
                 suffix in self._CODE_SUFFIXES
                 and suffix not in found
                 and not self.config.covers("test", suffix)
+                # A language the config declares as needing no runner is a
+                # decision on the record, not the oversight this gate is for.
+                and not self.config.exempt("test", suffix)
             ):
                 found.append(suffix)
         return found
