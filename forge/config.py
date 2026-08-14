@@ -103,6 +103,7 @@ _LANGUAGE_ALIASES = {
 _RUNNER_LANGUAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("cargo", (".rs",)),
     ("pytest", (".py",)),
+    ("unittest", (".py",)),
     ("mypy", (".py",)),
     ("ruff", (".py",)),
     ("go test", (".go",)),

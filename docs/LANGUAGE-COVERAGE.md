@@ -1,7 +1,9 @@
 # Per-language verify commands — design spec
 
-**Status:** proposed, not built. Written to be implemented in phases; each phase
-lands on its own with tests.
+**Status:** phases 1–3 built. 4 (`forge toolchain` and the setup loop) and 5
+(lint and typecheck as reported gaps) are still open. Each phase landed on its
+own with tests; the sections below describe the whole design, and what is not
+yet built is marked.
 
 `commands.lint`, `.typecheck` and `.test` are single strings, which encodes an
 assumption no real project keeps: that a repository is one language. Everything
@@ -219,28 +221,28 @@ blocks the ticket; an unlinted one is reported at run end and no more.
 
 ## Phases
 
-**1 — Config and normalisation.** Map or string, alias table, validation,
+**1 — Config and normalisation. Done.** Map or string, alias table, validation,
 `commands_for`, migration, `forge doctor` shows the matrix. No behaviour change:
 a one-language project runs exactly as now. *Tests: every existing config shape
 still loads and means the same; aliases normalise; a command that cannot run its
 language is a config error.*
 
-**2 — Verification over the map.** Per-language steps, step naming, baseline
+**2 — Verification over the map. Done.** Per-language steps, step naming, baseline
 keyed to match, identical commands deduped. *Tests: two languages both run;
 failures attribute to the right step; a language with no files present is
 skipped.*
 
-**3 — The tester and the gate.** Test language from the ticket's scope, the
+**3 — The tester and the gate. Done.** Test language from the ticket's scope, the
 block for an uncovered language, `_repro_target` the same. *Tests: a `.js`
 ticket gets a `.js` test file; an uncovered ticket blocks before any model call;
 the bug loop's block names the language.*
 
-**4 — `forge toolchain` and the setup loop.** Per-language detection, the
+**4 — `forge toolchain` and the setup loop. Open.** Per-language detection, the
 coverage matrix, the accept flow, the wizard asking per language, ingest and
 `forge bug` reporting uncovered scope up front. *Tests: detection scoped to one
 language; nothing is written without the accept flag.*
 
-**5 — Lint and typecheck.** The same map, reported not gated.
+**5 — Lint and typecheck. Open.** The same map, reported not gated.
 
 ---
 

@@ -6155,6 +6155,85 @@ class TestEveryLanguageIsVerified(unittest.TestCase):
         self.assertNotIn("test[.rs]", baseline)
 
 
+class TestATicketNothingCanRunDoesNotRun(unittest.TestCase):
+    """A Rust project's JavaScript was verified by nothing, and unrun read as
+    fine: TT-005's criteria were token-presence checks satisfied by code that
+    threw on the second line of its own entry point, and six tickets went green
+    above it. The loop's answer was to author no tests and log the skip as
+    routine."""
+
+    def _orch(self, commands, allowed=("web/main.js",)):
+        orch, root, run_id = _stub_orchestrator(commands)
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "a.rs").write_text("fn main() {}\n", encoding="utf-8")
+        called: list[str] = []
+        orch._call = lambda *a, **k: called.append(a[1]) or Completion(
+            text="ACCEPT", usage=Usage(), finish_reason="stop"
+        )
+        orch._shell = lambda *a, **k: StepResult(ok=True, detail="")
+        ticket = Ticket("TT-005", allowed_files=list(allowed))
+        orch.store.add_tickets(run_id, [ticket])
+        return orch, run_id, ticket, called
+
+    def test_it_blocks_before_a_single_model_call(self):
+        orch, run_id, ticket, called = self._orch(
+            {"lint": "", "typecheck": "", "test": "cargo test"}
+        )
+
+        orch._work_ticket(run_id, ticket)
+
+        stored = orch.store.list_tickets(run_id)[0]
+        self.assertEqual(stored.status, TICKET_BLOCKED)
+        self.assertEqual(called, [], "nothing should have been spent")
+        self.assertIn(".js", stored.blocked_note)
+        self.assertIn("forge toolchain --language .js", stored.blocked_note)
+        self.assertIn("web/main.js", stored.blocked_note)
+
+    def test_a_covered_ticket_runs_as_before(self):
+        orch, run_id, ticket, called = self._orch(
+            {"lint": "", "typecheck": "", "test": {".rs": "cargo test", ".js": "node --test"}}
+        )
+
+        orch._work_ticket(run_id, ticket)
+
+        self.assertNotEqual(orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED)
+        self.assertTrue(called)
+
+    def test_a_project_with_no_test_command_at_all_is_left_alone(self):
+        # A project without tests is a different situation, already reported at
+        # run end. Blocking every ticket in it would be a new failure, not a
+        # caught one.
+        orch, run_id, ticket, called = self._orch({"lint": "", "typecheck": "", "test": ""})
+
+        orch._work_ticket(run_id, ticket)
+
+        self.assertNotEqual(orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED)
+
+    def test_the_tester_writes_in_the_language_the_ticket_wrote(self):
+        # Not the project's language. A Rust core with a browser shell has two
+        # answers and the right one depends on which ticket is asking.
+        orch, _run_id, _ticket, _called = self._orch(
+            {"lint": "", "typecheck": "", "test": {".rs": "cargo test", ".js": "node --test"}}
+        )
+
+        self.assertEqual(orch._suite_suffix(["web/main.js"]), ".js")
+        self.assertEqual(orch._suite_suffix(["src/game.rs"]), ".rs")
+
+    def test_a_bug_in_an_unrunnable_language_says_so_instead_of_blaming_the_report(self):
+        # The level-0 case: the fault was real, in a file `cargo test` cannot
+        # run, and the block used to read "sharpen the report".
+        orch, run_id, _ticket, _called = self._orch(
+            {"lint": "", "typecheck": "", "test": "cargo test"}
+        )
+        bug = Ticket("BUG-001", kind=TICKET_BUG, spec="s", allowed_files=["web/main.js"])
+
+        path, reason = orch._repro_target(bug)
+
+        self.assertEqual(path, "")
+        self.assertIn("no test command covers", reason)
+        self.assertIn("forge toolchain --language .js", reason)
+
+
 class TestARetryCycleRemembersWhatFailed(unittest.TestCase):
     """`history` and `rejections` are locals in the attempt loop, and a retry
     cycle enters it fresh. So cycle 2's reviewer met a ticket it had already
@@ -6640,7 +6719,7 @@ class TestBaselineVerifyIsOptional(unittest.TestCase):
 
     def test_turning_it_off_skips_the_extra_verify_run(self):
         orch, _, run_id = _stub_orchestrator(
-            commands={"lint": "", "typecheck": "", "test": "cargo test"}
+            commands={"lint": "", "typecheck": "", "test": "pytest -q"}
         )
         orch.config.loop.baseline_verify = False
         orch.config.loop.max_attempts = 1

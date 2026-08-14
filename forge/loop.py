@@ -1401,6 +1401,14 @@ class Orchestrator:
             )
             return
 
+        # Before anything is spent. A ticket in a language nothing runs cannot
+        # be checked, and the loop's answer to that used to be to run it
+        # anyway and report the skip as routine.
+        uncovered = self._uncovered_languages(ticket)
+        if uncovered:
+            self._park(run_id, ticket, self._no_runner_note(ticket, uncovered))
+            return
+
         ticket.status = TICKET_RUNNING
         self.store.update_ticket(run_id, ticket)
         self.store.log(run_id, f"{ticket.ticket_id}: starting.", kind="ticket")
@@ -2509,6 +2517,24 @@ class Orchestrator:
         repo with neither falls back to what this ticket just wrote, which can
         only be wrong before there is anything to contradict it.
         """
+        # What this ticket actually wrote decides first, when something runs
+        # that language. A project with a Rust core and a browser shell has two
+        # answers, and the right one depends on which ticket is asking — the
+        # shell's tests belong in JavaScript however much Rust surrounds them.
+        # Falls through when nothing covers it, so a single-command project
+        # answers exactly as it always did.
+        own: Counter[str] = Counter()
+        for path in written:
+            suffix = Path(path).suffix.lower()
+            # A recognised language only. A `.xyz` file is not a language to
+            # author tests in, and a catch-all command saying nothing about it
+            # is not a reason to try.
+            if suffix in self._CODE_SUFFIXES:
+                own[suffix] += 1
+        for suffix, _count in own.most_common():
+            if self.config.covers("test", suffix):
+                return suffix
+
         repo = self._repo_test_suffixes(exclude or [])
         allowed = self._runner_suffixes()
         if allowed:
@@ -2587,6 +2613,51 @@ class Orchestrator:
         # everywhere else.
         return f"{prefix}{slug}_test{suffix}", ""
 
+    def _uncovered_languages(self, ticket: Ticket) -> list[str]:
+        """Languages this ticket writes that nothing here can test.
+
+        Only meaningful in a project that tests *something*: one with no test
+        command at all is a project without tests, which is a different
+        situation and already reported at run end. What this catches is the
+        polyglot gap — a Rust project's JavaScript, verified by nothing, whose
+        tickets pass on review alone over criteria a text search can satisfy.
+        That is not a hypothetical: it shipped a page that threw on the second
+        line of its own entry point, with six tickets green above it.
+        """
+        if not self.config.commands_for("test"):
+            return []
+        found: list[str] = []
+        for path in ticket.allowed_files:
+            if any(character in path for character in "*?["):
+                continue
+            suffix = Path(path).suffix.lower()
+            if (
+                suffix in self._CODE_SUFFIXES
+                and suffix not in found
+                and not self.config.covers("test", suffix)
+            ):
+                found.append(suffix)
+        return found
+
+    def _no_runner_note(self, ticket: Ticket, languages: list[str]) -> str:
+        """What to tell a human whose ticket has no way to be checked."""
+        files = [
+            path
+            for path in ticket.allowed_files
+            if Path(path).suffix.lower() in languages
+        ]
+        return (
+            f"this ticket writes {', '.join(languages)} and no test command "
+            f"covers {'it' if len(languages) == 1 else 'them'}, so nothing here "
+            f"could check the work — it would pass on review alone, against "
+            f"criteria a text search can satisfy. Files: {', '.join(files[:6])}.\n\n"
+            f"Set a runner up:\n"
+            f"  forge toolchain --language {languages[0]}\n"
+            f"or add it by hand in .hybridforge/config.json:\n"
+            f'  "commands": {{ "test": {{ "{languages[0]}": "<command>" }} }}\n\n'
+            f"Then: forge retry --ticket {ticket.ticket_id}"
+        )
+
     def _park(self, run_id: int, ticket: Ticket, note: str) -> None:
         """Stop work on a ticket and leave a human the reason.
 
@@ -2627,13 +2698,26 @@ class Orchestrator:
         if len(designated) == 1:
             return designated[0], ""
 
-        suffix = self._suite_suffix([])
-        if not suffix:
+        # Asked of the ticket's own scope before any fallback runs. Left to
+        # `_suite_suffix`, a JavaScript hypothesis in a Rust project resolves
+        # to `.rs` — the project's runner — and the reproduction would then
+        # assert something in a language the fault does not live in.
+        uncovered = self._uncovered_languages(ticket)
+        if uncovered:
+            return "", self._no_runner_note(ticket, uncovered)
+
+        suffix = self._suite_suffix(list(ticket.allowed_files))
+        if not suffix or not self.config.commands_for("test"):
             return "", (
                 "this project has no test command, so a reproduction could "
                 "never be run — and a bug loop with nothing to run the proof "
                 "is a fix nobody checked"
             )
+        if not self.config.covers("test", suffix):
+            # The level-0 case exactly: the fault is real and sits in a
+            # language nothing here runs, so a reproduction written in the
+            # project's own suite would assert something that was never wrong.
+            return "", self._no_runner_note(ticket, [suffix])
         example = self._example_test([], suffix)
         directory = Path(example[0]).parent.as_posix() if example else "tests"
         prefix = "" if directory in ("", ".") else f"{directory}/"
