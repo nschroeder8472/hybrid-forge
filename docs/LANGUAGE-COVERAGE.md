@@ -1,7 +1,7 @@
 # Per-language verify commands — design spec
 
-**Status:** phases 1–4 built. 5 (lint and typecheck as reported gaps) is still open, as is the
-wizard asking per language at `forge init`. Each phase landed on its
+**Status:** built. Only the wizard asking per language at `forge init` is
+outstanding; everything else in this spec is in. Each phase landed on its
 own with tests; the sections below describe the whole design, and what is not
 yet built is marked.
 
@@ -242,7 +242,7 @@ coverage matrix, the accept flow, the wizard asking per language, ingest and
 `forge bug` reporting uncovered scope up front. *Tests: detection scoped to one
 language; nothing is written without the accept flag.*
 
-**5 — Lint and typecheck. Open.** The same map, reported not gated.
+**5 — Lint and typecheck. Done.** The same map, reported not gated.
 
 ---
 

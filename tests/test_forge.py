@@ -6339,6 +6339,38 @@ class TestATicketNothingCanRunDoesNotRun(unittest.TestCase):
         self.assertEqual(orch._suite_suffix(["web/main.js"]), ".js")
         self.assertEqual(orch._suite_suffix(["src/game.rs"]), ".rs")
 
+    def test_an_unlinted_language_is_reported_and_not_blocked(self):
+        # Tests are proof; lint is quality. A ticket in a language nothing can
+        # test is one nothing can check, while one in a language nothing lints
+        # is merely one nobody is holding to a style — blocking on that would
+        # stall a backlog over a build script.
+        orch, run_id, _ticket, _called = self._orch(
+            {
+                "lint": {".rs": "cargo clippy"},
+                "typecheck": "",
+                "test": {".rs": "cargo test", ".js": "node --test"},
+            }
+        )
+        (orch.config.root / "web").mkdir(exist_ok=True)
+        (orch.config.root / "web" / "main.js").write_text("run()\n", encoding="utf-8")
+
+        orch._report_unlinted(run_id)
+
+        messages = " ".join(row["message"] for row in orch.store.events_after(0))
+        self.assertIn("No lint command covers .js", messages)
+        self.assertIn("forge toolchain --kind lint --language .js", messages)
+
+    def test_a_project_that_lints_nothing_is_not_nagged(self):
+        orch, run_id, _ticket, _called = self._orch(
+            {"lint": "", "typecheck": "", "test": "cargo test"}
+        )
+
+        orch._report_unlinted(run_id)
+
+        self.assertEqual(
+            [row for row in orch.store.events_after(0) if "lint" in row["message"]], []
+        )
+
     def test_a_bug_in_an_unrunnable_language_says_so_instead_of_blaming_the_report(self):
         # The level-0 case: the fault was real, in a file `cargo test` cannot
         # run, and the block used to read "sharpen the report".

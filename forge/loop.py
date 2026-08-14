@@ -849,6 +849,7 @@ class Orchestrator:
         after its second ticket and said nothing that read as wrong.
         """
         self._report_unexecuted(run_id)
+        self._report_unlinted(run_id)
         if not self.config.commands_for("test") or self._tests_authored:
             return
         if not self._tests_skipped:
@@ -861,6 +862,34 @@ class Orchestrator:
             f"tickets write are the same language.",
             level="warn",
             kind="lifecycle",
+        )
+
+    def _report_unlinted(self, run_id: int) -> None:
+        """Name the languages this project builds and does not lint.
+
+        Reported, never gated. Tests are proof and lint is quality: a ticket in
+        a language nothing can test is a ticket nothing can check, while one in
+        a language nothing lints is merely one nobody is holding to a style.
+        Blocking on the second would stall a backlog over a build script.
+        """
+        if not self.config.commands_for("lint"):
+            return
+        present = self._languages_present() & self._CODE_SUFFIXES
+        missing = sorted(
+            suffix for suffix in present if not self.config.covers("lint", suffix)
+        )
+        if not missing:
+            return
+        self.store.log(
+            run_id,
+            f"No lint command covers {', '.join(missing)}. Work in "
+            f"{'that language' if len(missing) == 1 else 'those languages'} was "
+            f"tested but never linted — add one with `forge toolchain --kind "
+            f"lint --language {missing[0]}`, or leave it and know that is the "
+            f"bar this run was held to.",
+            level="warn",
+            kind="lifecycle",
+            data={"unlinted": missing},
         )
 
     def _report_unexecuted(self, run_id: int) -> None:
