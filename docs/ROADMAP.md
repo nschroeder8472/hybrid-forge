@@ -7,17 +7,36 @@ deleted rather than implemented.
 
 ---
 
-## Bug-report loop
+## Bug-report loop — built
 
-**Status:** next up, design not started.
+**Status:** shipped as `forge bug`. See [BUG-LOOP.md](BUG-LOOP.md) for how it
+works and what it refuses to do; this entry keeps only what is still open.
 
-The loop today turns a *plan* into code. Every ticket describes work that does
-not exist yet, and the criteria come from `plan.md`. That shape has a hard edge:
-it verifies what the criteria say, so a defect nobody wrote a criterion for
-survives the whole pipeline — verification, review, and all.
+The five questions this entry was written around were answered as follows.
 
-Two such defects are sitting in the test project right now, both shipped by a
-run where all six tickets passed on the first attempt:
+- **Input** — a prose report, through `forge bug "<report>"`, `--file`, or
+  stdin. Separate from `ingest`: that turns a document into a backlog and takes
+  its criteria as the contract, while a report is one symptom whose contract
+  does not exist yet.
+- **Reproduce before fix** — a `REPRODUCE` step ahead of `BUILD`. The tester
+  writes a test asserting the correct behavior, the test command runs it, and it
+  must fail. The tester's contract really is inverted for this ticket kind, and
+  it is inverted explicitly: a separate prompt, a separate system message, and a
+  step whose `ok` means the suite went red.
+- **Scope discovery** — the harness gathers `git ls-files` and grep hits for the
+  report's own specific words, and the planner names the files from that. The
+  planner does not explore, and the ticket does not start wide.
+- **Regression protection** — the reproduction stays. It is the one file
+  `_discard_tests` does not reclaim, because it is the only assertion in the
+  loop demonstrated against real behavior.
+- **Relationship to respec** — they did not collapse into one mechanism. Respec
+  rewrites a ticket that already exists from evidence the loop produced; a bug
+  report arrives before any ticket, and its evidence has to be manufactured by
+  running something. What they share is the failure-to-revision shape, not the
+  code.
+
+**Still open: it has never been run.** Every part of it is covered by tests and
+none of it has met a real model, a real repository, or the two defects below.
 
 - `src/game.rs` — `Game::tick` drains its accumulator with a `while` loop that
   calls `SoftDrop`, and `SoftDrop` locks the piece on collision. A frame gap of
@@ -26,34 +45,26 @@ run where all six tickets passed on the first attempt:
 - `src/game.rs` — rotation has no wall kicks, so a piece against the right wall
   silently refuses to rotate rather than shifting away from it.
 
-Neither is a spec violation. Both are bugs. They are deliberately left unfixed
-as fixtures: the first real test of this feature is whether a bug-report loop
-can take a plain-language report and land a fix that the existing suite still
-passes.
+Both are still deliberately unfixed. Neither is a spec violation, both shipped
+from a run where all six tickets passed, and they are the honest first test:
+a plain-language report, a fix, and the existing suite still passing afterwards.
 
-The open questions, roughly in the order they need answering:
+---
 
-- **What is the input?** A prose report ("pieces sometimes drop three at once
-  after I switch tabs") is what a human actually has. Turning that into a
-  ticket is a different planning job from turning a spec into a backlog — it
-  starts from a symptom rather than an outcome, and the file scope is unknown
-  at the point the ticket is written.
-- **Reproduce before fix.** The current loop's verify step answers "is the tree
-  still green". A bug loop needs "does the bug still happen", which means a
-  failing test written *first*, and a ticket that cannot be marked done until
-  that test goes from red to green. That inverts the tester's contract: today a
-  tester that writes a failing assertion has failed the ticket.
-- **Scope discovery.** `allowed_files` is authored by the planner from the
-  plan. For a bug there is no plan, and the file that needs changing is the
-  thing being looked for. Either the planner gets to explore first, or the
-  ticket starts wide and narrows.
-- **Regression protection.** The reproduction test is the deliverable as much
-  as the fix is. It should outlive the ticket under the same one-file-per-ticket
-  rule the build loop uses.
-- **Relationship to `forge retry --respec`.** Respec already reads failure
-  evidence and rewrites a ticket. A bug report is the same shape from a
-  different source — worth checking whether one mechanism covers both before
-  building a second.
+## Per-language verify commands
+
+**Status:** designed, not built — [LANGUAGE-COVERAGE.md](LANGUAGE-COVERAGE.md).
+
+`commands.test` is one string, which assumes a repository is one language.
+Everything downstream inherits it: which language the tester writes in, what
+verification proves, and whether a bug can be reproduced at all. Three observed
+failures share that root — a ticket that shipped green over JavaScript the suite
+never ran, a bug report whose fault lived in that same unrun layer, and one
+stray `.js` file that once disabled test authoring for a whole Rust backlog.
+
+The spec turns each command into a map from language to command, blocks a ticket
+whose language has no runner rather than letting it pass on review alone, and
+adds `forge toolchain` to set one up. Five phases, each landing on its own.
 
 ---
 

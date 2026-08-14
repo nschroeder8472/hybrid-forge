@@ -217,8 +217,53 @@ run. That is the trade being made deliberately.
 }
 ```
 
-Three shell commands, run from the project root after each attempt. An empty
-string skips that check. They are the loop's only source of ground truth about
+Shell commands run from the project root after each attempt. An empty string
+skips that check.
+
+**Each one may also be a map from language to command**, because a repository is
+rarely one language and a single command silently means "everything is Rust":
+
+```json
+"commands": {
+  "test": { ".rs": "cargo test", ".js": "node --test web/" },
+  "lint": { ".rs": "cargo clippy --all-targets -- -D warnings", ".js": "eslint web/" }
+}
+```
+
+Keys are extensions (`.rs`) or language names (`rust`, `javascript` — which
+expands to `.js`, `.mjs`, `.cjs`, `.jsx`), and `*` is a catch-all. A plain
+string is read as `{"*": "..."}`, so every existing config keeps its meaning.
+
+A language with nothing worth testing is declared rather than left blank —
+`false` (or `"skip"`) says so, and the loop stops asking:
+
+```json
+"test": { ".rs": "cargo test", ".sh": false, ".ps1": false }
+```
+
+That is the difference between a decision and an oversight, which is the whole
+point of the gate: a build script nobody unit-tests is fine, a language nobody
+noticed is not. Work in a declared language is checked at review, and the run
+says so at the end.
+
+`forge toolchain` sets one up for a language that has none — reading the repo's
+own CI and build files to propose a command, and writing it only when you
+accept:
+
+```bash
+forge toolchain                                    # the coverage matrix
+forge toolchain --language .js                     # propose one, write nothing
+forge toolchain --language .js --accept            # write what it proposed
+forge toolchain --language .js --set "node --test web/"
+forge toolchain --language .sh --skip                 # nothing runs it, on purpose
+```
+
+A catch-all counts as coverage *until it names a runner that cannot run the
+language*: `"test": "cargo test"` does not cover a project's JavaScript, and
+`forge doctor` prints the matrix so the gap is visible before it becomes a
+ticket checked by reading. A command keyed to a language it demonstrably cannot
+run — `{".js": "cargo test"}` — is refused at startup, because a ticket failing
+that way reports it as the ticket's fault. They are the loop's only source of ground truth about
 whether the work is good — a run with all three empty is verified by review
 alone.
 
@@ -287,6 +332,7 @@ run some context, never the run.
 | `pollSeconds` | `2.0` | Control-channel poll interval while waiting. |
 | `maxRuntimeSeconds` | `0` (off) | Cap on unattended wall-clock time. |
 | `baselineVerify` | `true` | Run the verify commands once before each ticket, so breakage that was already there is not blamed on whichever ticket ran next. Turn off only when a full suite is slow enough that paying it per ticket costs more than the attempts it saves. |
+| `bugHypotheses` | `3` | How many explanations a `forge bug` ticket may go through before it parks. The first is the planner's reading of the report; each one after it is a re-diagnosis, asked for when the reproduction could not be written — a test that passes against the named code has *disproved* that reading, and disproof is evidence rather than a dead end. `1` parks on the first wrong guess. See [BUG-LOOP.md](BUG-LOOP.md). |
 | `executorTurns` | `0` (off) | Replay this many prior attempts to the executor as real conversation turns — its own reply as an `assistant` message, the failure that followed as the next `user` one. Experimental — a model shown its own wrong answer defends it more readily, and the flat prompt already anchors that way through disk state. See [SETUP](SETUP.md#thinking-models-answer-last) for the whole trade. |
 
 ---

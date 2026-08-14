@@ -17,6 +17,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import unittest.mock
@@ -24,7 +25,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from types import SimpleNamespace
 
-from forge import cli, modelfiles, respec
+from forge import cli, evidence, modelfiles, respec
 from forge.artifacts import Artifacts
 from forge.budget import BudgetGate, ContextOverflow, RateLimitPolicy
 from forge.config import ROLES, Config, ConfigError, LoopSettings, UISettings
@@ -54,6 +55,11 @@ from forge.patch import (
 )
 from forge.failures import distill, errors_naming, signatures
 from forge.prompts import (
+    bug_prompt,
+    locate_prompt,
+    parse_bug,
+    parse_locate,
+    repro_prompt,
     build_prompt,
     parse_respec,
     parse_verdict,
@@ -79,6 +85,8 @@ from forge.providers.claude_cli import (
     parse_reset_time,
 )
 from forge.state import (
+    TICKET_BLOCKED,
+    TICKET_BUG,
     TICKET_DONE,
     TICKET_PENDING,
     TICKET_FAILED,
@@ -528,6 +536,46 @@ class TestStoreResume(unittest.TestCase):
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [Ticket("T-1", status="running", position=0)])
         self.assertEqual(store.next_ticket(run_id).ticket_id, "T-1")
+
+
+class TestTheDashboardSharesTheStoreWithTheLoop(unittest.TestCase):
+    """`forge go` hands one Store to the dashboard, which serves every request
+    on a thread of its own. Interleaving those reads with the loop's writes on
+    a single sqlite3 connection is undefined use of the driver whatever
+    `check_same_thread` says — it eventually raised `bad parameter or other API
+    misuse` and killed a run fifteen retry cycles in."""
+
+    def test_reads_from_other_threads_do_not_disturb_the_writer(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(run_id, [Ticket("T-1")])
+        failures: list[Exception] = []
+        stop = threading.Event()
+
+        def read():
+            try:
+                while not stop.is_set():
+                    store.list_tickets(run_id)
+                    store.events_after(0)
+                    store.ticket_counts(run_id)
+            except Exception as exc:  # noqa: BLE001 - the point of the test
+                failures.append(exc)
+
+        readers = [threading.Thread(target=read, daemon=True) for _ in range(4)]
+        for reader in readers:
+            reader.start()
+        try:
+            for index in range(300):
+                store.log(run_id, f"event {index}", kind="ticket")
+                step = store.start_step(run_id, "T-1", "build")
+                store.end_step(step, "ok", "detail")
+        finally:
+            stop.set()
+            for reader in readers:
+                reader.join(timeout=5)
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(store.events_after(0, limit=1000)), 300)
 
 
 class TestRetry(unittest.TestCase):
@@ -1135,6 +1183,133 @@ class TestTheSampleConfigStaysHonest(unittest.TestCase):
 def _camel(name: str) -> str:
     head, *rest = name.split("_")
     return head + "".join(part.title() for part in rest)
+
+
+class TestCommandsAreKeyedByLanguage(unittest.TestCase):
+    """One command per verify step says a repository is one language, and
+    everything downstream inherited that: which language the tester writes in,
+    what verification proves, whether a bug in an unrun layer can be reproduced
+    at all. One project shipped a green ticket over JavaScript that threw on
+    its second line, because the suite was `cargo test` and nothing else ever
+    ran."""
+
+    def _config(self, commands) -> Config:
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x"}},
+                    "roles": {r: "m" for r in ROLES},
+                    "commands": commands,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return Config.load(root)
+
+    def test_a_plain_string_still_means_every_language(self):
+        # Every config that exists today keeps working and keeps meaning what
+        # it meant. Nothing about this feature is a migration.
+        config = self._config({"test": "pytest -q"})
+
+        self.assertEqual(config.commands_for("test"), {"*": "pytest -q"})
+        self.assertEqual(config.command_for("test", "src/a.py"), "pytest -q")
+        self.assertTrue(config.covers("test", ".py"))
+
+    def test_a_map_answers_per_language(self):
+        config = self._config({"test": {".rs": "cargo test", ".js": "node --test web/"}})
+
+        self.assertEqual(config.command_for("test", "src/game.rs"), "cargo test")
+        self.assertEqual(config.command_for("test", "web/main.js"), "node --test web/")
+
+    def test_language_names_are_accepted_and_expand(self):
+        # `.mjs` is JavaScript whether or not anybody wrote it down, and a
+        # `.mjs` file nothing claims is a language reported as having no runner.
+        config = self._config({"test": {"rust": "cargo test", "javascript": "node --test"}})
+
+        self.assertEqual(config.command_for("test", "src/a.rs"), "cargo test")
+        self.assertEqual(config.command_for("test", "web/a.mjs"), "node --test")
+        self.assertEqual(config.command_for("test", "web/a.jsx"), "node --test")
+
+    def test_an_exact_key_beats_the_catch_all(self):
+        config = self._config({"test": {"*": "make check", ".rs": "cargo test"}})
+
+        self.assertEqual(config.command_for("test", "src/a.rs"), "cargo test")
+        self.assertEqual(config.command_for("test", "build.sh"), "make check")
+
+    def test_a_catch_all_that_cannot_run_the_language_is_not_coverage(self):
+        # The case that shipped the defect: `cargo test` reads as coverage of
+        # every file in the project, and runs none of the JavaScript.
+        config = self._config({"test": "cargo test"})
+
+        self.assertTrue(config.covers("test", ".rs"))
+        self.assertFalse(config.covers("test", ".js"))
+        self.assertEqual(config.covering("test", ".js"), ("", "runs .rs"))
+
+    def test_a_compound_catch_all_covers_what_it_names(self):
+        config = self._config({"test": "cargo test && node --test web/"})
+
+        self.assertTrue(config.covers("test", ".rs"))
+        self.assertTrue(config.covers("test", ".js"))
+
+    def test_a_command_naming_no_runner_is_left_alone(self):
+        # `make check` may run anything. Guessing that it does not is worse
+        # than not knowing.
+        config = self._config({"test": "make check"})
+        self.assertTrue(config.covers("test", ".js"))
+
+    def test_a_command_keyed_to_a_language_it_cannot_run_is_refused(self):
+        # Fails at startup rather than one ticket at a time, because a ticket
+        # failing this way reports it as the ticket's fault.
+        with self.assertRaises(ConfigError) as caught:
+            self._config({"test": {".js": "cargo test"}})
+
+        self.assertIn("runs .rs", str(caught.exception))
+
+    def test_a_command_that_is_neither_string_nor_map_is_refused(self):
+        with self.assertRaises(ConfigError):
+            self._config({"test": ["cargo test"]})
+
+    def test_an_empty_command_covers_nothing(self):
+        config = self._config({"test": "", "lint": {".rs": ""}})
+        self.assertEqual(config.commands_for("test"), {})
+        self.assertFalse(config.covers("lint", ".rs"))
+
+    def test_a_language_can_be_declared_as_needing_no_runner(self):
+        # A shell wrapper and a PowerShell build script have no behavior a unit
+        # test could assert. The gate is for a language nobody thought about,
+        # not for stalling a backlog over build.sh.
+        config = self._config({"test": {".rs": "cargo test", ".sh": False}})
+
+        self.assertTrue(config.exempt("test", ".sh"))
+        self.assertFalse(config.covers("test", ".sh"))
+        self.assertEqual(config.covering("test", ".sh")[1], "declared as needing none")
+
+    def test_the_spellings_people_type_are_accepted(self):
+        for value in (False, "skip", "none", "no"):
+            with self.subTest(value=value):
+                self.assertTrue(self._config({"test": {".sh": value}}).exempt("test", ".sh"))
+
+    def test_an_exemption_is_not_a_command(self):
+        config = self._config({"test": {".rs": "cargo test", ".sh": False}})
+
+        self.assertEqual(config.commands_for("test"), {".rs": "cargo test"})
+        self.assertEqual(config.command_for("test", "build.sh"), "")
+
+    def test_exempting_by_language_name_covers_its_extensions(self):
+        config = self._config({"test": {".rs": "cargo test", "shell": False}})
+
+        self.assertTrue(config.exempt("test", ".sh"))
+        self.assertTrue(config.exempt("test", ".bash"))
+
+    def test_the_map_survives_a_write(self):
+        config = self._config({"test": {".rs": "cargo test", ".js": "node --test"}})
+        config.write()
+
+        self.assertEqual(
+            Config.load(config.root).command_for("test", "web/a.js"), "node --test"
+        )
 
 
 class TestRetryCycleConfig(unittest.TestCase):
@@ -3580,6 +3755,314 @@ class TestACriterionTheSpecAlreadyStatesIsNotARatchet(unittest.TestCase):
         self.assertNotIn("the plan is what needs changing", messages)
 
 
+class TestSettingUpARunnerForALanguage(unittest.TestCase):
+    """The other half of the gate. A ticket in a language nothing tests blocks
+    with a note pointing at `forge toolchain`, and a note pointing at a command
+    that does not exist is worse than no note."""
+
+    class _Planner(Provider):
+        kind = "stub"
+        reply = ""
+        seen = ""
+
+        def complete(self, messages, *, max_tokens, temperature=0.2, timeout=600):
+            type(self).seen = _joined(messages)
+            return Completion(text=self.reply, usage=Usage(), finish_reason="stop")
+
+        def capabilities(self):
+            return Capabilities(context_window=32768, max_output_tokens=8192)
+
+    def _project(self, commands=None):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x"}},
+                    "roles": {r: "m" for r in ROLES},
+                    "commands": commands if commands is not None else {"test": "cargo test"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (root / "src").mkdir()
+        (root / "src" / "a.rs").write_text("fn main() {}\n", encoding="utf-8")
+        (root / "web").mkdir()
+        (root / "web" / "main.js").write_text("run()\n", encoding="utf-8")
+        (root / "Makefile").write_text("test:\n\tnode --test web/\n", encoding="utf-8")
+        return root
+
+    def _run(self, root, *argv, reply=None):
+        planner = self._Planner("planner", {})
+        type(planner).reply = reply or ""
+        parsed = cli.build_parser().parse_args(["--root", str(root), "toolchain", *argv])
+        out = io.StringIO()
+        with unittest.mock.patch.object(Config, "provider_for", lambda self, role: planner):
+            with contextlib.redirect_stdout(out):
+                parsed.func(parsed)
+        return out.getvalue()
+
+    def test_it_names_the_languages_nothing_tests(self):
+        printed = self._run(self._project())
+
+        self.assertIn(".js", printed)
+        self.assertIn("No test command covers", printed)
+        self.assertIn("forge toolchain --language .js", printed)
+
+    def test_a_command_can_be_set_by_hand(self):
+        root = self._project()
+
+        self._run(root, "--language", ".js", "--set", "node --test web/")
+
+        config = Config.load(root)
+        self.assertEqual(config.command_for("test", "web/main.js"), "node --test web/")
+        # The command that was covering everything keeps doing so; this adds a
+        # language beside it rather than taking its place.
+        self.assertEqual(config.command_for("test", "src/a.rs"), "cargo test")
+
+    def test_a_language_name_sets_every_extension_it_owns(self):
+        root = self._project()
+
+        self._run(root, "--language", "javascript", "--set", "node --test web/")
+
+        config = Config.load(root)
+        self.assertEqual(config.command_for("test", "web/a.mjs"), "node --test web/")
+
+    def test_detection_is_asked_about_one_language(self):
+        root = self._project()
+
+        self._run(
+            root,
+            "--language",
+            ".js",
+            reply=json.dumps({"test": "node --test web/", "confidence": "high"}),
+        )
+
+        self.assertIn(".js files specifically", self._Planner.seen)
+
+    def test_detection_alone_writes_nothing(self):
+        # Changing what verification means is not a decision the loop makes
+        # while nobody is watching.
+        root = self._project()
+
+        printed = self._run(
+            root, "--language", ".js", reply=json.dumps({"test": "node --test web/"})
+        )
+
+        self.assertIn("Nothing was written", printed)
+        self.assertFalse(Config.load(root).covers("test", ".js"))
+
+    def test_accepting_writes_it(self):
+        root = self._project()
+
+        self._run(
+            root,
+            "--language",
+            ".js",
+            "--accept",
+            reply=json.dumps({"test": "node --test web/", "confidence": "high"}),
+        )
+
+        self.assertTrue(Config.load(root).covers("test", ".js"))
+
+    def test_a_language_can_be_declared_as_needing_nothing(self):
+        root = self._project()
+
+        printed = self._run(root, "--language", ".sh", "--skip")
+
+        self.assertIn("on purpose", printed)
+        config = Config.load(root)
+        self.assertTrue(config.exempt("test", ".sh"))
+        # And it stops being reported as a gap.
+        self.assertNotIn(".sh", self._run(root))
+
+    def test_a_command_that_cannot_run_the_language_is_refused_before_it_is_written(self):
+        root = self._project()
+
+        with self.assertRaises(SystemExit) as caught:
+            self._run(root, "--language", ".js", "--set", "cargo test")
+
+        self.assertIn("runs .rs", str(caught.exception))
+        self.assertFalse(Config.load(root).covers("test", ".js"))
+
+
+class TestFilingABugFromTheCommandLine(unittest.TestCase):
+    """`forge bug` is separate from `ingest` because the shapes differ at the
+    root: ingest turns a document into a backlog and takes its criteria as the
+    contract, while a report is one symptom whose file scope is unknown and
+    whose contract is written afterwards, by a test that has to fail first."""
+
+    REPLY = json.dumps(
+        {
+            "title": "tick locks three pieces",
+            "spec": "Game.tick should lock at most one piece per call",
+            "allowed_files": ["src/game.py"],
+            "reference_files": ["src/board.py"],
+            "reproduce": "tick(3000) locks at most one piece",
+        }
+    )
+
+    class _Planner(Provider):
+        kind = "stub"
+        replies: list[str] = []
+        seen: list[str] = []
+
+        def complete(self, messages, *, max_tokens, temperature=0.2, timeout=600):
+            type(self).seen.append(_joined(messages))
+            text = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
+            return Completion(text=text, usage=Usage(), finish_reason="stop")
+
+        def capabilities(self):
+            return Capabilities(context_window=32768, max_output_tokens=8192)
+
+    def _project(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x"}},
+                    "roles": {r: "m" for r in ("planner", "executor", "tester", "reviewer")},
+                    "commands": {"test": "pytest -q"},
+                    "neverDelegate": ["src/auth/**"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return root
+
+    def _run(self, root, *argv, reply=None, replies=None):
+        planner = self._Planner("planner", {})
+        type(planner).replies = list(replies or [reply or self.REPLY])
+        type(planner).seen = []
+        parsed = cli.build_parser().parse_args(["--root", str(root), "bug", *argv])
+        out = io.StringIO()
+        with unittest.mock.patch.object(Config, "provider_for", lambda self, role: planner):
+            with contextlib.redirect_stdout(out):
+                parsed.func(parsed)
+        return out.getvalue()
+
+    def _ticket(self, root):
+        store = Store(Config.load(root).db_path)
+        try:
+            return store.list_tickets(int(store.latest_run()["id"]))[0]
+        finally:
+            store.close()
+
+    def test_a_report_becomes_one_bug_ticket(self):
+        root = self._project()
+
+        printed = self._run(root, "pieces drop three at once after a tab switch")
+
+        ticket = self._ticket(root)
+        self.assertEqual(ticket.kind, TICKET_BUG)
+        self.assertEqual(ticket.ticket_id, "BUG-001")
+        self.assertEqual(ticket.allowed_files, ["src/game.py"])
+        # What the reproduction has to assert, read by the tester first and by
+        # the executor as the shape of the fix.
+        self.assertIn("locks at most one piece", ticket.context)
+        self.assertIn("BUG-001", printed)
+
+    def test_the_report_reaches_the_planner_with_the_repository(self):
+        root = self._project()
+        (root / "src").mkdir()
+
+        self._run(root, "pieces drop three at once")
+
+        self.assertIn("pieces drop three at once", self._Planner.seen[-1])
+
+    def test_the_ids_do_not_collide_across_runs(self):
+        # The id names the reproduction's filename, so a second run reusing
+        # BUG-001 would overwrite the first one's evidence.
+        root = self._project()
+        self._run(root, "first report")
+        self._run(root, "second report")
+
+        self.assertEqual(self._ticket(root).ticket_id, "BUG-002")
+
+    def test_a_bug_in_a_never_delegate_path_is_left_for_a_human(self):
+        root = self._project()
+        reply = json.dumps(
+            {"title": "t", "spec": "s", "allowed_files": ["src/auth/session.py"]}
+        )
+
+        printed = self._run(root, "login sometimes drops the session", reply=reply)
+
+        self.assertEqual(self._ticket(root).route, "claude-only")
+        self.assertIn("claude-only", printed)
+
+    def test_a_report_the_planner_cannot_place_stops_there(self):
+        root = self._project()
+        reply = json.dumps({"unclear": "nothing here matches that description"})
+
+        with self.assertRaises(SystemExit) as caught:
+            self._run(root, "the printer is on fire", reply=reply)
+
+        self.assertIn("nothing here matches", str(caught.exception))
+
+    def _checkout(self):
+        """A project that is also a git checkout, so evidence can be gathered."""
+        root = self._project()
+        (root / "src").mkdir()
+        (root / "src" / "game.py").write_text(
+            "def tick(dt):\n    while dt > 0:\n        lock()\n", encoding="utf-8"
+        )
+        for args in (["init", "-q"], ["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]):
+            subprocess.run(["git", *args], cwd=root, capture_output=True, check=False)
+        return root
+
+    def test_a_vague_report_is_located_before_the_ticket_is_written(self):
+        # Two passes: the first decides what to read, the second writes the
+        # ticket against the contents. One pass would be choosing scope from a
+        # list of filenames, which is what a report naming nothing leaves it.
+        root = self._checkout()
+        reply = json.dumps(
+            {"title": "t", "spec": "tick locks in a loop", "allowed_files": ["src/game.py"]}
+        )
+
+        printed = self._run(
+            root,
+            "sometimes several pieces lock at once",
+            replies=[json.dumps({"candidates": ["src/game.py"]}), reply],
+        )
+
+        self.assertEqual(len(self._Planner.seen), 2)
+        self.assertIn("Name the files to read", self._Planner.seen[0])
+        # The ticket was written with the code in front of it.
+        self.assertIn("while dt > 0", self._Planner.seen[1])
+        self.assertIn("reading src/game.py", printed)
+
+    def test_a_survey_that_answers_nothing_useful_still_files_the_ticket(self):
+        # Best effort: the second pass keeps the file list and the grep hits,
+        # which is what it had before the survey existed.
+        root = self._checkout()
+        reply = json.dumps({"title": "t", "spec": "s", "allowed_files": ["src/game.py"]})
+
+        self._run(
+            root, "sometimes several pieces lock at once", replies=["not json at all", reply]
+        )
+
+        self.assertEqual(self._ticket(root).allowed_files, ["src/game.py"])
+
+    def test_the_ticket_file_says_it_is_a_bug(self):
+        # The file is what a human reads before spending anything, and a bug
+        # ticket is read differently by the loop — it has to reproduce the
+        # fault first. A file that does not say so lies about what happens next.
+        root = self._project()
+        self._run(root, "pieces drop three at once")
+
+        written = (Config.load(root).tickets_dir / "BUG-001.md").read_text(encoding="utf-8")
+
+        self.assertIn("**Kind:** bug", written)
+        self.assertEqual(parse_plan(written)[0].kind, TICKET_BUG)
+
+    def test_an_empty_report_is_refused_before_any_model_is_called(self):
+        root = self._project()
+        with self.assertRaises(SystemExit) as caught:
+            self._run(root, "")
+        self.assertIn("report is empty", str(caught.exception))
+
+
 class TestAdoptingACriterionRespecWasRefused(unittest.TestCase):
     """Respec may not add to the standard it is judged against — it runs on a
     ticket that has just failed, and a ticket that keeps failing does not need
@@ -4711,6 +5194,234 @@ class TestOrphanedTestsNeverOutliveTheirTicket(unittest.TestCase):
         self.assertNotIn(True, seen, "verify saw the orphan still on disk")
 
 
+class TestEvidenceForABugReport(unittest.TestCase):
+    """A plan says which files a ticket may write. A report does not — the file
+    that needs changing is the thing being looked for. The harness gathers the
+    evidence rather than the model, so it works behind every adapter and needs
+    no tool grant."""
+
+    REPORT = (
+        "Pieces sometimes drop three at once after I switch tabs. Looks like "
+        "`SoftDrop` in src/game.rs, maybe Game::tick."
+    )
+
+    def _repo(self) -> Path:
+        root = Path(tempfile.mkdtemp())
+        (root / "src").mkdir()
+        (root / "src" / "game.rs").write_text(
+            "pub fn tick() {}\n// SoftDrop locks the piece\n", encoding="utf-8"
+        )
+        (root / "target").mkdir()
+        (root / "target" / "junk.rs").write_text("noise\n", encoding="utf-8")
+        (root / ".gitignore").write_text("target/\n", encoding="utf-8")
+        for args in (["init", "-q"], ["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]):
+            subprocess.run(["git", *args], cwd=root, capture_output=True, check=False)
+        return root
+
+    def test_the_searchable_terms_are_the_specific_ones(self):
+        found = evidence.terms(self.REPORT)
+
+        self.assertIn("SoftDrop", found)
+        self.assertIn("src/game.rs", found)
+        self.assertIn("Game::tick", found)
+        # Prose matches everything and locates nothing.
+        self.assertNotIn("sometimes", found)
+
+    def test_the_same_word_in_two_cases_is_searched_once(self):
+        self.assertEqual(evidence.terms("`SoftDrop` and softdrop"), ["SoftDrop"])
+
+    def test_it_lists_the_files_and_where_the_words_appear(self):
+        gathered = evidence.gather(self._repo(), self.REPORT)
+
+        self.assertIn("src/game.rs", gathered)
+        self.assertIn("SoftDrop", gathered)
+        # git ls-files honours .gitignore, so build output never reaches the
+        # prompt — a planner scoped to target/junk.rs writes a useless ticket.
+        self.assertNotIn("junk.rs", gathered)
+
+    def test_work_that_was_never_committed_is_still_searched(self):
+        """The case that broke it. `autoCommit` is off by default, so a project
+        the loop has just built is entirely untracked — `git ls-files` reports
+        nothing about it, and the first bug report against fresh work reached
+        the planner with an empty file list and came back "no repository
+        evidence was provided". The report was fine; the search never looked."""
+        root = Path(tempfile.mkdtemp())
+        (root / "src").mkdir()
+        (root / "src" / "game.rs").write_text("fn soft_drop() {}\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=root, capture_output=True, check=False)
+
+        gathered = evidence.gather(root, "`soft_drop` locks too early")
+
+        self.assertIn("src/game.rs", gathered)
+        self.assertIn("soft_drop", gathered)
+
+    def test_a_project_without_git_is_still_searched(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "game.py").write_text("def soft_drop():\n    pass\n", encoding="utf-8")
+
+        gathered = evidence.gather(root, "`soft_drop` locks too early")
+
+        self.assertIn("game.py", gathered)
+        self.assertIn("soft_drop", gathered)
+
+    def test_the_walk_skips_what_a_gitignore_would_have(self):
+        # A listing of node_modules is not evidence, and it would crowd out
+        # everything that is.
+        root = Path(tempfile.mkdtemp())
+        (root / "node_modules" / "dep").mkdir(parents=True)
+        (root / "node_modules" / "dep" / "index.js").write_text("x", encoding="utf-8")
+        (root / "app.js").write_text("function draw() {}\n", encoding="utf-8")
+
+        gathered = evidence.gather(root, "drawing is wrong")
+
+        self.assertIn("app.js", gathered)
+        self.assertNotIn("node_modules", gathered)
+
+    def test_an_empty_directory_yields_nothing(self):
+        # An honest empty block. A planner told "here is the evidence" over an
+        # invented tree scopes a ticket to files that do not exist.
+        self.assertEqual(evidence.gather(Path(tempfile.mkdtemp()), self.REPORT), "")
+
+
+class TestLocatingAVagueReport(unittest.TestCase):
+    """The report a person actually files names no function and no file: "the
+    score sometimes stops updating". Specific terms find nothing in it, and a
+    planner handed only a file tree is choosing scope by filename."""
+
+    VAGUE = "The score sometimes stops updating after I clear a line."
+
+    def _repo(self) -> Path:
+        root = Path(tempfile.mkdtemp())
+        (root / "src").mkdir()
+        (root / "src" / "scoring.py").write_text(
+            "def commit_lines(count):\n    return count * 100\n", encoding="utf-8"
+        )
+        (root / "src" / "render.py").write_text(
+            "def draw():\n    pass\n", encoding="utf-8"
+        )
+        for args in (["init", "-q"], ["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]):
+            subprocess.run(["git", *args], cwd=root, capture_output=True, check=False)
+        return root
+
+    def test_a_report_naming_nothing_specific_yields_no_terms(self):
+        self.assertEqual(evidence.terms(self.VAGUE), [])
+
+    def test_its_content_words_are_searched_instead(self):
+        found = evidence.prose_terms(self.VAGUE)
+
+        self.assertIn("score", found)
+        self.assertIn("line", found)
+        # Grepping these returns the whole project, which locates nothing.
+        for word in ("sometimes", "after", "the"):
+            self.assertNotIn(word, found)
+
+    def test_the_words_a_report_repeats_come_first(self):
+        found = evidence.prose_terms("The board is wrong. The board draws twice.")
+        self.assertEqual(found[0], "board")
+
+    def test_a_vague_report_still_finds_the_code(self):
+        gathered = evidence.gather(self._repo(), self.VAGUE)
+
+        # "score" is not in scoring.py's text, but it is in its name, and
+        # "line" reaches commit_lines.
+        self.assertIn("commit_lines", gathered)
+        # With nothing specific named, the definitions are worth their space:
+        # they are the bridge from the report's words to the code's names.
+        self.assertIn("Every definition in this repository", gathered)
+
+    def test_a_report_that_named_a_symbol_gets_no_definition_dump(self):
+        # It has already told us more than any word frequency will.
+        gathered = evidence.gather(self._repo(), "`commit_lines` returns twice the score")
+        self.assertNotIn("Every definition in this repository", gathered)
+
+    def test_the_survey_asks_which_files_to_open(self):
+        body = locate_prompt(self.VAGUE, "### Files\nsrc/scoring.py")[-1].content
+
+        self.assertIn(self.VAGUE, body)
+        self.assertIn("src/scoring.py", body)
+        self.assertIn("Name the files to read", body)
+
+    def test_candidates_are_filtered_to_files_that_exist(self):
+        # A path the model invented would be read as nothing, and the ticket
+        # then written as though the file had been read and found irrelevant.
+        chosen = parse_locate(
+            json.dumps({"candidates": ["src/scoring.py", "src/imagined.py"]}),
+            known=["src/scoring.py", "src/render.py"],
+        )
+        self.assertEqual(chosen, ["src/scoring.py"])
+
+    def test_an_unreadable_survey_reply_costs_nothing(self):
+        self.assertEqual(parse_locate("I think it is in the scorer.", known=["a.py"]), [])
+
+    def test_the_chosen_files_are_read_whole(self):
+        root = self._repo()
+        read = evidence.read_files(root, ["src/scoring.py"])
+        self.assertIn("commit_lines", read["src/scoring.py"])
+
+    def test_a_path_outside_the_project_is_not_read(self):
+        root = self._repo()
+        self.assertEqual(evidence.read_files(root, ["../../etc/passwd"]), {})
+
+    def test_the_ticket_is_written_against_the_contents(self):
+        body = bug_prompt(
+            self.VAGUE, "### Files\nsrc/scoring.py", {"src/scoring.py": "def commit_lines(): ..."}
+        )[-1].content
+
+        self.assertIn("def commit_lines()", body)
+        self.assertIn("State the defect in terms of what", body)
+
+
+class TestPlanningFromABugReport(unittest.TestCase):
+    def test_the_planner_is_given_the_report_and_the_repository(self):
+        body = bug_prompt("pieces drop three at once", "### Files\nsrc/game.rs")[-1].content
+
+        self.assertIn("pieces drop three at once", body)
+        self.assertIn("src/game.rs", body)
+        self.assertIn("every path you name", body)
+
+    def test_a_ticket_is_parsed_out_of_the_reply(self):
+        fields = parse_bug(
+            json.dumps(
+                {
+                    "title": "tick locks three pieces",
+                    "spec": "Game::tick drains its accumulator with a loop",
+                    "allowed_files": ["src/game.rs"],
+                    "reference_files": ["src/lib.rs"],
+                    "reproduce": "tick(3000) locks at most one piece",
+                }
+            )
+        )
+
+        self.assertEqual(fields["allowed_files"], ["src/game.rs"])
+        self.assertEqual(fields["reproduce"], "tick(3000) locks at most one piece")
+
+    def test_a_report_the_planner_cannot_place_is_not_turned_into_a_ticket(self):
+        # Better than a plausible ticket scoped to files that do not exist.
+        with self.assertRaises(ValueError) as caught:
+            parse_bug(json.dumps({"unclear": "nothing in this repo matches"}))
+        self.assertIn("nothing in this repo matches", str(caught.exception))
+
+    def test_a_reply_with_no_spec_is_refused(self):
+        with self.assertRaises(ValueError):
+            parse_bug(json.dumps({"title": "t", "allowed_files": ["a.py"]}))
+
+    def test_the_tester_is_told_to_write_a_test_that_fails(self):
+        body = repro_prompt(
+            Ticket("BUG-001", title="t", spec="tick locks three pieces"),
+            test_path="tests/bug_001_test.py",
+            reproduce="tick(3000) locks at most one piece",
+        )[-1].content
+        system = repro_prompt(
+            Ticket("BUG-001"), test_path="tests/bug_001_test.py"
+        )[0].content
+
+        self.assertIn("tick(3000) locks at most one piece", body)
+        self.assertIn("must FAIL", system)
+        self.assertIn("Assert the CORRECT behavior", system)
+        # The failure has to be the assertion, not a broken file.
+        self.assertIn("`assert False`", system)
+
+
 def _stub_orchestrator(commands: dict[str, str] | None = None):
     """An Orchestrator over a temp repo with every shell command disabled."""
     root = Path(tempfile.mkdtemp())
@@ -5053,6 +5764,688 @@ class TestConversationalExecutorIsOffUntilAskedFor(unittest.TestCase):
         assistants = [m.content for m in second if m.role == "assistant"]
         self.assertEqual(assistants, ["src/a.py\n```python\nx = 1\n```"])
         self.assertIn("the error path is swallowed", second[-1].content)
+
+
+class TestAWrongDiagnosisIsReplacedRatherThanParked(unittest.TestCase):
+    """A reproduction that cannot be written is a measurement, not a dead end.
+    The tester saying "this code already does what the report asks for" is a
+    fact about the code, and the right use of it is to look somewhere else.
+
+    One run parked on exactly that: the level really was initialised to 1, the
+    reporter really did see 0, and the answer sat one layer away in a file the
+    first hypothesis never named. The report was never what was disproved."""
+
+    REPORT = "the game starts at level 0"
+
+    def _orch(self, hypotheses=3):
+        orch, root, run_id = _stub_orchestrator({"lint": "", "typecheck": "", "test": "pytest -q"})
+        orch.config.loop.max_attempts = 1
+        orch.config.loop.bug_hypotheses = hypotheses
+        orch.store.set_run_status(run_id, "running")
+        orch.store._connection.execute(
+            "UPDATE runs SET source = ? WHERE id = ?", (self.REPORT, run_id)
+        )
+        orch.store._connection.commit()
+        orch.store.add_tickets(
+            run_id,
+            [
+                Ticket(
+                    "BUG-001",
+                    title="level starts at zero",
+                    kind=TICKET_BUG,
+                    spec="Game.new sets level to 0 and should set it to 1",
+                    allowed_files=["src/game.py"],
+                )
+            ],
+        )
+        return orch, root, run_id
+
+    def _second_hypothesis(self, **overrides):
+        return json.dumps(
+            {
+                "title": "the view never updates",
+                "spec": overrides.get("spec", "web/main.js throws before it reads the level"),
+                "allowed_files": overrides.get("allowed_files", ["web/main.js"]),
+                "reproduce": "the rendered level follows the game's level",
+            }
+        )
+
+    def _drive(self, orch, root, *, planner, reproduces_on):
+        """Reproduction fails until the given hypothesis is in scope."""
+        seen: dict[str, list[str]] = {}
+        state = {"scope": None}
+
+        def call(_run_id, role, messages, **_kwargs):
+            seen.setdefault(role, []).append(_joined(messages))
+            if role == "planner":
+                return Completion(text=planner.pop(0) if planner else "no idea",
+                                  usage=Usage(), finish_reason="stop")
+            if role == "tester":
+                state["scope"] = orch.store.list_tickets(1)[0].allowed_files
+                return Completion(
+                    text="tests/bug_001_test.py\n```python\ndef test_x():\n    assert True\n```",
+                    usage=Usage(), finish_reason="stop",
+                )
+            return Completion(text="ACCEPT", usage=Usage(), finish_reason="stop")
+
+        def shell(_run_id, name, command):
+            if not command.strip():
+                return StepResult(ok=True, detail="")
+            proven = state["scope"] == reproduces_on
+            if proven:
+                return StepResult(ok=False, detail="tests/bug_001_test.py::test_x FAILED\nassert 0 == 1")
+            return StepResult(ok=True, detail="1 passed")
+
+        orch._call = call
+        orch._shell = shell
+        return seen
+
+    def test_a_disproved_explanation_is_replaced_and_the_ticket_continues(self):
+        orch, root, run_id = self._orch()
+        seen = self._drive(
+            orch, root, planner=[self._second_hypothesis()], reproduces_on=["web/main.js"]
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        ticket = orch.store.list_tickets(run_id)[0]
+        self.assertEqual(ticket.allowed_files, ["web/main.js"])
+        self.assertIn("throws before it reads the level", ticket.spec)
+        # It got past reproduction on the second hypothesis rather than parking.
+        self.assertTrue(orch.store.reproduced(run_id, "BUG-001"))
+
+    def test_the_planner_is_shown_the_report_and_what_disproved_the_guess(self):
+        orch, root, run_id = self._orch()
+        seen = self._drive(
+            orch, root, planner=[self._second_hypothesis()], reproduces_on=["web/main.js"]
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        asked = seen["planner"][0]
+        self.assertIn(self.REPORT, asked)
+        self.assertIn("The explanation that was just disproved", asked)
+        self.assertIn("Game.new sets level to 0", asked)
+
+    def test_the_next_guess_cannot_be_the_last_one_again(self):
+        orch, root, run_id = self._orch()
+        seen = self._drive(
+            orch,
+            root,
+            planner=[self._second_hypothesis(), self._second_hypothesis(spec="another idea")],
+            reproduces_on=["never"],
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        second = seen["planner"][1]
+        self.assertIn("Already ruled out", second)
+        self.assertIn("Game.new sets level to 0", second)
+        self.assertIn("throws before it reads the level", second)
+
+    def test_the_block_lists_every_hypothesis_it_tried(self):
+        # The work the ticket actually did. Without it the next person starts
+        # from the report and repeats all of it.
+        orch, root, run_id = self._orch()
+        self._drive(
+            orch,
+            root,
+            planner=[self._second_hypothesis(), self._second_hypothesis(spec="a third idea")],
+            reproduces_on=["never"],
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        note = orch.store.list_tickets(run_id)[0].blocked_note
+        self.assertEqual(orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED)
+        self.assertIn("Hypotheses tried and ruled out", note)
+        self.assertIn("Game.new sets level to 0", note)
+
+    def test_a_planner_with_nothing_better_parks_immediately(self):
+        # An honest question beats a third wrong ticket.
+        orch, root, run_id = self._orch()
+        seen = self._drive(orch, root, planner=["no idea at all"], reproduces_on=["never"])
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertEqual(orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED)
+        self.assertEqual(len(seen["planner"]), 1)
+        messages = " ".join(row["message"] for row in orch.store.events_after(0))
+        self.assertIn("no further diagnosis", messages)
+
+    def test_one_hypothesis_is_the_old_behaviour(self):
+        orch, root, run_id = self._orch(hypotheses=1)
+        seen = self._drive(
+            orch, root, planner=[self._second_hypothesis()], reproduces_on=["web/main.js"]
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertEqual(orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED)
+        self.assertNotIn("planner", seen)
+
+
+class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
+    """The loop verifies what the criteria say, so a defect nobody wrote a
+    criterion for survives the whole pipeline. Two shipped that way in one
+    green run. A bug ticket inverts the order: a test that asserts the correct
+    behavior is written first and must fail, and the fix is not done until that
+    same test passes."""
+
+    REPRO = "tests/bug_001_test.py"
+    TEST_FAILURE = (
+        "tests/bug_001_test.py::test_one_piece_per_tick FAILED\n"
+        "assert 3 == 1  # three pieces locked in one tick"
+    )
+
+    def _orch(self, *, commands=None, ticket=None):
+        orch, root, run_id = _stub_orchestrator(
+            commands or {"lint": "", "typecheck": "", "test": "pytest -q"}
+        )
+        orch.config.loop.max_attempts = 2
+        orch.store.add_tickets(
+            run_id,
+            [
+                ticket
+                or Ticket(
+                    "BUG-001",
+                    title="tick locks three pieces",
+                    kind=TICKET_BUG,
+                    spec="Game.tick should lock at most one piece per call",
+                    allowed_files=["src/a.py"],
+                    context="tick(3000) locks at most one piece",
+                )
+            ],
+        )
+        return orch, root, run_id
+
+    def _shell_until_fixed(self, root: Path):
+        """The suite fails while the bug is on disk and passes once it is not."""
+
+        def shell(_run_id, name, command):
+            if not command.strip():
+                return StepResult(ok=True, detail="")
+            source = root / "src" / "a.py"
+            fixed = source.exists() and "fixed" in source.read_text(encoding="utf-8")
+            if fixed:
+                return StepResult(ok=True, detail="1 passed")
+            return StepResult(ok=False, detail=self.TEST_FAILURE)
+
+        return shell
+
+    def _calls(self, orch, *, tester: str, executor: str):
+        seen: dict[str, list[str]] = {}
+
+        def call(_run_id, role, messages, **_kwargs):
+            seen.setdefault(role, []).append(_joined(messages))
+            text = {"tester": tester, "executor": executor}.get(role, "ACCEPT")
+            return Completion(text=text, usage=Usage(), finish_reason="stop")
+
+        orch._call = call
+        return seen
+
+    _GOOD_TEST = (
+        "tests/bug_001_test.py\n```python\ndef test_one_piece_per_tick():\n"
+        "    assert locked(3000) == 1\n```"
+    )
+    _FIX = "src/a.py\n```python\n# fixed\ndef tick():\n    pass\n```"
+
+    def test_the_reproduction_is_written_first_and_has_to_fail(self):
+        orch, root, run_id = self._orch()
+        orch._shell = self._shell_until_fixed(root)
+        seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertEqual(orch.store.list_tickets(run_id)[0].status, TICKET_DONE)
+        # The proof is durable, and it is the failure the test produced.
+        self.assertIn("three pieces locked", orch.store.reproduced(run_id, "BUG-001"))
+        self.assertTrue((root / self.REPRO).exists())
+        # The executor is told what failed and that it cannot edit the proof.
+        self.assertIn("three pieces locked", seen["executor"][0])
+        self.assertIn("outside this ticket's scope", seen["executor"][0])
+
+    def test_no_further_tests_are_authored_for_a_bug_ticket(self):
+        # The contract was written before the fix, by a role that could not see
+        # it. Authoring more now would let the party being judged add to it.
+        orch, root, run_id = self._orch()
+        orch._shell = self._shell_until_fixed(root)
+        self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        names = [
+            row["name"]
+            for row in orch.store._connection.execute(
+                "SELECT name FROM steps WHERE ticket_id = 'BUG-001'"
+            )
+        ]
+        self.assertIn("reproduce", names)
+        self.assertNotIn("tests", names)
+
+    def test_the_reviewer_is_shown_the_red_to_green_evidence(self):
+        orch, root, run_id = self._orch()
+        orch._shell = self._shell_until_fixed(root)
+        seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        review = seen["reviewer"][-1]
+        self.assertIn("reproduced before it was fixed", review)
+        self.assertIn("three pieces locked", review)
+        self.assertIn("fixes the *cause*", review)
+
+    def test_a_reproduction_that_passes_proves_nothing_and_parks(self):
+        orch, _root, run_id = self._orch()
+        orch._shell = lambda _r, _n, command: StepResult(ok=True, detail="1 passed")
+        seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        stored = orch.store.list_tickets(run_id)[0]
+        self.assertEqual(stored.status, TICKET_BLOCKED)
+        self.assertIn("could not be reproduced", stored.blocked_note)
+        # Asked twice with the passing output quoted back, then parked. The
+        # executor is never reached: there is nothing to fix on faith.
+        self.assertEqual(len(seen["tester"]), 2)
+        self.assertNotIn("executor", seen)
+        self.assertIn("proved nothing", seen["tester"][1])
+
+    def test_an_unreproducible_bug_is_not_retried_forever(self):
+        """A real run spent fifteen retry cycles on one report — two tester
+        calls apiece — and would have spent them forever under `retryCycles:
+        -1`. Nothing between cycles makes an undemonstrable fault
+        demonstrable, and neither existing brake catches it: the ticket never
+        takes an attempt, so there is no respec to come back unchanged, and the
+        tester's prose varies enough that the evidence fingerprint differs
+        every time."""
+        orch, _root, run_id = self._orch()
+        orch.config.loop.retry_cycles = -1
+        orch._shell = lambda _r, _n, _c: StepResult(ok=True, detail="1 passed")
+        self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        went_again = orch._retry_cycle(run_id, "blocked")
+
+        self.assertFalse(went_again)
+        messages = " ".join(row["message"] for row in orch.store.events_after(0))
+        self.assertIn("never reproduced", messages)
+
+    def test_a_bug_that_did_reproduce_is_retried_normally(self):
+        # The exclusion is about proof, not about being a bug ticket: one that
+        # demonstrated its fault and then failed to fix it is ordinary work.
+        orch, root, run_id = self._orch()
+        orch.config.loop.retry_cycles = -1
+        orch.config.loop.respec_on_retry = False
+        orch._shell = lambda _r, _n, _c: StepResult(ok=False, detail=self.TEST_FAILURE)
+        self._calls(orch, tester=self._GOOD_TEST, executor="src/a.py\n```python\n# no fix\n```")
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertTrue(orch._retry_cycle(run_id, "blocked"))
+
+    def test_the_block_names_the_layers_the_suite_cannot_reach(self):
+        """The case this came from: a report said the game starts at level 0.
+        The Rust set it to 1, so no test of that code could fail — and the
+        symptom was real, in a JavaScript file that threw on its second line
+        and left the page showing a hardcoded `Level: 0`. `cargo test` runs no
+        JavaScript, so nothing in the pipeline could reach it."""
+        orch, root, run_id = self._orch()
+        (root / "web").mkdir()
+        (root / "web" / "main.js").write_text("run()\n", encoding="utf-8")
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        orch._shell = lambda _r, _n, _c: StepResult(ok=True, detail="1 passed")
+        self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        note = orch.store.list_tickets(run_id)[0].blocked_note
+        self.assertIn(".js", note)
+        self.assertIn("no ticket here can reach it", note)
+
+    def test_a_single_language_project_gets_no_such_note(self):
+        orch, root, run_id = self._orch()
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        orch._shell = lambda _r, _n, _c: StepResult(ok=True, detail="1 passed")
+        self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertNotIn("also contains", orch.store.list_tickets(run_id)[0].blocked_note)
+
+    def test_a_report_too_vague_to_assert_is_handed_back(self):
+        orch, _root, run_id = self._orch()
+        orch._shell = lambda _r, _n, _c: StepResult(ok=False, detail=self.TEST_FAILURE)
+        seen = self._calls(
+            orch,
+            tester="BLOCKED: the report does not say what value was expected",
+            executor=self._FIX,
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        stored = orch.store.list_tickets(run_id)[0]
+        self.assertEqual(stored.status, TICKET_BLOCKED)
+        self.assertIn("cannot be turned into a test", stored.blocked_note)
+        self.assertEqual(len(seen["tester"]), 1, "a refusal is an answer, not a retry")
+
+    def test_the_fix_cannot_edit_its_own_proof(self):
+        orch, root, run_id = self._orch()
+        orch._shell = self._shell_until_fixed(root)
+        self._calls(
+            orch,
+            tester=self._GOOD_TEST,
+            executor=self._FIX
+            + f"\n\n{self.REPRO}\n```python\ndef test_one_piece_per_tick():\n    assert True\n```",
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        kept = (root / self.REPRO).read_text(encoding="utf-8")
+        self.assertIn("locked(3000) == 1", kept)
+        self.assertNotIn("assert True", kept)
+
+    def test_the_reproduction_survives_a_ticket_that_never_passed(self):
+        # An unverified feature test is deleted, because it fails every later
+        # ticket and none of them can reach it. A reproduction is the opposite:
+        # it is the one assertion here demonstrated against real behavior, and
+        # it is half of what the ticket was for.
+        orch, root, run_id = self._orch()
+        orch._shell = lambda _r, _n, _c: StepResult(ok=False, detail=self.TEST_FAILURE)
+        self._calls(
+            orch, tester=self._GOOD_TEST, executor="src/a.py\n```python\n# no fix\n```"
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+        orch._sweep_orphan_tests(run_id)
+
+        self.assertEqual(orch.store.list_tickets(run_id)[0].status, TICKET_FAILED)
+        self.assertTrue((root / self.REPRO).exists(), "the evidence must outlive the ticket")
+
+    def test_a_reproduction_that_does_not_build_is_not_evidence(self):
+        # A test that will not import fails the command for a reason that has
+        # nothing to do with the bug, and the executor cannot fix it — the file
+        # is outside its scope. Distinct from a failing assertion, which names
+        # the same file and *is* the evidence.
+        orch, _root, run_id = self._orch()
+        broken = (
+            "ImportError: cannot import name 'locked'\n"
+            "tests/bug_001_test.py:1: in <module>\n"
+        )
+        orch._shell = lambda _r, _n, _c: StepResult(ok=False, detail=broken)
+        seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        stored = orch.store.list_tickets(run_id)[0]
+        self.assertEqual(stored.status, TICKET_BLOCKED)
+        self.assertIn("does not build", stored.blocked_note)
+        self.assertEqual(len(seen["tester"]), 2)
+        self.assertIn("errors are in the file you are about to write", seen["tester"][1])
+
+    def test_a_second_cycle_does_not_reproduce_it_again(self):
+        # Once the fix lands the test passes, so re-running reproduction would
+        # find nothing wrong and park a ticket whose work is nearly done.
+        orch, root, run_id = self._orch()
+        orch._shell = self._shell_until_fixed(root)
+        step = orch.store.start_step(run_id, "BUG-001", "reproduce")
+        orch.store.end_step(step, "ok", self.TEST_FAILURE)
+        seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertNotIn("tester", seen)
+        self.assertIn("three pieces locked", seen["executor"][0])
+
+    def test_a_project_with_no_test_command_cannot_prove_anything(self):
+        orch, _root, run_id = self._orch(commands={"lint": "", "typecheck": "", "test": ""})
+        self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        stored = orch.store.list_tickets(run_id)[0]
+        self.assertEqual(stored.status, TICKET_BLOCKED)
+        self.assertIn("no test command", stored.blocked_note)
+
+    def test_the_baseline_never_excuses_the_reproduction(self):
+        # The hole this closes: on a retry cycle the reproduction is already on
+        # disk and already failing, so it pre-dates the attempt by every
+        # measure the amnesty uses.
+        orch, _root, run_id = self._orch()
+        failure = (
+            "error[E0001]: assertion failed\n"
+            "  --> tests/bug_001_test.rs:3:1\n"
+        )
+        orch._shell = lambda _r, _n, _c: StepResult(ok=False, detail=failure)
+        ticket = orch.store.list_tickets(run_id)[0]
+
+        excused = orch._baseline_failures(run_id, ticket)
+        not_excused = orch._baseline_failures(
+            run_id, ticket, extra_scope=["tests/bug_001_test.rs"]
+        )
+
+        self.assertTrue(excused.get("test"), "an unrelated failure is still excused")
+        self.assertEqual(not_excused, {})
+
+
+class TestEveryLanguageIsVerified(unittest.TestCase):
+    """Verification was one command per step, so a project's second language
+    was never run at all — and unrun reads as fine everywhere downstream."""
+
+    def _orch(self, commands, files=("src/a.rs", "web/main.js")):
+        orch, root, run_id = _stub_orchestrator(commands)
+        for name in files:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x\n", encoding="utf-8")
+        return orch, root, run_id
+
+    def test_both_languages_run(self):
+        orch, _root, _run_id = self._orch(
+            {"lint": "", "typecheck": "", "test": {".rs": "cargo test", ".js": "node --test"}}
+        )
+
+        self.assertEqual(
+            orch._verify_plan(), [("test[.js]", "node --test"), ("test[.rs]", "cargo test")]
+        )
+
+    def test_a_language_the_project_does_not_have_is_not_run(self):
+        # A JavaScript runner in a repo with no JavaScript has nothing to say,
+        # and running it fails on an empty match.
+        orch, _root, _run_id = self._orch(
+            {"lint": "", "typecheck": "", "test": {".rs": "cargo test", ".js": "node --test"}},
+            files=("src/a.rs",),
+        )
+
+        self.assertEqual(orch._verify_plan(), [("test", "cargo test")])
+
+    def test_a_ticket_that_writes_the_first_file_of_a_language_activates_it(self):
+        # Read per attempt rather than cached: the verify step after the one
+        # that created `web/main.js` is the first place the JS runner matters.
+        orch, root, _run_id = self._orch(
+            {"lint": "", "typecheck": "", "test": {".rs": "cargo test", ".js": "node --test"}},
+            files=("src/a.rs",),
+        )
+        (root / "web").mkdir()
+        (root / "web" / "main.js").write_text("x\n", encoding="utf-8")
+
+        self.assertIn(("test[.js]", "node --test"), orch._verify_plan())
+
+    def test_one_command_keeps_its_plain_name(self):
+        # A one-language project's step log and dashboard read exactly as
+        # before; only a project that genuinely has two gets the suffix.
+        orch, _root, _run_id = self._orch({"lint": "", "typecheck": "", "test": "cargo test"})
+
+        self.assertEqual(orch._verify_plan(), [("test", "cargo test")])
+
+    def test_the_same_command_under_two_keys_runs_once(self):
+        orch, _root, _run_id = self._orch(
+            {"lint": "", "typecheck": "", "test": {".rs": "make check", ".js": "make check"}}
+        )
+
+        self.assertEqual(orch._verify_plan(), [("test", "make check")])
+
+    def test_each_language_is_attributed_to_its_own_step(self):
+        # The amnesty compares a step's failures against that same step's
+        # baseline. Two languages sharing one step name would forgive each
+        # other's breakage.
+        orch, _root, run_id = self._orch(
+            {"lint": "", "typecheck": "", "test": {".rs": "cargo test", ".js": "node --test"}}
+        )
+        ran: list[str] = []
+
+        def shell(_run_id, name, command):
+            ran.append(name)
+            failing = name.endswith("[.js]")
+            return StepResult(
+                ok=not failing,
+                detail="error: boom\n  --> web/main.js:1:1\n" if failing else "",
+            )
+
+        orch._shell = shell
+        ticket = Ticket("T-1", allowed_files=["src/a.rs"])
+
+        baseline = orch._baseline_failures(run_id, ticket)
+
+        self.assertEqual(ran, ["baseline-test[.js]", "baseline-test[.rs]"])
+        self.assertIn("test[.js]", baseline)
+        self.assertNotIn("test[.rs]", baseline)
+
+
+class TestATicketNothingCanRunDoesNotRun(unittest.TestCase):
+    """A Rust project's JavaScript was verified by nothing, and unrun read as
+    fine: TT-005's criteria were token-presence checks satisfied by code that
+    threw on the second line of its own entry point, and six tickets went green
+    above it. The loop's answer was to author no tests and log the skip as
+    routine."""
+
+    def _orch(self, commands, allowed=("web/main.js",)):
+        orch, root, run_id = _stub_orchestrator(commands)
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "a.rs").write_text("fn main() {}\n", encoding="utf-8")
+        called: list[str] = []
+        orch._call = lambda *a, **k: called.append(a[1]) or Completion(
+            text="ACCEPT", usage=Usage(), finish_reason="stop"
+        )
+        orch._shell = lambda *a, **k: StepResult(ok=True, detail="")
+        ticket = Ticket("TT-005", allowed_files=list(allowed))
+        orch.store.add_tickets(run_id, [ticket])
+        return orch, run_id, ticket, called
+
+    def test_it_blocks_before_a_single_model_call(self):
+        orch, run_id, ticket, called = self._orch(
+            {"lint": "", "typecheck": "", "test": "cargo test"}
+        )
+
+        orch._work_ticket(run_id, ticket)
+
+        stored = orch.store.list_tickets(run_id)[0]
+        self.assertEqual(stored.status, TICKET_BLOCKED)
+        self.assertEqual(called, [], "nothing should have been spent")
+        self.assertIn(".js", stored.blocked_note)
+        self.assertIn("forge toolchain --language .js", stored.blocked_note)
+        self.assertIn("web/main.js", stored.blocked_note)
+
+    def test_a_covered_ticket_runs_as_before(self):
+        orch, run_id, ticket, called = self._orch(
+            {"lint": "", "typecheck": "", "test": {".rs": "cargo test", ".js": "node --test"}}
+        )
+
+        orch._work_ticket(run_id, ticket)
+
+        self.assertNotEqual(orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED)
+        self.assertTrue(called)
+
+    def test_a_declared_language_does_not_block(self):
+        # The decision is on the record, so the gate stops asking.
+        orch, run_id, _ticket, called = self._orch(
+            {"lint": "", "typecheck": "", "test": {".rs": "cargo test", ".sh": False}},
+            allowed=("build.sh",),
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertNotEqual(orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED)
+        self.assertTrue(called)
+
+    def test_a_declared_language_is_not_reported_as_unlinted_either(self):
+        orch, run_id, _ticket, _called = self._orch(
+            {"lint": {".rs": "cargo clippy"}, "typecheck": "", "test": {".rs": "cargo test", ".sh": False}},
+            allowed=("build.sh",),
+        )
+        (orch.config.root / "build.sh").write_text("echo hi\n", encoding="utf-8")
+
+        orch._report_unlinted(run_id)
+
+        messages = " ".join(row["message"] for row in orch.store.events_after(0))
+        self.assertNotIn(".sh", messages)
+
+    def test_a_project_with_no_test_command_at_all_is_left_alone(self):
+        # A project without tests is a different situation, already reported at
+        # run end. Blocking every ticket in it would be a new failure, not a
+        # caught one.
+        orch, run_id, ticket, called = self._orch({"lint": "", "typecheck": "", "test": ""})
+
+        orch._work_ticket(run_id, ticket)
+
+        self.assertNotEqual(orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED)
+
+    def test_the_tester_writes_in_the_language_the_ticket_wrote(self):
+        # Not the project's language. A Rust core with a browser shell has two
+        # answers and the right one depends on which ticket is asking.
+        orch, _run_id, _ticket, _called = self._orch(
+            {"lint": "", "typecheck": "", "test": {".rs": "cargo test", ".js": "node --test"}}
+        )
+
+        self.assertEqual(orch._suite_suffix(["web/main.js"]), ".js")
+        self.assertEqual(orch._suite_suffix(["src/game.rs"]), ".rs")
+
+    def test_an_unlinted_language_is_reported_and_not_blocked(self):
+        # Tests are proof; lint is quality. A ticket in a language nothing can
+        # test is one nothing can check, while one in a language nothing lints
+        # is merely one nobody is holding to a style — blocking on that would
+        # stall a backlog over a build script.
+        orch, run_id, _ticket, _called = self._orch(
+            {
+                "lint": {".rs": "cargo clippy"},
+                "typecheck": "",
+                "test": {".rs": "cargo test", ".js": "node --test"},
+            }
+        )
+        (orch.config.root / "web").mkdir(exist_ok=True)
+        (orch.config.root / "web" / "main.js").write_text("run()\n", encoding="utf-8")
+
+        orch._report_unlinted(run_id)
+
+        messages = " ".join(row["message"] for row in orch.store.events_after(0))
+        self.assertIn("No lint command covers .js", messages)
+        self.assertIn("forge toolchain --kind lint --language .js", messages)
+
+    def test_a_project_that_lints_nothing_is_not_nagged(self):
+        orch, run_id, _ticket, _called = self._orch(
+            {"lint": "", "typecheck": "", "test": "cargo test"}
+        )
+
+        orch._report_unlinted(run_id)
+
+        self.assertEqual(
+            [row for row in orch.store.events_after(0) if "lint" in row["message"]], []
+        )
+
+    def test_a_bug_in_an_unrunnable_language_says_so_instead_of_blaming_the_report(self):
+        # The level-0 case: the fault was real, in a file `cargo test` cannot
+        # run, and the block used to read "sharpen the report".
+        orch, run_id, _ticket, _called = self._orch(
+            {"lint": "", "typecheck": "", "test": "cargo test"}
+        )
+        bug = Ticket("BUG-001", kind=TICKET_BUG, spec="s", allowed_files=["web/main.js"])
+
+        path, reason = orch._repro_target(bug)
+
+        self.assertEqual(path, "")
+        self.assertIn("no test command covers", reason)
+        self.assertIn("forge toolchain --language .js", reason)
 
 
 class TestARetryCycleRemembersWhatFailed(unittest.TestCase):
@@ -5540,7 +6933,7 @@ class TestBaselineVerifyIsOptional(unittest.TestCase):
 
     def test_turning_it_off_skips_the_extra_verify_run(self):
         orch, _, run_id = _stub_orchestrator(
-            commands={"lint": "", "typecheck": "", "test": "cargo test"}
+            commands={"lint": "", "typecheck": "", "test": "pytest -q"}
         )
         orch.config.loop.baseline_verify = False
         orch.config.loop.max_attempts = 1

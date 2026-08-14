@@ -216,13 +216,21 @@ def gather_evidence(root: Path) -> list[tuple[str, str]]:
     return collected
 
 
-def build_prompt(root: Path, evidence: list[tuple[str, str]]) -> list[Message]:
+def build_prompt(
+    root: Path, evidence: list[tuple[str, str]], language: str = ""
+) -> list[Message]:
     blocks = [f"### {name}\n```\n{text}\n```" for name, text in evidence]
-    body = (
-        f"Repository: {root.name}\n\n"
-        + "\n\n".join(blocks)
-        + "\n\nWhat are this project's lint, type-check, and test commands?"
+    asked = (
+        f"What are this project's lint, type-check, and test commands "
+        f"**for its {language} files specifically**? A polyglot repository runs "
+        f"each language its own way, and the command for another language is "
+        f"worse than none — it passes without running a line of {language} and "
+        f"reports that as verified. Answer only for {language}, and leave a "
+        f"field empty when this project states nothing for it."
+        if language
+        else "What are this project's lint, type-check, and test commands?"
     )
+    body = f"Repository: {root.name}\n\n" + "\n\n".join(blocks) + f"\n\n{asked}"
     return [
         Message(role="system", content=DETECT_SYSTEM),
         Message(role="user", content=body),
@@ -290,12 +298,19 @@ def parse_detection(text: str) -> Detection:
     )
 
 
-def detect(root: Path, provider: Provider, *, max_tokens: int = 1024) -> Detection:
+def detect(
+    root: Path, provider: Provider, *, max_tokens: int = 1024, language: str = ""
+) -> Detection:
     """Read the repo's own documents and ask `provider` what they say.
 
     Never raises. Detection is a convenience on top of a question the user can
     always answer themselves, so every failure path returns a Detection whose
     `error` explains what happened and whose commands are empty.
+
+    `language` narrows the question to one of them. A repository that builds
+    Rust and serves a JavaScript page states both, and the answer for the wrong
+    one is worse than no answer: it passes without running a line of the
+    language it claims to cover.
     """
     evidence = gather_evidence(root)
     if not evidence:
@@ -305,7 +320,7 @@ def detect(root: Path, provider: Provider, *, max_tokens: int = 1024) -> Detecti
 
     try:
         completion = provider.complete(
-            build_prompt(root, evidence), max_tokens=max_tokens, temperature=0.0
+            build_prompt(root, evidence, language), max_tokens=max_tokens, temperature=0.0
         )
     except ProviderError as exc:
         return Detection(error=str(exc))

@@ -8,6 +8,8 @@
                                    (-1: until it is clean or you stop it)
     forge status                   one-shot summary
     forge retry [--respec]         put failed tickets back on the backlog
+    forge bug "<report>"           reproduce a bug, then fix it
+    forge toolchain [--language X] what tests each language; set up what nothing does
     forge criteria [ID --accept N] adopt a criterion respec proposed and lost
     forge prune [--keep N]         delete the artifact trees of old runs
     forge models                   write Modelfiles pinning what config cannot
@@ -24,15 +26,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 import time
 import webbrowser
+from collections import Counter
 from pathlib import Path
 
-from . import modelfiles, respec, wizard
+from . import evidence, modelfiles, respec, toolchain, wizard
 from .artifacts import ARTIFACTS_DIR
-from .config import Config, ConfigError, default_config
+from .config import ANY_LANGUAGE, Config, ConfigError, default_config, normalize_language
 from .ingest import ingest as ingest_document
 from .ingest import write_tickets
 from .loop import (
@@ -44,15 +48,19 @@ from .loop import (
     retries_key,
 )
 from .memory import MemoryClient
+from .patch import matches_any
+from .prompts import bug_prompt, locate_prompt, parse_bug, parse_locate
 from .profile import Profile
 from .providers import ProviderError
 from .state import (
     RUN_IDLE,
     TICKET_BLOCKED,
+    TICKET_BUG,
     TICKET_DONE,
     TICKET_FAILED,
     TICKET_SKIPPED,
     Store,
+    Ticket,
 )
 from .tokens import format_tokens
 from .ui import server as ui_server
@@ -240,13 +248,72 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if report.startswith("FAIL"):
             failures += 1
 
-    for name in ("lint", "typecheck", "test"):
-        command = config.commands.get(name, "")
-        print(f"  {name} command: {command or '(none configured)'}")
+    uncovered = _report_coverage(config)
 
     print()
     print("all checks passed" if not failures else f"{failures} check(s) failed")
+    if uncovered:
+        print(
+            f"{len(uncovered)} language(s) in this project have no test command. "
+            f"Work in them can only be checked by reading."
+        )
     return 1 if failures else 0
+
+
+def _report_coverage(config: Config) -> list[str]:
+    """What runs against each language in the project, and what does not.
+
+    A repository is not one language, and the loop's verification is only as
+    wide as its commands. Printing the matrix is what makes a gap visible
+    before it becomes a ticket that passed on review alone over code nothing
+    ever ran.
+
+    Returns the extensions with no test command, so the caller can say so.
+    """
+    census = Counter(
+        suffix
+        for path in evidence.repo_files(config.root, limit=4000)
+        if (suffix := Path(path).suffix.lower()) in _SOURCE_SUFFIXES
+    )
+    if not census:
+        for name in ("lint", "typecheck", "test"):
+            commands = config.commands_for(name)
+            shown = commands.get(ANY_LANGUAGE) or "; ".join(
+                f"{key} {value}" for key, value in sorted(commands.items())
+            )
+            print(f"  {name} command: {shown or '(none configured)'}")
+        return []
+
+    width = max(len(suffix) for suffix in census)
+    print("\n  language  files  test / lint")
+    uncovered: list[str] = []
+    for suffix, count in sorted(census.items(), key=lambda item: (-item[1], item[0])):
+        test, how = config.covering("test", suffix)
+        lint, _ = config.covering("lint", suffix)
+        if not test and not config.exempt("test", suffix):
+            uncovered.append(suffix)
+        # A catch-all that cannot run the language is worse than none: it reads
+        # as coverage in every report and proves nothing about the files.
+        if config.exempt("test", suffix):
+            shown = "(none — declared)"
+        else:
+            shown = test or (
+                "(no test command" + (f" — the one configured {how})" if how else ")")
+            )
+        print(
+            f"  {suffix:<{max(width, 8)}}  {count:>5}  {shown}"
+            + ("  (catch-all)" if how == "catch-all" else "")
+            + (f"  |  {lint}" if lint else "")
+        )
+    return uncovered
+
+
+# Extensions worth reporting coverage for: languages whose behavior a test
+# could assert. A stylesheet with no runner is not a gap.
+_SOURCE_SUFFIXES = frozenset(
+    """.rs .py .js .mjs .cjs .jsx .ts .tsx .go .rb .java .kt .swift .c .cc .cpp
+    .h .hpp .cs .php .sh .ps1 .lua .ex .exs .scala .dart""".split()
+)
 
 
 def cmd_ingest(args: argparse.Namespace) -> int:
@@ -737,6 +804,301 @@ def cmd_retry(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bug(args: argparse.Namespace) -> int:
+    """Turn a prose bug report into one ticket the loop can reproduce and fix.
+
+    Separate from `ingest` because the shapes differ at the root. Ingest turns
+    a document into a backlog and takes the author's acceptance criteria as the
+    contract; a report is one symptom, its file scope is unknown, and its
+    contract is written afterwards by a test that has to fail first.
+    """
+    report = _read_report(args)
+    if not report.strip():
+        sys.exit("error: the report is empty. Say what you saw and what you expected.")
+
+    config = _load(args.root)
+    store = _store(config)
+
+    try:
+        provider = config.provider_for("planner")
+    except (ConfigError, ValueError) as exc:
+        sys.exit(f"error: {exc}")
+
+    # Gathered here rather than asked of the model: the planner has no
+    # filesystem, and the file that needs changing is the thing being looked
+    # for. See forge/evidence.py.
+    found = evidence.gather(config.root, report)
+    if not found:
+        # Says which of the two it is, because the fixes are different: an
+        # empty project is a wrong --root, and a project whose files are all
+        # ignored is a .gitignore doing more than it meant to.
+        print(
+            f"warning: nothing to search in {config.root}. Either that is the "
+            f"wrong directory, or everything in it is ignored. The ticket will "
+            f"be scoped from the report alone, and the planner will probably "
+            f"refuse it."
+        )
+
+    budget = max(2048, provider.capabilities().max_output_tokens // 4)
+
+    # Two passes, because one is not enough for the report a person actually
+    # files. "The score sometimes stops updating" names no function and no
+    # file, so a single call would be choosing scope from a list of filenames.
+    # The first pass spends a little context deciding what to read; the second
+    # writes the ticket against the contents.
+    sources: dict[str, str] = {}
+    if found:
+        print("Looking for where the problem lives...")
+        try:
+            located = provider.complete(
+                locate_prompt(report, found), max_tokens=budget, temperature=0.0
+            )
+            candidates = parse_locate(located.text, evidence.repo_files(config.root))
+        except (ProviderError, ValueError) as exc:
+            # Best effort by design: the second pass still has the file list
+            # and the grep hits, which is what it had before this existed.
+            print(f"warning: could not narrow the search ({exc}); reading nothing first.")
+            candidates = []
+        if candidates:
+            sources = evidence.read_files(config.root, candidates)
+            print(f"  reading {', '.join(sources)}")
+
+    print("Writing the ticket...")
+    try:
+        completion = provider.complete(
+            bug_prompt(report, found, sources), max_tokens=budget, temperature=0.1
+        )
+        fields = parse_bug(completion.text)
+    except (ProviderError, ValueError) as exc:
+        sys.exit(f"error: {exc}")
+
+    ticket_id = args.id or _next_bug_id(store)
+    ticket = Ticket(
+        ticket_id=ticket_id,
+        title=fields["title"] or "Bug report",
+        kind=TICKET_BUG,
+        # Never delegated blindly: a bug in code the project marked off-limits
+        # is exactly the kind that wants a person.
+        route="claude-only"
+        if any(matches_any(p, config.never_delegate) for p in fields["allowed_files"])
+        else "delegate",
+        spec=fields["spec"],
+        allowed_files=fields["allowed_files"],
+        reference_files=fields["reference_files"],
+        criteria=fields["criteria"],
+        # What the reproduction should assert, read by the tester before it
+        # writes anything and by the executor as the shape of the fix.
+        context=fields["reproduce"],
+    )
+
+    run_id = store.create_run(f"bug: {ticket.title}", source=report[:2000])
+    store.add_tickets(run_id, [ticket])
+    store.log(
+        run_id,
+        f"{ticket.ticket_id}: filed from a bug report. It must be reproduced "
+        f"before anything is allowed to fix it.",
+        kind="ticket",
+        data={"report": report[:2000]},
+    )
+
+    try:
+        write_tickets(config.tickets_dir, [ticket])
+    except OSError as exc:
+        print(f"warning: could not write the ticket file ({exc}).")
+
+    print(f"\nRun {run_id} — {ticket.ticket_id}: {ticket.title}")
+    print(f"  scope     {', '.join(ticket.allowed_files) or '(none named)'}")
+    _warn_uncovered(config, ticket.allowed_files)
+    if ticket.reference_files:
+        print(f"  reads     {', '.join(ticket.reference_files)}")
+    if ticket.context:
+        print(f"  reproduce {ticket.context}")
+    print(f"\n{ticket.spec}\n")
+    if ticket.route != "delegate":
+        print(
+            "Routed claude-only: the scope touches a neverDelegate path, so the "
+            "loop will leave it for you."
+        )
+
+    if args.go:
+        return cmd_go(
+            argparse.Namespace(
+                root=args.root, plan="", goal="", no_ui=args.no_ui, open=False,
+                retries=None, no_respec=False, wait=None,
+            )
+        )
+    print("Read the scope above, then: forge go")
+    return 0
+
+
+def _warn_uncovered(config: Config, paths: list[str]) -> list[str]:
+    """Say up front when planned work lands in a language nothing tests.
+
+    The loop blocks such a ticket when it reaches it, which is correct and
+    late: by then a run exists and a human has walked away. Ingest and `forge
+    bug` know the scope before anything is spent, and that is the cheapest
+    moment to hear it.
+    """
+    if not config.commands_for("test"):
+        return []
+    uncovered = sorted(
+        {
+            suffix
+            for path in paths
+            if not any(ch in path for ch in "*?[")
+            and (suffix := Path(path).suffix.lower())
+            and suffix in _SOURCE_SUFFIXES
+            and not config.covers("test", suffix)
+        }
+    )
+    if uncovered:
+        print(
+            f"\nwarning: this writes {', '.join(uncovered)}, which no test "
+            f"command covers. The loop will block rather than check it by "
+            f"reading:\n  forge toolchain --language {uncovered[0]}"
+        )
+    return uncovered
+
+
+def _read_report(args: argparse.Namespace) -> str:
+    """The report itself, from an argument, a file, or stdin."""
+    if args.file:
+        try:
+            return Path(args.file).read_text(encoding="utf-8")
+        except OSError as exc:
+            sys.exit(f"error: cannot read {args.file} ({exc})")
+    if args.report == "-":
+        return sys.stdin.read()
+    return args.report or ""
+
+
+def _next_bug_id(store: Store) -> str:
+    """The next free `BUG-nnn`, counting across every run in this repository.
+
+    Across runs rather than within one, because the id names a test file and
+    two runs reusing `BUG-001` would have the second overwrite the first's
+    reproduction — throwing away the evidence for a bug nobody said was fixed.
+    """
+    used = set()
+    for run in store.list_runs(limit=200):
+        for ticket in store.list_tickets(int(run["id"])):
+            match = re.fullmatch(r"BUG-(\d+)", ticket.ticket_id)
+            if match:
+                used.add(int(match.group(1)))
+    return f"BUG-{max(used) + 1 if used else 1:03d}"
+
+
+def cmd_toolchain(args: argparse.Namespace) -> int:
+    """Show what runs against each language, and set up what does not.
+
+    The other half of the gate. A ticket in a language nothing tests blocks
+    with a note pointing here, and a note pointing at a command that does not
+    exist is worse than no note.
+
+    Nothing is written without being asked for. Detection reads the repo's own
+    CI, build files and contributing guide and proposes; `--accept` or `--set`
+    writes. Changing what verification means is not a decision the loop gets to
+    make while nobody is watching.
+    """
+    config = _load(args.root)
+
+    if not args.language:
+        uncovered = _report_coverage(config)
+        if uncovered:
+            print(
+                f"\nNo test command covers: {', '.join(uncovered)}. Work in "
+                f"{'that language' if len(uncovered) == 1 else 'those languages'} "
+                f"cannot be checked by anything here, so the loop blocks tickets "
+                f"that write it.\n  forge toolchain --language {uncovered[0]}"
+            )
+        return 0
+
+    language = args.language if args.language.startswith(".") else f".{args.language.lstrip('.')}"
+    suffixes = normalize_language(args.language)
+    kind = args.kind
+
+    if args.skip:
+        # On the record, and readable as one: `false` cannot be mistaken for a
+        # command, and the gate stops asking about a language somebody has
+        # already decided about.
+        return _write_command(config, kind, language, False, suffixes=suffixes)
+
+    if args.set:
+        return _write_command(config, kind, language, args.set, suffixes=suffixes)
+
+    try:
+        provider = config.provider_for("planner")
+    except (ConfigError, ValueError) as exc:
+        sys.exit(f"error: {exc}")
+
+    print(f"Reading this repository for its {language} commands...")
+    detection = toolchain.detect(config.root, provider, language=language)
+    if not detection.ok:
+        sys.exit(
+            f"error: {detection.error}\n"
+            f"Set it by hand instead:\n"
+            f'  forge toolchain --language {language} --set "<command>"'
+        )
+
+    proposed = detection.commands.get(kind, "")
+    if not proposed:
+        print(
+            f"Nothing in this repository states a {kind} command for {language}"
+            + (f" (read: {', '.join(detection.evidence)})" if detection.evidence else "")
+            + ".\nSet it by hand:\n"
+            f'  forge toolchain --language {language} --set "<command>"'
+        )
+        return 1
+
+    print(f"\n  {kind} for {language}:  {proposed}")
+    if detection.source:
+        print(f"  from: {detection.source}")
+    print(f"  confidence: {detection.confidence}")
+
+    if not args.accept:
+        print(
+            "\nNothing was written. Accept it with:\n"
+            f"  forge toolchain --language {language} --accept"
+        )
+        return 0
+    return _write_command(config, kind, language, proposed, suffixes=suffixes)
+
+
+def _write_command(
+    config: Config, kind: str, language: str, command: str | bool, suffixes=()
+) -> int:
+    """Put one language's command into config, turning a string into a map.
+
+    An existing single command becomes the `*` entry rather than being
+    replaced: it was covering everything, and this is adding a language beside
+    it, not taking its place.
+    """
+    existing = config.commands.get(kind, "")
+    block = {ANY_LANGUAGE: existing} if isinstance(existing, str) and existing else dict(existing or {})
+    for key in suffixes or (language,):
+        if key != ANY_LANGUAGE:
+            block[key] = command
+    config.commands[kind] = block
+
+    try:
+        config.validate()
+    except ConfigError as exc:
+        sys.exit(f"error: {exc}")
+
+    written = config.write()
+    print(f"\nWrote {written}")
+    if command is False:
+        print(f"  commands.{kind}[{language}] = false  (nothing runs it, on purpose)")
+        print("\nTickets writing it are no longer blocked. Their work is checked")
+        print("at review rather than by running anything, and the run says so.")
+        return 0
+    print(f'  commands.{kind}[{language}] = "{command}"')
+    print("\nCheck it runs, then requeue whatever was blocked:")
+    print("  forge doctor")
+    print("  forge retry --ticket <ID>")
+    return 0
+
+
 def cmd_criteria(args: argparse.Namespace) -> int:
     """Show the criteria respec proposed and refused, and adopt one.
 
@@ -982,6 +1344,50 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="list what would be removed and stop"
     )
     p.set_defaults(func=cmd_prune)
+
+    p = sub.add_parser(
+        "toolchain", help="show what tests each language, and set up what nothing does"
+    )
+    p.add_argument(
+        "--language",
+        default="",
+        metavar="EXT",
+        help="the language to set up, as an extension or a name (.js, javascript)",
+    )
+    p.add_argument(
+        "--kind",
+        default="test",
+        choices=("test", "lint", "typecheck"),
+        help="which command to set (default: test)",
+    )
+    p.add_argument(
+        "--set", default="", metavar="CMD", help="write this command, without asking a model"
+    )
+    p.add_argument(
+        "--accept", action="store_true", help="write the detected command to config"
+    )
+    p.add_argument(
+        "--skip",
+        action="store_true",
+        help="declare that nothing runs this language, so tickets writing it "
+        "stop being blocked (build scripts, shell wrappers)",
+    )
+    p.set_defaults(func=cmd_toolchain)
+
+    p = sub.add_parser(
+        "bug", help="turn a bug report into a ticket the loop must reproduce first"
+    )
+    p.add_argument(
+        "report",
+        nargs="?",
+        default="",
+        help="the report itself, or - to read it from stdin",
+    )
+    p.add_argument("--file", default="", metavar="PATH", help="read the report from a file")
+    p.add_argument("--id", default="", metavar="ID", help="ticket id (default: the next BUG-nnn)")
+    p.add_argument("--go", action="store_true", help="start the loop straight after")
+    p.add_argument("--no-ui", action="store_true", help="with --go, skip the dashboard")
+    p.set_defaults(func=cmd_bug)
 
     p = sub.add_parser(
         "criteria",

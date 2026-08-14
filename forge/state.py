@@ -16,6 +16,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -42,6 +43,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     ticket_id     TEXT NOT NULL,
     title         TEXT NOT NULL DEFAULT '',
     route         TEXT NOT NULL DEFAULT 'delegate',
+    kind          TEXT NOT NULL DEFAULT 'feature',
     status        TEXT NOT NULL DEFAULT 'pending',
     position      INTEGER NOT NULL DEFAULT 0,
     attempts      INTEGER NOT NULL DEFAULT 0,
@@ -128,6 +130,11 @@ def _criterion_key(criterion: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", criterion.lower())
 
 
+# What a ticket is for. `bug` earns the reproduce-before-fix path; everything
+# else is ordinary forward work.
+TICKET_FEATURE = "feature"
+TICKET_BUG = "bug"
+
 TICKET_PENDING = "pending"
 TICKET_RUNNING = "running"
 TICKET_DONE = "done"
@@ -141,6 +148,15 @@ class Ticket:
     ticket_id: str
     title: str = ""
     route: str = "delegate"
+    # What kind of work this is. `feature` tickets describe work that does not
+    # exist yet and are verified against their criteria. A `bug` ticket
+    # describes something that already misbehaves, and the loop treats it
+    # differently in one decisive way: it must reproduce the fault before it is
+    # allowed to fix it, and the ticket is only done when the test that proved
+    # the fault passes. Criteria alone cannot carry that — a criterion is
+    # satisfied the moment the code reads right, and both bugs shipped by one
+    # green run read right.
+    kind: str = TICKET_FEATURE
     status: str = TICKET_PENDING
     position: int = 0
     attempts: int = 0
@@ -228,6 +244,7 @@ class Ticket:
             "ticket_id": self.ticket_id,
             "title": self.title,
             "route": self.route,
+            "kind": self.kind,
             "status": self.status,
             "position": self.position,
             "attempts": self.attempts,
@@ -252,6 +269,7 @@ class Ticket:
             ticket_id=row["ticket_id"],
             title=row["title"],
             route=row["route"],
+            kind=row["kind"],
             status=row["status"],
             position=row["position"],
             attempts=row["attempts"],
@@ -277,13 +295,37 @@ class Store:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(self.path, check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
-        # WAL so the dashboard can read while the loop writes.
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.executescript(SCHEMA)
+        # One connection per thread, not one connection shared by all of them.
+        # `forge go` hands this same Store to the dashboard, which serves every
+        # request on a thread of its own, so the loop's writes and the
+        # dashboard's reads were interleaving on a single sqlite3 connection.
+        # That is undefined use of the driver whatever `check_same_thread`
+        # says, and it eventually raised `bad parameter or other API misuse`
+        # and killed a run mid-cycle. WAL is what makes the split cheap:
+        # readers do not block the writer, and each thread gets its own cursor
+        # state instead of trampling a shared one.
+        self._local = threading.local()
+        connection = self._connect()
+        connection.executescript(SCHEMA)
         self._migrate()
-        self._connection.commit()
+        connection.commit()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        # WAL so the dashboard can read while the loop writes.
+        connection.execute("PRAGMA journal_mode=WAL")
+        # A writer that arrives mid-checkpoint waits rather than raising. Five
+        # seconds is far longer than anything this store does.
+        connection.execute("PRAGMA busy_timeout=5000")
+        self._local.connection = connection
+        return connection
+
+    @property
+    def _connection(self) -> sqlite3.Connection:
+        """This thread's connection, opened on first use."""
+        connection = getattr(self._local, "connection", None)
+        return connection if connection is not None else self._connect()
 
     # Columns added after the first release. `CREATE TABLE IF NOT EXISTS` will
     # not add them to a database that already exists, so widen it here instead
@@ -297,6 +339,7 @@ class Store:
         ("tickets", "original_spec", "TEXT NOT NULL DEFAULT ''"),
         ("tickets", "original_criteria", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "original_context", "TEXT NOT NULL DEFAULT ''"),
+        ("tickets", "kind", "TEXT NOT NULL DEFAULT 'feature'"),
         ("tickets", "needs", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "dep_stamp", "TEXT NOT NULL DEFAULT '{}'"),
         ("tickets", "baseline_tree", "TEXT NOT NULL DEFAULT ''"),
@@ -314,7 +357,15 @@ class Store:
                 )
 
     def close(self) -> None:
-        self._connection.close()
+        """Close this thread's connection. Other threads keep their own.
+
+        Enough for every caller there is: the CLI closes the store it opened,
+        and the dashboard's threads are daemons that die with the process.
+        """
+        connection = getattr(self._local, "connection", None)
+        if connection is not None:
+            connection.close()
+            self._local.connection = None
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
@@ -414,12 +465,12 @@ class Store:
                 row["original_context"] = ticket.original_context or ticket.context
                 connection.execute(
                     "INSERT OR REPLACE INTO tickets "
-                    "(run_id, ticket_id, title, route, status, position, attempts, "
+                    "(run_id, ticket_id, title, route, kind, status, position, attempts, "
                     " attempt_base, spec, allowed_files, reference_files, criteria, needs, dep_stamp, "
                     " baseline_tree, context, "
                     " blocked_note, original_spec, original_criteria, original_context, "
                     " updated_at) "
-                    "VALUES (:run_id, :ticket_id, :title, :route, :status, :position, "
+                    "VALUES (:run_id, :ticket_id, :title, :route, :kind, :status, :position, "
                     ":attempts, :attempt_base, :spec, :allowed_files, :reference_files, "
                     ":criteria, :needs, :dep_stamp, :baseline_tree, :context, "
                     ":blocked_note, :original_spec, :original_criteria, :original_context, :now)",
@@ -471,7 +522,7 @@ class Store:
         # is judged against, and an anchor that any caller can move is not one.
         with self._write() as connection:
             connection.execute(
-                "UPDATE tickets SET status = :status, attempts = :attempts, "
+                "UPDATE tickets SET status = :status, kind = :kind, attempts = :attempts, "
                 "attempt_base = :attempt_base, spec = :spec, "
                 "allowed_files = :allowed_files, reference_files = :reference_files, "
                 "criteria = :criteria, needs = :needs, dep_stamp = :dep_stamp, "
@@ -602,6 +653,58 @@ class Store:
             seen.add(key)
             failures.append({"name": row["name"], "detail": detail})
         return failures[-limit:]
+
+    def reproduced(self, run_id: int, ticket_id: str) -> str:
+        """The output that proved this bug, or "" if it was never reproduced.
+
+        The `reproduce` step is recorded `ok` when the test the loop wrote
+        *failed* — that failure is the proof, and it is the one place in the
+        pipeline where a red suite is the desired outcome.
+
+        Durable because the fix erases the evidence. Once the bug is fixed the
+        test passes, and a retry cycle re-running reproduction would find
+        nothing wrong and park a ticket whose work is already done. Asking the
+        step log instead answers the only question that matters on a second
+        pass: was this fault ever real.
+        """
+        row = self._connection.execute(
+            "SELECT detail FROM steps "
+            "WHERE run_id = ? AND ticket_id = ? AND name = 'reproduce' "
+            "AND status = 'ok' ORDER BY id DESC LIMIT 1",
+            (run_id, ticket_id),
+        ).fetchone()
+        return row["detail"] if row else ""
+
+    def ruled_out(self, run_id: int, ticket_id: str) -> list[tuple[str, str]]:
+        """Hypotheses this bug ticket has already disproved, oldest first.
+
+        Read back out of the run log rather than kept in a column of its own:
+        each re-diagnosis already logs what it dropped and why, and a second
+        store of the same fact is a second thing to keep true.
+
+        The list is what stops the third hypothesis being the first one again.
+        A planner handed only "that was wrong, try again" proposes the same
+        files with the same reasoning, because from where it sits nothing has
+        changed.
+        """
+        rows = self._connection.execute(
+            "SELECT data FROM events WHERE run_id = ? AND kind = 'ticket' "
+            "AND data LIKE '%\"ruled_out\"%' ORDER BY id",
+            (run_id,),
+        ).fetchall()
+
+        found: list[tuple[str, str]] = []
+        for row in rows:
+            try:
+                data = json.loads(row["data"])
+            except json.JSONDecodeError:
+                continue
+            if data.get("ticket") != ticket_id:
+                continue
+            spec = str(data.get("ruled_out", "")).strip()
+            if spec:
+                found.append((spec, str(data.get("disproof", "")).strip()))
+        return found
 
     def ticket_turns(
         self, run_id: int, ticket_id: str, limit: int = 2

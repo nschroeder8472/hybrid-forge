@@ -30,6 +30,7 @@ import hashlib
 import os
 import re
 import subprocess
+import traceback
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -37,9 +38,10 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from . import respec
+from . import evidence
 from .artifacts import Artifacts
 from .budget import BudgetGate, Wait
-from .config import Config, ConfigError
+from .config import ANY_LANGUAGE, Config, ConfigError
 from .failures import distill, errors_naming, signatures
 from .ingest import write_tickets
 from .memory import MemoryClient, MemoryRefused, MemoryUnavailable, ticket_query
@@ -71,7 +73,10 @@ from .prompts import (
     build_prompt,
     parse_record,
     parse_verdict,
+    parse_bug,
     record_prompt,
+    rediagnose_prompt,
+    repro_prompt,
     review_prompt,
     strip_prompt_echo,
     tests_prompt,
@@ -85,6 +90,7 @@ from .state import (
     RUN_STOPPED,
     RUN_WAITING_BUDGET,
     TICKET_BLOCKED,
+    TICKET_BUG,
     TICKET_DONE,
     TICKET_FAILED,
     TICKET_PENDING,
@@ -105,6 +111,22 @@ _DROPPABLE_HEADINGS = (
     PRIOR_FAILURES_HEADING,
     PRIOR_VERDICTS_HEADING,
     PRIOR_ATTEMPT_HEADING,
+)
+
+
+# A failure in the reproduction that is about the test file rather than about
+# the bug: it did not compile, did not import, was not collected. Deliberately
+# narrow. A test naming its own file while reporting a failed assertion is the
+# reproduction working, and treating that as a broken test parks every bug the
+# loop could actually have fixed — so anything not matched here counts as
+# evidence, and a build error that slips through fails the attempt the ordinary
+# way instead of discarding the proof.
+_UNBUILDABLE = re.compile(
+    r"syntaxerror|indentationerror|importerror|modulenotfounderror|"
+    r"error\[e\d+\]|cannot find|unresolved|undeclared|not declared|"
+    r"no such (?:module|file)|failed to compile|collection error|"
+    r"error: expected|fatal error",
+    re.IGNORECASE,
 )
 
 
@@ -499,6 +521,54 @@ class Orchestrator:
     # The verify steps, in the order a failure is cheapest to diagnose.
     _VERIFY_STEPS = ("lint", "typecheck", "test")
 
+    def _verify_plan(self) -> list[tuple[str, str]]:
+        """Every verify command to run, as `(step name, command)`.
+
+        One command per step assumed a repository is one language. With a map
+        there is one per language, and all of them run: verification stays
+        whole-project, which is what the baseline amnesty, the orphan sweep and
+        "you broke this, not the ticket before you" all rest on. A language
+        with no files in the tree is skipped — a JavaScript runner in a repo
+        that has no JavaScript yet has nothing to say, and running it would
+        fail on an empty match.
+
+        Identical commands under two keys run once. A step with a single
+        command keeps its plain name, so a one-language project's step log and
+        dashboard read exactly as before; only a project that genuinely has two
+        gets `test[.js]`.
+        """
+        present = self._languages_present()
+        plan: list[tuple[str, str]] = []
+        for kind in self._VERIFY_STEPS:
+            commands = self.config.commands_for(kind)
+            wanted = {
+                suffix: command
+                for suffix, command in commands.items()
+                if suffix == ANY_LANGUAGE or suffix in present
+            }
+            seen: dict[str, str] = {}
+            for suffix, command in sorted(wanted.items()):
+                if command in seen.values():
+                    continue
+                seen[suffix] = command
+            for suffix, command in seen.items():
+                label = kind if len(seen) == 1 else f"{kind}[{suffix}]"
+                plan.append((label, command))
+        return plan
+
+    def _languages_present(self) -> set[str]:
+        """Extensions of the source files this project actually has.
+
+        Read per call rather than cached: a ticket that writes the project's
+        first `.js` file has just made the JavaScript runner relevant, and the
+        verify step that follows it is the first place that matters.
+        """
+        return {
+            suffix
+            for path in evidence.repo_files(self.config.root, limit=4000)
+            if (suffix := Path(path).suffix.lower())
+        }
+
     @staticmethod
     def _fence_guidance(truncated: list[str], written: Sequence[str] = ()) -> str:
         """What to tell an executor whose fence was shorter than its content."""
@@ -577,7 +647,9 @@ class Orchestrator:
                 return True
         return False
 
-    def _baseline_failures(self, run_id: int, ticket: Ticket) -> dict[str, set[str]]:
+    def _baseline_failures(
+        self, run_id: int, ticket: Ticket, extra_scope: Sequence[str] = ()
+    ) -> dict[str, set[str]]:
         """Which verify steps were already failing before this ticket started.
 
         Verification is whole-project — `cargo clippy --all-targets`, `pytest`,
@@ -603,10 +675,7 @@ class Orchestrator:
         them.
         """
         known: dict[str, set[str]] = {}
-        for name in self._VERIFY_STEPS:
-            command = self.config.commands.get(name, "")
-            if not command.strip():
-                continue
+        for name, command in self._verify_plan():
             result = self._shell(run_id, f"baseline-{name}", command)
             if result.ok:
                 continue
@@ -617,10 +686,17 @@ class Orchestrator:
                 # normally, which is the safe direction to be wrong in.
                 continue
 
+            # `extra_scope` carries a bug ticket's reproduction test. That
+            # file is not writable by anyone here, so the ordinary rule would
+            # excuse it — and on a retry cycle the reproduction is already on
+            # disk and already failing, which is exactly the failure the ticket
+            # exists to clear. Amnesty for it would let a bug ticket pass
+            # verification with the bug still in place.
+            scope = list(ticket.allowed_files) + list(extra_scope)
             owned = {
                 signature
                 for signature in found
-                if self._signature_scope(signature, ticket.allowed_files)
+                if self._signature_scope(signature, scope)
             }
             if owned:
                 self.store.log(
@@ -699,9 +775,17 @@ class Orchestrator:
             self.store.log(run_id, "Loop stopped.", level="warn", kind="lifecycle")
             return RUN_STOPPED
         except Exception as exc:  # noqa: BLE001 - the daemon must record why it died
+            # With the traceback. Without it the record is a sentence with no
+            # location — one run died on `bad parameter or other API misuse`,
+            # which is sqlite's way of saying two threads shared a connection,
+            # and nothing said which call it happened in.
             self.store.set_run_status(run_id, RUN_FAILED, str(exc))
             self.store.log(
-                run_id, f"Loop failed: {exc}", level="error", kind="lifecycle"
+                run_id,
+                f"Loop failed: {exc}",
+                level="error",
+                kind="lifecycle",
+                data={"traceback": traceback.format_exc()[-4000:]},
             )
             return RUN_FAILED
 
@@ -765,7 +849,8 @@ class Orchestrator:
         after its second ticket and said nothing that read as wrong.
         """
         self._report_unexecuted(run_id)
-        if not self.config.commands.get("test") or self._tests_authored:
+        self._report_unlinted(run_id)
+        if not self.config.commands_for("test") or self._tests_authored:
             return
         if not self._tests_skipped:
             return
@@ -777,6 +862,38 @@ class Orchestrator:
             f"tickets write are the same language.",
             level="warn",
             kind="lifecycle",
+        )
+
+    def _report_unlinted(self, run_id: int) -> None:
+        """Name the languages this project builds and does not lint.
+
+        Reported, never gated. Tests are proof and lint is quality: a ticket in
+        a language nothing can test is a ticket nothing can check, while one in
+        a language nothing lints is merely one nobody is holding to a style.
+        Blocking on the second would stall a backlog over a build script.
+        """
+        if not self.config.commands_for("lint"):
+            return
+        present = self._languages_present() & self._CODE_SUFFIXES
+        missing = sorted(
+            suffix
+            for suffix in present
+            if not self.config.covers("lint", suffix)
+            and not self.config.exempt("lint", suffix)
+            and not self.config.exempt("test", suffix)
+        )
+        if not missing:
+            return
+        self.store.log(
+            run_id,
+            f"No lint command covers {', '.join(missing)}. Work in "
+            f"{'that language' if len(missing) == 1 else 'those languages'} was "
+            f"tested but never linted — add one with `forge toolchain --kind "
+            f"lint --language {missing[0]}`, or leave it and know that is the "
+            f"bar this run was held to.",
+            level="warn",
+            kind="lifecycle",
+            data={"unlinted": missing},
         )
 
     def _report_unexecuted(self, run_id: int) -> None:
@@ -962,8 +1079,7 @@ class Orchestrator:
         # that nobody owns a breakage nobody introduced, so the run has to
         # check for one itself rather than report a green backlog over a red
         # build.
-        for name in self._VERIFY_STEPS:
-            command = self.config.commands.get(name, "")
+        for name, command in self._verify_plan():
             result = self._shell(run_id, f"final-{name}", command)
             if result.ok:
                 continue
@@ -1055,10 +1171,37 @@ class Orchestrator:
         # unsafe to delegate, so requeueing it only gets it skipped again — and
         # under `-1` that is a cycle that repeats forever while doing nothing
         # but spending a planner call on each pass.
+        # A bug ticket that never reproduced is in the same position: it stops
+        # at the same step every cycle, because nothing between cycles makes an
+        # undemonstrable fault demonstrable. One report ran fifteen cycles that
+        # way — two tester calls apiece — and would have run forever under
+        # `-1`. The tester's own explanation is in `blocked_note`; that is the
+        # thing to read, and it needs a person.
+        unprovable = {
+            ticket.ticket_id
+            for ticket in tickets
+            if ticket.kind == TICKET_BUG
+            and ticket.status == TICKET_BLOCKED
+            and not self.store.reproduced(run_id, ticket.ticket_id)
+        }
+        for ticket_id in sorted(unprovable):
+            self.store.log(
+                run_id,
+                f"{ticket_id}: not retried — the bug was never reproduced, and "
+                f"another cycle would write the same test against the same code "
+                f"for the same result. Read the blocked note: either the report "
+                f"needs sharpening, or the fault is somewhere this project's "
+                f"test command does not reach.",
+                level="warn",
+                kind="lifecycle",
+            )
+
         eligible = [
             ticket.ticket_id
             for ticket in tickets
-            if ticket.status in self.store.RETRYABLE and ticket.route == "delegate"
+            if ticket.status in self.store.RETRYABLE
+            and ticket.route == "delegate"
+            and ticket.ticket_id not in unprovable
         ]
         if not eligible:
             # Nothing here is the loop's to retry: either every ticket landed
@@ -1291,6 +1434,14 @@ class Orchestrator:
             )
             return
 
+        # Before anything is spent. A ticket in a language nothing runs cannot
+        # be checked, and the loop's answer to that used to be to run it
+        # anyway and report the skip as routine.
+        uncovered = self._uncovered_languages(ticket)
+        if uncovered:
+            self._park(run_id, ticket, self._no_runner_note(ticket, uncovered))
+            return
+
         ticket.status = TICKET_RUNNING
         self.store.update_ticket(run_id, ticket)
         self.store.log(run_id, f"{ticket.ticket_id}: starting.", kind="ticket")
@@ -1321,11 +1472,45 @@ class Orchestrator:
         # the state the ticket inherited, and every attempt is judged against
         # it. Re-running it per attempt would also fold the ticket's own
         # half-finished work into what counts as "already broken".
+        # A bug ticket's reproduction is settled before anything is verified,
+        # because the baseline has to know about that file: on a retry cycle it
+        # is already on disk and already failing, and amnesty for it would let
+        # the ticket pass with the bug still there.
+        repro: tuple[str, str] | None = None
+        if ticket.kind == TICKET_BUG:
+            repro_path, why_not = self._repro_target(ticket)
+            if not repro_path:
+                self._park(run_id, ticket, why_not)
+                return
+        else:
+            repro_path = ""
+
         pre_existing = (
-            self._baseline_failures(run_id, ticket)
+            self._baseline_failures(
+                run_id, ticket, extra_scope=[repro_path] if repro_path else []
+            )
             if self.config.loop.baseline_verify
             else {}
         )
+
+        if ticket.kind == TICKET_BUG:
+            # Proof is durable, and it has to be: once the fix lands the test
+            # passes, so a second cycle re-running reproduction would find
+            # nothing wrong and park a ticket whose work is nearly done.
+            proof = self.store.reproduced(run_id, ticket.ticket_id)
+            if not proof:
+                proof = self._prove(run_id, ticket, repro_path)
+                if not proof:
+                    return
+            repro = (repro_path, proof)
+            # The failure the executor is being asked to clear. Stated as
+            # evidence rather than left for it to infer from the spec: the
+            # first thing it needs to know is what the test actually reported.
+            failure_context = (
+                f"The bug is reproduced by `{repro_path}`, which fails against the "
+                f"code as it stands. Your fix is not done until it passes, and you "
+                f"cannot edit it — it is outside this ticket's scope:\n\n{proof}"
+            )
 
         # Test files this ticket created, and whether it created them rather
         # than overwriting something that was already there. Unverified ones
@@ -1371,6 +1556,7 @@ class Orchestrator:
                 pre_existing=pre_existing, authored=authored,
                 prior_failures=history[-self._PRIOR_FAILURES:],
                 rejections=rejections,
+                repro=repro,
             )
 
             if outcome.blocked:
@@ -1575,7 +1761,17 @@ class Orchestrator:
         authored: dict[str, bool] | None = None,
         prior_failures: Sequence[str] = (),
         rejections: list[str] | None = None,
+        repro: tuple[str, str] | None = None,
     ) -> StepResult:
+        """One attempt at a ticket: build, apply, test, verify, review.
+
+        `repro` marks this as a bug ticket whose reproduction is already on
+        disk, as `(path, the failure it produced)`. It changes two things. No
+        tests are authored — the contract was written before the fix and asking
+        for more now would let the party being judged add to it — and the
+        reviewer is shown what failed before, so it judges the fix against the
+        fault rather than against a green suite.
+        """
         # --- BUILD ---------------------------------------------------
         # The files this ticket may write must reach the executor whole; it is
         # about to send them back as whole files.
@@ -1763,12 +1959,21 @@ class Orchestrator:
         # written in; the example only shows how. Reading the language off
         # whichever example turned up first is what let one `.js` file in a
         # Rust repo disable test authoring for the whole backlog.
-        suffix = self._suite_suffix(written, exclude=written)
-        example = self._example_test(written, suffix)
-        test_path, no_tests_because = self._test_target(
-            ticket, written, example, suffix
-        )
-        if wrote_nothing:
+        if repro is not None:
+            # The contract for a bug ticket was written before the fix was
+            # attempted, by a role that could not see it. Authoring more tests
+            # here would let the attempt add to the standard it is judged
+            # against, which is the rule the loop already enforces everywhere
+            # else — and the reproduction is the standard.
+            test_path, no_tests_because = repro[0], ""
+            suffix, example = "", None
+        else:
+            suffix = self._suite_suffix(written, exclude=written)
+            example = self._example_test(written, suffix)
+            test_path, no_tests_because = self._test_target(
+                ticket, written, example, suffix
+            )
+        if wrote_nothing and repro is None:
             # Nothing was written this attempt, so there is no new behavior to
             # assert against — and authoring a file here would put a test on
             # disk for an attempt that changed nothing. Whatever this ticket
@@ -1777,15 +1982,20 @@ class Orchestrator:
                 "the attempt wrote no files, so there is nothing new to assert "
                 "against"
             )
-        if test_path:
+        if test_path and repro is None:
             # On a retry the ticket's own test file is already on disk, and a
             # fixed path makes that the common case rather than the rare one.
             # Handing it back as "the convention this repo follows" would
             # launder the previous attempt's mistakes into a rule.
             example = self._example_test(written + [test_path], suffix)
-        if ticket.criteria and test_path:
+        if repro is not None:
+            # Counted as covered whatever its criteria say: a bug ticket has a
+            # test that failed and then passed, which is the strongest coverage
+            # any ticket in this loop can have.
             self._tests_authored.add(ticket.ticket_id)
-        if ticket.criteria and no_tests_because:
+        if ticket.criteria and test_path and repro is None:
+            self._tests_authored.add(ticket.ticket_id)
+        if ticket.criteria and no_tests_because and repro is None:
             self._tests_skipped.add(ticket.ticket_id)
         if ticket.criteria and no_tests_because:
             # Not a failure. The criteria are still checked at review, which is
@@ -1799,7 +2009,7 @@ class Orchestrator:
                 "Review will check the criteria instead.",
                 kind="ticket",
             )
-        if ticket.criteria and test_path:
+        if ticket.criteria and test_path and repro is None:
             step_id = self.store.start_step(run_id, ticket.ticket_id, "tests")
             existed = (self.config.root / test_path).exists()
             try:
@@ -1815,7 +2025,7 @@ class Orchestrator:
                         # own file renames it on every retry and leaves the
                         # previous one running forever.
                         test_path=test_path,
-                        test_command=self.config.commands.get("test", ""),
+                        test_command=self.config.command_for("test", test_path),
                         example_test=example,
                         # The executor already gets this. Without it here, a
                         # tester that wrote one wrong assertion rewrites the
@@ -1935,8 +2145,7 @@ class Orchestrator:
 
         # --- VERIFY --------------------------------------------------
         inherited = pre_existing or {}
-        for name in self._VERIFY_STEPS:
-            command = self.config.commands.get(name, "")
+        for name, command in self._verify_plan():
             result = self._shell(run_id, name, command)
             already = inherited.get(name, set())
             introduced = signatures(result.detail) - already if already else set()
@@ -1959,15 +2168,35 @@ class Orchestrator:
             # likely not in its scope to fix either. Passing the step is what
             # stops one abandoned file from failing an entire backlog.
             if already and not introduced:
+                # One thing is never excused on a bug ticket: its own
+                # reproduction. On a second cycle that test is already on disk
+                # and already failing, so it pre-dates the attempt by every
+                # measure the amnesty uses — and excusing it would pass the
+                # ticket with the bug it was filed for still in place. Checked
+                # textually because the signature parser needs a location the
+                # tool may not print.
+                still_failing = (
+                    errors_naming(result.detail, repro[0]) if repro else []
+                )
+                if not still_failing:
+                    self.store.log(
+                        run_id,
+                        f"{ticket.ticket_id}: {name} still failing, but only on "
+                        "errors that pre-date this ticket; not counted against it.",
+                        level="warn",
+                        kind="verify",
+                        data={"step": name},
+                    )
+                    continue
                 self.store.log(
                     run_id,
-                    f"{ticket.ticket_id}: {name} still failing, but only on "
-                    "errors that pre-date this ticket; not counted against it.",
+                    f"{ticket.ticket_id}: {name} is failing on the reproduction "
+                    f"itself, which pre-dates this attempt and is exactly what "
+                    f"the ticket exists to clear; not excused.",
                     level="warn",
                     kind="verify",
-                    data={"step": name},
+                    data={"step": name, "reproduction": repro[0]},
                 )
-                continue
 
             # Distilled, not tail-sliced: compilers lead with the error and
             # end with warnings and a summary, so the last 4k reliably kept
@@ -2038,6 +2267,7 @@ class Orchestrator:
                     prior_verdicts=list(rejections or [])[-self._PRIOR_VERDICTS :],
                     state=state,
                     unchanged=invisible,
+                    reproduced=repro,
                 ),
                 max_tokens=self._output_budget("reviewer"),
                 temperature=0.0,
@@ -2278,13 +2508,13 @@ class Orchestrator:
     def _runner_suffixes(self) -> tuple[str, ...]:
         """Extensions the configured test command can collect, if it names a
         runner this knows. Empty when there is no command or no match."""
-        command = (self.config.commands.get("test") or "").lower()
-        if not command:
-            return ()
-        for needle, suffixes in self._RUNNER_SUFFIXES:
-            if needle in command:
-                return suffixes
-        return ()
+        found: list[str] = []
+        for command in self.config.commands_for("test").values():
+            lowered = command.lower()
+            for needle, suffixes in self._RUNNER_SUFFIXES:
+                if needle in lowered:
+                    found.extend(suffixes)
+        return tuple(dict.fromkeys(found))
 
     def _repo_test_suffixes(self, exclude: list[str]) -> Counter[str]:
         """How many test files of each extension the repo already has."""
@@ -2320,6 +2550,24 @@ class Orchestrator:
         repo with neither falls back to what this ticket just wrote, which can
         only be wrong before there is anything to contradict it.
         """
+        # What this ticket actually wrote decides first, when something runs
+        # that language. A project with a Rust core and a browser shell has two
+        # answers, and the right one depends on which ticket is asking — the
+        # shell's tests belong in JavaScript however much Rust surrounds them.
+        # Falls through when nothing covers it, so a single-command project
+        # answers exactly as it always did.
+        own: Counter[str] = Counter()
+        for path in written:
+            suffix = Path(path).suffix.lower()
+            # A recognised language only. A `.xyz` file is not a language to
+            # author tests in, and a catch-all command saying nothing about it
+            # is not a reason to try.
+            if suffix in self._CODE_SUFFIXES:
+                own[suffix] += 1
+        for suffix, _count in own.most_common():
+            if self.config.covers("test", suffix):
+                return suffix
+
         repo = self._repo_test_suffixes(exclude or [])
         allowed = self._runner_suffixes()
         if allowed:
@@ -2397,6 +2645,461 @@ class Orchestrator:
         # one of pytest's two default collection patterns, and it is inert
         # everywhere else.
         return f"{prefix}{slug}_test{suffix}", ""
+
+    def _uncovered_languages(self, ticket: Ticket) -> list[str]:
+        """Languages this ticket writes that nothing here can test.
+
+        Only meaningful in a project that tests *something*: one with no test
+        command at all is a project without tests, which is a different
+        situation and already reported at run end. What this catches is the
+        polyglot gap — a Rust project's JavaScript, verified by nothing, whose
+        tickets pass on review alone over criteria a text search can satisfy.
+        That is not a hypothetical: it shipped a page that threw on the second
+        line of its own entry point, with six tickets green above it.
+        """
+        if not self.config.commands_for("test"):
+            return []
+        found: list[str] = []
+        for path in ticket.allowed_files:
+            if any(character in path for character in "*?["):
+                continue
+            suffix = Path(path).suffix.lower()
+            if (
+                suffix in self._CODE_SUFFIXES
+                and suffix not in found
+                and not self.config.covers("test", suffix)
+                # A language the config declares as needing no runner is a
+                # decision on the record, not the oversight this gate is for.
+                and not self.config.exempt("test", suffix)
+            ):
+                found.append(suffix)
+        return found
+
+    def _no_runner_note(self, ticket: Ticket, languages: list[str]) -> str:
+        """What to tell a human whose ticket has no way to be checked."""
+        files = [
+            path
+            for path in ticket.allowed_files
+            if Path(path).suffix.lower() in languages
+        ]
+        return (
+            f"this ticket writes {', '.join(languages)} and no test command "
+            f"covers {'it' if len(languages) == 1 else 'them'}, so nothing here "
+            f"could check the work — it would pass on review alone, against "
+            f"criteria a text search can satisfy. Files: {', '.join(files[:6])}.\n\n"
+            f"Set a runner up:\n"
+            f"  forge toolchain --language {languages[0]}\n"
+            f"or add it by hand in .hybridforge/config.json:\n"
+            f'  "commands": {{ "test": {{ "{languages[0]}": "<command>" }} }}\n\n'
+            f"Then: forge retry --ticket {ticket.ticket_id}"
+        )
+
+    def _park(self, run_id: int, ticket: Ticket, note: str) -> None:
+        """Stop work on a ticket and leave a human the reason.
+
+        Same ending as an executor's `BLOCKED:`, and it honours
+        `stopOnBlocked` for the same reason: a ticket that needs a person is
+        not made better by the loop moving on to the next one.
+        """
+        ticket.status = TICKET_BLOCKED
+        ticket.blocked_note = note
+        self.store.update_ticket(run_id, ticket)
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: BLOCKED — {note[:400]}",
+            level="warn",
+            kind="ticket",
+        )
+        if self.config.loop.stop_on_blocked:
+            raise Stopped()
+
+    def _repro_target(self, ticket: Ticket) -> tuple[str, str]:
+        """Where a bug ticket's reproduction goes, or why it cannot have one.
+
+        Returns `(path, reason)` with exactly one side filled in — the same
+        contract as `_test_target`, and the same fixed-path-per-ticket rule, so
+        a second cycle overwrites its own reproduction rather than leaving one
+        behind that nothing owns.
+
+        Unlike `_test_target` this runs before any code is written, so there
+        are no changed files to read a language off. The test command decides,
+        and a project with no test command cannot reproduce anything: there is
+        nothing that would run the proof.
+        """
+        designated = [
+            normalize_path(path)
+            for path in ticket.allowed_files
+            if not any(ch in path for ch in "*?[") and matches_any(path, self._TEST_GLOBS)
+        ]
+        if len(designated) == 1:
+            return designated[0], ""
+
+        # Asked of the ticket's own scope before any fallback runs. Left to
+        # `_suite_suffix`, a JavaScript hypothesis in a Rust project resolves
+        # to `.rs` — the project's runner — and the reproduction would then
+        # assert something in a language the fault does not live in.
+        uncovered = self._uncovered_languages(ticket)
+        if uncovered:
+            return "", self._no_runner_note(ticket, uncovered)
+
+        suffix = self._suite_suffix(list(ticket.allowed_files))
+        if not suffix or not self.config.commands_for("test"):
+            return "", (
+                "this project has no test command, so a reproduction could "
+                "never be run — and a bug loop with nothing to run the proof "
+                "is a fix nobody checked"
+            )
+        if not self.config.covers("test", suffix):
+            # The level-0 case exactly: the fault is real and sits in a
+            # language nothing here runs, so a reproduction written in the
+            # project's own suite would assert something that was never wrong.
+            return "", self._no_runner_note(ticket, [suffix])
+        example = self._example_test([], suffix)
+        directory = Path(example[0]).parent.as_posix() if example else "tests"
+        prefix = "" if directory in ("", ".") else f"{directory}/"
+        return f"{prefix}{self._ticket_slug(ticket)}_test{suffix}", ""
+
+    # Extensions that hold behavior a test suite could have covered. A ticket
+    # that cannot reproduce a fault in one language is worth pointing at the
+    # others; a ticket that cannot reproduce one in a stylesheet is not.
+    _CODE_SUFFIXES = frozenset(
+        """.rs .py .js .mjs .ts .tsx .jsx .go .rb .java .kt .swift .c .cc .cpp
+        .h .hpp .cs .php .sh .ps1 .lua .ex .exs .scala .dart""".split()
+    )
+
+    def _unreachable_layers(self, test_path: str) -> str:
+        """A note naming languages in this project the test command cannot run.
+
+        The case that produced it: a report said the game starts at level 0.
+        The Rust sets it to 1, so no test of that code could fail, and the loop
+        parked — correctly. The symptom was real and lived in `web/main.js`,
+        which threw on its second line and left the page showing the hardcoded
+        `Level: 0` forever. `cargo test` runs no JavaScript, so nothing in the
+        pipeline could have reached it, and the block said only "sharpen the
+        report" about a report that was accurate.
+
+        Naming the gap costs nothing and is often the whole answer.
+        """
+        suite = Path(test_path).suffix.lower()
+        others = sorted(
+            {
+                suffix
+                for path in evidence.repo_files(self.config.root)
+                if (suffix := Path(path).suffix.lower()) in self._CODE_SUFFIXES
+                and suffix != suite
+            }
+        )
+        if not others:
+            return ""
+        command = self.config.command_for("test", test_path) or "the test command"
+        return (
+            f"\n\nBefore sharpening it, consider where the fault is: the suite "
+            f"is written in {suite} and `{command}` runs nothing else, while "
+            f"this project also contains {', '.join(others)} files. A symptom "
+            f"you can see in the running program and cannot reproduce in {suite} "
+            f"is usually in one of those, and no ticket here can reach it."
+        )
+
+    def _prove(self, run_id: int, ticket: Ticket, test_path: str) -> str:
+        """Demonstrate the fault, re-diagnosing when the explanation is wrong.
+
+        Returns the failure that proved it, or "" with the ticket parked.
+
+        A reproduction that cannot be written is a measurement, not a dead end.
+        The tester saying "this code already does what the report asks for" is
+        a fact about the code, and the right use of it is to look somewhere
+        else — the report is not what was disproved, the previous ticket's
+        reading of it was. One run parked on exactly that: the level really was
+        initialised to 1, the reporter really did see 0, and the answer sat one
+        layer away in a file the first hypothesis never named.
+
+        So each failure feeds a re-diagnosis, up to `loop.bugHypotheses`, with
+        everything already ruled out in front of the planner so the next guess
+        cannot be the last one again. Parking is what happens when the budget
+        runs out or the planner has nothing better than another guess — with
+        every hypothesis it tried written down, which is the part a human
+        actually needs.
+        """
+        for remaining in range(self.config.loop.bug_hypotheses - 1, -1, -1):
+            outcome = self._reproduce(run_id, ticket, test_path)
+            if outcome.ok:
+                return outcome.detail
+            if not remaining:
+                self._park(run_id, ticket, self._exhausted(run_id, ticket, outcome.detail))
+                return ""
+
+            revised = self._rediagnose(run_id, ticket, outcome.detail)
+            if revised is None:
+                self._park(run_id, ticket, self._exhausted(run_id, ticket, outcome.detail))
+                return ""
+        return ""
+
+    def _exhausted(self, run_id: int, ticket: Ticket, last: str) -> str:
+        """The blocked note for a bug that was never demonstrated.
+
+        Every hypothesis that was tried, in order, because that is the work
+        this ticket actually did and the next person should not repeat it.
+        """
+        tried = self.store.ruled_out(run_id, ticket.ticket_id)
+        note = last
+        if tried:
+            note += "\n\nHypotheses tried and ruled out, in order:\n" + "\n".join(
+                f"  {index}. {spec.splitlines()[0][:200]}"
+                for index, (spec, _why) in enumerate(tried, start=1)
+            )
+        return note
+
+    def _rediagnose(self, run_id: int, ticket: Ticket, disproof: str) -> Ticket | None:
+        """Rewrite the ticket around a different cause. None when there is none.
+
+        The ticket is revised in place and persisted, so the next reproduction
+        attempt runs against the new hypothesis — and `original_spec` still
+        holds what the report first became, which is what the ratchet compares
+        a later respec against.
+        """
+        report = ""
+        run = self.store.get_run(run_id)
+        if run is not None:
+            report = run["source"] or ""
+
+        try:
+            completion = self._call(
+                run_id,
+                "planner",
+                rediagnose_prompt(
+                    ticket,
+                    report or ticket.spec,
+                    disproof=disproof,
+                    ruled_out=self.store.ruled_out(run_id, ticket.ticket_id),
+                    evidence=evidence.gather(self.config.root, report or ticket.spec),
+                    sources=self._sources_for(ticket)[0],
+                ),
+                max_tokens=self._output_budget("planner"),
+                temperature=0.2,
+            )
+            fields = parse_bug(completion.text)
+        except (ContextOverflow, ProviderError, ValueError) as exc:
+            # `unclear` arrives here too, as a ValueError carrying what the
+            # planner said it would need. Either way there is no next
+            # hypothesis, and saying so is the honest end.
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: no further diagnosis — {exc}",
+                level="warn",
+                kind="ticket",
+            )
+            return None
+
+        # Written before the ticket changes, so the record is of what was
+        # dropped rather than of what replaced it.
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: that explanation was disproved, so it was "
+            f"dropped and a different cause proposed:\n"
+            f"  was: {ticket.spec.splitlines()[0][:160]}\n"
+            f"  now: {fields['spec'].splitlines()[0][:160]}",
+            level="warn",
+            kind="ticket",
+            data={
+                "ticket": ticket.ticket_id,
+                "ruled_out": ticket.spec,
+                "disproof": disproof[:2000],
+                "scope": ticket.allowed_files,
+            },
+        )
+
+        ticket.title = fields["title"] or ticket.title
+        ticket.spec = fields["spec"]
+        ticket.allowed_files = fields["allowed_files"] or ticket.allowed_files
+        ticket.reference_files = fields["reference_files"]
+        ticket.context = fields["reproduce"] or ticket.context
+        # The reproduction path is derived from the ticket id and does not
+        # move, so the next attempt overwrites the test that proved nothing
+        # rather than leaving it behind asserting something never in doubt.
+        self.store.update_ticket(run_id, ticket)
+        return ticket
+
+    def _reproduce(self, run_id: int, ticket: Ticket, test_path: str) -> StepResult:
+        """Write a test that fails because of this bug, and prove it fails.
+
+        The one step in the loop where a red suite is the result being asked
+        for. `ok` means the test ran and failed for the reported reason, and
+        its output is the evidence — carried into the executor's prompt as what
+        to fix, and into the reviewer's as what the fix has to have addressed.
+
+        Three ways it does not get there, and they are not the same thing:
+
+        - The test will not build. That is a defect in the test, not evidence
+          about the code, so the tester is pointed at its own errors and asked
+          again — the same reprompt the ordinary test path already does.
+        - The test passes. Either it asserts something the bug does not touch,
+          or it asserts the bug itself. One more attempt with the passing
+          output quoted back, then the ticket parks.
+        - The tester replies `BLOCKED:`. A report too vague to assert anything
+          specific is a report a human has to sharpen, and guessing at it
+          produces a proof of nothing that everything downstream then trusts.
+
+        Parking is the honest end for all three. A bug nobody can demonstrate
+        is a bug the loop would be fixing on faith, and the green afterwards
+        would mean exactly as much as the green that shipped the two defects
+        this whole path exists to catch.
+        """
+        command = self.config.command_for("test", test_path)
+        sources = self._sources_for(ticket)[0]
+        example = self._example_test([test_path], Path(test_path).suffix.lower())
+        own_file_errors: list[str] = []
+        passed_instead = ""
+
+        for remaining in (1, 0):
+            step_id = self.store.start_step(run_id, ticket.ticket_id, "reproduce")
+            try:
+                completion = self._call(
+                    run_id,
+                    "tester",
+                    repro_prompt(
+                        ticket,
+                        test_path=test_path,
+                        test_command=command,
+                        example_test=example,
+                        sources=sources,
+                        reproduce=ticket.context,
+                        own_file_errors=own_file_errors,
+                        passed_instead=passed_instead,
+                    ),
+                    max_tokens=self._output_budget("tester"),
+                    temperature=0.1,
+                )
+            except (ContextOverflow, ProviderError) as exc:
+                self.store.end_step(step_id, "failed", str(exc))
+                return StepResult(ok=False, blocked=True, detail=f"reproduction unavailable: {exc}")
+
+            self._record_call(ticket, "reproduce", "tester", completion)
+            if completion.truncated:
+                self.store.end_step(step_id, "failed", completion.text[:20000])
+                return StepResult(
+                    ok=False,
+                    blocked=True,
+                    detail="the tester ran out of output room writing the "
+                    "reproduction; raise maxOutputTokens for the tester model",
+                )
+
+            parsed = parse_output(completion.text)
+            if parsed.is_blocked:
+                self.store.end_step(step_id, "failed", parsed.blocked_reason)
+                return StepResult(
+                    ok=False,
+                    blocked=True,
+                    detail=f"the report cannot be turned into a test: "
+                    f"{parsed.blocked_reason}",
+                )
+
+            scoped = enforce_scope(parsed, [test_path], self.config.never_delegate)
+            bindings = [
+                line for edit in scoped.edits for line in foreign_bindings(edit.content)
+            ]
+            if not scoped.edits or bindings:
+                detail = (
+                    "the tester declared the code under test as a foreign binding"
+                    if bindings
+                    else "the tester wrote no test file"
+                )
+                self.store.end_step(step_id, "failed", detail)
+                if not remaining:
+                    return StepResult(ok=False, blocked=True, detail=detail)
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: {detail}; asking again.",
+                    level="warn",
+                    kind="ticket",
+                )
+                continue
+
+            apply_edits(self.config.root, scoped.edits)
+            result = self._shell(run_id, "reproduce-test", command)
+
+            if result.ok:
+                # Nothing was demonstrated. The file stays on disk for the
+                # retry to overwrite; a passing test hurts nothing while it
+                # sits there, and deleting it would throw away the thing the
+                # next attempt is supposed to improve on.
+                passed_instead = distill(result.detail, limit=2000) or "(no output)"
+                self.store.end_step(
+                    step_id, "failed", f"the test passed, so nothing was proved:\n{passed_instead}"
+                )
+                if not remaining:
+                    return StepResult(
+                        ok=False,
+                        blocked=True,
+                        detail=(
+                            f"the bug could not be reproduced. `{test_path}` was "
+                            f"written twice and passed both times, so there is "
+                            f"nothing to fix and no way to tell whether a fix "
+                            f"worked. Sharpen the report — the exact input, the "
+                            f"value you saw, the value you expected — or fix it "
+                            f"by hand. The test is on disk to start from."
+                            + self._unreachable_layers(test_path)
+                        ),
+                    )
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: the reproduction passed, so it proved "
+                    f"nothing; asking for a sharper one.",
+                    level="warn",
+                    kind="ticket",
+                )
+                continue
+
+            # Two conditions, because either alone is wrong. The test file
+            # has to be implicated — otherwise the build error belongs to
+            # somebody else's code and the reproduction stands — and the run
+            # has to report a build or collection error somewhere, because a
+            # failing assertion names its own file too and that is the evidence
+            # this step exists to collect.
+            implicated = errors_naming(result.detail, test_path)
+            own_file_errors = (
+                implicated if implicated and _UNBUILDABLE.search(result.detail) else []
+            )
+            if own_file_errors:
+                # A test that will not build fails the command for a reason
+                # that has nothing to do with the bug. Counting that as a
+                # reproduction would hand the executor a compiler error in a
+                # file it cannot even write.
+                self.store.end_step(
+                    step_id,
+                    "failed",
+                    "the reproduction does not build:\n" + "\n".join(own_file_errors),
+                )
+                if not remaining:
+                    return StepResult(
+                        ok=False,
+                        blocked=True,
+                        detail=(
+                            f"`{test_path}` still does not build, so the bug was "
+                            f"never demonstrated:\n" + "\n".join(own_file_errors[:10])
+                        ),
+                    )
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: the reproduction does not build; asking again.",
+                    level="warn",
+                    kind="ticket",
+                )
+                continue
+
+            proof = distill(result.detail, limit=4000)
+            self.store.end_step(step_id, "ok", proof)
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: reproduced. `{test_path}` fails against the "
+                f"code as it stands, and the fix is not done until it passes.",
+                kind="ticket",
+                data={"test": test_path},
+            )
+            return StepResult(ok=True, detail=proof)
+
+        # Unreachable: every branch above either returns or continues, and the
+        # last iteration always returns.
+        return StepResult(ok=False, blocked=True, detail="reproduction failed")
 
     @staticmethod
     def _ticket_slug(ticket: Ticket) -> str:
@@ -2481,6 +3184,25 @@ class Orchestrator:
         to extend, and a failed ticket does not earn the right to delete a
         human's work.
         """
+        if ticket.kind == TICKET_BUG:
+            # A reproduction is not an unverified assertion — it is the one
+            # assertion here that was demonstrated against real behavior, and
+            # it is half of what the ticket was for. Deleting it on failure
+            # would throw away the only durable record that the fault is real
+            # and leave the next person with the report they started from.
+            #
+            # Safe to leave failing, too: every other ticket takes a baseline
+            # before it runs and is not blamed for breakage outside its own
+            # scope, which is exactly what this file is to them.
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: the reproduction was kept. It still "
+                f"fails, and it is the evidence — fix the bug by hand, or "
+                f"retry the ticket once the report is sharper.",
+                level="warn",
+                kind="ticket",
+            )
+            return
         doomed = set(self._owned_test_files(ticket))
         doomed.update(path for path, was_created in created.items() if was_created)
         for path in sorted(doomed):
@@ -2497,7 +3219,7 @@ class Orchestrator:
         the run reports anything.
         """
         for ticket in self.store.list_tickets(run_id):
-            if ticket.status == TICKET_DONE:
+            if ticket.status == TICKET_DONE or ticket.kind == TICKET_BUG:
                 continue
             for path in self._owned_test_files(ticket):
                 self._remove_test_file(run_id, ticket, path)

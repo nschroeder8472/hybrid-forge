@@ -31,6 +31,7 @@ second-guessing an OpenAI executor — with no code change.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,150 @@ ROLES = ("planner", "executor", "tester", "reviewer")
 
 class ConfigError(Exception):
     """Configuration is missing or internally inconsistent."""
+
+
+# Language names people write in config, and the extensions each one owns. The
+# expansion matters more than the spelling: a project that says "javascript"
+# means its `.mjs` files too, and a `.mjs` file nothing claims is a language
+# the loop would report as having no runner.
+_LANGUAGE_SUFFIXES: dict[str, tuple[str, ...]] = {
+    "rust": (".rs",),
+    "python": (".py",),
+    "javascript": (".js", ".mjs", ".cjs", ".jsx"),
+    "typescript": (".ts", ".tsx", ".mts", ".cts"),
+    "go": (".go",),
+    "ruby": (".rb",),
+    "java": (".java",),
+    "kotlin": (".kt", ".kts"),
+    "swift": (".swift",),
+    "c": (".c", ".h"),
+    "cpp": (".cpp", ".cc", ".cxx", ".hpp"),
+    "csharp": (".cs",),
+    "php": (".php",),
+    "shell": (".sh", ".bash"),
+    "powershell": (".ps1",),
+    "lua": (".lua",),
+    "elixir": (".ex", ".exs"),
+    "scala": (".scala",),
+    "dart": (".dart",),
+}
+
+# Spellings that mean one of the above.
+_LANGUAGE_ALIASES = {
+    "rs": "rust",
+    "py": "python",
+    "js": "javascript",
+    "node": "javascript",
+    "ts": "typescript",
+    "golang": "go",
+    "rb": "ruby",
+    "kt": "kotlin",
+    "c++": "cpp",
+    "cplusplus": "cpp",
+    "c#": "csharp",
+    "cs": "csharp",
+    "sh": "shell",
+    "bash": "shell",
+    "pwsh": "powershell",
+    "ps1": "powershell",
+    "ex": "elixir",
+}
+
+# A command that names one of these is running that language and no other, so a
+# key claiming otherwise is a configuration mistake worth catching at startup
+# rather than one failing ticket at a time.
+_RUNNER_LANGUAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("cargo", (".rs",)),
+    ("pytest", (".py",)),
+    ("unittest", (".py",)),
+    ("mypy", (".py",)),
+    ("ruff", (".py",)),
+    ("go test", (".go",)),
+    ("go vet", (".go",)),
+    ("dotnet test", (".cs",)),
+    ("swift test", (".swift",)),
+    ("xcodebuild", (".swift",)),
+    ("rspec", (".rb",)),
+    ("phpunit", (".php",)),
+    ("eslint", (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")),
+    ("tsc", (".ts", ".tsx", ".mts", ".cts")),
+    ("jest", (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")),
+    ("vitest", (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")),
+    ("mocha", (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")),
+    ("node", (".js", ".mjs", ".cjs", ".jsx")),
+    ("npm", (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")),
+    ("pnpm", (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")),
+    ("yarn", (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")),
+    ("deno", (".js", ".ts", ".tsx", ".mjs")),
+    ("bun", (".js", ".ts", ".tsx", ".mjs", ".jsx")),
+    ("clippy", (".rs",)),
+)
+
+# Every command applies to this when the config gives one string rather than a
+# map, and it is a legal key in its own right for a runner that covers the lot.
+ANY_LANGUAGE = "*"
+
+# What a config writes to say "nothing runs this language, on purpose". `false`
+# is unambiguous in JSON and cannot be mistaken for a command; "skip" and
+# "none" are accepted because they are what people type.
+_EXEMPTIONS = frozenset({"skip", "none", "false", "no"})
+
+
+def _is_exemption(value: object) -> bool:
+    if value is False:
+        return True
+    return isinstance(value, str) and value.strip().lower() in _EXEMPTIONS
+
+
+def _named_runners(command: str) -> list[tuple[str, ...]]:
+    """The languages of every runner this command names.
+
+    Word boundaries matter more than they look: `cargo test` contains the
+    substring "go test", and a plain `in` check read a Rust project as a Go one
+    and reported its own `.rs` files as uncovered.
+    """
+    lowered = command.lower()
+    return [
+        suffixes
+        for needle, suffixes in _RUNNER_LANGUAGES
+        if re.search(r"\b" + re.escape(needle) + r"\b", lowered)
+    ]
+
+
+def _wrong_language(suffix: str, command: str) -> str:
+    """What a command runs, when none of it can run the given extension.
+
+    Answers empty for a command naming no runner this knows — `make test`
+    under `.js` is nobody's business here — and for a compound command where
+    any part covers the language, which is how `cargo test && node --test`
+    legitimately covers two.
+    """
+    if suffix == ANY_LANGUAGE:
+        return ""
+    named = _named_runners(command)
+    if not named or any(suffix in suffixes for suffixes in named):
+        return ""
+    return ", ".join(sorted({s for suffixes in named for s in suffixes}))
+
+
+def normalize_language(key: str) -> tuple[str, ...]:
+    """The extensions a `commands` key covers.
+
+    Extensions are canonical, names are accepted: `.rs`, `rs` and `rust` are
+    the same key, and `javascript` expands to every extension it owns. An
+    unknown key that looks like an extension is taken at its word — the loop
+    meets languages this table has never heard of, and refusing them would be
+    worse than not knowing their name.
+    """
+    raw = key.strip().lower()
+    if not raw:
+        return ()
+    if raw == ANY_LANGUAGE:
+        return (ANY_LANGUAGE,)
+    name = _LANGUAGE_ALIASES.get(raw.lstrip("."), raw.lstrip("."))
+    if name in _LANGUAGE_SUFFIXES:
+        return _LANGUAGE_SUFFIXES[name]
+    return (raw if raw.startswith(".") else f".{raw}",)
 
 
 @dataclass
@@ -123,6 +268,13 @@ class LoopSettings:
     # trade is not clean either way — which is why this is measured on a
     # backlog rather than switched on.
     executor_turns: int = 0
+    # Hypotheses a bug ticket may go through before it parks for a human. The
+    # first is the planner's reading of the report; each one after it is a
+    # re-diagnosis, asked for when the reproduction could not be written —
+    # because a test that passes against the named code has *disproved* that
+    # reading, and disproof is evidence, not a dead end. 1 parks on the first
+    # wrong guess, which is what this did before the re-diagnosis existed.
+    bug_hypotheses: int = 3
 
 
 @dataclass
@@ -202,6 +354,7 @@ class Config:
             max_runtime_seconds=int(loop.get("maxRuntimeSeconds", 0)),
             baseline_verify=bool(loop.get("baselineVerify", True)),
             executor_turns=int(loop.get("executorTurns", 0)),
+            bug_hypotheses=int(loop.get("bugHypotheses", 3)),
         )
 
         ui = data.get("ui", {}) or {}
@@ -226,6 +379,38 @@ class Config:
                 f"back to a human), a positive count, or -1 (retry until the "
                 f"backlog is clean or the run is stopped)."
             )
+        for kind, raw in self.commands.items():
+            if not isinstance(raw, (str, dict)):
+                raise ConfigError(
+                    f"commands.{kind} is {type(raw).__name__}; expected a "
+                    f'command string, or a map of language to command like '
+                    f'{{".rs": "cargo test", ".js": "node --test"}}.'
+                )
+            if isinstance(raw, dict):
+                for key, value in raw.items():
+                    if _is_exemption(value):
+                        continue
+                    if not isinstance(value, str):
+                        raise ConfigError(
+                            f"commands.{kind}.{key} is {type(value).__name__}; "
+                            f"expected a command string."
+                        )
+            for suffix, command in self.commands_for(kind).items():
+                mismatch = _wrong_language(suffix, command)
+                if mismatch:
+                    raise ConfigError(
+                        f"commands.{kind} runs {command!r} for {suffix} files, "
+                        f"but that command runs {mismatch}. A command keyed to "
+                        f"a language it cannot run fails every ticket in that "
+                        f"language and reports it as the ticket's fault."
+                    )
+
+        if self.loop.bug_hypotheses < 1:
+            raise ConfigError(
+                f"loop.bugHypotheses is {self.loop.bug_hypotheses}; expected 1 "
+                f"(park on the first hypothesis that cannot be reproduced) or "
+                f"more."
+            )
         if self.loop.executor_turns < 0:
             raise ConfigError(
                 f"loop.executorTurns is {self.loop.executor_turns}; expected 0 "
@@ -243,6 +428,98 @@ class Config:
                 )
 
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Verify commands
+    # ------------------------------------------------------------------
+
+    def commands_for(self, kind: str) -> dict[str, str]:
+        """One verify step's commands, keyed by extension, plus `*`.
+
+        A repository is not one language, and a single command per step says it
+        is. Everything downstream inherited that: which language the tester
+        writes in, what verification proves, and whether a bug in an unrun
+        layer can be reproduced at all. One project shipped a green ticket over
+        JavaScript that threw on its second line, because the suite was
+        `cargo test` and nothing else was ever run.
+
+        A plain string still means what it always did — every language, one
+        command — so no existing config changes meaning by being read here.
+        """
+        raw = self.commands.get(kind, "")
+        if isinstance(raw, str):
+            return {ANY_LANGUAGE: raw.strip()} if raw.strip() else {}
+        found: dict[str, str] = {}
+        for key, value in (raw or {}).items():
+            if _is_exemption(value):
+                continue
+            command = str(value or "").strip()
+            if not command:
+                continue
+            for suffix in normalize_language(str(key)):
+                found[suffix] = command
+        return found
+
+    def command_for(self, kind: str, path: str) -> str:
+        """The command that verifies one file's language, or "" if none does.
+
+        A catch-all answers for anything with no entry of its own, which is
+        what makes a one-language project's single string keep working.
+        """
+        commands = self.commands_for(kind)
+        suffix = Path(path).suffix.lower() if path else ""
+        return commands.get(suffix) or commands.get(ANY_LANGUAGE, "")
+
+    def exempt(self, kind: str, suffix: str) -> bool:
+        """Whether this language is declared as one nothing needs to run.
+
+        The third state, and it earns its place. A shell wrapper and a
+        PowerShell build script have no behavior a unit test could assert, and
+        the gate is meant to catch a language nobody thought about — not to
+        stall a backlog over `build.sh`. Saying so in config is a decision on
+        the record; leaving the key out is an oversight, and those are exactly
+        what this feature exists to surface.
+        """
+        raw = self.commands.get(kind, "")
+        if isinstance(raw, str):
+            return False
+        wanted = suffix.lower()
+        for key, value in (raw or {}).items():
+            if _is_exemption(value) and wanted in normalize_language(str(key)):
+                return True
+        return False
+
+    def covers(self, kind: str, suffix: str) -> bool:
+        """Whether this step has something that genuinely runs the extension.
+
+        A catch-all counts — until it names a runner that cannot possibly run
+        the language. A project whose only command is `cargo test` does not
+        cover its JavaScript, and saying it does is how a ticket ships green
+        over code nothing ran. That claim was true of a real run.
+        """
+        return bool(self.covering(kind, suffix)[0])
+
+    def covering(self, kind: str, suffix: str) -> tuple[str, str]:
+        """`(command, how)` for one extension: 'exact', 'catch-all', or ''.
+
+        The empty answer is the interesting one — it is what a gate and a
+        coverage report are both asking about. A catch-all that cannot run the
+        language answers empty and says why in `how`.
+        """
+        if self.exempt(kind, suffix):
+            return "", "declared as needing none"
+        commands = self.commands_for(kind)
+        suffix = suffix.lower()
+        exact = commands.get(suffix)
+        if exact:
+            return exact, "exact"
+        fallback = commands.get(ANY_LANGUAGE, "")
+        if not fallback:
+            return "", ""
+        mismatch = _wrong_language(suffix, fallback)
+        if mismatch:
+            return "", f"runs {mismatch}"
+        return fallback, "catch-all"
 
     def model_block(self, name: str) -> dict[str, Any]:
         """A model's config with project-scoped defaults filled in.
@@ -323,6 +600,7 @@ class Config:
                 "maxRuntimeSeconds": self.loop.max_runtime_seconds,
                 "baselineVerify": self.loop.baseline_verify,
                 "executorTurns": self.loop.executor_turns,
+                "bugHypotheses": self.loop.bug_hypotheses,
             },
             "ui": {"host": self.ui.host, "port": self.ui.port, "enabled": self.ui.enabled},
         }

@@ -93,6 +93,78 @@ Output the complete contents of that one test file: the path on its own line,
 then a fenced code block with the whole file.
 """
 
+REPRO_SYSTEM = """You write the test that proves a bug is real.
+
+You are given a bug report and the code it is about. Write one test that
+asserts the behavior the report says the code SHOULD have. Run against the code
+as it stands today, that test must FAIL — that failure is the whole point of
+it, and it is what earns the fix an attempt.
+
+This is the opposite of your usual instruction, so be exact about it:
+
+- Assert the CORRECT behavior. Never encode the fault as though it were
+  expected: a test asserting that three pieces lock is a test that passes today
+  and passes forever, and it certifies the bug instead of catching it.
+- Fail for the reported reason and no other. `assert False`, a syntax error, an
+  import of something that does not exist — all of those fail, and none of them
+  proves anything. The failure must be the assertion you wrote comparing what
+  the code does against what it should do.
+- Assert on behavior through the public interface. This test outlives the fix
+  and runs on every later ticket in this project, so it must keep testing the
+  behavior rather than the arrangement of the code.
+- If the report is too vague to assert anything specific, say so instead of
+  guessing. Reply with a single line starting `BLOCKED:` naming what you would
+  need to know. A test written from a guess proves nothing and is then trusted
+  by everything downstream.
+
+Never:
+- Read a source file and assert on its text, or assert that a file exists.
+- Assert on the exact whole contents of any file.
+- Declare foreign-function bindings (`extern`, `dlopen`, `ctypes`) against the
+  code under test. Import it the way the rest of the project imports it.
+- Write anything to a path other than the one file you are told to write.
+
+Output the complete contents of that one test file: the path on its own line,
+then a fenced code block with the whole file.
+"""
+
+BUG_PLANNER_SYSTEM = """You turn a bug report into one implementable ticket.
+
+A bug report is not a plan. It describes a symptom — what somebody saw — and
+your job is to say which code is responsible and what it should do instead. You
+are given the repository's file list and every place the report's own words
+appear in the code, because you cannot open files yourself.
+
+Rules:
+
+- Name the files that must change in `allowed_files`, and be honest about
+  uncertainty: list the files the fix plausibly touches, not every file that
+  mentioned the words. Nothing outside that list can be written, so a list that
+  is too narrow blocks the ticket and a list of forty files makes the scope
+  meaningless.
+- Put files the fix must be read against — the caller, the type, the module it
+  has to stay consistent with — in `reference_files`. The executor has no
+  filesystem and sees only what the ticket carries.
+- The spec states the defect and the behavior that should replace it, in terms
+  of this codebase. "Handle the timing better" is not a spec. "`Game::tick`
+  drains its accumulator with a loop that can lock several pieces in one frame;
+  it should lock at most one per tick and reset the accumulator on lock" is.
+- Do not describe the fix as a diff or name the lines to change. State the
+  behavior; the executor is the one reading the code.
+- Acceptance criteria are optional here and usually unnecessary: a reproduction
+  test is written before any fix is attempted, and that test is the contract.
+  Add one only for a consequence the reproduction cannot check.
+- If the report cannot be located in this repository at all — nothing it names
+  exists, or it describes a different project — say so in `unclear` rather than
+  inventing a plausible ticket.
+
+Reply with a single JSON object and nothing else:
+
+{"title": "...", "spec": "...", "allowed_files": ["..."],
+ "reference_files": ["..."], "criteria": [],
+ "reproduce": "what a failing test should assert, in one sentence"}
+"""
+
 REVIEWER_SYSTEM = """You are the reviewer in a plan-and-execute pipeline.
 
 Lint, type-checking, and the test suite have already passed. Your job is what
@@ -562,6 +634,379 @@ function is an ordinary function of its own language.
     ]
 
 
+def bug_prompt(
+    report: str, evidence: str = "", sources: dict[str, str] | None = None
+) -> list[Message]:
+    """Ask the planner to turn a prose bug report into one ticket.
+
+    `evidence` is gathered by the harness — the file list and where the
+    report's words appear — because the planner has no filesystem and the file
+    that needs changing is exactly what is being looked for. Without it a
+    planner writes a confident ticket scoped to files that do not exist.
+    """
+    body = f"""## The report, as it was written
+{report.strip()}
+"""
+    if evidence.strip():
+        body += f"""
+## What is actually in this repository
+You cannot open files. This is what the harness found, and every path you name
+must come from it.
+
+{evidence.strip()}
+"""
+    else:
+        body += """
+## No repository evidence was available
+Nothing could be gathered — this may not be a git checkout. Name files only if
+the report itself names them, and say so in `unclear` if you cannot.
+"""
+
+    if sources:
+        # The files a survey pass asked for, read by the harness. This is the
+        # difference between a ticket written from filenames and one written
+        # from the code: the defect is usually visible here, and the spec
+        # should describe *it* rather than the symptom that led to it.
+        body += f"""
+## The code itself
+These are the files worth reading, in full. State the defect in terms of what
+is actually here — the function, the condition, the value it produces — rather
+than restating the report. If none of this can produce the reported behavior,
+say so in `unclear` instead of picking the nearest plausible file.
+
+{_sources_block(sources)}
+"""
+
+    body += "\nWrite the ticket now."
+    return [
+        Message(role="system", content=BUG_PLANNER_SYSTEM),
+        Message(role="user", content=body),
+    ]
+
+
+LOCATE_SYSTEM = """You are finding where a reported problem lives.
+
+You are given a bug report and what the harness could gather from the
+repository: its files, every place the report's words appear, and — when the
+report named nothing specific — the definitions in the project. You cannot open
+files yourself, so this pass exists to ask for the ones worth reading.
+
+Name the files most likely to contain the fault. Prefer few: the point is to
+read them properly, not to skim the project. Six is plenty and two is often
+right. Reason from what the code is *for* rather than from the words alone — a
+report about a score that stops updating belongs wherever scoring happens, even
+if the word "score" appears nowhere near it.
+
+Every path must come from the evidence exactly as written there. A path you
+invent is a file that will not be read, and this pass will have found nothing.
+
+Reply with JSON and nothing else:
+
+{"candidates": ["src/game.rs", "src/board.rs"],
+ "reasoning": "one sentence on why these"}
+"""
+
+
+def locate_prompt(report: str, evidence: str) -> list[Message]:
+    """Ask which files to open before any ticket is written.
+
+    The pass that makes a vague report workable. A report naming a function is
+    already located; "it sometimes drops inputs" is not, and a planner given
+    only a file tree picks by filename. So the first call spends nothing but a
+    little context deciding what to read, and the ticket is then written
+    against the real contents of those files.
+    """
+    return [
+        Message(role="system", content=LOCATE_SYSTEM),
+        Message(
+            role="user",
+            content=f"""## The report
+{report.strip()}
+
+## What the harness found
+{evidence.strip() or "(nothing — this may not be a git checkout)"}
+
+Name the files to read.""",
+        ),
+    ]
+
+
+def parse_locate(text: str, known: Sequence[str], limit: int = 6) -> list[str]:
+    """Candidate paths from a locate reply, filtered to files that exist.
+
+    A path the model invented is dropped rather than passed on: reading it
+    would fail silently, and the ticket would then be written as though the
+    file had been read and found irrelevant.
+    """
+    candidate = (text or "").strip()
+    fence = re.search(r"```(?:json)?\s*\n(.*?)\n```", candidate, re.DOTALL)
+    if fence:
+        candidate = fence.group(1)
+    else:
+        first, last = candidate.find("{"), candidate.rfind("}")
+        if first != -1 and last > first:
+            candidate = candidate[first : last + 1]
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    tracked = {str(path).replace("\\", "/"): str(path) for path in known}
+    chosen: list[str] = []
+    for raw in data.get("candidates", []) or []:
+        path = str(raw).strip().replace("\\", "/").lstrip("./")
+        if path in tracked and tracked[path] not in chosen:
+            chosen.append(tracked[path])
+    return chosen[:limit]
+
+
+REDIAGNOSE_SYSTEM = """You are re-diagnosing a bug whose first explanation was wrong.
+
+A ticket was written from a report, naming code that was supposed to be at
+fault. A test was then written to demonstrate that fault, and it did not: the
+test passed against the code as it stands, or it could not be written at all.
+That is not a dead end. It is a measurement, and it rules something out.
+
+The report itself is not in question. Somebody saw the behavior they described.
+What has been disproved is where the previous ticket said it comes from.
+
+So: propose a different cause.
+
+- Do not re-propose what has already been ruled out. Naming the same files
+  again with the same reasoning wastes the only budget this ticket has.
+- Reason from what would actually produce the reported symptom. If the value
+  the report mentions is correct everywhere it is computed, then what is wrong
+  is where it is displayed, transported, cached, or re-initialised — follow it
+  outward from the code that was cleared.
+- A symptom seen in a running program whose logic checks out is usually in the
+  layer between the logic and the eye: the bindings, the entry point, the
+  template, the build output, the wiring that never ran.
+- Say `unclear` when you have nothing better than another guess, and say what
+  would settle it. Parking with an honest question beats a third wrong ticket,
+  and it beats a ticket nobody can write a failing test for.
+
+Reply with a single JSON object and nothing else, exactly as the first ticket
+was written:
+
+{"title": "...", "spec": "...", "allowed_files": ["..."],
+ "reference_files": ["..."], "criteria": [],
+ "reproduce": "what a failing test should assert, in one sentence"}
+"""
+
+
+def rediagnose_prompt(
+    ticket: Ticket,
+    report: str,
+    *,
+    disproof: str,
+    ruled_out: Sequence[tuple[str, str]] = (),
+    evidence: str = "",
+    sources: dict[str, str] | None = None,
+) -> list[Message]:
+    """Ask for a new cause after a reproduction failed to reproduce anything.
+
+    The step that keeps a wrong first guess from ending the ticket. The tester
+    reporting "this code already does what the report asks for" is a fact about
+    the code, and the right use of it is to look somewhere else — not to park
+    and tell the reporter their report was vague when it was not.
+
+    `ruled_out` carries every hypothesis already disproved, so the planner
+    cannot spend the next one re-proposing the last.
+    """
+    body = f"""## The report, unchanged
+{report.strip()}
+
+## The explanation that was just disproved
+{ticket.spec.strip()}
+
+Scoped to: {', '.join(ticket.allowed_files) or "(nothing named)"}
+
+## How it was disproved
+{disproof.strip()}
+"""
+
+    if ruled_out:
+        body += "\n## Already ruled out — do not propose these again\n"
+        for spec, why in ruled_out:
+            body += f"\n- **{spec.strip().splitlines()[0][:200]}**\n  {why.strip()[:400]}\n"
+
+    if sources:
+        body += f"""
+## The code that was cleared
+This is what the last hypothesis blamed. It has been read and it does not
+produce the reported behavior — use it to work out what does.
+
+{_sources_block(sources)}
+"""
+
+    if evidence.strip():
+        body += f"""
+## The repository
+Every path you name must come from here.
+
+{evidence.strip()}
+"""
+
+    body += "\nWrite the next ticket, or say `unclear`."
+    return [
+        Message(role="system", content=REDIAGNOSE_SYSTEM),
+        Message(role="user", content=body),
+    ]
+
+
+def parse_bug(text: str) -> dict[str, Any]:
+    """Parse a bug-planner reply into the fields of one ticket.
+
+    Shares `tickets_from_json`'s tolerance of a fenced block or prose around
+    the object, and its refusal to guess: a reply with no spec has not written
+    a ticket, whatever else it contains.
+    """
+    candidate = (text or "").strip()
+    fence = re.search(r"```(?:json)?\s*\n(.*?)\n```", candidate, re.DOTALL)
+    if fence:
+        candidate = fence.group(1)
+    else:
+        first, last = candidate.find("{"), candidate.rfind("}")
+        if first != -1 and last > first:
+            candidate = candidate[first : last + 1]
+
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"planner did not return usable JSON: {(text or '')[:400]}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("planner reply was not a JSON object")
+
+    unclear = str(data.get("unclear", "") or "").strip()
+    if unclear:
+        raise ValueError(f"the planner could not place this report: {unclear}")
+
+    spec = str(data.get("spec", "") or "").strip()
+    if not spec:
+        raise ValueError("planner reply carried no spec")
+
+    return {
+        "title": str(data.get("title", "") or "").strip(),
+        "spec": spec,
+        "allowed_files": [str(p).strip() for p in data.get("allowed_files", []) if str(p).strip()],
+        "reference_files": [
+            str(p).strip() for p in data.get("reference_files", []) if str(p).strip()
+        ],
+        "criteria": [str(c).strip() for c in data.get("criteria", []) if str(c).strip()],
+        "reproduce": str(data.get("reproduce", "") or "").strip(),
+    }
+
+
+def repro_prompt(
+    ticket: Ticket,
+    *,
+    test_path: str,
+    test_command: str = "",
+    example_test: tuple[str, str] | None = None,
+    sources: dict[str, str] | None = None,
+    reproduce: str = "",
+    own_file_errors: list[str] | None = None,
+    passed_instead: str = "",
+) -> list[Message]:
+    """Ask the tester for the test that must fail before anything is fixed.
+
+    Separate from `tests_prompt` because the instruction is inverted. That one
+    encodes criteria and treats a failing assertion as the ticket's failure;
+    this one is asked for a failure on purpose, and a test that passes is the
+    result that stops the ticket.
+    """
+    body = f"""Bug: {ticket.ticket_id} — {ticket.title}
+
+## The defect, as the ticket states it
+{ticket.spec}
+"""
+    if reproduce:
+        body += f"""
+## What the test should assert
+{reproduce}
+"""
+
+    body += f"""
+## Write exactly one file, at exactly this path
+```
+{test_path}
+```
+This is the only path you may write, and it is the deliverable: it outlives the
+fix, and it is what stops this bug coming back. Anything you write anywhere
+else is discarded before it reaches disk.
+"""
+
+    if test_command:
+        body += f"""
+## The command that will run it
+```
+{test_command}
+```
+Your test must be collected and executed by that command. A file it does not
+collect reports nothing, which is indistinguishable from a bug that is not
+there.
+"""
+
+    if sources:
+        body += f"""
+## The code as it is today — the code that has the bug
+Assert against these names, signatures and types exactly. A test that fails to
+compile is not a reproduction: it proves nothing about the behavior, and it
+takes the rest of the suite down with it.
+
+{_sources_block(sources)}
+"""
+
+    if example_test is not None:
+        path, content = example_test
+        body += f"""
+## An existing test in this repository — match this framework and style
+`{path}`:
+```
+{content}
+```
+"""
+    else:
+        body += "\nFollow the test framework and conventions already used in this repository.\n"
+
+    if passed_instead:
+        body += f"""
+## Your last test passed, so it proved nothing
+
+```
+{passed_instead}
+```
+
+A test that passes against code that has the reported bug is either asserting
+something the bug does not affect, or asserting the buggy behavior itself.
+Re-read the report and assert the behavior it says is missing — the specific
+value, the specific count, the specific ordering. If the report does not give
+you one, reply `BLOCKED:` and say what you would need.
+"""
+
+    if own_file_errors:
+        quoted = "\n".join(f"  {line}" for line in own_file_errors)
+        body += f"""
+## These errors are in the file you are about to write
+
+```
+{quoted}
+```
+
+They are defects in the test, not evidence about the bug — `{test_path}` is
+yours and nobody else can fix it. A test that will not build cannot reproduce
+anything. Fix exactly what they point at and keep the assertion.
+"""
+
+    body += "\nWrite the test now."
+    return [
+        Message(role="system", content=REPRO_SYSTEM),
+        Message(role="user", content=body),
+    ]
+
+
 def review_prompt(
     ticket: Ticket,
     diff: str,
@@ -570,6 +1015,7 @@ def review_prompt(
     prior_verdicts: Sequence[str] = (),
     state: dict[str, str] | None = None,
     unchanged: dict[str, str] | None = None,
+    reproduced: tuple[str, str] | None = None,
 ) -> list[Message]:
     messages = [Message(role="system", content=REVIEWER_SYSTEM)]
 
@@ -610,6 +1056,30 @@ say so and ACCEPT: a ticket whose work was already done is finished, not
 failed. If they are not, REJECT and name what is missing.
 
 {_sources_block(state)}
+"""
+
+    if reproduced is not None:
+        # A bug ticket carries evidence no feature ticket has: the fault was
+        # demonstrated before it was fixed. Without this the reviewer judges
+        # the diff against a spec describing a defect it cannot see any trace
+        # of, and "the tests pass" is the least informative thing about it.
+        path, output = reproduced
+        body += f"""
+## This bug was reproduced before it was fixed
+`{path}` was written first and failed against the code as it stood:
+
+```
+{output.strip()}
+```
+
+That test passes now. Judge the diff on whether it fixes the *cause* of that
+failure: a change that satisfies this one test while leaving the same fault
+reachable another way is the thing to reject.
+
+The test file appears in the diff below. It was written before any fix was
+attempted, by a different role, and the author of this fix could not edit it —
+so read it as evidence rather than as the fix's own work, and say so if it
+asserts something weaker than the report describes.
 """
 
     if unchanged:
