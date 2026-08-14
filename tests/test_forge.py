@@ -17,6 +17,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import unittest.mock
@@ -535,6 +536,46 @@ class TestStoreResume(unittest.TestCase):
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [Ticket("T-1", status="running", position=0)])
         self.assertEqual(store.next_ticket(run_id).ticket_id, "T-1")
+
+
+class TestTheDashboardSharesTheStoreWithTheLoop(unittest.TestCase):
+    """`forge go` hands one Store to the dashboard, which serves every request
+    on a thread of its own. Interleaving those reads with the loop's writes on
+    a single sqlite3 connection is undefined use of the driver whatever
+    `check_same_thread` says — it eventually raised `bad parameter or other API
+    misuse` and killed a run fifteen retry cycles in."""
+
+    def test_reads_from_other_threads_do_not_disturb_the_writer(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(run_id, [Ticket("T-1")])
+        failures: list[Exception] = []
+        stop = threading.Event()
+
+        def read():
+            try:
+                while not stop.is_set():
+                    store.list_tickets(run_id)
+                    store.events_after(0)
+                    store.ticket_counts(run_id)
+            except Exception as exc:  # noqa: BLE001 - the point of the test
+                failures.append(exc)
+
+        readers = [threading.Thread(target=read, daemon=True) for _ in range(4)]
+        for reader in readers:
+            reader.start()
+        try:
+            for index in range(300):
+                store.log(run_id, f"event {index}", kind="ticket")
+                step = store.start_step(run_id, "T-1", "build")
+                store.end_step(step, "ok", "detail")
+        finally:
+            stop.set()
+            for reader in readers:
+                reader.join(timeout=5)
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(store.events_after(0, limit=1000)), 300)
 
 
 class TestRetry(unittest.TestCase):
@@ -5592,6 +5633,69 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         self.assertEqual(len(seen["tester"]), 2)
         self.assertNotIn("executor", seen)
         self.assertIn("proved nothing", seen["tester"][1])
+
+    def test_an_unreproducible_bug_is_not_retried_forever(self):
+        """A real run spent fifteen retry cycles on one report — two tester
+        calls apiece — and would have spent them forever under `retryCycles:
+        -1`. Nothing between cycles makes an undemonstrable fault
+        demonstrable, and neither existing brake catches it: the ticket never
+        takes an attempt, so there is no respec to come back unchanged, and the
+        tester's prose varies enough that the evidence fingerprint differs
+        every time."""
+        orch, _root, run_id = self._orch()
+        orch.config.loop.retry_cycles = -1
+        orch._shell = lambda _r, _n, _c: StepResult(ok=True, detail="1 passed")
+        self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        went_again = orch._retry_cycle(run_id, "blocked")
+
+        self.assertFalse(went_again)
+        messages = " ".join(row["message"] for row in orch.store.events_after(0))
+        self.assertIn("never reproduced", messages)
+
+    def test_a_bug_that_did_reproduce_is_retried_normally(self):
+        # The exclusion is about proof, not about being a bug ticket: one that
+        # demonstrated its fault and then failed to fix it is ordinary work.
+        orch, root, run_id = self._orch()
+        orch.config.loop.retry_cycles = -1
+        orch.config.loop.respec_on_retry = False
+        orch._shell = lambda _r, _n, _c: StepResult(ok=False, detail=self.TEST_FAILURE)
+        self._calls(orch, tester=self._GOOD_TEST, executor="src/a.py\n```python\n# no fix\n```")
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertTrue(orch._retry_cycle(run_id, "blocked"))
+
+    def test_the_block_names_the_layers_the_suite_cannot_reach(self):
+        """The case this came from: a report said the game starts at level 0.
+        The Rust set it to 1, so no test of that code could fail — and the
+        symptom was real, in a JavaScript file that threw on its second line
+        and left the page showing a hardcoded `Level: 0`. `cargo test` runs no
+        JavaScript, so nothing in the pipeline could reach it."""
+        orch, root, run_id = self._orch()
+        (root / "web").mkdir()
+        (root / "web" / "main.js").write_text("run()\n", encoding="utf-8")
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        orch._shell = lambda _r, _n, _c: StepResult(ok=True, detail="1 passed")
+        self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        note = orch.store.list_tickets(run_id)[0].blocked_note
+        self.assertIn(".js", note)
+        self.assertIn("no ticket here can reach it", note)
+
+    def test_a_single_language_project_gets_no_such_note(self):
+        orch, root, run_id = self._orch()
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        orch._shell = lambda _r, _n, _c: StepResult(ok=True, detail="1 passed")
+        self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertNotIn("also contains", orch.store.list_tickets(run_id)[0].blocked_note)
 
     def test_a_report_too_vague_to_assert_is_handed_back(self):
         orch, _root, run_id = self._orch()

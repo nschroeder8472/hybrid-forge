@@ -16,6 +16,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -294,13 +295,37 @@ class Store:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(self.path, check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
-        # WAL so the dashboard can read while the loop writes.
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.executescript(SCHEMA)
+        # One connection per thread, not one connection shared by all of them.
+        # `forge go` hands this same Store to the dashboard, which serves every
+        # request on a thread of its own, so the loop's writes and the
+        # dashboard's reads were interleaving on a single sqlite3 connection.
+        # That is undefined use of the driver whatever `check_same_thread`
+        # says, and it eventually raised `bad parameter or other API misuse`
+        # and killed a run mid-cycle. WAL is what makes the split cheap:
+        # readers do not block the writer, and each thread gets its own cursor
+        # state instead of trampling a shared one.
+        self._local = threading.local()
+        connection = self._connect()
+        connection.executescript(SCHEMA)
         self._migrate()
-        self._connection.commit()
+        connection.commit()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        # WAL so the dashboard can read while the loop writes.
+        connection.execute("PRAGMA journal_mode=WAL")
+        # A writer that arrives mid-checkpoint waits rather than raising. Five
+        # seconds is far longer than anything this store does.
+        connection.execute("PRAGMA busy_timeout=5000")
+        self._local.connection = connection
+        return connection
+
+    @property
+    def _connection(self) -> sqlite3.Connection:
+        """This thread's connection, opened on first use."""
+        connection = getattr(self._local, "connection", None)
+        return connection if connection is not None else self._connect()
 
     # Columns added after the first release. `CREATE TABLE IF NOT EXISTS` will
     # not add them to a database that already exists, so widen it here instead
@@ -332,7 +357,15 @@ class Store:
                 )
 
     def close(self) -> None:
-        self._connection.close()
+        """Close this thread's connection. Other threads keep their own.
+
+        Enough for every caller there is: the CLI closes the store it opened,
+        and the dashboard's threads are daemons that die with the process.
+        """
+        connection = getattr(self._local, "connection", None)
+        if connection is not None:
+            connection.close()
+            self._local.connection = None
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:

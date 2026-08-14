@@ -30,6 +30,7 @@ import hashlib
 import os
 import re
 import subprocess
+import traceback
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from . import respec
+from . import evidence
 from .artifacts import Artifacts
 from .budget import BudgetGate, Wait
 from .config import Config, ConfigError
@@ -726,9 +728,17 @@ class Orchestrator:
             self.store.log(run_id, "Loop stopped.", level="warn", kind="lifecycle")
             return RUN_STOPPED
         except Exception as exc:  # noqa: BLE001 - the daemon must record why it died
+            # With the traceback. Without it the record is a sentence with no
+            # location — one run died on `bad parameter or other API misuse`,
+            # which is sqlite's way of saying two threads shared a connection,
+            # and nothing said which call it happened in.
             self.store.set_run_status(run_id, RUN_FAILED, str(exc))
             self.store.log(
-                run_id, f"Loop failed: {exc}", level="error", kind="lifecycle"
+                run_id,
+                f"Loop failed: {exc}",
+                level="error",
+                kind="lifecycle",
+                data={"traceback": traceback.format_exc()[-4000:]},
             )
             return RUN_FAILED
 
@@ -1082,10 +1092,37 @@ class Orchestrator:
         # unsafe to delegate, so requeueing it only gets it skipped again — and
         # under `-1` that is a cycle that repeats forever while doing nothing
         # but spending a planner call on each pass.
+        # A bug ticket that never reproduced is in the same position: it stops
+        # at the same step every cycle, because nothing between cycles makes an
+        # undemonstrable fault demonstrable. One report ran fifteen cycles that
+        # way — two tester calls apiece — and would have run forever under
+        # `-1`. The tester's own explanation is in `blocked_note`; that is the
+        # thing to read, and it needs a person.
+        unprovable = {
+            ticket.ticket_id
+            for ticket in tickets
+            if ticket.kind == TICKET_BUG
+            and ticket.status == TICKET_BLOCKED
+            and not self.store.reproduced(run_id, ticket.ticket_id)
+        }
+        for ticket_id in sorted(unprovable):
+            self.store.log(
+                run_id,
+                f"{ticket_id}: not retried — the bug was never reproduced, and "
+                f"another cycle would write the same test against the same code "
+                f"for the same result. Read the blocked note: either the report "
+                f"needs sharpening, or the fault is somewhere this project's "
+                f"test command does not reach.",
+                level="warn",
+                kind="lifecycle",
+            )
+
         eligible = [
             ticket.ticket_id
             for ticket in tickets
-            if ticket.status in self.store.RETRYABLE and ticket.route == "delegate"
+            if ticket.status in self.store.RETRYABLE
+            and ticket.route == "delegate"
+            and ticket.ticket_id not in unprovable
         ]
         if not eligible:
             # Nothing here is the loop's to retry: either every ticket landed
@@ -2559,6 +2596,47 @@ class Orchestrator:
         prefix = "" if directory in ("", ".") else f"{directory}/"
         return f"{prefix}{self._ticket_slug(ticket)}_test{suffix}", ""
 
+    # Extensions that hold behavior a test suite could have covered. A ticket
+    # that cannot reproduce a fault in one language is worth pointing at the
+    # others; a ticket that cannot reproduce one in a stylesheet is not.
+    _CODE_SUFFIXES = frozenset(
+        """.rs .py .js .mjs .ts .tsx .jsx .go .rb .java .kt .swift .c .cc .cpp
+        .h .hpp .cs .php .sh .ps1 .lua .ex .exs .scala .dart""".split()
+    )
+
+    def _unreachable_layers(self, test_path: str) -> str:
+        """A note naming languages in this project the test command cannot run.
+
+        The case that produced it: a report said the game starts at level 0.
+        The Rust sets it to 1, so no test of that code could fail, and the loop
+        parked — correctly. The symptom was real and lived in `web/main.js`,
+        which threw on its second line and left the page showing the hardcoded
+        `Level: 0` forever. `cargo test` runs no JavaScript, so nothing in the
+        pipeline could have reached it, and the block said only "sharpen the
+        report" about a report that was accurate.
+
+        Naming the gap costs nothing and is often the whole answer.
+        """
+        suite = Path(test_path).suffix.lower()
+        others = sorted(
+            {
+                suffix
+                for path in evidence.repo_files(self.config.root)
+                if (suffix := Path(path).suffix.lower()) in self._CODE_SUFFIXES
+                and suffix != suite
+            }
+        )
+        if not others:
+            return ""
+        command = self.config.commands.get("test", "the test command")
+        return (
+            f"\n\nBefore sharpening it, consider where the fault is: the suite "
+            f"is written in {suite} and `{command}` runs nothing else, while "
+            f"this project also contains {', '.join(others)} files. A symptom "
+            f"you can see in the running program and cannot reproduce in {suite} "
+            f"is usually in one of those, and no ticket here can reach it."
+        )
+
     def _reproduce(self, run_id: int, ticket: Ticket, test_path: str) -> StepResult:
         """Write a test that fails because of this bug, and prove it fails.
 
@@ -2677,6 +2755,7 @@ class Orchestrator:
                             f"worked. Sharpen the report — the exact input, the "
                             f"value you saw, the value you expected — or fix it "
                             f"by hand. The test is on disk to start from."
+                            + self._unreachable_layers(test_path)
                         ),
                     )
                 self.store.log(
