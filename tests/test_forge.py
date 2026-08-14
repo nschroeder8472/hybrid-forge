@@ -3728,6 +3728,126 @@ class TestACriterionTheSpecAlreadyStatesIsNotARatchet(unittest.TestCase):
         self.assertNotIn("the plan is what needs changing", messages)
 
 
+class TestSettingUpARunnerForALanguage(unittest.TestCase):
+    """The other half of the gate. A ticket in a language nothing tests blocks
+    with a note pointing at `forge toolchain`, and a note pointing at a command
+    that does not exist is worse than no note."""
+
+    class _Planner(Provider):
+        kind = "stub"
+        reply = ""
+        seen = ""
+
+        def complete(self, messages, *, max_tokens, temperature=0.2, timeout=600):
+            type(self).seen = _joined(messages)
+            return Completion(text=self.reply, usage=Usage(), finish_reason="stop")
+
+        def capabilities(self):
+            return Capabilities(context_window=32768, max_output_tokens=8192)
+
+    def _project(self, commands=None):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x"}},
+                    "roles": {r: "m" for r in ROLES},
+                    "commands": commands if commands is not None else {"test": "cargo test"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (root / "src").mkdir()
+        (root / "src" / "a.rs").write_text("fn main() {}\n", encoding="utf-8")
+        (root / "web").mkdir()
+        (root / "web" / "main.js").write_text("run()\n", encoding="utf-8")
+        (root / "Makefile").write_text("test:\n\tnode --test web/\n", encoding="utf-8")
+        return root
+
+    def _run(self, root, *argv, reply=None):
+        planner = self._Planner("planner", {})
+        type(planner).reply = reply or ""
+        parsed = cli.build_parser().parse_args(["--root", str(root), "toolchain", *argv])
+        out = io.StringIO()
+        with unittest.mock.patch.object(Config, "provider_for", lambda self, role: planner):
+            with contextlib.redirect_stdout(out):
+                parsed.func(parsed)
+        return out.getvalue()
+
+    def test_it_names_the_languages_nothing_tests(self):
+        printed = self._run(self._project())
+
+        self.assertIn(".js", printed)
+        self.assertIn("No test command covers", printed)
+        self.assertIn("forge toolchain --language .js", printed)
+
+    def test_a_command_can_be_set_by_hand(self):
+        root = self._project()
+
+        self._run(root, "--language", ".js", "--set", "node --test web/")
+
+        config = Config.load(root)
+        self.assertEqual(config.command_for("test", "web/main.js"), "node --test web/")
+        # The command that was covering everything keeps doing so; this adds a
+        # language beside it rather than taking its place.
+        self.assertEqual(config.command_for("test", "src/a.rs"), "cargo test")
+
+    def test_a_language_name_sets_every_extension_it_owns(self):
+        root = self._project()
+
+        self._run(root, "--language", "javascript", "--set", "node --test web/")
+
+        config = Config.load(root)
+        self.assertEqual(config.command_for("test", "web/a.mjs"), "node --test web/")
+
+    def test_detection_is_asked_about_one_language(self):
+        root = self._project()
+
+        self._run(
+            root,
+            "--language",
+            ".js",
+            reply=json.dumps({"test": "node --test web/", "confidence": "high"}),
+        )
+
+        self.assertIn(".js files specifically", self._Planner.seen)
+
+    def test_detection_alone_writes_nothing(self):
+        # Changing what verification means is not a decision the loop makes
+        # while nobody is watching.
+        root = self._project()
+
+        printed = self._run(
+            root, "--language", ".js", reply=json.dumps({"test": "node --test web/"})
+        )
+
+        self.assertIn("Nothing was written", printed)
+        self.assertFalse(Config.load(root).covers("test", ".js"))
+
+    def test_accepting_writes_it(self):
+        root = self._project()
+
+        self._run(
+            root,
+            "--language",
+            ".js",
+            "--accept",
+            reply=json.dumps({"test": "node --test web/", "confidence": "high"}),
+        )
+
+        self.assertTrue(Config.load(root).covers("test", ".js"))
+
+    def test_a_command_that_cannot_run_the_language_is_refused_before_it_is_written(self):
+        root = self._project()
+
+        with self.assertRaises(SystemExit) as caught:
+            self._run(root, "--language", ".js", "--set", "cargo test")
+
+        self.assertIn("runs .rs", str(caught.exception))
+        self.assertFalse(Config.load(root).covers("test", ".js"))
+
+
 class TestFilingABugFromTheCommandLine(unittest.TestCase):
     """`forge bug` is separate from `ingest` because the shapes differ at the
     root: ingest turns a document into a backlog and takes its criteria as the

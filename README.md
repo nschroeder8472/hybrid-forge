@@ -182,6 +182,7 @@ forge go --retries N        # requeue and respec what did not land, N more
 forge status                # one-shot summary
 forge retry [--respec]      # requeue failed tickets, optionally re-specced
 forge bug "<report>"        # reproduce a bug, then fix it
+forge toolchain             # what tests each language; set up what nothing does
 forge criteria [ID --accept N]
                             # adopt a criterion the loop proposed and refused
 forge pause | resume | stop # applied after the current step, never mid-patch

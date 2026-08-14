@@ -234,6 +234,17 @@ Keys are extensions (`.rs`) or language names (`rust`, `javascript` — which
 expands to `.js`, `.mjs`, `.cjs`, `.jsx`), and `*` is a catch-all. A plain
 string is read as `{"*": "..."}`, so every existing config keeps its meaning.
 
+`forge toolchain` sets one up for a language that has none — reading the repo's
+own CI and build files to propose a command, and writing it only when you
+accept:
+
+```bash
+forge toolchain                                    # the coverage matrix
+forge toolchain --language .js                     # propose one, write nothing
+forge toolchain --language .js --accept            # write what it proposed
+forge toolchain --language .js --set "node --test web/"
+```
+
 A catch-all counts as coverage *until it names a runner that cannot run the
 language*: `"test": "cargo test"` does not cover a project's JavaScript, and
 `forge doctor` prints the matrix so the gap is visible before it becomes a

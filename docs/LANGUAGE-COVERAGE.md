@@ -1,7 +1,7 @@
 # Per-language verify commands — design spec
 
-**Status:** phases 1–3 built. 4 (`forge toolchain` and the setup loop) and 5
-(lint and typecheck as reported gaps) are still open. Each phase landed on its
+**Status:** phases 1–4 built. 5 (lint and typecheck as reported gaps) is still open, as is the
+wizard asking per language at `forge init`. Each phase landed on its
 own with tests; the sections below describe the whole design, and what is not
 yet built is marked.
 
@@ -237,7 +237,7 @@ block for an uncovered language, `_repro_target` the same. *Tests: a `.js`
 ticket gets a `.js` test file; an uncovered ticket blocks before any model call;
 the bug loop's block names the language.*
 
-**4 — `forge toolchain` and the setup loop. Open.** Per-language detection, the
+**4 — `forge toolchain` and the setup loop. Done**, bar the wizard. Per-language detection, the
 coverage matrix, the accept flow, the wizard asking per language, ingest and
 `forge bug` reporting uncovered scope up front. *Tests: detection scoped to one
 language; nothing is written without the accept flag.*
