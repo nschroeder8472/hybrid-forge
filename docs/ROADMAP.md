@@ -51,6 +51,23 @@ a plain-language report, a fix, and the existing suite still passing afterwards.
 
 ---
 
+## Per-language verify commands
+
+**Status:** designed, not built — [LANGUAGE-COVERAGE.md](LANGUAGE-COVERAGE.md).
+
+`commands.test` is one string, which assumes a repository is one language.
+Everything downstream inherits it: which language the tester writes in, what
+verification proves, and whether a bug can be reproduced at all. Three observed
+failures share that root — a ticket that shipped green over JavaScript the suite
+never ran, a bug report whose fault lived in that same unrun layer, and one
+stray `.js` file that once disabled test authoring for a whole Rust backlog.
+
+The spec turns each command into a map from language to command, blocks a ticket
+whose language has no runner rather than letting it pass on review alone, and
+adds `forge toolchain` to set one up. Five phases, each landing on its own.
+
+---
+
 ## Deferred from the review
 
 Found while reviewing the loop, judged not worth building yet.
