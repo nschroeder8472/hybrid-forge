@@ -58,7 +58,9 @@
     ".github/workflows/**"
   ],
   "memory": {
-    "command": ["mempalace-mcp"],
+    "command": [
+      "mempalace-mcp"
+    ],
     "room": "image-marquee",
     "limit": 6,
     "maxTokens": 1200,
@@ -78,6 +80,7 @@
     "pollSeconds": 2.0,
     "maxRuntimeSeconds": 0,
     "baselineVerify": true,
+    "bugHypotheses": 3,
     "executorTurns": 0
   },
   "ui": {

@@ -762,6 +762,100 @@ def parse_locate(text: str, known: Sequence[str], limit: int = 6) -> list[str]:
     return chosen[:limit]
 
 
+REDIAGNOSE_SYSTEM = """You are re-diagnosing a bug whose first explanation was wrong.
+
+A ticket was written from a report, naming code that was supposed to be at
+fault. A test was then written to demonstrate that fault, and it did not: the
+test passed against the code as it stands, or it could not be written at all.
+That is not a dead end. It is a measurement, and it rules something out.
+
+The report itself is not in question. Somebody saw the behavior they described.
+What has been disproved is where the previous ticket said it comes from.
+
+So: propose a different cause.
+
+- Do not re-propose what has already been ruled out. Naming the same files
+  again with the same reasoning wastes the only budget this ticket has.
+- Reason from what would actually produce the reported symptom. If the value
+  the report mentions is correct everywhere it is computed, then what is wrong
+  is where it is displayed, transported, cached, or re-initialised — follow it
+  outward from the code that was cleared.
+- A symptom seen in a running program whose logic checks out is usually in the
+  layer between the logic and the eye: the bindings, the entry point, the
+  template, the build output, the wiring that never ran.
+- Say `unclear` when you have nothing better than another guess, and say what
+  would settle it. Parking with an honest question beats a third wrong ticket,
+  and it beats a ticket nobody can write a failing test for.
+
+Reply with a single JSON object and nothing else, exactly as the first ticket
+was written:
+
+{"title": "...", "spec": "...", "allowed_files": ["..."],
+ "reference_files": ["..."], "criteria": [],
+ "reproduce": "what a failing test should assert, in one sentence"}
+"""
+
+
+def rediagnose_prompt(
+    ticket: Ticket,
+    report: str,
+    *,
+    disproof: str,
+    ruled_out: Sequence[tuple[str, str]] = (),
+    evidence: str = "",
+    sources: dict[str, str] | None = None,
+) -> list[Message]:
+    """Ask for a new cause after a reproduction failed to reproduce anything.
+
+    The step that keeps a wrong first guess from ending the ticket. The tester
+    reporting "this code already does what the report asks for" is a fact about
+    the code, and the right use of it is to look somewhere else — not to park
+    and tell the reporter their report was vague when it was not.
+
+    `ruled_out` carries every hypothesis already disproved, so the planner
+    cannot spend the next one re-proposing the last.
+    """
+    body = f"""## The report, unchanged
+{report.strip()}
+
+## The explanation that was just disproved
+{ticket.spec.strip()}
+
+Scoped to: {', '.join(ticket.allowed_files) or "(nothing named)"}
+
+## How it was disproved
+{disproof.strip()}
+"""
+
+    if ruled_out:
+        body += "\n## Already ruled out — do not propose these again\n"
+        for spec, why in ruled_out:
+            body += f"\n- **{spec.strip().splitlines()[0][:200]}**\n  {why.strip()[:400]}\n"
+
+    if sources:
+        body += f"""
+## The code that was cleared
+This is what the last hypothesis blamed. It has been read and it does not
+produce the reported behavior — use it to work out what does.
+
+{_sources_block(sources)}
+"""
+
+    if evidence.strip():
+        body += f"""
+## The repository
+Every path you name must come from here.
+
+{evidence.strip()}
+"""
+
+    body += "\nWrite the next ticket, or say `unclear`."
+    return [
+        Message(role="system", content=REDIAGNOSE_SYSTEM),
+        Message(role="user", content=body),
+    ]
+
+
 def parse_bug(text: str) -> dict[str, Any]:
     """Parse a bug-planner reply into the fields of one ticket.
 

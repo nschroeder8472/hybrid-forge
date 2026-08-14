@@ -5508,6 +5508,165 @@ class TestConversationalExecutorIsOffUntilAskedFor(unittest.TestCase):
         self.assertIn("the error path is swallowed", second[-1].content)
 
 
+class TestAWrongDiagnosisIsReplacedRatherThanParked(unittest.TestCase):
+    """A reproduction that cannot be written is a measurement, not a dead end.
+    The tester saying "this code already does what the report asks for" is a
+    fact about the code, and the right use of it is to look somewhere else.
+
+    One run parked on exactly that: the level really was initialised to 1, the
+    reporter really did see 0, and the answer sat one layer away in a file the
+    first hypothesis never named. The report was never what was disproved."""
+
+    REPORT = "the game starts at level 0"
+
+    def _orch(self, hypotheses=3):
+        orch, root, run_id = _stub_orchestrator({"lint": "", "typecheck": "", "test": "pytest -q"})
+        orch.config.loop.max_attempts = 1
+        orch.config.loop.bug_hypotheses = hypotheses
+        orch.store.set_run_status(run_id, "running")
+        orch.store._connection.execute(
+            "UPDATE runs SET source = ? WHERE id = ?", (self.REPORT, run_id)
+        )
+        orch.store._connection.commit()
+        orch.store.add_tickets(
+            run_id,
+            [
+                Ticket(
+                    "BUG-001",
+                    title="level starts at zero",
+                    kind=TICKET_BUG,
+                    spec="Game.new sets level to 0 and should set it to 1",
+                    allowed_files=["src/game.py"],
+                )
+            ],
+        )
+        return orch, root, run_id
+
+    def _second_hypothesis(self, **overrides):
+        return json.dumps(
+            {
+                "title": "the view never updates",
+                "spec": overrides.get("spec", "web/main.js throws before it reads the level"),
+                "allowed_files": overrides.get("allowed_files", ["web/main.js"]),
+                "reproduce": "the rendered level follows the game's level",
+            }
+        )
+
+    def _drive(self, orch, root, *, planner, reproduces_on):
+        """Reproduction fails until the given hypothesis is in scope."""
+        seen: dict[str, list[str]] = {}
+        state = {"scope": None}
+
+        def call(_run_id, role, messages, **_kwargs):
+            seen.setdefault(role, []).append(_joined(messages))
+            if role == "planner":
+                return Completion(text=planner.pop(0) if planner else "no idea",
+                                  usage=Usage(), finish_reason="stop")
+            if role == "tester":
+                state["scope"] = orch.store.list_tickets(1)[0].allowed_files
+                return Completion(
+                    text="tests/bug_001_test.py\n```python\ndef test_x():\n    assert True\n```",
+                    usage=Usage(), finish_reason="stop",
+                )
+            return Completion(text="ACCEPT", usage=Usage(), finish_reason="stop")
+
+        def shell(_run_id, name, command):
+            if not command.strip():
+                return StepResult(ok=True, detail="")
+            proven = state["scope"] == reproduces_on
+            if proven:
+                return StepResult(ok=False, detail="tests/bug_001_test.py::test_x FAILED\nassert 0 == 1")
+            return StepResult(ok=True, detail="1 passed")
+
+        orch._call = call
+        orch._shell = shell
+        return seen
+
+    def test_a_disproved_explanation_is_replaced_and_the_ticket_continues(self):
+        orch, root, run_id = self._orch()
+        seen = self._drive(
+            orch, root, planner=[self._second_hypothesis()], reproduces_on=["web/main.js"]
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        ticket = orch.store.list_tickets(run_id)[0]
+        self.assertEqual(ticket.allowed_files, ["web/main.js"])
+        self.assertIn("throws before it reads the level", ticket.spec)
+        # It got past reproduction on the second hypothesis rather than parking.
+        self.assertTrue(orch.store.reproduced(run_id, "BUG-001"))
+
+    def test_the_planner_is_shown_the_report_and_what_disproved_the_guess(self):
+        orch, root, run_id = self._orch()
+        seen = self._drive(
+            orch, root, planner=[self._second_hypothesis()], reproduces_on=["web/main.js"]
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        asked = seen["planner"][0]
+        self.assertIn(self.REPORT, asked)
+        self.assertIn("The explanation that was just disproved", asked)
+        self.assertIn("Game.new sets level to 0", asked)
+
+    def test_the_next_guess_cannot_be_the_last_one_again(self):
+        orch, root, run_id = self._orch()
+        seen = self._drive(
+            orch,
+            root,
+            planner=[self._second_hypothesis(), self._second_hypothesis(spec="another idea")],
+            reproduces_on=["never"],
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        second = seen["planner"][1]
+        self.assertIn("Already ruled out", second)
+        self.assertIn("Game.new sets level to 0", second)
+        self.assertIn("throws before it reads the level", second)
+
+    def test_the_block_lists_every_hypothesis_it_tried(self):
+        # The work the ticket actually did. Without it the next person starts
+        # from the report and repeats all of it.
+        orch, root, run_id = self._orch()
+        self._drive(
+            orch,
+            root,
+            planner=[self._second_hypothesis(), self._second_hypothesis(spec="a third idea")],
+            reproduces_on=["never"],
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        note = orch.store.list_tickets(run_id)[0].blocked_note
+        self.assertEqual(orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED)
+        self.assertIn("Hypotheses tried and ruled out", note)
+        self.assertIn("Game.new sets level to 0", note)
+
+    def test_a_planner_with_nothing_better_parks_immediately(self):
+        # An honest question beats a third wrong ticket.
+        orch, root, run_id = self._orch()
+        seen = self._drive(orch, root, planner=["no idea at all"], reproduces_on=["never"])
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertEqual(orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED)
+        self.assertEqual(len(seen["planner"]), 1)
+        messages = " ".join(row["message"] for row in orch.store.events_after(0))
+        self.assertIn("no further diagnosis", messages)
+
+    def test_one_hypothesis_is_the_old_behaviour(self):
+        orch, root, run_id = self._orch(hypotheses=1)
+        seen = self._drive(
+            orch, root, planner=[self._second_hypothesis()], reproduces_on=["web/main.js"]
+        )
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertEqual(orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED)
+        self.assertNotIn("planner", seen)
+
+
 class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
     """The loop verifies what the criteria say, so a defect nobody wrote a
     criterion for survives the whole pipeline. Two shipped that way in one

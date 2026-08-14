@@ -86,15 +86,40 @@ than becoming a plausible ticket scoped to files that do not exist.
 
 ---
 
+## A wrong guess is a measurement, not a dead end
+
+The first ticket is a hypothesis: *this code, here, is what produces that
+symptom*. When the reproduction cannot be written — the test passes against the
+named code, or the tester refuses because that code already does what the
+report asks for — the hypothesis has been **disproved**. The report has not.
+Somebody saw the behavior they described.
+
+So the planner is asked for a different cause, with three things in front of
+it: the report unchanged, what disproved the last explanation, and every
+hypothesis already ruled out — so the next guess cannot be the last one again.
+The ticket is rewritten around the new cause, the old one is dropped, and
+reproduction runs again.
+
+This is what one real run needed and did not have. A report said the game
+starts at level 0. The Rust set it to 1, so no test of that code could fail; the
+loop parked and told the reporter to sharpen a report that was accurate. The
+answer was one layer away, in a JavaScript entry point that threw before it ever
+read the level. A re-diagnosis is the step that gets to look there.
+
+`loop.bugHypotheses` bounds it — 3 by default, `1` to park on the first wrong
+guess. When the budget runs out, or when the planner has nothing better than
+another guess, the ticket parks with **every hypothesis it tried** written into
+the block, because that is the work it did and the next person should not repeat
+it.
+
+---
+
 ## What it refuses to do
 
-**Fix a bug it could not reproduce.** If the test passes against the code as it
-stands, it is asserting something the fault does not touch — or asserting the
-fault itself. The tester gets one more attempt with the passing output quoted
-back, and then the ticket parks with the test on disk to start from. A bug
-nobody can demonstrate is a bug the loop would be fixing on faith, and the green
-afterwards would mean exactly what the green that shipped those two defects
-meant.
+**Fix a bug it could not reproduce.** Once the hypotheses are spent, the ticket
+parks rather than fixing on faith, with the last test on disk to start from. The
+green that would follow a guessed fix means exactly what the green that shipped
+those two defects meant.
 
 **Guess at a report it cannot turn into an assertion.** The tester may reply
 `BLOCKED:` naming what it would need to know. That is an answer, not a failure —

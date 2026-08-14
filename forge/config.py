@@ -123,6 +123,13 @@ class LoopSettings:
     # trade is not clean either way — which is why this is measured on a
     # backlog rather than switched on.
     executor_turns: int = 0
+    # Hypotheses a bug ticket may go through before it parks for a human. The
+    # first is the planner's reading of the report; each one after it is a
+    # re-diagnosis, asked for when the reproduction could not be written —
+    # because a test that passes against the named code has *disproved* that
+    # reading, and disproof is evidence, not a dead end. 1 parks on the first
+    # wrong guess, which is what this did before the re-diagnosis existed.
+    bug_hypotheses: int = 3
 
 
 @dataclass
@@ -202,6 +209,7 @@ class Config:
             max_runtime_seconds=int(loop.get("maxRuntimeSeconds", 0)),
             baseline_verify=bool(loop.get("baselineVerify", True)),
             executor_turns=int(loop.get("executorTurns", 0)),
+            bug_hypotheses=int(loop.get("bugHypotheses", 3)),
         )
 
         ui = data.get("ui", {}) or {}
@@ -225,6 +233,12 @@ class Config:
                 f"loop.retryCycles is {self.loop.retry_cycles}; expected 0 (hand "
                 f"back to a human), a positive count, or -1 (retry until the "
                 f"backlog is clean or the run is stopped)."
+            )
+        if self.loop.bug_hypotheses < 1:
+            raise ConfigError(
+                f"loop.bugHypotheses is {self.loop.bug_hypotheses}; expected 1 "
+                f"(park on the first hypothesis that cannot be reproduced) or "
+                f"more."
             )
         if self.loop.executor_turns < 0:
             raise ConfigError(
@@ -323,6 +337,7 @@ class Config:
                 "maxRuntimeSeconds": self.loop.max_runtime_seconds,
                 "baselineVerify": self.loop.baseline_verify,
                 "executorTurns": self.loop.executor_turns,
+                "bugHypotheses": self.loop.bug_hypotheses,
             },
             "ui": {"host": self.ui.host, "port": self.ui.port, "enabled": self.ui.enabled},
         }

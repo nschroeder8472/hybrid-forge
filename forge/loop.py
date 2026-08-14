@@ -73,7 +73,9 @@ from .prompts import (
     build_prompt,
     parse_record,
     parse_verdict,
+    parse_bug,
     record_prompt,
+    rediagnose_prompt,
     repro_prompt,
     review_prompt,
     strip_prompt_echo,
@@ -1412,11 +1414,9 @@ class Orchestrator:
             # nothing wrong and park a ticket whose work is nearly done.
             proof = self.store.reproduced(run_id, ticket.ticket_id)
             if not proof:
-                outcome = self._reproduce(run_id, ticket, repro_path)
-                if not outcome.ok:
-                    self._park(run_id, ticket, outcome.detail)
+                proof = self._prove(run_id, ticket, repro_path)
+                if not proof:
                     return
-                proof = outcome.detail
             repro = (repro_path, proof)
             # The failure the executor is being asked to clear. Stated as
             # evidence rather than left for it to infer from the spec: the
@@ -2636,6 +2636,125 @@ class Orchestrator:
             f"you can see in the running program and cannot reproduce in {suite} "
             f"is usually in one of those, and no ticket here can reach it."
         )
+
+    def _prove(self, run_id: int, ticket: Ticket, test_path: str) -> str:
+        """Demonstrate the fault, re-diagnosing when the explanation is wrong.
+
+        Returns the failure that proved it, or "" with the ticket parked.
+
+        A reproduction that cannot be written is a measurement, not a dead end.
+        The tester saying "this code already does what the report asks for" is
+        a fact about the code, and the right use of it is to look somewhere
+        else — the report is not what was disproved, the previous ticket's
+        reading of it was. One run parked on exactly that: the level really was
+        initialised to 1, the reporter really did see 0, and the answer sat one
+        layer away in a file the first hypothesis never named.
+
+        So each failure feeds a re-diagnosis, up to `loop.bugHypotheses`, with
+        everything already ruled out in front of the planner so the next guess
+        cannot be the last one again. Parking is what happens when the budget
+        runs out or the planner has nothing better than another guess — with
+        every hypothesis it tried written down, which is the part a human
+        actually needs.
+        """
+        for remaining in range(self.config.loop.bug_hypotheses - 1, -1, -1):
+            outcome = self._reproduce(run_id, ticket, test_path)
+            if outcome.ok:
+                return outcome.detail
+            if not remaining:
+                self._park(run_id, ticket, self._exhausted(run_id, ticket, outcome.detail))
+                return ""
+
+            revised = self._rediagnose(run_id, ticket, outcome.detail)
+            if revised is None:
+                self._park(run_id, ticket, self._exhausted(run_id, ticket, outcome.detail))
+                return ""
+        return ""
+
+    def _exhausted(self, run_id: int, ticket: Ticket, last: str) -> str:
+        """The blocked note for a bug that was never demonstrated.
+
+        Every hypothesis that was tried, in order, because that is the work
+        this ticket actually did and the next person should not repeat it.
+        """
+        tried = self.store.ruled_out(run_id, ticket.ticket_id)
+        note = last
+        if tried:
+            note += "\n\nHypotheses tried and ruled out, in order:\n" + "\n".join(
+                f"  {index}. {spec.splitlines()[0][:200]}"
+                for index, (spec, _why) in enumerate(tried, start=1)
+            )
+        return note
+
+    def _rediagnose(self, run_id: int, ticket: Ticket, disproof: str) -> Ticket | None:
+        """Rewrite the ticket around a different cause. None when there is none.
+
+        The ticket is revised in place and persisted, so the next reproduction
+        attempt runs against the new hypothesis — and `original_spec` still
+        holds what the report first became, which is what the ratchet compares
+        a later respec against.
+        """
+        report = ""
+        run = self.store.get_run(run_id)
+        if run is not None:
+            report = run["source"] or ""
+
+        try:
+            completion = self._call(
+                run_id,
+                "planner",
+                rediagnose_prompt(
+                    ticket,
+                    report or ticket.spec,
+                    disproof=disproof,
+                    ruled_out=self.store.ruled_out(run_id, ticket.ticket_id),
+                    evidence=evidence.gather(self.config.root, report or ticket.spec),
+                    sources=self._sources_for(ticket)[0],
+                ),
+                max_tokens=self._output_budget("planner"),
+                temperature=0.2,
+            )
+            fields = parse_bug(completion.text)
+        except (ContextOverflow, ProviderError, ValueError) as exc:
+            # `unclear` arrives here too, as a ValueError carrying what the
+            # planner said it would need. Either way there is no next
+            # hypothesis, and saying so is the honest end.
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: no further diagnosis — {exc}",
+                level="warn",
+                kind="ticket",
+            )
+            return None
+
+        # Written before the ticket changes, so the record is of what was
+        # dropped rather than of what replaced it.
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: that explanation was disproved, so it was "
+            f"dropped and a different cause proposed:\n"
+            f"  was: {ticket.spec.splitlines()[0][:160]}\n"
+            f"  now: {fields['spec'].splitlines()[0][:160]}",
+            level="warn",
+            kind="ticket",
+            data={
+                "ticket": ticket.ticket_id,
+                "ruled_out": ticket.spec,
+                "disproof": disproof[:2000],
+                "scope": ticket.allowed_files,
+            },
+        )
+
+        ticket.title = fields["title"] or ticket.title
+        ticket.spec = fields["spec"]
+        ticket.allowed_files = fields["allowed_files"] or ticket.allowed_files
+        ticket.reference_files = fields["reference_files"]
+        ticket.context = fields["reproduce"] or ticket.context
+        # The reproduction path is derived from the ticket id and does not
+        # move, so the next attempt overwrites the test that proved nothing
+        # rather than leaving it behind asserting something never in doubt.
+        self.store.update_ticket(run_id, ticket)
+        return ticket
 
     def _reproduce(self, run_id: int, ticket: Ticket, test_path: str) -> StepResult:
         """Write a test that fails because of this bug, and prove it fails.

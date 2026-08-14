@@ -675,6 +675,37 @@ class Store:
         ).fetchone()
         return row["detail"] if row else ""
 
+    def ruled_out(self, run_id: int, ticket_id: str) -> list[tuple[str, str]]:
+        """Hypotheses this bug ticket has already disproved, oldest first.
+
+        Read back out of the run log rather than kept in a column of its own:
+        each re-diagnosis already logs what it dropped and why, and a second
+        store of the same fact is a second thing to keep true.
+
+        The list is what stops the third hypothesis being the first one again.
+        A planner handed only "that was wrong, try again" proposes the same
+        files with the same reasoning, because from where it sits nothing has
+        changed.
+        """
+        rows = self._connection.execute(
+            "SELECT data FROM events WHERE run_id = ? AND kind = 'ticket' "
+            "AND data LIKE '%\"ruled_out\"%' ORDER BY id",
+            (run_id,),
+        ).fetchall()
+
+        found: list[tuple[str, str]] = []
+        for row in rows:
+            try:
+                data = json.loads(row["data"])
+            except json.JSONDecodeError:
+                continue
+            if data.get("ticket") != ticket_id:
+                continue
+            spec = str(data.get("ruled_out", "")).strip()
+            if spec:
+                found.append((spec, str(data.get("disproof", "")).strip()))
+        return found
+
     def ticket_turns(
         self, run_id: int, ticket_id: str, limit: int = 2
     ) -> list[tuple[str, str]]:

@@ -287,6 +287,7 @@ run some context, never the run.
 | `pollSeconds` | `2.0` | Control-channel poll interval while waiting. |
 | `maxRuntimeSeconds` | `0` (off) | Cap on unattended wall-clock time. |
 | `baselineVerify` | `true` | Run the verify commands once before each ticket, so breakage that was already there is not blamed on whichever ticket ran next. Turn off only when a full suite is slow enough that paying it per ticket costs more than the attempts it saves. |
+| `bugHypotheses` | `3` | How many explanations a `forge bug` ticket may go through before it parks. The first is the planner's reading of the report; each one after it is a re-diagnosis, asked for when the reproduction could not be written — a test that passes against the named code has *disproved* that reading, and disproof is evidence rather than a dead end. `1` parks on the first wrong guess. See [BUG-LOOP.md](BUG-LOOP.md). |
 | `executorTurns` | `0` (off) | Replay this many prior attempts to the executor as real conversation turns — its own reply as an `assistant` message, the failure that followed as the next `user` one. Experimental — a model shown its own wrong answer defends it more readily, and the flat prompt already anchors that way through disk state. See [SETUP](SETUP.md#thinking-models-answer-last) for the whole trade. |
 
 ---
