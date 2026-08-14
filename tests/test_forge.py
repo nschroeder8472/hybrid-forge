@@ -1185,6 +1185,106 @@ def _camel(name: str) -> str:
     return head + "".join(part.title() for part in rest)
 
 
+class TestCommandsAreKeyedByLanguage(unittest.TestCase):
+    """One command per verify step says a repository is one language, and
+    everything downstream inherited that: which language the tester writes in,
+    what verification proves, whether a bug in an unrun layer can be reproduced
+    at all. One project shipped a green ticket over JavaScript that threw on
+    its second line, because the suite was `cargo test` and nothing else ever
+    ran."""
+
+    def _config(self, commands) -> Config:
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x"}},
+                    "roles": {r: "m" for r in ROLES},
+                    "commands": commands,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return Config.load(root)
+
+    def test_a_plain_string_still_means_every_language(self):
+        # Every config that exists today keeps working and keeps meaning what
+        # it meant. Nothing about this feature is a migration.
+        config = self._config({"test": "pytest -q"})
+
+        self.assertEqual(config.commands_for("test"), {"*": "pytest -q"})
+        self.assertEqual(config.command_for("test", "src/a.py"), "pytest -q")
+        self.assertTrue(config.covers("test", ".py"))
+
+    def test_a_map_answers_per_language(self):
+        config = self._config({"test": {".rs": "cargo test", ".js": "node --test web/"}})
+
+        self.assertEqual(config.command_for("test", "src/game.rs"), "cargo test")
+        self.assertEqual(config.command_for("test", "web/main.js"), "node --test web/")
+
+    def test_language_names_are_accepted_and_expand(self):
+        # `.mjs` is JavaScript whether or not anybody wrote it down, and a
+        # `.mjs` file nothing claims is a language reported as having no runner.
+        config = self._config({"test": {"rust": "cargo test", "javascript": "node --test"}})
+
+        self.assertEqual(config.command_for("test", "src/a.rs"), "cargo test")
+        self.assertEqual(config.command_for("test", "web/a.mjs"), "node --test")
+        self.assertEqual(config.command_for("test", "web/a.jsx"), "node --test")
+
+    def test_an_exact_key_beats_the_catch_all(self):
+        config = self._config({"test": {"*": "make check", ".rs": "cargo test"}})
+
+        self.assertEqual(config.command_for("test", "src/a.rs"), "cargo test")
+        self.assertEqual(config.command_for("test", "build.sh"), "make check")
+
+    def test_a_catch_all_that_cannot_run_the_language_is_not_coverage(self):
+        # The case that shipped the defect: `cargo test` reads as coverage of
+        # every file in the project, and runs none of the JavaScript.
+        config = self._config({"test": "cargo test"})
+
+        self.assertTrue(config.covers("test", ".rs"))
+        self.assertFalse(config.covers("test", ".js"))
+        self.assertEqual(config.covering("test", ".js"), ("", "runs .rs"))
+
+    def test_a_compound_catch_all_covers_what_it_names(self):
+        config = self._config({"test": "cargo test && node --test web/"})
+
+        self.assertTrue(config.covers("test", ".rs"))
+        self.assertTrue(config.covers("test", ".js"))
+
+    def test_a_command_naming_no_runner_is_left_alone(self):
+        # `make check` may run anything. Guessing that it does not is worse
+        # than not knowing.
+        config = self._config({"test": "make check"})
+        self.assertTrue(config.covers("test", ".js"))
+
+    def test_a_command_keyed_to_a_language_it_cannot_run_is_refused(self):
+        # Fails at startup rather than one ticket at a time, because a ticket
+        # failing this way reports it as the ticket's fault.
+        with self.assertRaises(ConfigError) as caught:
+            self._config({"test": {".js": "cargo test"}})
+
+        self.assertIn("runs .rs", str(caught.exception))
+
+    def test_a_command_that_is_neither_string_nor_map_is_refused(self):
+        with self.assertRaises(ConfigError):
+            self._config({"test": ["cargo test"]})
+
+    def test_an_empty_command_covers_nothing(self):
+        config = self._config({"test": "", "lint": {".rs": ""}})
+        self.assertEqual(config.commands_for("test"), {})
+        self.assertFalse(config.covers("lint", ".rs"))
+
+    def test_the_map_survives_a_write(self):
+        config = self._config({"test": {".rs": "cargo test", ".js": "node --test"}})
+        config.write()
+
+        self.assertEqual(
+            Config.load(config.root).command_for("test", "web/a.js"), "node --test"
+        )
+
+
 class TestRetryCycleConfig(unittest.TestCase):
     """The knob is read from config, and a typo in it must not run forever."""
 

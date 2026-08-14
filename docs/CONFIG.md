@@ -217,8 +217,29 @@ run. That is the trade being made deliberately.
 }
 ```
 
-Three shell commands, run from the project root after each attempt. An empty
-string skips that check. They are the loop's only source of ground truth about
+Shell commands run from the project root after each attempt. An empty string
+skips that check.
+
+**Each one may also be a map from language to command**, because a repository is
+rarely one language and a single command silently means "everything is Rust":
+
+```json
+"commands": {
+  "test": { ".rs": "cargo test", ".js": "node --test web/" },
+  "lint": { ".rs": "cargo clippy --all-targets -- -D warnings", ".js": "eslint web/" }
+}
+```
+
+Keys are extensions (`.rs`) or language names (`rust`, `javascript` — which
+expands to `.js`, `.mjs`, `.cjs`, `.jsx`), and `*` is a catch-all. A plain
+string is read as `{"*": "..."}`, so every existing config keeps its meaning.
+
+A catch-all counts as coverage *until it names a runner that cannot run the
+language*: `"test": "cargo test"` does not cover a project's JavaScript, and
+`forge doctor` prints the matrix so the gap is visible before it becomes a
+ticket checked by reading. A command keyed to a language it demonstrably cannot
+run — `{".js": "cargo test"}` — is refused at startup, because a ticket failing
+that way reports it as the ticket's fault. They are the loop's only source of ground truth about
 whether the work is good — a run with all three empty is verified by review
 alone.
 

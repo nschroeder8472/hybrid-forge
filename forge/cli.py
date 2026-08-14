@@ -30,11 +30,12 @@ import shutil
 import sys
 import time
 import webbrowser
+from collections import Counter
 from pathlib import Path
 
 from . import evidence, modelfiles, respec, wizard
 from .artifacts import ARTIFACTS_DIR
-from .config import Config, ConfigError, default_config
+from .config import ANY_LANGUAGE, Config, ConfigError, default_config
 from .ingest import ingest as ingest_document
 from .ingest import write_tickets
 from .loop import (
@@ -246,13 +247,67 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if report.startswith("FAIL"):
             failures += 1
 
-    for name in ("lint", "typecheck", "test"):
-        command = config.commands.get(name, "")
-        print(f"  {name} command: {command or '(none configured)'}")
+    uncovered = _report_coverage(config)
 
     print()
     print("all checks passed" if not failures else f"{failures} check(s) failed")
+    if uncovered:
+        print(
+            f"{len(uncovered)} language(s) in this project have no test command. "
+            f"Work in them can only be checked by reading."
+        )
     return 1 if failures else 0
+
+
+def _report_coverage(config: Config) -> list[str]:
+    """What runs against each language in the project, and what does not.
+
+    A repository is not one language, and the loop's verification is only as
+    wide as its commands. Printing the matrix is what makes a gap visible
+    before it becomes a ticket that passed on review alone over code nothing
+    ever ran.
+
+    Returns the extensions with no test command, so the caller can say so.
+    """
+    census = Counter(
+        suffix
+        for path in evidence.repo_files(config.root, limit=4000)
+        if (suffix := Path(path).suffix.lower()) in _SOURCE_SUFFIXES
+    )
+    if not census:
+        for name in ("lint", "typecheck", "test"):
+            commands = config.commands_for(name)
+            shown = commands.get(ANY_LANGUAGE) or "; ".join(
+                f"{key} {value}" for key, value in sorted(commands.items())
+            )
+            print(f"  {name} command: {shown or '(none configured)'}")
+        return []
+
+    width = max(len(suffix) for suffix in census)
+    print("\n  language  files  test / lint")
+    uncovered: list[str] = []
+    for suffix, count in sorted(census.items(), key=lambda item: (-item[1], item[0])):
+        test, how = config.covering("test", suffix)
+        lint, _ = config.covering("lint", suffix)
+        if not test:
+            uncovered.append(suffix)
+        # A catch-all that cannot run the language is worse than none: it reads
+        # as coverage in every report and proves nothing about the files.
+        shown = test or ("(no test command" + (f" — the one configured {how})" if how else ")"))
+        print(
+            f"  {suffix:<{max(width, 8)}}  {count:>5}  {shown}"
+            + ("  (catch-all)" if how == "catch-all" else "")
+            + (f"  |  {lint}" if lint else "")
+        )
+    return uncovered
+
+
+# Extensions worth reporting coverage for: languages whose behavior a test
+# could assert. A stylesheet with no runner is not a gap.
+_SOURCE_SUFFIXES = frozenset(
+    """.rs .py .js .mjs .cjs .jsx .ts .tsx .go .rb .java .kt .swift .c .cc .cpp
+    .h .hpp .cs .php .sh .ps1 .lua .ex .exs .scala .dart""".split()
+)
 
 
 def cmd_ingest(args: argparse.Namespace) -> int:
