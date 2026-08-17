@@ -68,6 +68,56 @@ adds `forge toolchain` to set one up. Five phases, each landing on its own.
 
 ---
 
+## Image generation as a ticket kind
+
+**Status:** designed, not built — [IMAGE-LOOP.md](IMAGE-LOOP.md).
+
+The loop's steps are named after code, but only two of them are about code. The
+rest is a shape: produce an artifact under a scope, check it mechanically, have
+something that gains nothing from passing rule on it, refine until a criterion
+is met. Nothing in `state.py`, `budget.py`, `artifacts.py` or the retry and
+respec machinery knows what a program is.
+
+The problem it solves is that generated images are refined the same way and
+nowhere near as carefully. The usual shape is a person in a chat window, judging
+by eye, with no record of the prompt or seed that produced the accepted version,
+no assertion that the palette or the dimensions are right, and no bound on how
+many attempts it took. Every part of that is something this harness already
+does for code.
+
+Three things make it more than a `kind` string, and the spec is mostly about
+them.
+
+- **A reviewer that cannot see the image is not a reviewer.** `Message.content`
+  is a `str` and all five adapters format it as one. Multimodal messages are
+  phase 1, and they ship useful on their own — a reviewer handed a screenshot on
+  an ordinary code ticket needs the same change, with no image generation in the
+  picture.
+- **There is no compiler.** A six-fingered hand passes every mechanical check
+  that can be written. Dimensions, palette distance, OCR and safe-area
+  occupancy are real and worth asserting, and they are also a shell script the
+  tester writes and `commands.test[".png"]` runs — no new loop machinery. What
+  they miss falls on a paid vision reviewer, which is why review here is one
+  call per *attempt* rather than per ticket, and why an unverifiable criterion
+  blocks at ingest instead of running forever.
+- **The refinement input is spatial.** "The hand is wrong" is a mask, not a
+  sentence. So the next attempt is either a regenerate or an edit of the
+  previous rendering, and the reviewer picks — the same distinction bug
+  re-diagnosis draws when the first explanation is disproved.
+
+**Open: which backend.** `supports_edit` decides whether the interesting loop is
+buildable or degrades to regenerate-with-a-better-prompt. The spec is written so
+a generate-only backend still works.
+
+**The honest weakness: no evidence.** The per-language spec above opened with
+three failing runs. This one opens with none — every claim in it was derived from
+reading the loop rather than watching an image ticket fail, which is the kind of
+argument §9 of [LOOP-INVARIANTS.md](LOOP-INVARIANTS.md) exists to distrust. The
+phase order is the mitigation: phase 1 is worth building even if the rest of the
+spec does not survive contact.
+
+---
+
 ## Deferred from the review
 
 Found while reviewing the loop, judged not worth building yet.
@@ -79,14 +129,20 @@ Found while reviewing the loop, judged not worth building yet.
   makes it behave like the completion endpoint the loop assumes. A stronger
   version would let a role *declare* what it needs — "this role reads text and
   returns text" — and refuse a provider that cannot promise it, rather than
-  relying on a default.
+  relying on a default. The image spec above makes this load-bearing: a reviewer
+  that has to *see* needs a capability four of the five adapters cannot offer,
+  and discovering that at review time costs the ticket.
 - **Cross-ticket oscillation detection.** The executor now sees its last two
   failures, which is enough to spot an A-then-B-then-A cycle if it reads them.
   Detecting the cycle mechanically — comparing failure signatures across
   attempts, the way `signatures()` already compares them across tickets — would
-  catch it without depending on the model noticing.
+  catch it without depending on the model noticing. Deferrable only while the
+  terminating condition is a test result; an image ticket ends on an opinion, and
+  the spec above treats stall detection as required rather than nice to have.
 - **Reviewer cost.** Review is ~100% of the money on a hybrid run and roughly
   one call per ticket. Skipping review for tickets whose diff is trivial, or
   batching several tickets into one review, would cut that — at the cost of the
   thing that keeps a cheap executor honest. Needs evidence before it is worth
-  the risk.
+  the risk. An image ticket makes it worse in the other direction — one vision
+  call per *attempt*, because every attempt produces something only a judge can
+  rule on.
