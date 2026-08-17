@@ -25,7 +25,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from types import SimpleNamespace
 
-from forge import cli, evidence, modelfiles, respec
+from forge import cli, evidence, modelfiles, replay, respec
 from forge.artifacts import Artifacts
 from forge.budget import BudgetGate, ContextOverflow, RateLimitPolicy
 from forge.config import ROLES, Config, ConfigError, LoopSettings, UISettings
@@ -42,12 +42,19 @@ from forge.ingest import (
 )
 from forge.ingest import ingest as ingest_document
 from forge.respec import _merge_criteria, _refuse_protocol_edits
-from forge.loop import _DROPPABLE_HEADINGS, _droppable, Orchestrator, StepResult
+from forge.loop import (
+    _DROPPABLE_HEADINGS,
+    _droppable,
+    CURRENT_RUN_KEY,
+    Orchestrator,
+    StepResult,
+)
 from forge.patch import (
     describe_unparsed,
     duplicate_paths,
     enforce_scope,
     foreign_bindings,
+    infer_single_file,
     is_safe_path,
     matches_any,
     normalize_path,
@@ -537,6 +544,340 @@ class TestStoreResume(unittest.TestCase):
         store.add_tickets(run_id, [Ticket("T-1", status="running", position=0)])
         self.assertEqual(store.next_ticket(run_id).ticket_id, "T-1")
 
+    def test_the_open_backlog_is_the_newest_run_nothing_has_been_spent_on(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        older = store.create_run("older")
+        store.add_tickets(older, [Ticket("T-1")])
+        newer = store.create_run("newer")
+        store.add_tickets(newer, [Ticket("T-2")])
+
+        self.assertEqual(int(store.unstarted_run()["id"]), newer)
+
+        # Once a run has been worked it is closed to new tickets, whatever its
+        # run status says — a ticket appended behind the orchestrator's
+        # position is one it has already walked past.
+        ticket = store.list_tickets(newer)[0]
+        ticket.status = "done"
+        store.update_ticket(newer, ticket)
+        self.assertEqual(int(store.unstarted_run()["id"]), older)
+
+    def test_there_is_no_open_backlog_when_every_run_has_started(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(run_id, [Ticket("T-1")])
+        store.set_run_status(run_id, "running")
+
+        self.assertIsNone(store.unstarted_run())
+
+    def test_an_appended_ticket_goes_last_in_the_reading_order(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(run_id, [Ticket("T-1"), Ticket("T-2")])
+
+        store.add_tickets(run_id, [Ticket("T-3", position=store.next_position(run_id))])
+
+        self.assertEqual(
+            [t.ticket_id for t in store.list_tickets(run_id)], ["T-1", "T-2", "T-3"]
+        )
+
+    def test_the_first_position_on_an_empty_run_is_zero(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        self.assertEqual(store.next_position(store.create_run("goal")), 0)
+
+    def test_a_retried_run_is_not_an_open_backlog(self):
+        # `forge retry --all` returns every ticket to pending and sets the run
+        # back to idle, so by status alone it looks untouched. It is not — that
+        # backlog has already been through the loop once, and new work filed
+        # into it would join a retry cycle rather than start clean.
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(run_id, [Ticket("T-1", status="failed", attempts=2)])
+        store.reset_tickets(run_id, statuses=("failed",))
+        store.set_run_status(run_id, "idle")
+
+        self.assertIsNone(store.unstarted_run())
+
+    def test_every_run_with_work_left_is_queued_oldest_first(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        first = store.create_run("first")
+        store.add_tickets(first, [Ticket("T-1")])
+        second = store.create_run("second")
+        store.add_tickets(second, [Ticket("T-2")])
+        third = store.create_run("third")
+        store.add_tickets(third, [Ticket("T-3")])
+
+        # Filed order, not newest first: the loop used to take the highest id
+        # and leave everything behind it stranded.
+        self.assertEqual([int(r["id"]) for r in store.resumable_runs()], [first, second, third])
+
+    def test_a_blocked_run_does_not_hide_the_work_queued_behind_it(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        blocked = store.create_run("blocked")
+        store.add_tickets(blocked, [Ticket("T-1", status="blocked")])
+        store.set_run_status(blocked, "blocked", "1 ticket(s) need a human")
+        later = store.create_run("later")
+        store.add_tickets(later, [Ticket("T-2")])
+
+        # The blocked run has nothing left to work, so it is not queued; the
+        # run behind it is, and used to be invisible until a human cleared the
+        # block by hand.
+        self.assertEqual([int(r["id"]) for r in store.resumable_runs()], [later])
+
+    def test_a_stopped_run_keeps_its_place_in_the_queue(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        stopped = store.create_run("stopped")
+        store.add_tickets(stopped, [Ticket("T-1")])
+        store.set_run_status(stopped, "stopped")
+        later = store.create_run("later")
+        store.add_tickets(later, [Ticket("T-2")])
+
+        self.assertEqual([int(r["id"]) for r in store.resumable_runs()], [stopped, later])
+
+    def test_done_and_failed_runs_are_never_queued(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        for status in ("done", "failed"):
+            run_id = store.create_run(status)
+            store.add_tickets(run_id, [Ticket(f"T-{status}")])
+            store.set_run_status(run_id, status)
+
+        # A failed run died of something outside its backlog — an unreachable
+        # role, a crash — and re-entering it turns one failure into several.
+        self.assertEqual(store.resumable_runs(), [])
+
+
+class TestForgeGoDrainsEveryQueuedRun(unittest.TestCase):
+    """`forge go` used to work the newest run and stop. Every command that
+    files work opens a run of its own — `ingest`, `bug`, `go --plan`, `retry` —
+    so anything filed behind a run that then blocked waited for a human to
+    notice it, and `forge status` shows one run, so it was not on screen to be
+    noticed."""
+
+    def _project(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x"}},
+                    "roles": {r: "m" for r in ("planner", "executor", "tester", "reviewer")},
+                    "ui": {"enabled": False},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return root
+
+    def _queue(self, root, goals):
+        """One run per goal, each with a pending ticket, oldest id first."""
+        store = Store(Config.load(root).db_path)
+        try:
+            ids = []
+            for index, goal in enumerate(goals):
+                run_id = store.create_run(goal)
+                store.add_tickets(run_id, [Ticket(f"T-{index}")])
+                ids.append(run_id)
+            return ids
+        finally:
+            store.close()
+
+    def _go(self, root, outcomes):
+        """Run `forge go` with the loop stubbed to the given per-run outcomes.
+
+        Records the run ids it was handed, which is the whole question here.
+        """
+        worked: list[int] = []
+
+        class _Loop:
+            def __init__(self, config, store, started_at=None):
+                self.store = store
+
+            def run(self, run_id):
+                worked.append(run_id)
+                status = outcomes.get(run_id, "done")
+                self.store.set_run_status(run_id, status)
+                for ticket in self.store.list_tickets(run_id):
+                    ticket.status = "done" if status == "done" else "blocked"
+                    self.store.update_ticket(run_id, ticket)
+                return status
+
+        parsed = cli.build_parser().parse_args(["--root", str(root), "go", "--no-ui"])
+        parsed.wait = False
+        out = io.StringIO()
+        with unittest.mock.patch.object(cli, "Orchestrator", _Loop):
+            with contextlib.redirect_stdout(out):
+                code = parsed.func(parsed)
+        return worked, out.getvalue(), code
+
+    def test_every_queued_run_is_worked_oldest_first(self):
+        root = self._project()
+        first, second, third = self._queue(root, ["first", "second", "third"])
+
+        worked, printed, code = self._go(root, {})
+
+        self.assertEqual(worked, [first, second, third])
+        self.assertEqual(code, 0)
+        self.assertIn("3 runs queued", printed)
+
+    def test_a_blocked_run_no_longer_strands_the_work_behind_it(self):
+        # The case this exists for: a report filed while an earlier backlog was
+        # blocked used to wait for the block to be cleared by hand.
+        root = self._project()
+        first, second = self._queue(root, ["blocks", "the bug filed after it"])
+
+        worked, _, code = self._go(root, {first: "blocked"})
+
+        self.assertEqual(worked, [first, second])
+        # Blocked work still needs a human, so the queue is not reported green.
+        self.assertEqual(code, 1)
+
+    def test_stopping_leaves_the_rest_of_the_queue_untouched(self):
+        # A person asking the loop to stop means stop, not "stop this run and
+        # start the next one".
+        root = self._project()
+        first, second, third = self._queue(root, ["one", "two", "three"])
+
+        worked, printed, code = self._go(root, {first: "stopped"})
+
+        self.assertEqual(worked, [first])
+        self.assertIn("2 queued run(s) left untouched", printed)
+        self.assertEqual(code, 1)
+
+    def test_a_failed_run_stops_the_drain(self):
+        # A run fails on something outside its own backlog — an unreachable
+        # role, a crash. Draining into the next one turns one failure into
+        # several, each costing a preflight to discover the same thing.
+        root = self._project()
+        first, second = self._queue(root, ["one", "two"])
+
+        worked, _, code = self._go(root, {first: "failed"})
+
+        self.assertEqual(worked, [first])
+        self.assertEqual(code, 1)
+
+    def test_one_run_still_reads_the_way_it_always_did(self):
+        root = self._project()
+        (only,) = self._queue(root, ["just the one"])
+
+        worked, printed, code = self._go(root, {})
+
+        self.assertEqual(worked, [only])
+        self.assertIn(f"Run {only}: just the one", printed)
+        self.assertIn("Finished: done", printed)
+        self.assertNotIn("runs queued", printed)
+        self.assertEqual(code, 0)
+
+    def test_an_empty_queue_still_says_so(self):
+        root = self._project()
+
+        with self.assertRaises(SystemExit) as caught:
+            self._go(root, {})
+
+        self.assertIn("no run to work on", str(caught.exception))
+
+    def test_a_spent_backlog_is_still_entered_so_it_reports_itself(self):
+        # Nothing is queued in a run whose tickets are all blocked, but `forge
+        # go` has always entered it to re-report what needs a human. That is
+        # the answer `forge status` points at, and the drain must not eat it.
+        root = self._project()
+        (only,) = self._queue(root, ["spent"])
+        store = Store(Config.load(root).db_path)
+        try:
+            ticket = store.list_tickets(only)[0]
+            ticket.status = "blocked"
+            store.update_ticket(only, ticket)
+            store.set_run_status(only, "blocked", "1 ticket(s) need a human")
+        finally:
+            store.close()
+
+        worked, _, code = self._go(root, {only: "blocked"})
+
+        self.assertEqual(worked, [only])
+        self.assertEqual(code, 1)
+
+    def test_the_runtime_cap_covers_the_whole_queue(self):
+        # `maxRuntimeSeconds` caps unattended wall-clock time. A fresh clock per
+        # run would let a queue of three spend three times the cap.
+        root = self._project()
+        self._queue(root, ["one", "two"])
+        clocks: list[float] = []
+
+        class _Loop:
+            def __init__(self, config, store, started_at=None):
+                clocks.append(started_at)
+                self.store = store
+
+            def run(self, run_id):
+                for ticket in self.store.list_tickets(run_id):
+                    ticket.status = "done"
+                    self.store.update_ticket(run_id, ticket)
+                self.store.set_run_status(run_id, "done")
+                return "done"
+
+        parsed = cli.build_parser().parse_args(["--root", str(root), "go", "--no-ui"])
+        parsed.wait = False
+        with unittest.mock.patch.object(cli, "Orchestrator", _Loop):
+            with contextlib.redirect_stdout(io.StringIO()):
+                parsed.func(parsed)
+
+        self.assertEqual(len(clocks), 2)
+        self.assertIsNotNone(clocks[0])
+        self.assertEqual(clocks[0], clocks[1])
+
+
+class TestTheDashboardFollowsTheRunTheLoopIsIn(unittest.TestCase):
+    """The dashboard shows the newest run, which was right while `forge go`
+    worked the newest run. Draining oldest first breaks that: the loop can be
+    three runs back, and the page would show one still waiting its turn."""
+
+    def _config(self, root):
+        return Config(
+            root=root,
+            models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
+            roles={r: "m" for r in ("planner", "executor", "tester", "reviewer")},
+        )
+
+    def test_the_live_run_outranks_a_newer_one_waiting_its_turn(self):
+        root = Path(tempfile.mkdtemp())
+        store = Store(root / "t.db")
+        working = store.create_run("being worked")
+        store.create_run("still queued")
+        store.set_run_status(working, "running")
+        store.set_control(CURRENT_RUN_KEY, str(working))
+
+        state = ui_server.snapshot(store, self._config(root))
+
+        self.assertEqual(state["run"]["id"], working)
+
+    def test_a_finished_run_hands_the_page_back_to_the_newest(self):
+        # The key is written when a run is entered and never cleared, so after
+        # the drain it names history. A stale pointer must not outrank the run
+        # someone has just filed.
+        root = Path(tempfile.mkdtemp())
+        store = Store(root / "t.db")
+        worked = store.create_run("worked last time")
+        store.set_run_status(worked, "done")
+        store.set_control(CURRENT_RUN_KEY, str(worked))
+        filed = store.create_run("filed since")
+
+        state = ui_server.snapshot(store, self._config(root))
+
+        self.assertEqual(state["run"]["id"], filed)
+
+    def test_a_blocked_run_still_loses_to_the_one_that_succeeded_after_it(self):
+        # The original bug this rule was written for: a backlog that had gone
+        # six-for-six reported `run 7: blocked`, naming a run two days stale.
+        root = Path(tempfile.mkdtemp())
+        store = Store(root / "t.db")
+        old = store.create_run("older")
+        store.set_run_status(old, "blocked", "6 ticket(s) need a human")
+        store.set_control(CURRENT_RUN_KEY, str(old))
+        new = store.create_run("newer")
+        store.set_run_status(new, "done", "all tickets complete")
+
+        state = ui_server.snapshot(store, self._config(root))
+
+        self.assertEqual(state["run"]["id"], new)
+
 
 class TestTheDashboardSharesTheStoreWithTheLoop(unittest.TestCase):
     """`forge go` hands one Store to the dashboard, which serves every request
@@ -803,6 +1144,15 @@ class TestAutomaticRetryCycles(unittest.TestCase):
         self.assertEqual(orchestrator.run(run_id), "blocked")
         self.assertEqual(worked, ["T-1", "T-2"])
         self.assertEqual(store.get_control(f"retries:{run_id}", "0"), "0")
+
+    def test_entering_a_run_records_it_for_the_dashboard(self):
+        # `forge go` drains oldest first, so the live run is often not the
+        # newest and the page has nothing else to follow.
+        orchestrator, store, run_id = self._orchestrator()
+        self._script(orchestrator)
+        orchestrator.run(run_id)
+
+        self.assertEqual(store.get_control(CURRENT_RUN_KEY, ""), str(run_id))
 
     def test_the_backlog_is_requeued_the_configured_number_of_times(self):
         orchestrator, store, run_id = self._orchestrator(retry_cycles=2)
@@ -1452,6 +1802,602 @@ class TestRespecHasGroundTruth(unittest.TestCase):
             -1
         ].content
         self.assertNotIn("What you may do to the acceptance criteria", body)
+
+
+class TestRespecCannotReviveARuledOutCause(unittest.TestCase):
+    """A re-diagnosed bug ticket has no "original intent" to return to: its
+    first spec was a hypothesis, and the loop disproved it by running a test.
+
+    Anchoring respec on `original_spec` told the planner the opposite. One run
+    re-diagnosed from the Rust to `web/main.js`, *reproduced the bug there*,
+    and the next respec reverted the scope to `src/lib.rs` reasoning that "the
+    previous revision drifted into build/JS paths, but the original intent and
+    all failures point to a Rust initialization". The executor then blocked,
+    because the code it had been told to fix was outside its scope.
+    """
+
+    RUST = "`Game::new` must initialize the `level` field to 1, in src/lib.rs."
+    JS = "web/main.js must await the wasm module before it reads the level."
+
+    def _store(self, rediagnosed=True):
+        """A bug ticket whose first hypothesis was tested and disproved."""
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("bug: level starts at 0", source="the game starts at level 0")
+        store.add_tickets(
+            run_id,
+            [
+                Ticket(
+                    "BUG-001",
+                    kind="bug",
+                    spec=self.JS if rediagnosed else self.RUST,
+                    original_spec=self.RUST,
+                    allowed_files=["web/main.js"] if rediagnosed else ["src/lib.rs"],
+                    status="failed",
+                )
+            ],
+        )
+        if rediagnosed:
+            store.log(
+                run_id,
+                "BUG-001: that explanation was disproved.",
+                kind="ticket",
+                data={
+                    "ticket": "BUG-001",
+                    "ruled_out": self.RUST,
+                    "disproof": "the test passed; Game::new already sets level to 1",
+                },
+            )
+        step = store.start_step(run_id, "BUG-001", "review")
+        store.end_step(step, "failed", "REJECT: nope")
+        return store, run_id
+
+    def _reply(self, **payload):
+        def call(_messages, _budget):
+            return Completion(text=json.dumps(payload), usage=Usage())
+
+        return call
+
+    def test_the_anchor_is_the_live_hypothesis_once_one_is_ruled_out(self):
+        ticket = Ticket("BUG-001", spec=self.JS, original_spec=self.RUST)
+
+        self.assertEqual(respec._anchor(ticket, [(self.RUST, "disproved")]), self.JS)
+        # Unchanged where nothing has been ruled out: an ordinary ticket still
+        # needs the human's text as its fixed point or it drifts.
+        self.assertEqual(respec._anchor(ticket, []), self.RUST)
+
+    def test_a_revision_that_re_proposes_a_disproved_cause_is_refused(self):
+        store, run_id = self._store()
+        ticket = store.list_tickets(run_id)[0]
+
+        respec.revise(
+            store,
+            run_id,
+            ticket,
+            call=self._reply(spec=self.RUST, allowed_files=["src/lib.rs"]),
+            budget=1024,
+        )
+
+        after = store.list_tickets(run_id)[0]
+        self.assertEqual(after.spec, self.JS)
+        self.assertEqual(after.allowed_files, ["web/main.js"])
+
+    def test_the_refusal_reaches_the_run_log(self):
+        store, run_id = self._store()
+        ticket = store.list_tickets(run_id)[0]
+
+        respec.revise(
+            store,
+            run_id,
+            ticket,
+            call=self._reply(spec=self.RUST, allowed_files=["src/lib.rs"]),
+            budget=1024,
+        )
+
+        logged = [r["message"] for r in store.events_after(0) if "already disproved" in r["message"]]
+        self.assertTrue(logged, "reverting to a dead hypothesis must be reported")
+
+    def test_a_genuinely_new_hypothesis_still_goes_through(self):
+        # The guard must not freeze the ticket. Re-diagnosis is the whole
+        # mechanism here; only going *backwards* is refused.
+        store, run_id = self._store()
+        ticket = store.list_tickets(run_id)[0]
+        fresh = "web/index.html loads the module with the wrong MIME type."
+
+        respec.revise(
+            store, run_id, ticket, call=self._reply(spec=fresh), budget=1024
+        )
+
+        self.assertEqual(store.list_tickets(run_id)[0].spec, fresh)
+
+    def test_the_prompt_shows_the_dead_ends_instead_of_calling_them_the_intent(self):
+        ticket = Ticket(
+            "BUG-001", spec=self.JS, original_spec=self.RUST, allowed_files=["web/main.js"]
+        )
+
+        body = respec_prompt(
+            ticket,
+            [{"name": "review", "detail": "REJECT"}],
+            ruled_out=[(self.RUST, "the test passed")],
+            report="the game starts at level 0",
+        )[-1].content
+
+        self.assertIn("Explanations already tested and disproved", body)
+        self.assertIn("Do not propose any of these again", body)
+        # The drift block is what the planner obeyed when it reverted.
+        self.assertNotIn("the original is the intent", body)
+
+    def test_an_ordinary_drifted_ticket_still_gets_the_drift_block(self):
+        ticket = Ticket("T-1", spec="revised", original_spec="what the plan said")
+
+        body = respec_prompt(ticket, [{"name": "review", "detail": "REJECT"}])[-1].content
+
+        self.assertIn("the original is the intent", body)
+
+
+class TestAnOlderTestMayAssertTheBugItself(unittest.TestCase):
+    """The project's founding problem in its purest form. An earlier ticket
+    wrote both an implementation and the assertion judging it, and encoded the
+    defect in the assertion:
+
+        assert_eq!(piece::color(kind), (kind as u8) + 1);   // color(0) == 1
+
+    A report later says `color(0)` should be `255`. Both cannot hold. The fix
+    landed, the reproduction passed, and the suite failed on a file the ticket
+    could not touch — so the attempt scored as a failure and the executor was
+    asked again, five times, for an edit that cannot exist. It then reported
+    "gave up after 5 attempts", which reads as a fix nobody could write rather
+    than a contract nobody can satisfy.
+    """
+
+    FAILURE = (
+        # The banner cargo prints for every target, passing or not. Asking
+        # `errors_naming` whether the reproduction is implicated found it here,
+        # in its own success line, and concluded the fix was not working.
+        "     Running tests\\bug_002_test.rs (target\\debug\\deps\\bug_002_test-a1b2)\n"
+        "running 2 tests\n"
+        "test test_i_piece_color_is_255 ... ok\n"
+        "test test_all_piece_colors_unique ... ok\n"
+        "test result: ok. 2 passed; 0 failed\n"
+        "running 8 tests\n"
+        "test test_color_values ... FAILED\n"
+        "failures:\n"
+        "thread 'test_color_values' (44792) panicked at tests\\tt_001_test.rs:87:9:\n"
+        "assertion `left == right` failed\n"
+        "  left: 255\n"
+        " right: 1\n"
+        "error: test failed, to rerun pass `--test tt_001_test`\n"
+    )
+
+    def _orchestrator(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "piece.rs").write_text("pub fn color(k: usize) -> u8 { 255 }\n", encoding="utf-8")
+        (root / "tests" / "tt_001_test.rs").write_text(
+            "#[test]\nfn test_color_values() {\n"
+            "    assert_eq!(piece::color(kind), (kind as u8) + 1);\n}\n",
+            encoding="utf-8",
+        )
+        (root / "tests" / "bug_002_test.rs").write_text(
+            "#[test]\nfn test_i_piece_color_is_255() { assert_eq!(piece::color(0), 255); }\n",
+            encoding="utf-8",
+        )
+        config = Config(
+            root=root,
+            models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
+            roles={r: "m" for r in ("planner", "executor", "tester", "reviewer")},
+            commands={"test": "cargo test"},
+        )
+        store = Store(root / "t.db")
+        run_id = store.create_run("bug: I-piece renders black", source="the I piece renders black")
+        store.add_tickets(
+            run_id,
+            [
+                Ticket(
+                    "BUG-002",
+                    kind="bug",
+                    spec="piece::color(0) must return 255.",
+                    allowed_files=["src/piece.rs"],
+                    status="failed",
+                )
+            ],
+        )
+        return Orchestrator(config, store), run_id, store
+
+    def _repro(self):
+        return ("tests/bug_002_test.rs", "assertion failed")
+
+    def test_a_passing_target_is_not_implicated_by_its_own_banner(self):
+        # Every test runner announces the targets it is about to run, and cargo
+        # does it by path — whether the target passed or failed. Scanning the
+        # raw output found a file in its own success banner, so the amnesty was
+        # told the reproduction itself had failed and refused to excuse
+        # anything. A bug ticket was failed fifteen times over it: its own
+        # reproduction was passing and another ticket's was the one that was red.
+        out = (
+            "     Running tests\\bug_001_test.rs (target\\debug\\deps\\bug_001_test-737.exe)\n"
+            "test result: ok. 1 passed; 0 failed\n"
+            "     Running tests\\bug_002_test.rs (target\\debug\\deps\\bug_002_test-c4b.exe)\n"
+            "test test_i_piece_color_is_255 ... FAILED\n"
+            "thread 'test_i_piece_color_is_255' (52768) panicked at tests\\bug_002_test.rs:8:5:\n"
+            "assertion `left == right` failed\n"
+        )
+
+        self.assertEqual(errors_naming(out, "tests/bug_001_test.rs"), [])
+        # The one that actually failed is still found.
+        self.assertTrue(errors_naming(out, "tests/bug_002_test.rs"))
+
+    def test_a_python_exception_is_recognised_as_a_diagnostic(self):
+        # Only `AssertionError` was matched, so every other exception parsed as
+        # no diagnostic at all — and a caller reading blocks got nothing back
+        # rather than the error. The location line under it was dropped too:
+        # pytest puts it unindented, which the "unindented ends the block" rule
+        # threw away along with the only mention of the file.
+        out = "ImportError: cannot import name 'locked'\ntests/bug_001_test.py:1: in <module>\n"
+
+        self.assertTrue(signatures(out))
+        self.assertTrue(errors_naming(out, "tests/bug_001_test.py"))
+
+    def test_a_rust_panic_is_recognised_as_a_diagnostic(self):
+        # Current rustc prints the thread's pid between the name and the verb,
+        # which defeated `thread '.*' panicked`. Every panic was invisible to
+        # `signatures`, so the baseline amnesty was comparing empty sets and
+        # could not tell a new panic from a pre-existing one.
+        line = "thread 'test_color_values' (44792) panicked at tests\\tt_001_test.rs:87:9:"
+        self.assertTrue(signatures(line + "\nassertion failed\n"))
+
+    def test_the_contradicting_test_is_identified_by_name(self):
+        orch, run_id, store = self._orchestrator()
+        ticket = store.list_tickets(run_id)[0]
+
+        found = orch._contradicting_tests(ticket, self._repro(), self.FAILURE)
+
+        self.assertEqual(list(found), ["tests/tt_001_test.rs"])
+
+    def test_a_reproduction_that_is_still_failing_is_not_a_contradiction(self):
+        # The fix simply is not working yet, which is ordinary.
+        orch, run_id, store = self._orchestrator()
+        ticket = store.list_tickets(run_id)[0]
+        failing = self.FAILURE + "\npanicked at tests/bug_002_test.rs:4:5:\n"
+
+        self.assertEqual(orch._contradicting_tests(ticket, self._repro(), failing), {})
+
+    def test_a_broken_source_file_is_a_regression_not_a_contradiction(self):
+        # Otherwise this becomes a way to widen scope by breaking things.
+        orch, run_id, store = self._orchestrator()
+        ticket = store.list_tickets(run_id)[0]
+        broken = "error[E0308]: mismatched types\n  --> src/board.rs:21:19\n"
+
+        self.assertEqual(orch._contradicting_tests(ticket, self._repro(), broken), {})
+
+    def test_a_test_that_was_already_red_is_not_a_contradiction(self):
+        # The defect the first real run exposed. A bug about the game's
+        # starting level, scoped to src/game.rs, was reported as contradicted
+        # by an assertion about piece geometry that had been failing since
+        # before the ticket was filed — one line under an amnesty log saying
+        # exactly that. Every red file in the repo read as being about
+        # whichever ticket happened to be running.
+        orch, run_id, store = self._orchestrator()
+        ticket = store.list_tickets(run_id)[0]
+        already = signatures(self.FAILURE)
+
+        self.assertEqual(
+            orch._contradicting_tests(ticket, self._repro(), self.FAILURE, already), {}
+        )
+
+    def test_a_newly_broken_assertion_beside_an_old_one_still_counts(self):
+        # Only the pre-existing failures are excused, not the file they are in.
+        orch, run_id, store = self._orchestrator()
+        ticket = store.list_tickets(run_id)[0]
+        stale = "thread 'test_unrelated' (11) panicked at tests\\tt_009_test.rs:3:1:\nassertion failed\n"
+
+        found = orch._contradicting_tests(
+            ticket, self._repro(), stale + self.FAILURE, signatures(stale)
+        )
+
+        self.assertEqual(list(found), ["tests/tt_001_test.rs"])
+
+    def test_an_ordinary_ticket_is_never_treated_this_way(self):
+        # No reproduction means no contract to weigh the assertion against.
+        orch, run_id, store = self._orchestrator()
+        ticket = store.list_tickets(run_id)[0]
+
+        self.assertEqual(orch._contradicting_tests(ticket, None, self.FAILURE), {})
+
+    def test_the_note_states_both_demands_and_settles_neither(self):
+        orch, run_id, store = self._orchestrator()
+        ticket = store.list_tickets(run_id)[0]
+        found = orch._contradicting_tests(ticket, self._repro(), self.FAILURE)
+
+        note = orch._contradiction_note(ticket, self._repro(), found)
+
+        self.assertIn("tests/tt_001_test.rs", note)
+        self.assertIn("The fix works", note)
+        self.assertIn("One of them is wrong", note)
+
+    def test_the_executor_cannot_get_a_test_file_by_blocking_for_it(self):
+        # The whole reproduce-first premise is that the party being judged does
+        # not write the assertion. That does not become safe because the
+        # request was phrased as a block.
+        orch, run_id, store = self._orchestrator()
+        ticket = store.list_tickets(run_id)[0]
+
+        granted = orch._widen_scope(
+            run_id, ticket, "BLOCKED: I need `tests/tt_001_test.rs`, it asserts the old value."
+        )
+
+        self.assertEqual(granted, [])
+        self.assertEqual(store.list_tickets(run_id)[0].allowed_files, ["src/piece.rs"])
+
+
+class TestRetiringAnAssertionNeedsAnArgument(unittest.TestCase):
+    """Respec may propose retiring a stale assertion; it may not decide it.
+    Respec's job is making a failing ticket pass, which makes it the wrong role
+    to also rule that the assertion in its way is wrong. The reviewer rules,
+    and an assertion is not an argument."""
+
+    ARGUMENT = (
+        "GRANT: tests/tt_001_test.rs:87 asserts piece::color(kind) == (kind as u8) + 1, "
+        "so it requires color(0) == 1. The report says the I-piece renders black, and "
+        "1 is the value the renderer treats as empty. The assertion encodes the defect "
+        "rather than a decision — it was written alongside the implementation it checks, "
+        "and nothing in the plan states that colors must be consecutive from 1. The "
+        "report is right and the assertion is stale."
+    )
+
+    def _orchestrator(self, reply):
+        root = Path(tempfile.mkdtemp())
+        (root / "tests").mkdir()
+        (root / "src").mkdir()
+        (root / "src" / "piece.rs").write_text("pub fn color(k: usize) -> u8 { 255 }\n", encoding="utf-8")
+        (root / "tests" / "tt_001_test.rs").write_text("assert_eq!(color(k), k + 1);\n", encoding="utf-8")
+        config = Config(
+            root=root,
+            models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
+            roles={r: "m" for r in ("planner", "executor", "tester", "reviewer")},
+            commands={"test": "cargo test"},
+        )
+        store = Store(root / "t.db")
+        run_id = store.create_run("bug: colors", source="the I piece renders black")
+        store.add_tickets(
+            run_id,
+            [Ticket("BUG-002", kind="bug", spec="color(0) is 255", allowed_files=["src/piece.rs"])],
+        )
+        orch = Orchestrator(config, store)
+        orch._contradictions["BUG-002"] = {"tests/tt_001_test.rs": ["panicked at tests/tt_001_test.rs:87"]}
+        orch._call = lambda *a, **k: Completion(text=reply, usage=Usage())
+        return orch, run_id, store
+
+    def test_a_reasoned_grant_widens_the_scope(self):
+        orch, run_id, store = self._orchestrator(self.ARGUMENT)
+        ticket = store.list_tickets(run_id)[0]
+
+        granted = orch._grant_contradicted_scope(run_id, ticket, ["tests/tt_001_test.rs"])
+
+        self.assertTrue(granted)
+        self.assertIn("tests/tt_001_test.rs", store.list_tickets(run_id)[0].allowed_files)
+
+    def test_a_grant_that_is_asserted_rather_than_argued_is_refused(self):
+        # The failure this gate exists to catch: a reviewer that says yes
+        # because the ticket is stuck. That is true of every contradiction.
+        orch, run_id, store = self._orchestrator("GRANT: yes, it must be changed.")
+        ticket = store.list_tickets(run_id)[0]
+
+        granted = orch._grant_contradicted_scope(run_id, ticket, ["tests/tt_001_test.rs"])
+
+        self.assertFalse(granted)
+        self.assertEqual(store.list_tickets(run_id)[0].allowed_files, ["src/piece.rs"])
+
+    def test_a_refusal_leaves_the_ticket_as_it_was(self):
+        orch, run_id, store = self._orchestrator(
+            "REFUSE: the assertion states a deliberate contract that colors are "
+            "consecutive from 1, stated in tests/tt_001_test.rs, and the report "
+            "does not say otherwise. A person should settle this."
+        )
+        ticket = store.list_tickets(run_id)[0]
+
+        self.assertFalse(
+            orch._grant_contradicted_scope(run_id, ticket, ["tests/tt_001_test.rs"])
+        )
+
+    def test_an_unreadable_reply_is_not_a_grant(self):
+        # Fail-closed, and for a sharper reason than the ordinary verdict: an
+        # unreadable reply here would hand a ticket the assertion judging it.
+        orch, run_id, store = self._orchestrator("I think this is probably fine to change.")
+        ticket = store.list_tickets(run_id)[0]
+
+        self.assertFalse(
+            orch._grant_contradicted_scope(run_id, ticket, ["tests/tt_001_test.rs"])
+        )
+
+    def test_the_argument_is_written_to_the_log_whichever_way_it_goes(self):
+        # What a person wants later is not that scope changed, but why somebody
+        # thought the old assertion was wrong.
+        orch, run_id, store = self._orchestrator(self.ARGUMENT)
+        ticket = store.list_tickets(run_id)[0]
+
+        orch._grant_contradicted_scope(run_id, ticket, ["tests/tt_001_test.rs"])
+
+        logged = " ".join(r["message"] for r in store.events_after(0))
+        self.assertIn("the assertion encodes the defect".lower(), logged.lower())
+
+    def test_respec_proposes_the_scope_but_does_not_take_it(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("bug", source="the I piece renders black")
+        store.add_tickets(
+            run_id,
+            [Ticket("BUG-002", kind="bug", spec="old", allowed_files=["src/piece.rs"], status="failed")],
+        )
+        step = store.start_step(run_id, "BUG-002", "verify-test")
+        store.end_step(step, "failed", "contradiction")
+
+        def call(_messages, _budget):
+            return Completion(
+                text=json.dumps(
+                    {"spec": "new", "allowed_files": ["src/piece.rs", "tests/tt_001_test.rs"]}
+                ),
+                usage=Usage(),
+            )
+
+        result = respec.revise(
+            store,
+            run_id,
+            store.list_tickets(run_id)[0],
+            call=call,
+            budget=1024,
+            contradiction={"tests/tt_001_test.rs": ["panicked"]},
+        )
+
+        self.assertEqual(result.pending_scope, ["tests/tt_001_test.rs"])
+        self.assertNotIn("tests/tt_001_test.rs", store.list_tickets(run_id)[0].allowed_files)
+        # The rest of the revision still lands; only the gated file is held.
+        self.assertEqual(store.list_tickets(run_id)[0].spec, "new")
+
+
+class TestReadingScopeIsWiderThanWritingScope(unittest.TestCase):
+    """A ticket that may write one file was shown that one file, so the role
+    holding it could not check a call against what it calls, and could not tell
+    whether the cause it was handed was even the right one.
+
+    The case: a bug scoped to `src/lib.rs`, which in that crate is four `pub
+    mod` lines and 62 bytes. Seven retry cycles later the executor's answer was
+    that the struct it had been told to fix "is likely defined in src/game.rs
+    ... outside the allowed scope I'm permitted to modify"."""
+
+    def _crate(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "src").mkdir()
+        (root / "src" / "lib.rs").write_text(
+            "pub mod board;\npub mod game;\npub mod piece;\n", encoding="utf-8"
+        )
+        (root / "src" / "game.rs").write_text("pub struct Game { pub level: u32 }\n", encoding="utf-8")
+        (root / "src" / "board.rs").write_text("pub struct Board;\n", encoding="utf-8")
+        (root / "src" / "piece.rs").write_text("pub struct Piece;\n", encoding="utf-8")
+        return root
+
+    def test_a_module_list_is_recognised_by_what_is_in_it(self):
+        self.assertTrue(evidence.is_module_list("pub mod game;\npub mod board;\n", "lib.rs"))
+        # Named like one, but holding real code — a legitimate thing to scope to.
+        self.assertFalse(
+            evidence.is_module_list("import os\n\ndef run():\n    return 1\n", "__init__.py")
+        )
+        self.assertFalse(evidence.is_module_list("pub struct Game;\n", "game.rs"))
+
+    def test_the_modules_a_module_list_declares_become_readable(self):
+        root = self._crate()
+
+        reading = evidence.reading_scope(root, ["src/lib.rs"], ["src/lib.rs"])
+
+        self.assertIn("src/game.rs", reading)
+
+    def test_a_greenfield_plan_is_widened_by_nothing(self):
+        # The cost of widening every ticket's read scope, on the case where it
+        # buys nothing: an empty repository has no siblings to add, and only
+        # files that exist are kept.
+        root = Path(tempfile.mkdtemp())
+
+        self.assertEqual(evidence.reading_scope(root, ["src/game.rs"], []), [])
+
+    def test_what_may_be_written_is_never_widened(self):
+        # The whole point: reading is loosened, writing is not.
+        root = self._crate()
+
+        reading = evidence.reading_scope(root, ["src/lib.rs"])
+
+        self.assertNotIn("src/lib.rs", reading)
+
+    def test_a_file_that_does_not_exist_is_not_offered(self):
+        root = self._crate()
+
+        reading = evidence.reading_scope(root, ["src/game.rs"], ["src/invented.rs"])
+
+        self.assertNotIn("src/invented.rs", reading)
+
+    def test_the_read_scope_is_capped(self):
+        root = self._crate()
+        for index in range(30):
+            (root / "src" / f"extra{index}.rs").write_text("// x\n", encoding="utf-8")
+
+        reading = evidence.reading_scope(root, ["src/game.rs"], limit=5)
+
+        self.assertEqual(len(reading), 5)
+
+
+class TestABlockedTicketIsGrantedTheFileItNamed(unittest.TestCase):
+    """The executor is told `BLOCKED:` "names the file you need ... and can
+    widen the ticket". That was half true — the note reached a human, and
+    nothing widened anything, so the sentence naming the missing file sat in
+    the block being read by nobody."""
+
+    def _orchestrator(self, never_delegate=()):
+        root = Path(tempfile.mkdtemp())
+        (root / "src").mkdir()
+        (root / "src" / "lib.rs").write_text("pub mod game;\n", encoding="utf-8")
+        (root / "src" / "game.rs").write_text("pub struct Game;\n", encoding="utf-8")
+        config = Config(
+            root=root,
+            models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
+            roles={r: "m" for r in ("planner", "executor", "tester", "reviewer")},
+            never_delegate=list(never_delegate),
+        )
+        store = Store(root / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(run_id, [Ticket("BUG-001", kind="bug", allowed_files=["src/lib.rs"])])
+        return Orchestrator(config, store), run_id, store
+
+    NOTE = (
+        "BLOCKED: the Game struct is likely defined in `src/game.rs`, which is "
+        "outside the allowed scope I'm permitted to modify."
+    )
+
+    def test_the_named_file_is_read_out_of_the_note_and_granted(self):
+        orch, run_id, store = self._orchestrator()
+        ticket = store.list_tickets(run_id)[0]
+
+        granted = orch._widen_scope(run_id, ticket, self.NOTE)
+
+        self.assertEqual(granted, ["src/game.rs"])
+        self.assertIn("src/game.rs", store.list_tickets(run_id)[0].allowed_files)
+
+    def test_a_never_delegate_path_is_still_refused(self):
+        # Scope is not a negotiation. A path a human placed off-limits stays
+        # off-limits however convincingly a model asks for it.
+        orch, run_id, store = self._orchestrator(never_delegate=["src/game.rs"])
+        ticket = store.list_tickets(run_id)[0]
+
+        self.assertEqual(orch._widen_scope(run_id, ticket, self.NOTE), [])
+        self.assertEqual(store.list_tickets(run_id)[0].allowed_files, ["src/lib.rs"])
+
+    def test_a_file_the_model_invented_gets_nothing(self):
+        # Existence is what makes granting safe to do without a human.
+        orch, run_id, store = self._orchestrator()
+        ticket = store.list_tickets(run_id)[0]
+
+        granted = orch._widen_scope(run_id, ticket, "BLOCKED: I need `src/nowhere.rs`.")
+
+        self.assertEqual(granted, [])
+
+    def test_scope_is_granted_once_and_not_again(self):
+        # A ticket that blocks again having been given what it asked for is
+        # telling a human something real.
+        orch, run_id, store = self._orchestrator()
+        ticket = store.list_tickets(run_id)[0]
+        orch._widen_scope(run_id, ticket, self.NOTE)
+
+        (orch.config.root / "src" / "other.rs").write_text("//\n", encoding="utf-8")
+        again = orch._widen_scope(run_id, ticket, "BLOCKED: I also need `src/other.rs`.")
+
+        self.assertEqual(again, [])
+
+    def test_the_grant_reaches_the_run_log_with_the_new_scope(self):
+        orch, run_id, store = self._orchestrator()
+        ticket = store.list_tickets(run_id)[0]
+
+        orch._widen_scope(run_id, ticket, self.NOTE)
+
+        logged = [r["message"] for r in store.events_after(0) if "granted" in r["message"]]
+        self.assertTrue(logged)
+        self.assertIn("src/game.rs", logged[0])
 
 
 class TestCriteriaAreScopedByProvenance(unittest.TestCase):
@@ -3942,12 +4888,16 @@ class TestFilingABugFromTheCommandLine(unittest.TestCase):
                 parsed.func(parsed)
         return out.getvalue()
 
-    def _ticket(self, root):
+    def _tickets(self, root):
         store = Store(Config.load(root).db_path)
         try:
-            return store.list_tickets(int(store.latest_run()["id"]))[0]
+            return store.list_tickets(int(store.latest_run()["id"]))
         finally:
             store.close()
+
+    def _ticket(self, root):
+        """The ticket the last `forge bug` filed — the last one on the run."""
+        return self._tickets(root)[-1]
 
     def test_a_report_becomes_one_bug_ticket(self):
         root = self._project()
@@ -3990,6 +4940,92 @@ class TestFilingABugFromTheCommandLine(unittest.TestCase):
 
         self.assertEqual(self._ticket(root).route, "claude-only")
         self.assertIn("claude-only", printed)
+
+    def test_two_reports_filed_back_to_back_land_on_one_backlog(self):
+        # `forge go` works a single run. A second report that opened its own
+        # run shadowed the first: the older run kept its pending ticket, and
+        # nothing touched it until the newer run reached a terminal state.
+        root = self._project()
+
+        self._run(root, "first report")
+        printed = self._run(root, "second report")
+
+        store = Store(Config.load(root).db_path)
+        try:
+            self.assertEqual(len(store.list_runs()), 1)
+            filed = store.list_tickets(int(store.latest_run()["id"]))
+        finally:
+            store.close()
+        self.assertEqual([t.ticket_id for t in filed], ["BUG-001", "BUG-002"])
+        self.assertIn("added to run", printed)
+
+    def test_the_second_report_is_worked_after_the_first(self):
+        # Appended, not inserted. `list_tickets` breaks ties on position by id,
+        # so a second ticket left at the default position 0 would sort ahead of
+        # everything filed after the first.
+        root = self._project()
+
+        self._run(root, "first report")
+        self._run(root, "second report")
+
+        filed = self._tickets(root)
+        self.assertEqual(filed[0].ticket_id, "BUG-001")
+        self.assertLess(filed[0].position, filed[1].position)
+
+    def test_a_report_filed_against_a_started_run_opens_its_own(self):
+        # Only a run nothing has been spent on is open to more work. Joining a
+        # run already in flight would add a ticket the orchestrator has walked
+        # past, or land one in a backlog a human has started reviewing.
+        root = self._project()
+        self._run(root, "first report")
+
+        store = Store(Config.load(root).db_path)
+        try:
+            first = int(store.latest_run()["id"])
+            store.set_run_status(first, "running")
+        finally:
+            store.close()
+        self._run(root, "second report")
+
+        store = Store(Config.load(root).db_path)
+        try:
+            self.assertEqual(len(store.list_runs()), 2)
+            latest = int(store.latest_run()["id"])
+            self.assertNotEqual(latest, first)
+            self.assertEqual(
+                [t.ticket_id for t in store.list_tickets(latest)], ["BUG-002"]
+            )
+        finally:
+            store.close()
+
+    def test_a_scope_that_is_only_a_module_list_is_called_out(self):
+        # `lib.rs` here is four `pub mod` lines. A ticket scoped to it can
+        # never succeed and fails slowly: the executor cannot see the code it
+        # was told to change, so it blocks, and the block reads as a scoping
+        # refusal rather than as the mis-scope it is.
+        root = self._project()
+        (root / "src").mkdir()
+        (root / "src" / "lib.rs").write_text("pub mod game;\n", encoding="utf-8")
+        (root / "src" / "game.rs").write_text("pub struct Game;\n", encoding="utf-8")
+        reply = json.dumps({"title": "t", "spec": "s", "allowed_files": ["src/lib.rs"]})
+
+        printed = self._run(root, "the level starts at zero", reply=reply)
+
+        self.assertIn("re-export other modules", printed)
+
+    def test_the_ticket_may_read_the_modules_it_may_not_write(self):
+        root = self._project()
+        (root / "src").mkdir()
+        (root / "src" / "lib.rs").write_text("pub mod game;\n", encoding="utf-8")
+        (root / "src" / "game.rs").write_text("pub struct Game;\n", encoding="utf-8")
+        reply = json.dumps({"title": "t", "spec": "s", "allowed_files": ["src/lib.rs"]})
+
+        self._run(root, "the level starts at zero", reply=reply)
+
+        ticket = self._ticket(root)
+        self.assertIn("src/game.rs", ticket.reference_files)
+        # Reading is what was widened. Writing is untouched.
+        self.assertEqual(ticket.allowed_files, ["src/lib.rs"])
 
     def test_a_report_the_planner_cannot_place_stops_there(self):
         root = self._project()
@@ -6590,6 +7626,291 @@ class TestFailureHistoryReachesBothRoles(unittest.TestCase):
 
         self.assertEqual(rejections, ["REJECT\nthe error path is swallowed"])
         self.assertNotIn("already rejected", rejections[0])
+
+
+class TestReplayingWhatARunRecorded(unittest.TestCase):
+    """`forge replay` re-reads recorded output with the parsers as they stand
+    now, and where the run recorded what the parser produced at the time, says
+    whether the answer changed.
+
+    The check a unit test cannot make. A fixture asserts what its author
+    believed the output looked like; the artifacts hold what it actually was,
+    and two parser changes in one afternoon passed their tests and were wrong
+    against the first real recording they met."""
+
+    def _project(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x"}},
+                    "roles": {r: "m" for r in ("planner", "executor", "tester", "reviewer")},
+                }
+            ),
+            encoding="utf-8",
+        )
+        config = Config.load(root)
+        store = Store(config.db_path)
+        run_id = store.create_run("goal")
+        store.add_tickets(run_id, [Ticket("T-1", allowed_files=["src/a.py"])])
+        return config, store, run_id
+
+    def _record(self, config, run_id, ticket, attempt, index, step, meta, text=""):
+        directory = (
+            config.config_dir / "artifacts" / f"run-{run_id}" / ticket / f"attempt-{attempt}"
+        )
+        directory.mkdir(parents=True, exist_ok=True)
+        stem = f"{index:02d}-{step}"
+        (directory / f"{stem}.json").write_text(
+            json.dumps({"ticket": ticket, "attempt": attempt, "step": step, **meta}),
+            encoding="utf-8",
+        )
+        if text:
+            (directory / f"{stem}.md").write_text(text, encoding="utf-8")
+
+    REPLY = "src/a.py\n```python\nx = 1\n```"
+
+    def test_a_reply_read_the_same_way_is_not_flagged(self):
+        config, store, run_id = self._project()
+        self._record(config, run_id, "T-1", 1, 1, "build", {"role": "executor"}, self.REPLY)
+        self._record(config, run_id, "T-1", 1, 2, "apply", {"written": ["src/a.py"]})
+
+        findings, source = replay.replay(config, store, lens="parse")
+
+        self.assertEqual(source, "artifacts")
+        self.assertEqual([f.changed for f in findings], [False])
+
+    def test_a_reply_that_now_reads_differently_is_flagged(self):
+        # The whole point: the set of past output a parser change alters the
+        # reading of is the set worth looking at by hand.
+        config, store, run_id = self._project()
+        self._record(config, run_id, "T-1", 1, 1, "build", {"role": "executor"}, self.REPLY)
+        self._record(config, run_id, "T-1", 1, 2, "apply", {"written": ["src/b.py"]})
+
+        findings, _ = replay.replay(config, store, lens="parse")
+
+        self.assertTrue(findings[0].changed)
+        self.assertIn("src/a.py", findings[0].now)
+        self.assertIn("src/b.py", findings[0].then)
+
+    def test_an_apply_belongs_to_the_reply_that_came_before_it(self):
+        # This tool caught this about itself on its first real run. An attempt
+        # holds several replies — a reprompted build writes two, and a bug
+        # attempt writes its reproduction first — and only one apply. Matching
+        # on "same attempt" compared the wrong two and reported three parser
+        # changes where the parser had not changed at all.
+        config, store, run_id = self._project()
+        self._record(config, run_id, "T-1", 1, 1, "tests", {"role": "tester"}, "tests/t.py\n```\n1\n```")
+        self._record(config, run_id, "T-1", 1, 2, "build", {"role": "executor"}, self.REPLY)
+        self._record(config, run_id, "T-1", 1, 3, "apply", {"written": ["src/a.py"]})
+
+        findings, _ = replay.replay(config, store, lens="parse")
+        by_step = {f.record.step: f for f in findings}
+
+        # The build owns the apply; the tester's reply has nothing recorded.
+        self.assertIs(by_step["build"].changed, False)
+        self.assertIsNone(by_step["tests"].changed)
+
+    def test_edits_the_ticket_refused_are_not_a_difference(self):
+        # Scope rejection happens after parsing, so a path the parser produced
+        # and the ticket refused is absent from `written` without the parser
+        # differing at all.
+        config, store, run_id = self._project()
+        self._record(config, run_id, "T-1", 1, 1, "build", {"role": "executor"}, self.REPLY)
+        self._record(
+            config, run_id, "T-1", 1, 2, "apply", {"written": [], "rejected": ["src/a.py"]}
+        )
+
+        findings, _ = replay.replay(config, store, lens="parse")
+
+        self.assertIsNone(findings[0].changed)
+        self.assertIn("rejected", findings[0].note)
+
+    OUTPUT = "thread 'test_x' (44792) panicked at tests/x.rs:9:5:\nassertion failed\n"
+
+    def test_command_output_is_compared_against_what_the_run_attributed(self):
+        config, store, run_id = self._project()
+        self._record(
+            config, run_id, "T-1", 1, 1, "verify-test",
+            {"command": "pytest", "pre_existing": ["something old"], "introduced": []},
+            self.OUTPUT,
+        )
+
+        findings, _ = replay.replay(config, store, lens="blame")
+
+        # The panic is a diagnostic the run did not record as introduced.
+        self.assertTrue(findings[0].changed)
+        self.assertIn("tests/x.rs", findings[0].now)
+
+    def test_a_run_that_recorded_no_baseline_is_not_compared(self):
+        # `introduced` was empty by rule rather than by measurement, so there
+        # is nothing to disagree with.
+        config, store, run_id = self._project()
+        self._record(
+            config, run_id, "T-1", 1, 1, "verify-test",
+            {"command": "pytest", "pre_existing": [], "introduced": []},
+            self.OUTPUT,
+        )
+
+        findings, _ = replay.replay(config, store, lens="blame")
+
+        self.assertIsNone(findings[0].changed)
+        self.assertIn("no baseline", findings[0].note)
+
+    def test_clipped_records_are_reported_as_not_comparable(self):
+        # `Artifacts.record` keeps twenty entries, so a bigger set cannot be
+        # compared exactly and a difference nobody can act on is worse than
+        # saying so.
+        config, store, run_id = self._project()
+        self._record(
+            config, run_id, "T-1", 1, 1, "verify-test",
+            {
+                "command": "pytest",
+                "pre_existing": [f"old {n}" for n in range(20)],
+                "introduced": [],
+            },
+            self.OUTPUT,
+        )
+
+        findings, _ = replay.replay(config, store, lens="blame")
+
+        self.assertIsNone(findings[0].changed)
+        self.assertIn("clipped", findings[0].note)
+
+    def test_a_run_without_artifacts_falls_back_to_the_steps_table(self):
+        config, store, run_id = self._project()
+        step = store.start_step(run_id, "T-1", "verify-test")
+        store.end_step(step, "failed", self.OUTPUT)
+
+        findings, source = replay.replay(config, store)
+
+        self.assertEqual(source, "the steps table")
+        self.assertTrue(findings)
+        # Nothing recorded what was read out of it, so nothing is claimed.
+        self.assertIsNone(findings[0].changed)
+
+    def test_a_ticket_filter_narrows_the_records(self):
+        config, store, run_id = self._project()
+        store.add_tickets(run_id, [Ticket("T-2", position=1, allowed_files=["src/b.py"])])
+        self._record(config, run_id, "T-1", 1, 1, "build", {"role": "executor"}, self.REPLY)
+        self._record(config, run_id, "T-2", 1, 1, "build", {"role": "executor"}, self.REPLY)
+
+        findings, _ = replay.replay(config, store, ticket="T-2", lens="parse")
+
+        self.assertEqual([f.record.ticket_id for f in findings], ["T-2"])
+
+    def test_nothing_recorded_is_not_an_error(self):
+        config, store, run_id = self._project()
+
+        findings, _ = replay.replay(config, store)
+
+        self.assertEqual(findings, [])
+
+
+class TestAWholeFileWithNoPathLineIsStillTheFile(unittest.TestCase):
+    """The reprompt assumes the model misunderstood the format. Often it did
+    not: it reasoned at length about a hard ticket, quoted the existing code in
+    one fence, emitted the whole corrected file in another, and left off the
+    path line. Asked again it produces the same shape, because the reasoning is
+    what filled the reply. One ticket lost three of five attempts that way and
+    another six of nine — every one of them carrying a correct file.
+
+    Recovering it is only safe because the destination is not being guessed. The
+    ticket writes exactly one file; the question is which block is that file."""
+
+    CURRENT = (
+        "pub const WIDTH: usize = 10;\n"
+        "pub const KIND_COUNT: usize = 7;\n\n"
+        "pub fn cells(kind: usize, rotation: usize) -> [(i8, i8); 4] {\n"
+        "    CELLS[kind * 4 + (rotation % 4)]\n"
+        "}\n\n"
+        "pub fn color(kind: usize) -> u8 {\n"
+        "    kind as u8 + 1\n"
+        "}\n"
+    )
+
+    def _reply(self, *bodies):
+        """Reasoning prose with each body in a bare fence — the observed shape."""
+        out = ["Looking at the problem, I need to fix the color function.\n"]
+        for body in bodies:
+            out.append("```rust\n" + body + "```\n")
+            out.append("Let me reconsider that.\n")
+        return "\n".join(out)
+
+    def test_the_whole_file_is_recovered(self):
+        rewritten = self.CURRENT.replace("kind as u8 + 1", "if kind == 0 { 255 } else { kind as u8 + 1 }")
+
+        body = infer_single_file(self._reply(rewritten), self.CURRENT)
+
+        self.assertIn("255", body)
+        self.assertIn("pub const WIDTH", body)
+
+    def test_a_quoted_fragment_beside_the_file_does_not_win(self):
+        # The real replies quote the current function first and emit the file
+        # last. Picking the wrong one writes a fragment over the whole file.
+        fragment = "pub fn color(kind: usize) -> u8 {\n    kind as u8 + 1\n}\n"
+        rewritten = self.CURRENT.replace("kind as u8 + 1", "255")
+
+        body = infer_single_file(self._reply(fragment, rewritten), self.CURRENT)
+
+        self.assertIn("pub const WIDTH", body)
+
+    def test_a_reply_holding_only_fragments_is_refused(self):
+        # The case that matters most. One real reply contained nothing but the
+        # `color` function; writing it over the file would have deleted the
+        # constants and `cells` with a successful apply and nothing in the log.
+        fragment = "pub fn color(kind: usize) -> u8 {\n    if kind == 0 { 255 } else { kind as u8 + 1 }\n}\n"
+
+        self.assertEqual(infer_single_file(self._reply(fragment), self.CURRENT), "")
+
+    def test_a_file_that_does_not_exist_yet_is_never_recovered(self):
+        # Nothing to check a block against, so an illustrative snippet would
+        # become the whole contents of a new module.
+        self.assertEqual(infer_single_file("```python\nx = 1\n```", ""), "")
+
+    def test_a_reply_with_no_fences_recovers_nothing(self):
+        self.assertEqual(infer_single_file("I could not work out what to do.", self.CURRENT), "")
+
+    def _orchestrator(self):
+        orch, root, run_id = _stub_orchestrator()
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "piece.rs").write_text(self.CURRENT, encoding="utf-8")
+        return orch, root, run_id
+
+    def test_the_loop_writes_the_recovered_file(self):
+        orch, root, run_id = self._orchestrator()
+        rewritten = self.CURRENT.replace("kind as u8 + 1", "255")
+        ticket = Ticket("T-1", allowed_files=["src/piece.rs"])
+
+        recovered = orch._recover_unlabeled(run_id, ticket, self._reply(rewritten))
+
+        self.assertIsNotNone(recovered)
+        self.assertEqual(recovered.edits[0].path, "src/piece.rs")
+        self.assertIn("255", recovered.edits[0].content)
+
+    def test_a_ticket_writing_two_files_is_left_alone(self):
+        # With two possible destinations the path line is carrying information
+        # nothing else has, and inferring it would be a guess.
+        orch, root, run_id = self._orchestrator()
+        rewritten = self.CURRENT.replace("kind as u8 + 1", "255")
+        ticket = Ticket("T-1", allowed_files=["src/piece.rs", "src/board.rs"])
+
+        self.assertIsNone(
+            orch._recover_unlabeled(run_id, ticket, self._reply(rewritten))
+        )
+
+    def test_the_recovery_is_reported_rather_than_silent(self):
+        # The harness has just written a file the model never addressed by name.
+        orch, root, run_id = self._orchestrator()
+        rewritten = self.CURRENT.replace("kind as u8 + 1", "255")
+
+        orch._recover_unlabeled(
+            run_id, Ticket("T-1", allowed_files=["src/piece.rs"]), self._reply(rewritten)
+        )
+
+        logged = " ".join(r["message"] for r in orch.store.events_after(0))
+        self.assertIn("no path line above it", logged)
 
 
 class TestAnUnreadableReplyIsAskedForAgain(unittest.TestCase):

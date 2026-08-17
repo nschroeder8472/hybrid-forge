@@ -30,8 +30,19 @@ _ERROR = re.compile(
     r"|error\s+TS\d+"                            # tsc
     r"|E\s+\w|FAILED|ERROR\b"                    # pytest
     r"|.*\berror\b\s*(?:TS\d+)?\s*:"             # eslint, generic "path: error:"
-    r"|panicked at|thread '.*' panicked"         # rust panics
-    r"|\s*(?:Assertion|assert)\w*Error"          # python
+    # Rust panics. Matched on `panicked at` wherever it appears in the line
+    # rather than on the header's shape: current rustc prints the thread's pid
+    # between the name and the verb — `thread 'x' (44792) panicked at ...` —
+    # which defeated `thread '.*' panicked` and made every panic invisible.
+    # `signatures` is built from these blocks, so the baseline amnesty was
+    # comparing empty sets and could not tell a new panic from an old one.
+    r"|.*\bpanicked at\b"
+    # Python exception headers, which end a traceback and carry the message:
+    # `ImportError: cannot import name 'locked'`. Previously only
+    # `AssertionError` was recognised, so every other exception ended a run
+    # with no diagnostic block parsed at all — and a caller reading blocks got
+    # nothing back rather than the error.
+    r"|\s*[A-Z]\w*(?:Error|Exception)\b\s*:"
     r"|FAIL\b|✗|×"                               # assorted test runners
     r")",
     re.IGNORECASE,
@@ -47,7 +58,13 @@ _CONTINUATION = re.compile(
     r"^\s*(?:\d+\s*)?\|"                    # rustc / cargo source spans
     r"|^\s*[-=]+>"                          # `-->` location lines
     r"|^\s*(?:help|note|expected|found|caused by|hint)\b"
-    r"|^\s*\^+",                            # caret underlines
+    r"|^\s*\^+"                             # caret underlines
+    # `tests/bug_001_test.py:1: in <module>` — pytest and friends put the
+    # location on its own unindented line, which the "unindented ends the
+    # block" rule threw away along with the only mention of the file. A new
+    # diagnostic is still checked for first, so an eslint `path.js: error: …`
+    # opens its own block rather than being swallowed here.
+    r"|^\s*[\w./\\+-]+\.[A-Za-z0-9]{1,5}:\d+",
     re.IGNORECASE,
 )
 
@@ -136,17 +153,29 @@ def signatures(output: str) -> set[str]:
     found: set[str] = set()
     blocks, _ = _blocks((output or "").splitlines())
     for block in blocks:
-        # The opening line says what went wrong; the `-->` span says where. One
-        # without the other collapses distinct errors together: rustc emits the
-        # same `unresolved import` head once per test target.
-        head = block[0].strip()
-        where = next(
-            (line.strip() for line in block[1:] if line.strip().startswith("-->")), ""
-        )
-        key = re.sub(r"\s+", " ", _VOLATILE.sub("#", f"{head} {where}")).strip().lower()
+        key = _block_key(block)
         if key:
             found.add(key)
     return found
+
+
+def _block_key(block: list[str]) -> str:
+    """One diagnostic block reduced to a stable identifier.
+
+    The opening line says what went wrong; the `-->` span says where. One
+    without the other collapses distinct errors together: rustc emits the same
+    `unresolved import` head once per test target.
+
+    Shared by `signatures` and `files_blamed` so the two agree on what counts
+    as the same error. They must: `files_blamed` is asked which files a
+    ticket's *own* failures name, and it answers that by excluding the
+    signatures the baseline already had.
+    """
+    head = block[0].strip()
+    where = next(
+        (line.strip() for line in block[1:] if line.strip().startswith("-->")), ""
+    )
+    return re.sub(r"\s+", " ", _VOLATILE.sub("#", f"{head} {where}")).strip().lower()
 
 
 def distill(output: str, *, limit: int = 6000) -> str:
@@ -209,6 +238,48 @@ def _clip_lines(lines: list[str], limit: int, *, note: str) -> str:
     return "\n".join(kept)
 
 
+# A `path:line` or `path:line:col` location inside a diagnostic. Deliberately
+# loose about the path shape, because this runs over every toolchain a user can
+# configure; the caller checks the path against the repository before trusting
+# it.
+_LOCATION = re.compile(r"([\w./\\+-]+\.[A-Za-z0-9]{1,5}):(\d+)(?::\d+)?")
+
+
+def files_blamed(output: str, exclude: set[str] | None = None) -> dict[str, list[str]]:
+    """Files the failures in this output point at, with the lines naming them.
+
+    `signatures` answers "is this the same error as before"; this answers "whose
+    code is it in". A bug ticket needs the second question: its fix can be
+    correct and complete and still fail the suite, because an *older test*
+    asserts the behavior the report calls a bug. Distinguishing that from an
+    ordinary regression is the difference between a ticket a human can settle in
+    a minute and five attempts spent oscillating.
+
+    `exclude` holds the signatures that were already failing before the ticket
+    started, and dropping them is what makes the answer mean anything. Without
+    it every red file in a repository looks like it is about the ticket in
+    hand: a run asked whether a *level* bug was contradicted by an assertion
+    and was told yes by `tests/tt_001_test.rs`, which is about piece geometry
+    and had been failing since before that ticket was filed.
+
+    Only lines inside a diagnostic block count, so a passing test that happens
+    to mention a filename does not implicate it.
+    """
+    blamed: dict[str, list[str]] = {}
+    blocks, _ = _blocks((output or "").splitlines())
+    for block in blocks:
+        if exclude and _block_key(block) in exclude:
+            continue
+        for line in block:
+            for match in _LOCATION.finditer(line):
+                path = match.group(1).replace("\\", "/")
+                entry = line.strip()
+                lines = blamed.setdefault(path, [])
+                if entry not in lines:
+                    lines.append(entry)
+    return blamed
+
+
 def errors_naming(text: str, path: str) -> list[str]:
     """Lines of a verify failure that name `path`, with their message.
 
@@ -221,11 +292,21 @@ def errors_naming(text: str, path: str) -> list[str]:
     tester keeps reproducing it — one run spent twelve retry cycles on a single
     unused variable, because the failure it was shown read as evidence about
     the implementation rather than about its own file.
+
+    Read out of the diagnostic blocks rather than the whole output, because
+    every test runner announces the targets it is about to run and cargo does
+    it by path: `Running tests\\bug_001_test.rs (target\\debug\\deps\\...)`. That
+    line appears whether the target passed or failed, so scanning the raw text
+    reported a file as implicated in its own success banner. A bug ticket was
+    failed fifteen times over it — its own reproduction was passing, another
+    ticket's was red, and the amnesty was told the reproduction itself had
+    failed and refused to excuse anything.
     """
     if not path:
         return []
     wanted = {path.replace("\\", "/").lower(), path.replace("/", "\\").lower()}
-    lines = text.splitlines()
+    blocks, _ = _blocks(text.splitlines())
+    lines = [line for block in blocks for line in block]
     found: list[str] = []
     for index, raw in enumerate(lines):
         lowered = raw.lower()

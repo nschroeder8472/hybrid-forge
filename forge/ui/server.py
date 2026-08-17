@@ -24,7 +24,13 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Config
-from ..loop import CONTROL_KEY, CONTROL_PAUSE, CONTROL_RUN, CONTROL_STOP
+from ..loop import (
+    CONTROL_KEY,
+    CONTROL_PAUSE,
+    CONTROL_RUN,
+    CONTROL_STOP,
+    CURRENT_RUN_KEY,
+)
 from ..state import Store
 from ..tokens import format_tokens
 
@@ -37,21 +43,45 @@ _ALLOWED_COMMANDS = {
     "stop": CONTROL_STOP,
 }
 
+# A run in one of these is over; the loop is not inside it whatever the control
+# table last recorded, so the dashboard falls back to showing the newest run.
+_TERMINAL = ("done", "failed", "stopped", "blocked")
+
+
+def _live_run(store: Store) -> Any:
+    """The run the loop is working right now, or None if it is between runs.
+
+    Read through the run's own status rather than trusted outright: the key is
+    written when a run is entered and never cleared, so after `forge go` exits
+    it names the last run worked, which is history.
+    """
+    recorded = store.get_control(CURRENT_RUN_KEY, "")
+    if not recorded.isdigit():
+        return None
+    run = store.get_run(int(recorded))
+    if run is None or run["status"] in _TERMINAL:
+        return None
+    return run
+
 
 def snapshot(store: Store, config: Config) -> dict[str, Any]:
     """Everything the dashboard renders, in one read.
 
-    Always the newest run, terminal or not. `active_run()` looks like the right
-    choice here and is not: it skips finished runs, so an older run someone
-    left blocked outranks the one that just succeeded. A backlog that had gone
-    six-for-six reported `run 7: blocked — 6 ticket(s) need a human`, naming a
-    run two days stale, which reads as the run having just failed.
+    The run the loop is inside, if it is inside one; otherwise the newest.
 
-    A new run always takes the highest id, so the newest row is the live one
-    whenever there is a live one. `resumable_run()` is what the loop uses to
-    decide where to continue; this is only what a human is shown.
+    `active_run()` looks like the right second choice and is not: it skips
+    finished runs, so an older run someone left blocked outranks the one that
+    just succeeded. A backlog that had gone six-for-six reported `run 7:
+    blocked — 6 ticket(s) need a human`, naming a run two days stale, which
+    reads as the run having just failed. Newest-wins is what fixed that.
+
+    Newest-wins alone is not enough now that `forge go` drains its queue oldest
+    first: the live run is often not the highest id, and the dashboard would
+    show a run still waiting its turn while the loop worked another. So the
+    loop records which run it entered, and that wins while it is non-terminal.
+    A terminal one is exactly the stale case above, and falls back to newest.
     """
-    run = store.latest_run()
+    run = _live_run(store) or store.latest_run()
     if run is None:
         return {"run": None, "tickets": [], "steps": [], "usage": [], "control": CONTROL_RUN}
 
