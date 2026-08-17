@@ -1,0 +1,17 @@
+{
+  "name": "forge-setup",
+  "displayName": "Forge Setup",
+  "version": "0.1.0",
+  "description": "Gets a machine and a repository ready for the hybrid plan-and-execute loop: checks the install, probes every model endpoint, writes the machine profile once, and configures this repo's verify commands, roles, and never-delegate list.",
+  "author": {
+    "name": "NMS App Works LLC"
+  },
+  "keywords": [
+    "setup",
+    "onboarding",
+    "local-llm",
+    "bring-your-own-model",
+    "ollama",
+    "vllm"
+  ]
+}

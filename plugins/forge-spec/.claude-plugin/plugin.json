@@ -1,0 +1,24 @@
+{
+  "name": "forge-spec",
+  "displayName": "Forge Spec",
+  "version": "0.1.0",
+  "description": "Author a specification the loop executes verbatim. Produces ticket-shaped markdown that `forge ingest` parses without a planner model rephrasing it, so the acceptance criteria a human wrote are the ones the executor is judged against.",
+  "author": {
+    "name": "NMS App Works LLC"
+  },
+  "keywords": [
+    "spec",
+    "planning",
+    "requirements",
+    "acceptance-criteria",
+    "backlog",
+    "tickets"
+  ],
+  "userConfig": {
+    "memPalaceUrl": {
+      "type": "string",
+      "description": "URL of the MemPalace MCP endpoint holding prior decisions and conventions. Leave as-is if you do not run one; the spec workflow works without it.",
+      "default": "http://localhost:8787/mcp"
+    }
+  }
+}

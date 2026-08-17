@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mempalace": {
+      "type": "http",
+      "url": "${memPalaceUrl}"
+    }
+  }
+}

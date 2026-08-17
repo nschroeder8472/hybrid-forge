@@ -510,6 +510,22 @@ Rotate them.
         self.assertEqual(tickets[0].criteria, ["returns 1 for input 0"])
         self.assertEqual(tickets[1].route, "claude-only")
 
+    def test_reference_files_stay_read_only_across_a_round_trip(self):
+        # `write_tickets` emits "## Reference files (read-only)", so a backlog
+        # re-ingested from its own markdown reads that section back. Before it
+        # was a recognized boundary its bullets fell into the section above —
+        # usually `Allowed files` — and a file the executor was given to read
+        # became a file it was allowed to write.
+        plan = self.PLAN.replace(
+            "### Acceptance criteria\n\n- returns 1 for input 0",
+            "### Reference files (read-only)\n\n- `types.py`\n\n"
+            "### Acceptance criteria\n\n- returns 1 for input 0",
+            1,
+        )
+        ticket = parse_plan(plan)[0]
+        self.assertEqual(ticket.allowed_files, ["a.py"])
+        self.assertEqual(ticket.reference_files, ["types.py"])
+
     def test_planner_json_tolerates_a_code_fence(self):
         reply = '```json\n{"tickets":[{"id":"X-1","title":"t","spec":"s",' \
                 '"allowed_files":["a"],"criteria":["c"]}]}\n```'

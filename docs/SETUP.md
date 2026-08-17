@@ -15,11 +15,12 @@ this goes wrong:
 | | What it is | Where it runs | How often |
 |---|---|---|---|
 | **Host services** | Model weights, inference server, MemPalace store | 5090 desktop only | Once |
-| **Daemon + plugin** | The `forge` CLI, skills, commands, MCP config | Every machine you code from — it must sit with the repo | Once per machine |
+| **Daemon + plugins** | The `forge` CLI, plus the setup and spec plugins | Every machine you code from — it must sit with the repo | Once per machine |
 | **Project config** | `.hybridforge/` — models, roles, commands, tickets | Per repository | Once per repo |
 
-The plugin is a few kilobytes of text. It does not contain the model. It contains
-the address of the model.
+The plugins are a few kilobytes of text. They do not contain the model, and they
+do not run the loop. They get you configured and get a spec written; the daemon
+does the rest from a terminal.
 
 ---
 
@@ -411,33 +412,38 @@ more fragile across driver updates.
 
 ## Part 2 — Client setup (each machine you code from)
 
-Do this on the 5090 itself as well — the plugin is per-machine even when the
+Do this on the 5090 itself as well — the plugins are per-machine even when the
 services are local, because the 5090 running Claude Code is just another client
 that happens to have a very short network path.
 
-### 2.1 Install the plugin
+### 2.1 Install the plugins
 
-From your GitHub repo:
+Two, and they are independent. `forge-setup` gets a machine and a repository
+configured; `forge-spec` is where features get designed into documents the loop
+executes. Neither runs the loop — that stays in a terminal, where it outlives
+the session.
 
 ```bash
 claude plugin marketplace add <your-github-user>/hybrid-forge
-claude plugin install hybrid-forge@nms-forge
+claude plugin install forge-setup@nms-forge
+claude plugin install forge-spec@nms-forge
 ```
 
-For local development, skip the marketplace and load the directory directly:
+For local development, skip the marketplace and load a directory directly:
 
 ```bash
-claude --plugin-dir /path/to/hybrid-forge
+claude --plugin-dir /path/to/hybrid-forge/plugins/forge-spec
 ```
 
 ### 2.2 Configure endpoints
 
-The plugin declares its endpoints in `userConfig`, so Claude Code prompts for
-them at enable time rather than making you hand-edit settings. Supply:
+`forge-spec` declares one setting in `userConfig`, so Claude Code prompts for it
+at enable time rather than making you hand-edit settings:
 
-- `executorBaseUrl` — `http://<host-address-or-name>:11434/v1`
-- `executorModel` — `qwen3.6:35b-a3b`
 - `memPalaceUrl` — your MemPalace endpoint from step 1.4
+
+Model endpoints are not plugin settings. They belong to the daemon, and
+`/forge-setup` writes them to the machine profile in step 2.3 below.
 
 ### 2.3 Install the daemon
 
@@ -449,13 +455,6 @@ The daemon and CLI have **no runtime dependencies** — stdlib Python 3.10+ only
 That is deliberate: a failed `pip install` is a bad way to discover that an
 overnight run never started.
 
-The optional MCP shim (`mcp_servers/executor_server.py`, used for interactive
-delegation rather than the loop) does need one package:
-
-```bash
-pip install "hybrid-forge[mcp]"           # or: pip install mcp
-```
-
 If you want the loop to drive Claude for planning and review, Claude Code must
 be installed **on whatever machine runs the daemon** — the `claude-cli` adapter
 shells out to it. That machine is usually your workstation, not the GPU host.
@@ -466,18 +465,17 @@ shells out to it. That machine is usually your workstation, not the GPU host.
 forge --help
 ```
 
-For the interactive MCP path as well:
+Then, inside Claude Code with `forge-spec` enabled:
 
 ```bash
 claude
 > /mcp
 ```
 
-You should see `forge-executor` and `mempalace` connected. Then ask Claude to run
-`executor_health` — it should return the model, its context window, and a live
-reply.
+You should see `mempalace` connected. That is the only server either plugin
+ships — the loop itself speaks to models directly and does not use MCP at all.
 
-If a server fails to connect, `claude --debug` shows connection attempts and tool
+If it fails to connect, `claude --debug` shows connection attempts and tool
 discovery, which is considerably more informative than the summary view.
 
 ---
@@ -488,7 +486,7 @@ In each repository you want to use the pipeline in:
 
 ```bash
 cd ~/code/image-marquee
-forge init          # or, inside Claude Code: /forge-init
+forge init          # or, inside Claude Code: /forge-setup project
 ```
 
 `forge init` asks five short questions — executor endpoint, who plans and
@@ -1029,11 +1027,14 @@ dashboard shows the reason and the reopen time, and the loop resumes on its own.
 
 ### Define the work
 
-Either plan inside Claude Code:
+Either design it inside Claude Code:
 
 ```bash
-> /forge-plan add PNG export with configurable DPI
+> /forge-spec add PNG export with configurable DPI
 ```
+
+which settles the open questions first and writes a document in the shape ingest
+parses verbatim — `/forge-spec-check <file>` confirms it before you commit…
 
 …or bring a plan written anywhere else — the Claude desktop app, a web chat, an
 ordinary Claude Code session, or a PRD you typed yourself:

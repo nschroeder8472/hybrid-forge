@@ -5,10 +5,16 @@
   },
   "plugins": [
     {
-      "name": "hybrid-forge",
-      "displayName": "Hybrid Forge",
-      "source": "./",
-      "description": "Plan-and-execute coding pipeline pairing Claude with a locally hosted executor model."
+      "name": "forge-setup",
+      "displayName": "Forge Setup",
+      "source": "./plugins/forge-setup",
+      "description": "Cold-start setup for the hybrid loop: install check, model endpoints, machine profile, and this repository's .hybridforge config."
+    },
+    {
+      "name": "forge-spec",
+      "displayName": "Forge Spec",
+      "source": "./plugins/forge-spec",
+      "description": "Design a specification the loop can execute verbatim — ticket-shaped, criteria written by you, parsed by `forge ingest` without a planner model touching it."
     }
   ]
 }

@@ -38,6 +38,12 @@ _TICKET_HEADER = re.compile(
 _FIELD = {
     "spec": re.compile(r"^#{1,4}\s*Spec\s*$", re.MULTILINE | re.IGNORECASE),
     "allowed": re.compile(r"^#{1,4}\s*Allowed files\s*$", re.MULTILINE | re.IGNORECASE),
+    # Matched loosely because this is the heading `write_tickets` emits, and it
+    # emits it with a parenthetical: "## Reference files (read-only)". Without
+    # a pattern here the section is not a boundary at all, so its bullets fall
+    # into whichever known section precedes them — usually `Allowed files`,
+    # which silently promotes a read-only file to a writable one.
+    "reference": re.compile(r"^#{1,4}\s*Reference files.*$", re.MULTILINE | re.IGNORECASE),
     "criteria": re.compile(
         r"^#{1,4}\s*Acceptance criteria\s*$", re.MULTILINE | re.IGNORECASE
     ),
@@ -417,6 +423,9 @@ def parse_plan(text: str) -> list[Ticket]:
                 position=index,
                 spec=_section(body, found["spec"], boundaries),
                 allowed_files=_bullets(_section(body, found["allowed"], boundaries)),
+                reference_files=_bullets(
+                    _section(body, found["reference"], boundaries)
+                ),
                 criteria=_bullets(_section(body, found["criteria"], boundaries)),
                 needs=needs,
                 context=_section(body, found["context"], boundaries),
