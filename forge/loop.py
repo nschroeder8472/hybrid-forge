@@ -42,16 +42,18 @@ from . import evidence
 from .artifacts import Artifacts
 from .budget import BudgetGate, Wait
 from .config import ANY_LANGUAGE, Config, ConfigError
-from .failures import distill, errors_naming, signatures
+from .failures import distill, errors_naming, files_blamed, signatures
 from .ingest import write_tickets
 from .memory import MemoryClient, MemoryRefused, MemoryUnavailable, ticket_query
 from .patch import (
+    FileEdit,
     ParsedOutput,
     apply_edits,
     describe_unparsed,
     duplicate_paths,
     enforce_scope,
     foreign_bindings,
+    infer_single_file,
     is_safe_path,
     matches_any,
     normalize_path,
@@ -74,10 +76,12 @@ from .prompts import (
     parse_record,
     parse_verdict,
     parse_bug,
+    parse_scope_argument,
     record_prompt,
     rediagnose_prompt,
     repro_prompt,
     review_prompt,
+    scope_argument_prompt,
     strip_prompt_echo,
     tests_prompt,
 )
@@ -150,6 +154,12 @@ CONTROL_RUN = "run"
 CONTROL_PAUSE = "pause"
 CONTROL_STOP = "stop"
 
+# The run the loop is inside right now, written when it enters one. `forge go`
+# drains its queue oldest first, so the live run is not always the newest, and
+# the dashboard has no other way to tell which one to follow. Only meaningful
+# while that run is non-terminal; see `ui.server.snapshot`.
+CURRENT_RUN_KEY = "current-run"
+
 
 def evidence_key(run_id: int) -> str:
     """Control-channel key holding the last retry cycle's failure fingerprint."""
@@ -180,12 +190,17 @@ class Stopped(Exception):
 
 
 class Orchestrator:
-    def __init__(self, config: Config, store: Store):
+    def __init__(self, config: Config, store: Store, started_at: float | None = None):
         self.config = config
         self.store = store
         self.gate = BudgetGate(store, config.rate_limit_policies())
         self.memory = MemoryClient.from_config(config.memory, room=config.room)
-        self.started_at = time.time()
+        # `maxRuntimeSeconds` caps unattended wall-clock time, not one run's
+        # share of it. `forge go` builds a fresh Orchestrator per run in its
+        # queue — the coverage and memory state below must not carry across —
+        # and passes the queue's start time so draining three runs cannot
+        # quietly spend three times the cap.
+        self.started_at = time.time() if started_at is None else started_at
         # Bound to a run id in run(); until then nothing is recorded, which is
         # what a bare Orchestrator in a test should do.
         self.artifacts = Artifacts(config.config_dir, 0, enabled=False)
@@ -202,6 +217,15 @@ class Orchestrator:
         # which ones those were. See `_report_test_coverage`.
         self._tests_authored: set[str] = set()
         self._tests_skipped: set[str] = set()
+        # Tickets already granted the file they blocked asking for. One grant
+        # each: a ticket that blocks again after getting what it asked for is
+        # saying something a human should read. See `_widen_scope`.
+        self._widened: set[str] = set()
+        # Bug tickets whose fix works but whose suite fails on an older
+        # assertion of the very behavior the report calls a bug, as
+        # `{ticket_id: {test path: the lines blaming it}}`. Read at respec,
+        # which is where retiring an assertion is settled.
+        self._contradictions: dict[str, dict[str, list[str]]] = {}
 
     # ------------------------------------------------------------------
     # Project memory
@@ -606,6 +630,60 @@ class Orchestrator:
             "file exactly once."
         )
 
+    def _recover_unlabeled(
+        self, run_id: int, ticket: Ticket, text: str
+    ) -> ParsedOutput | None:
+        """Read a reply that wrote the right file and forgot to name it.
+
+        `None` when nothing here is safe to recover, which leaves the reply
+        refused exactly as before.
+
+        The observed failure is not a model that cannot follow the format. It is
+        a model that reasons at length about a hard ticket, quotes the existing
+        code in one fence, emits the whole corrected file in another, and omits
+        the path line above it. Asking again produces the same shape — the
+        reprompt was answered twice, identically — because the reasoning is what
+        filled the reply, not a misunderstanding about headers. Three of one
+        ticket's five attempts went this way, and six of another's nine.
+
+        Only attempted when the ticket has exactly **one** writable file, so
+        there is no destination to guess: either that file was rewritten or
+        nothing was. Which block is the file is decided in `infer_single_file`,
+        against what is already on disk.
+
+        Recorded at `warn` whenever it fires. The harness has just written a
+        file the model did not explicitly address, and that should be visible in
+        the log rather than inferred from a diff.
+        """
+        writable = [
+            path for path in ticket.allowed_files if not any(c in path for c in "*?[")
+        ]
+        if len(writable) != 1:
+            return None
+
+        path = writable[0]
+        try:
+            current = (self.config.root / path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            current = ""
+
+        body = infer_single_file(text, current)
+        if not body:
+            return None
+
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: the executor's reply held the whole of "
+            f"{path} in a fenced block with no path line above it. This ticket "
+            f"writes one file and the block still contains what is on disk, so "
+            f"it was read as that file rather than thrown away. The reply was "
+            f"right; only its header was missing.",
+            level="warn",
+            kind="ticket",
+            data={"ticket": ticket.ticket_id, "path": path, "characters": len(body)},
+        )
+        return ParsedOutput(edits=[FileEdit(path=path, content=body)])
+
     def _malformed_reply(self, parsed: ParsedOutput, text: str) -> str:
         """Why a reply did not parse into files, or `""` if it did.
 
@@ -731,6 +809,7 @@ class Orchestrator:
     def run(self, run_id: int) -> str:
         """Drive a run to a terminal state. Returns that state."""
         self.store.set_control(CONTROL_KEY, CONTROL_RUN)
+        self.store.set_control(CURRENT_RUN_KEY, str(run_id))
         self.store.set_run_status(run_id, RUN_RUNNING)
         self.store.log(run_id, "Loop started.", kind="lifecycle")
 
@@ -1360,6 +1439,7 @@ class Orchestrator:
                 # convention the implementation had never used.
                 sources=self._sources_for(ticket)[0],
                 criteria_locked=not self.config.loop.respec_criteria,
+                contradiction=self._contradictions.get(ticket.ticket_id),
             )
             if result.impossible:
                 # Spending a full attempt budget on a ticket the planner has
@@ -1370,6 +1450,18 @@ class Orchestrator:
                 ticket.blocked_note = f"respec: {result.impossible}"
                 self.store.update_ticket(run_id, ticket)
                 continue
+
+            # Respec asked to retire an assertion. It does not get to decide
+            # that — it is the role whose job is making this ticket pass, and a
+            # scope grant justified by the party that benefits is not a check.
+            # The reviewer rules, and has to argue for it.
+            if result.pending_scope and self._grant_contradicted_scope(
+                run_id, ticket, result.pending_scope
+            ):
+                if ticket not in revised:
+                    revised.append(ticket)
+                continue
+
             if result.revised:
                 revised.append(ticket)
                 continue
@@ -1560,6 +1652,17 @@ class Orchestrator:
             )
 
             if outcome.blocked:
+                # The executor's own words, read back before the block is
+                # spent. It was told `BLOCKED:` "can widen the ticket" — see
+                # `_scope_feedback` — and until now nothing made that true.
+                if self._widen_scope(run_id, ticket, outcome.detail):
+                    # The attempt produced nothing to judge, so it is not
+                    # charged: the executor was asking a question, and it now
+                    # has the answer.
+                    ticket.attempts -= 1
+                    self.store.update_ticket(run_id, ticket)
+                    continue
+
                 self._discard_tests(run_id, ticket, authored)
                 ticket.status = TICKET_BLOCKED
                 ticket.blocked_note = outcome.detail
@@ -1643,6 +1746,273 @@ class Orchestrator:
     # attempt: three is enough to show an objection repeating, which is the
     # signal the block exists for.
     _PRIOR_VERDICTS = 3
+
+    def _grant_contradicted_scope(
+        self, run_id: int, ticket: Ticket, wanted: list[str]
+    ) -> bool:
+        """Let the reviewer argue for retiring a stale assertion. True if granted.
+
+        The one place the loop hands a ticket write access to a test. Everything
+        about how it is done is chosen so the grant is auditable afterwards:
+
+        - The **reviewer** rules, not the planner that asked. Respec's job is to
+          make a failing ticket pass, so it is exactly the wrong role to also
+          decide that the assertion blocking it is wrong.
+        - It must **argue**, not assert. A `GRANT:` that never names the file or
+          runs to two lines is recorded as a refusal — see `parse_scope_argument`.
+          "The ticket cannot pass otherwise" is true of every contradiction and
+          settles none of them.
+        - The argument is written to the run log **verbatim**, whichever way it
+          goes, because the thing a person will want later is not that scope
+          changed but why somebody thought the old assertion was wrong.
+
+        A refusal leaves the ticket parked with the contradiction in its note,
+        which is the honest end: two demands disagree and nothing here could
+        tell which is right.
+        """
+        report = ""
+        run = self.store.get_run(run_id)
+        if run is not None:
+            report = run["source"] or ""
+        blamed = self._contradictions.get(ticket.ticket_id, {})
+        repro_path, _ = self._repro_target(ticket)
+        granted: list[str] = []
+
+        for path in wanted:
+            sources = self._sources_for(ticket, extra=[path, repro_path])[0]
+            try:
+                completion = self._call(
+                    run_id,
+                    "reviewer",
+                    scope_argument_prompt(
+                        ticket,
+                        report,
+                        test_path=path,
+                        test_source=sources.get(path, ""),
+                        blamed=blamed.get(path, []),
+                        repro_path=repro_path,
+                        repro_source=sources.get(repro_path, ""),
+                    ),
+                    max_tokens=self._output_budget("reviewer"),
+                    temperature=0.0,
+                )
+            except (ContextOverflow, ProviderError) as exc:
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: could not ask the reviewer whether "
+                    f"{path} should be retired ({exc}); it stays out of scope.",
+                    level="warn",
+                    kind="ticket",
+                )
+                continue
+
+            ok, argument, why_not = parse_scope_argument(completion.text, path)
+            if not ok:
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: the reviewer would not have {path} "
+                    f"retired"
+                    + (f" — {why_not}" if why_not else "")
+                    + f". Scope unchanged. What it said:\n{argument[:1200]}",
+                    level="warn",
+                    kind="ticket",
+                    data={"ticket": ticket.ticket_id, "path": path, "why_not": why_not},
+                )
+                continue
+
+            granted.append(path)
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: the reviewer argued that {path} asserts "
+                f"the behavior this report calls a bug, and it was granted to "
+                f"the ticket to retire. This is the loop editing a test it is "
+                f"judged by — read the argument:\n{argument[:2000]}",
+                level="warn",
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "path": path, "argument": argument},
+            )
+
+        if not granted:
+            return False
+
+        ticket.allowed_files = list(ticket.allowed_files) + granted
+        self.store.update_ticket(run_id, ticket)
+        return True
+
+    def _contradicting_tests(
+        self,
+        ticket: Ticket,
+        repro: tuple[str, str] | None,
+        output: str,
+        already: set[str] | None = None,
+    ) -> dict[str, list[str]]:
+        """Test files outside this ticket's scope that assert the reported bug.
+
+        The failure this exists for is the project's founding problem in its
+        purest form. An earlier ticket wrote both an implementation and the
+        assertion it is judged by, and encoded the bug in the assertion:
+
+            assert_eq!(piece::color(kind), (kind as u8) + 1);   // color(0) == 1
+
+        A bug report later says `color(0)` should be `255`. Both cannot hold.
+        The fix lands, the reproduction passes, and the suite fails on a file
+        the ticket may not touch — so the attempt is scored as a failure and
+        the executor is asked again, five times, for an edit that cannot exist.
+
+        Four conditions, all necessary. This is a **bug** ticket, so there is a
+        reproduction to be the contract. That reproduction **passes**, or the
+        fix is simply not working yet and this is nothing special. What fails is
+        a **test file outside the ticket's scope** — a broken source file is an
+        ordinary regression the executor should fix, and treating it as a
+        contradiction would turn this into a way to widen scope by breaking
+        things. And the failure is one this ticket **introduced**, which
+        `already` decides.
+
+        That last condition was missing on the first run of this code and it
+        matters more than it looks. Without it, every red file in the repository
+        reads as being about whichever ticket is in hand: a bug about the game's
+        starting *level*, scoped to `src/game.rs`, was reported as contradicted
+        by `tests/tt_001_test.rs` — an assertion about piece geometry that had
+        been failing since before the ticket was filed. The ticket then blocked
+        on a contradiction that did not exist, one line under an amnesty log
+        saying those errors pre-dated it.
+        """
+        if repro is None:
+            return {}
+        blamed = files_blamed(output, exclude=already)
+        # Whether the reproduction is among the *failures*, which is not the
+        # same question as whether the output mentions it. `errors_naming`
+        # answers the looser one and matches cargo's `Running tests\bug_002_
+        # test.rs` banner, which every run prints whether the test passed or
+        # not — so asking it here found the reproduction in its own success
+        # line and concluded the fix was not working.
+        repro_key = normalize_path(repro[0])
+        if any(normalize_path(path) == repro_key for path in blamed):
+            return {}
+        writable = {normalize_path(path) for path in ticket.allowed_files}
+        writable.add(repro_key)
+        found: dict[str, list[str]] = {}
+        for path, lines in blamed.items():
+            if normalize_path(path) in writable:
+                continue
+            if not matches_any(path, self._TEST_GLOBS):
+                continue
+            if not (self.config.root / path).is_file():
+                continue
+            found[path] = lines[:6]
+        return found
+
+    def _contradiction_note(
+        self, ticket: Ticket, repro: tuple[str, str] | None, contradicted: dict[str, list[str]]
+    ) -> str:
+        """The block note for a ticket no edit in its scope can satisfy.
+
+        Written for the two readers it has: a human deciding which assertion is
+        right, and the respec that runs before the next cycle. Both need the
+        same thing — the two demands side by side, and where each one lives.
+        """
+        lines = [
+            f"BLOCKED: this ticket cannot be satisfied within its scope, and "
+            f"another attempt would not change that.",
+            "",
+            f"The fix works. The reproduction "
+            + (f"`{repro[0]}` " if repro else "")
+            + "passes against it.",
+            "",
+            "What fails is an assertion this ticket may not write:",
+        ]
+        for path, blamed in contradicted.items():
+            lines.append(f"  - {path}")
+            for entry in blamed:
+                lines.append(f"      {entry}")
+        lines += [
+            "",
+            "That assertion states the behavior this report calls a bug, so it "
+            "and the reproduction are direct opposites. One of them is wrong.",
+            "",
+            "If the report is right, the assertion is stale and has to be "
+            "retired — which is a decision about the project's contract, not an "
+            "edit, and is settled at respec rather than by whoever is holding "
+            "the ticket. If the assertion is right, the report is wrong and the "
+            "ticket should be closed.",
+        ]
+        return "\n".join(lines)
+
+    def _widen_scope(self, run_id: int, ticket: Ticket, note: str) -> list[str]:
+        """Grant a blocked ticket the file it named, once. Returns what it got.
+
+        The executor is told that `BLOCKED:` "names the file you need ... and
+        can widen the ticket". That was half true: the note reached a human,
+        and nothing widened anything. So a ticket whose scope was one file too
+        narrow parked, and the sentence naming the missing file — `the Game
+        struct ... is likely defined in src/game.rs ... outside the allowed
+        scope I'm permitted to modify` — sat in the block note being read by
+        nobody. That run had already reproduced the bug.
+
+        What makes this safe to do automatically is that it is not negotiation.
+        The file has to already exist in the repository, so a model cannot
+        invent its way into scope, and `neverDelegate` is checked exactly as it
+        is everywhere else — a path a human has placed off-limits is refused
+        here too, and the ticket parks with that stated. What is granted is a
+        file the project already contains, to a ticket that has stopped.
+
+        Once per ticket per run. A second grant would be the loop bargaining
+        with itself, and a ticket that blocks again after being given what it
+        asked for is telling a human something real.
+        """
+        if ticket.ticket_id in self._widened:
+            return []
+
+        named = evidence.paths_named(self.config.root, note)
+        writable = {normalize_path(path) for path in ticket.allowed_files}
+        wanted = [path for path in named if normalize_path(path) not in writable]
+        if not wanted:
+            return []
+
+        # A test file is never granted by asking. The executor wanting write
+        # access to the assertion it is being judged by is the exact move the
+        # reproduce-first design exists to prevent, and it does not become safe
+        # because the request was phrased as a block. Retiring an assertion is
+        # settled at respec, by a reviewer that has to argue for it — see
+        # `_argue_for_scope`.
+        refused = [
+            path
+            for path in wanted
+            if matches_any(path, self.config.never_delegate)
+            or matches_any(path, self._TEST_GLOBS)
+        ]
+        granted = [path for path in wanted if path not in refused]
+        if refused:
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: asked for {', '.join(refused)}, which is "
+                f"either off-limits at the project level or a test file; "
+                f"refused. neverDelegate is a decision a human made and the "
+                f"loop does not revisit it, and no ticket writes the assertion "
+                f"it is judged by just because it asked to.",
+                level="warn",
+                kind="ticket",
+            )
+        if not granted:
+            return []
+
+        self._widened.add(ticket.ticket_id)
+        ticket.allowed_files = list(ticket.allowed_files) + granted
+        ticket.reference_files = evidence.reading_scope(
+            self.config.root, ticket.allowed_files, ticket.reference_files
+        )
+        self.store.update_ticket(run_id, ticket)
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: blocked asking for {', '.join(granted)}, "
+            f"which exists in this repository and is not off-limits; granted "
+            f"and retried without spending the attempt. Scope is now "
+            f"{', '.join(ticket.allowed_files)}.",
+            level="warn",
+            kind="ticket",
+            data={"ticket": ticket.ticket_id, "granted": granted, "note": note[:2000]},
+        )
+        return granted
 
     def _scope_guidance(
         self, ticket: Ticket, rejected: list[str], *, total_loss: bool
@@ -1881,9 +2251,14 @@ class Orchestrator:
         if parsed.is_blocked:
             return StepResult(ok=False, blocked=True, detail=parsed.blocked_reason)
 
-        # Still unreadable after being told exactly what was wrong with it.
+        # Still unreadable after being told exactly what was wrong with it —
+        # which for a local model is the common case rather than the rare one,
+        # because the format is usually not what it got wrong.
         if malformed:
-            return StepResult(ok=False, detail=malformed)
+            recovered = self._recover_unlabeled(run_id, ticket, completion.text)
+            if recovered is None:
+                return StepResult(ok=False, detail=malformed)
+            parsed, malformed = recovered, ""
 
         # Everything that could not be read has already been refused above. What
         # is left is a reply that parsed — possibly into no files at all, which
@@ -2196,6 +2571,35 @@ class Orchestrator:
                     level="warn",
                     kind="verify",
                     data={"step": name, "reproduction": repro[0]},
+                )
+
+            # A bug ticket whose fix works and whose suite still fails, because
+            # an older test asserts the behavior the report calls a bug. Worth
+            # separating from an ordinary regression before the executor is
+            # asked again: there is no edit inside this scope that satisfies
+            # both, and asking five times produces five attempts at squaring a
+            # circle. It did — one ticket oscillated for five attempts and then
+            # reported "gave up after 5 attempts", which reads as a fix nobody
+            # could write rather than a contract nobody can satisfy.
+            contradicted = self._contradicting_tests(
+                ticket, repro, result.detail, already
+            )
+            if contradicted:
+                self._contradictions[ticket.ticket_id] = contradicted
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: the reproduction passes, so the fix "
+                    f"works — but {', '.join(contradicted)} asserts the "
+                    f"behavior this ticket was filed to change, and is outside "
+                    f"its scope. Nothing the executor may write satisfies both.",
+                    level="warn",
+                    kind="verify",
+                    data={"ticket": ticket.ticket_id, "contradicted": contradicted},
+                )
+                return StepResult(
+                    ok=False,
+                    blocked=True,
+                    detail=self._contradiction_note(ticket, repro, contradicted),
                 )
 
             # Distilled, not tail-sliced: compilers lead with the error and
@@ -2911,7 +3315,13 @@ class Orchestrator:
         ticket.title = fields["title"] or ticket.title
         ticket.spec = fields["spec"]
         ticket.allowed_files = fields["allowed_files"] or ticket.allowed_files
-        ticket.reference_files = fields["reference_files"]
+        # Read scope is widened around the new writable scope for the same
+        # reason it is at filing time: a hypothesis is checked by reading the
+        # code around it, and a role shown only the file it may write cannot
+        # tell whether the cause it was handed is the right one.
+        ticket.reference_files = evidence.reading_scope(
+            self.config.root, ticket.allowed_files, fields["reference_files"]
+        )
         ticket.context = fields["reproduce"] or ticket.context
         # The reproduction path is derived from the ticket id and does not
         # move, so the next attempt overwrites the test that proved nothing

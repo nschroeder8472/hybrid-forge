@@ -138,10 +138,11 @@ spec corruption, through a reviewer that was telling the truth.
    the specific complaint back as `failure_context`. The single message sent
    respec chasing spec defects that did not exist (events 36, 64) when the fix
    was a missing header line.
-4. **Not done, still open:** when a ticket authorises exactly one file and the
-   reply is a single fenced block with no path line, infer the path. Safe for a
-   one-file ticket; do not attempt it for TT-002's two. Left out because mode D
-   turned out to be the commoner shape and a clear message may be enough.
+4. ~~**Not done, still open:**~~ **Landed** — when a ticket authorises exactly
+   one file and the reply is a fenced block with no path line, infer the path.
+   Safe for a one-file ticket; not attempted for TT-002's two. It needed two
+   guards the original sketch did not have; see *Recovering a whole file that
+   forgot its name* below.
 
 **Landed as.** `_fence_is_too_short` and `ParsedOutput.truncated` in
 `forge/patch.py`; `describe_unparsed` in the same module; the refusal ahead of
@@ -1246,3 +1247,68 @@ attributable.
 **Before re-running `alllocal`:** restore TT-006's spec and context (1.3
 follow-up), and delete `src/board.rs` plus its `pub mod board;` line, or the
 1.5 baseline is already poisoned on the next start.
+
+---
+
+## Recovering a whole file that forgot its name
+
+The reprompt (1.8) assumes the model misunderstood the format. Replayed against
+a later run, that assumption is often wrong. `alllocal2` BUG-002 lost three of
+five attempts to unparsed replies, and the reprompt was answered **in the same
+shape both times** — because formatting was not what the model got wrong.
+
+The shape, from the artifacts:
+
+```
+Looking at the problem, I need to fix the `piece::color` function so that:
+...900 words of reasoning about a genuine contradiction...
+```rust
+pub fn color(kind: usize) -> u8 { ... }      <- the current code, QUOTED
+```
+...more reasoning...
+```rust
+pub const WIDTH: usize = 10;                  <- the whole rewritten file
+...
+```
+```
+
+A correct file, complete, with one line missing above it. Discarded, attempt
+spent, and the ticket eventually reported "gave up after 5 attempts".
+
+The original sketch — *one file authorised, one fenced block, infer the path* —
+would not have worked here, because these replies hold **two** blocks and the
+first is a fragment. Applying the wrong one writes a fragment over a whole file:
+a successful apply, no rejected paths, nothing in the log connecting the two.
+That is worse than discarding the reply, and it is the outcome the guards exist
+to rule out.
+
+**`infer_single_file` (`forge/patch.py`).** Called only when the ticket
+authorises exactly one writable path, so the destination is never guessed. Then:
+
+- Take the **largest** block, so a quoted fragment loses to the file containing
+  it.
+- Require it to still hold **80% of the top-level lines already on disk**
+  (`_REWRITE_COVERAGE`). Measured against the real replies: the quoted function
+  scores 17%, the whole file scores 100%. Nothing lands near the threshold.
+- **Never** recover into a file that does not exist. With nothing to compare
+  against, ```` ```python\nx = 1\n``` ```` would become the entire contents of a
+  new module. A reply meant to be a file that arrived unreadable stays a failure.
+
+Recovery runs *after* the reprompt, so a model that can be corrected still is,
+and is logged at `warn` when it fires — the harness has just written a file the
+model never addressed by name, and that should be visible rather than inferred
+from a diff.
+
+**Replayed over every build reply in `alllocal2` run 3:**
+
+| reply | before | now |
+|---|---|---|
+| attempt-2/01 | discarded | recovered (1422 chars, whole file) |
+| attempt-3/02 | discarded | recovered (1422 chars, whole file) |
+| attempt-3/01 | discarded | **still refused** — fragments only |
+
+The third is the one that matters. Its largest block is the `color` function
+alone; writing it would have deleted `CELLS`, `cells` and `WIDTH`.
+
+**Tests.** `TestAWholeFileWithNoPathLineIsStillTheFile` — eight, including the
+fragment-beside-the-file case and the two-file ticket that is left alone.

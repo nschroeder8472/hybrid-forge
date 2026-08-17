@@ -23,6 +23,9 @@ import re
 import subprocess
 from collections import Counter
 from pathlib import Path
+from typing import Sequence
+
+from .patch import normalize_path
 
 # Enough of a tree to locate work in a normal repository, and few enough paths
 # that the report and the grep hits still fit beside it.
@@ -270,6 +273,159 @@ def symbol_index(root: Path, limit: int = MAX_SYMBOLS) -> list[str]:
         if Path(path).suffix.lower() in _NOT_SOURCE:
             continue
         found.append(line[:LINE_LIMIT])
+        if len(found) >= limit:
+            break
+    return found
+
+
+# Files that exist to re-export other files. Naming one as a ticket's scope is
+# almost always a mis-scope: there is no behavior in it to fix, and the code
+# the report is about is in a sibling.
+_MODULE_LIST_NAMES = frozenset(
+    """lib.rs mod.rs __init__.py index.js index.ts index.mjs mod.ts""".split()
+)
+
+# A line that re-exports rather than implements, or is not code at all.
+_REEXPORT = re.compile(
+    r"^\s*(?:(?:pub(?:\s*\([^)]*\))?\s+)?(?:mod|use|export|import|from|require)\b"
+    r"|[#}\]);]|//|/\*|\*)"
+)
+
+# How many files a widened read scope may add. Enough to cover a module and its
+# neighbours; not so many that the real scope is lost in a directory listing.
+MAX_READING = 12
+
+
+def is_module_list(text: str, name: str) -> bool:
+    """Whether this file only re-exports, so there is nothing in it to fix.
+
+    Judged on the contents rather than the name alone. A `__init__.py` that
+    holds real code is a legitimate thing to scope a ticket to; one holding
+    four import lines is not, whatever it is called.
+
+    This is why a run spent seven retry cycles going nowhere. A bug ticket was
+    scoped to `src/lib.rs`, which in that crate is four `pub mod` lines and 62
+    bytes, and both the executor and the tester were shown that file and
+    nothing else. The executor's final answer was that the struct it had been
+    told to fix "is likely defined in `src/game.rs` ... outside the allowed
+    scope I'm permitted to modify", which was exactly right.
+    """
+    if name.lower() not in _MODULE_LIST_NAMES:
+        return False
+    lines = [line for line in text.splitlines() if line.strip()]
+    return bool(lines) and all(_REEXPORT.match(line) for line in lines)
+
+
+def reading_scope(
+    root: Path,
+    allowed: Sequence[str],
+    reference: Sequence[str] = (),
+    extra: Sequence[str] = (),
+    limit: int = MAX_READING,
+) -> list[str]:
+    """What a ticket should be allowed to read, given what it may write.
+
+    Reading and writing are not the same permission and were being granted as
+    though they were. A ticket that may write one file was shown that one file,
+    so the role holding it could not check a call against the function it
+    calls, could not see the type it has to stay consistent with, and could not
+    tell whether the cause it was given was even the right cause. Widening what
+    may be *read* costs a prompt some tokens; widening what may be *written* is
+    the thing worth being strict about, and is untouched here.
+
+    Three sources, in descending order of how much they are worth:
+
+    - The modules a module-list file declares. `src/lib.rs` naming `pub mod
+      game` is a direct pointer at `src/game.rs`, and following it is the
+      difference between showing a role 62 bytes and showing it the code.
+    - `extra`, which the caller already has reason to believe is relevant —
+      for a bug ticket, the files the report's own words grepped to.
+    - Source siblings in the same directory. A fix almost always has to stay
+      consistent with the module next to it.
+
+    Everything is filtered to files that exist and are not already writable,
+    and the whole thing is capped: a read scope of forty files is a directory
+    listing, and the role stops reading any of it carefully.
+    """
+    writable = {normalize_path(path) for path in allowed}
+    picked: list[str] = []
+    seen: set[str] = set()
+
+    def take(path: str) -> None:
+        key = normalize_path(path)
+        if key in writable or key in seen or len(picked) >= limit:
+            return
+        if not (root / path).is_file():
+            return
+        seen.add(key)
+        picked.append(path)
+
+    for path in reference:
+        take(path)
+
+    # Declared modules first — the one pointer in this function that is a fact
+    # about the code rather than a guess from the directory.
+    for path in allowed:
+        if any(character in path for character in "*?["):
+            continue
+        candidate = root / path
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if not is_module_list(text, candidate.name):
+            continue
+        for name in sorted(set(_WORD.findall(text))):
+            for sibling in candidate.parent.glob(f"{name}.*"):
+                if sibling.is_file() and sibling.suffix.lower() not in _NOT_SOURCE:
+                    take(str(sibling.relative_to(root)).replace("\\", "/"))
+            nested = candidate.parent / name / candidate.name
+            if nested.is_file():
+                take(str(nested.relative_to(root)).replace("\\", "/"))
+
+    for path in extra:
+        take(path)
+
+    for path in allowed:
+        if any(character in path for character in "*?["):
+            continue
+        parent = (root / path).parent
+        suffix = Path(path).suffix.lower()
+        if not suffix or not parent.is_dir():
+            continue
+        for sibling in sorted(parent.iterdir()):
+            if sibling.is_file() and sibling.suffix.lower() == suffix:
+                take(str(sibling.relative_to(root)).replace("\\", "/"))
+
+    return picked
+
+
+def paths_named(root: Path, text: str, limit: int = 4) -> list[str]:
+    """Repo-relative paths mentioned in prose that actually exist on disk.
+
+    For reading a role's own words back. When the executor gives up with
+    `BLOCKED: the Game struct is likely defined in src/game.rs ... outside the
+    allowed scope I'm permitted to modify`, it has said precisely what it
+    needs, in a sentence nothing was reading.
+
+    Existence is the filter that makes this safe to act on. A model naming a
+    file it invented gets nothing; a model naming a file in the repository is
+    pointing at something checkable.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _PATHLIKE.findall(text or ""):
+        path = normalize_path(match.strip("`'\"(),;"))
+        if path in seen or path.startswith(("/", "\\")) or ".." in path:
+            continue
+        seen.add(path)
+        candidate = root / path
+        try:
+            if not candidate.is_file() or root.resolve() not in candidate.resolve().parents:
+                continue
+        except OSError:
+            continue
+        found.append(path)
         if len(found) >= limit:
             break
     return found

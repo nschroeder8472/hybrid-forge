@@ -1176,6 +1176,152 @@ def strip_prompt_echo(verdict: str) -> str:
     return (verdict or "").strip()
 
 
+SCOPE_ARGUMENT_SYSTEM = """You are the reviewer, ruling on one question about a \
+ticket's scope.
+
+A bug ticket's fix works — its reproduction passes — and the suite still fails,
+because an older test asserts the behavior the report calls a bug. The two
+assertions are opposites and both cannot hold. You are being asked whether the
+older assertion should be retired, which would let the ticket write the test
+file it is currently forbidden to touch.
+
+This is the most dangerous grant in the pipeline. The whole reason a bug is
+reproduced before it is fixed is that a model which writes both the code and
+the assertion it is judged by will encode its bugs as passing tests. Handing a
+ticket authority over the test that contradicts it is that failure in one step —
+if the reproduction asserts the wrong thing, you are approving the deletion of
+the test that would have caught it.
+
+So do not rule on which assertion is more recent, or which is more convenient,
+or on the fact that the ticket is stuck. Rule on which one is *right*, and say
+why in terms of the report and the two assertions in front of you.
+
+Answer with exactly one of these on the first line, then your argument:
+
+GRANT: the older assertion is stale and should be retired
+REFUSE: the older assertion is correct, or you cannot tell from what is here
+
+Your argument must do these things, or the grant is discarded and read as a
+refusal:
+
+- Name the test file and quote what it asserts.
+- Say what the report claims the behavior should be instead.
+- Say which of the two is right and how you know — from the report, from the
+  spec, from the code you were shown. "The ticket cannot pass otherwise" is not
+  a reason; that is true of every contradiction and settles nothing.
+
+REFUSE is a complete answer and often the correct one. A contradiction you
+cannot settle from the evidence is one a person should settle.
+"""
+
+
+def scope_argument_prompt(
+    ticket: Ticket,
+    report: str,
+    *,
+    test_path: str,
+    test_source: str,
+    blamed: Sequence[str] = (),
+    repro_path: str = "",
+    repro_source: str = "",
+) -> list[Message]:
+    """Ask the reviewer to argue for or against retiring a stale assertion.
+
+    Deliberately a separate call from the ordinary review, and deliberately the
+    reviewer's rather than the planner's. Respec proposes the widening because
+    it is the role that rewrites tickets; it is also the role that wants the
+    ticket to pass, and a scope grant justified by the party that benefits is
+    not a check. The reviewer gains nothing from the ticket going green.
+    """
+    body = f"""Ticket: {ticket.ticket_id} — {ticket.title}
+
+## The report this ticket came from
+{(report or ticket.original_spec or ticket.spec).strip()[:3000]}
+
+## What the ticket says the behavior should be
+{ticket.spec.strip()}
+
+## The assertion that contradicts it
+`{test_path}`, which this ticket may not write. The suite fails here:
+
+{chr(10).join(f"  {line}" for line in blamed) or "  (no location reported)"}
+
+```
+{test_source.strip()[:8000]}
+```
+"""
+
+    if repro_source.strip():
+        body += f"""
+## The reproduction, which passes
+`{repro_path}` was written from the report before any fix was attempted, and it
+passes against the fix as it stands. It is the ticket's contract.
+
+```
+{repro_source.strip()[:6000]}
+```
+"""
+
+    body += f"""
+## The question
+Should `{test_path}` be retired so this ticket can write it?
+
+Answer GRANT or REFUSE on the first line, then argue it.
+"""
+
+    return [
+        Message(role="system", content=SCOPE_ARGUMENT_SYSTEM),
+        Message(role="user", content=body),
+    ]
+
+
+# How much argument a grant has to carry. Not a quality measure — nothing here
+# can measure that — but enough to separate a reviewer that reasoned from one
+# that answered `GRANT: yes, it must be changed`, which is the failure this
+# whole gate exists to catch.
+ARGUMENT_FLOOR = 160
+
+
+def parse_scope_argument(text: str, test_path: str) -> tuple[bool, str, str]:
+    """Read the reviewer's ruling as `(granted, argument, why not)`.
+
+    Fail-closed, like `parse_verdict`, and for a sharper reason: an unreadable
+    reply here would hand a ticket write access to the assertion judging it.
+
+    A grant must also be *argued*. The reply has to name the file it is talking
+    about and say enough to be checkable by a person reading the run log later.
+    A bare `GRANT:` is recorded as a refusal with its own explanation, because
+    "the reviewer asserted this" and "the reviewer argued this" are different
+    facts and only one of them is worth acting on.
+    """
+    verdict = ""
+    for raw in text.splitlines():
+        line = raw.strip().strip("*#`_ \t.:—-").upper()
+        if not line:
+            continue
+        has_grant, has_refuse = "GRANT" in line, "REFUSE" in line
+        # Both on one line is the instruction echoed back, not a ruling.
+        if has_grant and has_refuse:
+            continue
+        verdict = "grant" if has_grant else "refuse" if has_refuse else ""
+        if verdict:
+            break
+
+    argument = text.strip()
+    if verdict != "grant":
+        return False, argument, "" if verdict else "no GRANT or REFUSE line in the reply"
+
+    name = test_path.rsplit("/", 1)[-1].lower()
+    if name and name not in argument.lower():
+        return False, argument, f"the argument never mentions {test_path}"
+    if len(argument) < ARGUMENT_FLOOR:
+        return False, argument, (
+            f"the grant was asserted in {len(argument)} characters rather than "
+            f"argued; retiring an assertion needs a reason a person can check"
+        )
+    return True, argument, ""
+
+
 def parse_verdict(text: str) -> tuple[bool, str]:
     """Read a reviewer's reply as (approved, reason).
 
@@ -1393,6 +1539,9 @@ def respec_prompt(
     *,
     sources: dict[str, str] | None = None,
     criteria_locked: bool = True,
+    ruled_out: Sequence[tuple[str, str]] = (),
+    report: str = "",
+    contradiction: dict[str, list[str]] | None = None,
 ) -> list[Message]:
     """Ask the planner to fix a ticket that its own executor could not satisfy.
 
@@ -1433,7 +1582,40 @@ def respec_prompt(
 {ticket.context.strip() or "(none)"}
 """
 
-    if ticket.drifted:
+    if ruled_out:
+        # A re-diagnosed bug ticket has no "original intent" worth returning
+        # to: its first spec was a hypothesis, and the loop disproved it by
+        # running a test. Showing the drift block below instead told a planner
+        # that the disproved cause was the human's intent and the reproduction
+        # was drift — so it reverted a bug that had just been reproduced in
+        # `web/main.js` back to a Rust file holding four `pub mod` lines.
+        dead = "\n\n".join(
+            f"### Ruled out {index}: no longer a candidate\n{spec.strip()}\n\n"
+            f"**Disproved by:** {why.strip()[:600]}"
+            for index, (spec, why) in enumerate(ruled_out, start=1)
+        )
+        body += f"""
+## The report this ticket came from
+This is the fixed point, not the spec above. The spec is the current *theory*
+of what causes it; the report is what a person actually saw, and no revision
+rewrites it.
+
+{(report or ticket.original_spec or ticket.spec).strip()[:4000]}
+
+## Explanations already tested and disproved
+Each of these was the ticket's spec at some point. Each was tested by writing a
+reproduction against it, and each failed to reproduce anything — which is a
+fact about that cause, not about the report.
+
+{dead}
+
+**Do not propose any of these again**, and do not narrow the scope back to the
+files they named. A reproduction that would not fail against a cause is the
+strongest evidence available that the cause is not where the bug is. If the
+current spec is also wrong, propose something *new*; if you have nothing new,
+say so in `rationale` and leave the ticket as written.
+"""
+    elif ticket.drifted:
         # The anchor. Each revision is derived from the last, so without the
         # ingested text in front of it the planner cannot tell its own
         # accumulated drift from what a human actually asked for — and it will
@@ -1470,6 +1652,39 @@ that contradicts what is here — if the code and the current spec disagree,
 say which one you are changing and why.
 
 {_sources_block(sources)}
+"""
+
+    if contradiction:
+        blocking = "\n\n".join(
+            f"### `{path}`\n" + "\n".join(f"  {line}" for line in lines)
+            for path, lines in contradiction.items()
+        )
+        body += f"""
+## Why this ticket cannot pass as scoped
+The fix works — the reproduction written from the report passes against it. What
+fails is an assertion in a file this ticket may not write:
+
+{blocking}
+
+That assertion states the behavior the report calls a bug, so it and the
+reproduction are direct opposites and no edit inside the current scope satisfies
+both. An earlier ticket wrote that test alongside its own implementation, which
+is how a defect ends up encoded as a passing assertion.
+
+You have two honest answers:
+
+- The assertion is stale. Propose adding its file to `allowed_files` so it can
+  be retired along with the fix. **You are proposing this, not deciding it** —
+  the reviewer is asked separately to argue whether the assertion is genuinely
+  wrong, and the scope is granted only if it does. Say in `rationale` why you
+  think the report is right and the assertion is not.
+- The assertion is correct and the report is wrong. Reply with `impossible`
+  saying so. That parks the ticket for a person and costs nothing further, and
+  it is the right answer whenever the report contradicts something the project
+  deliberately decided.
+
+Do not rewrite the spec to dodge the contradiction, and do not weaken the
+reproduction. Both leave the disagreement in place and hide it.
 """
 
     body += f"""

@@ -419,6 +419,45 @@ class Store:
             (RUN_DONE, RUN_FAILED, RUN_STOPPED),
         ).fetchone()
 
+    def unstarted_run(self) -> sqlite3.Row | None:
+        """The newest run that was filed and never worked, if there is one.
+
+        A backlog still open to more tickets. `RUN_IDLE` is written once, by
+        `create_run`, and the orchestrator moves a run off it before its first
+        step, so the status alone means "nothing has been spent here yet". The
+        ticket check is the second half of that promise: a run holding worked
+        tickets is not one a newly filed ticket should join, whatever its run
+        status says. `attempt_base` is checked with it because `forge retry
+        --all` returns every ticket to `pending` and sets the run back to
+        `idle` — a run whose whole backlog has already been through the loop
+        once looks untouched by status alone, and is not.
+
+        Grouping filed work rather than draining it: two reports filed back to
+        back belong on one backlog, in the order they were written. What
+        happens to work that was *not* grouped this way — filed behind a run
+        already in flight — is `resumable_runs`.
+        """
+        return self._connection.execute(
+            "SELECT r.* FROM runs r WHERE r.status = ? AND NOT EXISTS ("
+            "  SELECT 1 FROM tickets t WHERE t.run_id = r.id AND ("
+            "    t.status != ? OR t.attempts != 0 OR t.attempt_base != 0"
+            "  )"
+            ") ORDER BY r.id DESC LIMIT 1",
+            (RUN_IDLE, TICKET_PENDING),
+        ).fetchone()
+
+    def next_position(self, run_id: int) -> int:
+        """Where a ticket appended to this run belongs in the reading order.
+
+        `list_tickets` orders by position then id, and positions start at 0,
+        so an appended ticket left at the default would sort second rather
+        than last.
+        """
+        row = self._connection.execute(
+            "SELECT MAX(position) AS last FROM tickets WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return 0 if row is None or row["last"] is None else int(row["last"]) + 1
+
     def resumable_run(self) -> sqlite3.Row | None:
         """The run a restarted daemon should pick up.
 
@@ -437,6 +476,32 @@ class Store:
             ") ORDER BY r.id DESC LIMIT 1",
             (RUN_STOPPED, TICKET_PENDING, TICKET_RUNNING),
         ).fetchone()
+
+    def resumable_runs(self) -> list[sqlite3.Row]:
+        """Every run with work still queued, oldest first.
+
+        The whole queue, because `forge go` drains it rather than working the
+        newest and leaving the rest. Four commands open runs — `ingest`, `bug`,
+        `go --plan` and `retry` — and taking only the highest id meant anything
+        filed behind a run that then blocked waited for a human to notice it.
+        Noticing was unlikely: `forge status` shows one run too, so the stranded
+        work was not on screen anywhere.
+
+        Oldest first, which is the order it was filed in.
+
+        `done` and `failed` are excluded, as they are by `resumable_run`. A done
+        run has nothing queued by definition; a failed one died of something —
+        an unreachable role, a crash — that re-entering the same backlog does
+        not fix, and draining into it would turn one failure into several.
+        """
+        return list(
+            self._connection.execute(
+                "SELECT r.* FROM runs r WHERE r.status NOT IN (?, ?) AND EXISTS ("
+                "  SELECT 1 FROM tickets t WHERE t.run_id = r.id AND t.status IN (?, ?)"
+                ") ORDER BY r.id",
+                (RUN_DONE, RUN_FAILED, TICKET_PENDING, TICKET_RUNNING),
+            ).fetchall()
+        )
 
     def list_runs(self, limit: int = 20) -> list[sqlite3.Row]:
         return list(
@@ -674,6 +739,31 @@ class Store:
             (run_id, ticket_id),
         ).fetchone()
         return row["detail"] if row else ""
+
+    def steps_for_replay(
+        self, run_id: int | None = None, ticket_id: str | None = None
+    ) -> list[sqlite3.Row]:
+        """Recorded step output, for re-reading with the current parsers.
+
+        The fallback behind `forge replay` for runs whose artifacts were never
+        written or have been deleted. Clipped at 20k characters by whoever
+        wrote it, and carrying no record of what the parser made of it at the
+        time — so these can be re-read but not checked for a difference.
+        """
+        clauses, values = ["detail != ''"], []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            values.append(run_id)
+        if ticket_id:
+            clauses.append("ticket_id = ?")
+            values.append(ticket_id)
+        return list(
+            self._connection.execute(
+                f"SELECT id, run_id, ticket_id, name, status, detail FROM steps "
+                f"WHERE {' AND '.join(clauses)} ORDER BY id",
+                tuple(values),
+            ).fetchall()
+        )
 
     def ruled_out(self, run_id: int, ticket_id: str) -> list[tuple[str, str]]:
         """Hypotheses this bug ticket has already disproved, oldest first.

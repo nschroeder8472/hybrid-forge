@@ -112,6 +112,122 @@ another guess, the ticket parks with **every hypothesis it tried** written into
 the block, because that is the work it did and the next person should not repeat
 it.
 
+### A ruled-out cause stays ruled out
+
+Respec runs between retry cycles and rewrites a ticket that keeps failing. It
+judges a revision against `original_spec` — the human's text — because every
+revision is derived from the last, and without a fixed point the loop drifts
+away from the plan one plausible step at a time.
+
+A re-diagnosed bug ticket breaks that rule, because there `original_spec` is
+*the first hypothesis* — a cause the loop has already disproved by running a
+test. Anchoring on it inverts the whole mechanism. The run above got as far as
+`BUG-001: reproduced. tests/bug_001_test.rs fails against the code as it
+stands` in `web/main.js`, and the next respec reverted it, reasoning:
+
+> the previous revision drifted into build/JS paths, but the original intent and
+> all failures point to a Rust initialization
+
+Scope went back to `src/lib.rs` and the executor blocked, because the code it
+had been told to fix was no longer inside it.
+
+So once a hypothesis has been ruled out, the anchor becomes the **report** —
+which no revision rewrites — and the current spec is the live theory rather than
+drift to be undone. The disproved specs are shown to respec as dead ends it may
+not propose again, and a revision that re-proposes one anyway is refused whole,
+scope included. A reproduction that would not fail against a cause is the
+strongest evidence available that the cause is not where the bug is; it is not
+a reason to go back.
+
+---
+
+## What a ticket may read, and what it may write
+
+These are different permissions and used to be granted as one. The planner named
+`src/lib.rs` for both, so every role saw one 62-byte file — and in that crate
+`lib.rs` is four `pub mod` lines, with `Game` in `src/game.rs`. The executor's
+last word was that the struct it had been told to fix "is likely defined in
+`src/game.rs` ... outside the allowed scope I'm permitted to modify", which was
+exactly right and reached nobody.
+
+**Writable scope stays narrow.** That is the one worth being strict about, and
+nothing below widens it on its own.
+
+**Read scope is widened around it**, to the modules a module-list file declares,
+the files the report's own words grepped to, and the source siblings in the same
+directory — capped, because a read scope of forty files is a directory listing
+nobody reads carefully.
+
+**A scope that is only re-export files is called out at filing time.**
+`lib.rs`, `mod.rs`, `__init__.py`, `index.js` declare modules and hold no
+behavior to fix. Judged on contents, not on the name: an `__init__.py` with real
+code in it is a fine thing to scope a ticket to.
+
+**A block that names a file is answered rather than filed.** The executor is
+told `BLOCKED:` names the file it needs and "can widen the ticket". Now it does:
+a path named in the block that **already exists in the repository** is granted
+once, and the attempt is not charged. Existence is what makes that safe without
+a human — a model cannot invent its way into scope — and `neverDelegate` is
+enforced here exactly as everywhere else. A ticket that blocks a second time
+after getting what it asked for is saying something a person should read.
+
+**A test file is never granted this way.** Whatever the block says, however
+reasonable the request. The party being judged does not get write access to the
+assertion judging it; that is settled below.
+
+---
+
+## When an older test asserts the bug
+
+The founding problem, in its purest form. From a real run:
+
+```rust
+// tests/tt_001_test.rs:87, written by an earlier ticket
+assert_eq!(piece::color(kind), (kind as u8) + 1);   // so color(0) == 1
+```
+
+A report then says the I-piece renders black, and `color(0)` should be `255`.
+The two assertions are opposites; both cannot hold. The fix landed, the
+reproduction passed, and the suite failed on a file the ticket could not touch —
+so the attempt scored as a failure and the executor was asked again, five times,
+for an edit that cannot exist. It ended `gave up after 5 attempts`, which reads
+as a fix nobody could write rather than a contract nobody can satisfy.
+
+This is what the reproduce-first design is *for*: a ticket that writes both the
+code and the assertion judging it will encode its bugs as passing tests. TT-001
+did exactly that. What was missing was any way to undo it.
+
+**Detected, not inferred.** Three conditions, all required. The ticket is a bug
+ticket, so a reproduction exists to be the contract. That reproduction **passes**
+— otherwise the fix is simply not working yet. And what fails is a **test file
+outside the ticket's scope**; a broken source file is an ordinary regression the
+executor should fix, and treating it as a contradiction would make this a way to
+widen scope by breaking things.
+
+The ticket then blocks *immediately* rather than at attempt five, with both
+demands and their locations in the note.
+
+**Retiring the assertion is argued, not asserted.** At respec the contradiction
+is put to the planner, which may propose adding the test file to
+`allowed_files` — or reply `impossible`, which is the right answer whenever the
+report contradicts something the project deliberately decided.
+
+Proposing is as far as respec gets. Its job is making a failing ticket pass,
+which makes it the wrong role to also rule that the assertion in its way is
+wrong, so the scope is held back and put to the **reviewer**, which gains
+nothing from the ticket going green. It must answer `GRANT:` or `REFUSE:` and
+then make the case: name the file, quote what it asserts, say what the report
+claims instead, and say which is right and how it knows. A `GRANT:` that never
+names the file, or that runs to two lines, is recorded as a refusal — *"the
+ticket cannot pass otherwise"* is true of every contradiction and settles none
+of them. The argument goes into the run log verbatim either way, because what a
+person wants later is not that scope changed but why somebody thought the old
+assertion was wrong.
+
+A refusal leaves the ticket parked with the contradiction in its note. Two
+demands disagree and nothing here could tell which is right, which is a fine
+thing for a loop to say.
+
 ---
 
 ## What it refuses to do
@@ -172,6 +288,37 @@ the id names the reproduction's filename, and reusing it would overwrite the
 evidence for a bug nobody said was fixed. The ticket is written to
 `.hybridforge/tickets/` like any other, and the scope it chose is printed for
 you to read before `forge go` spends anything.
+
+**Reports filed back to back land on one backlog.** A report joins the open
+backlog when there is one — the newest run nothing has been spent on yet,
+whether that run came from `forge bug` or from `forge ingest` — and is appended
+to the end of its reading order.
+
+```
+forge bug "the score stops updating after I clear a line"
+forge bug "rotation clips the wall on the right edge"   (added to run 4 — 2 ticket(s) waiting)
+forge go                                                 works both, in the order filed
+```
+
+A run already in flight is never joined, because a ticket appended behind the
+orchestrator's position is one it has already walked past. A report filed
+against one opens a run of its own — and is still worked, because **`forge go`
+drains its whole queue, oldest first**. That is the other half of the same fix.
+Every command that files work opens a run — `ingest`, `bug`, `go --plan`,
+`retry` — and the loop used to take the highest id and stop there, so a bug
+filed while an earlier backlog sat blocked waited for a human to clear the block
+first. `forge status` shows one run too, so the stranded ticket was not on
+screen to be noticed.
+
+Blocked is no longer a reason to abandon what is behind it; the runs in the
+queue are separate work. **Stopped** and **failed** are: the first is a person
+asking the loop to stop, and the second means something outside the backlog is
+wrong and the next run would hit it too. Either breaks off the drain and says
+how many runs were left untouched.
+
+`maxRuntimeSeconds` caps the queue, not each run in it — it means unattended
+wall-clock time, and a fresh clock per run would let three runs spend three
+times the cap.
 
 A bug whose scope touches a `neverDelegate` path is routed `claude-only` and
 left for a person, on the same reasoning that governs the build loop: a defect

@@ -18,10 +18,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from .ingest import derive_needs, plan_decisions, whole_file_claims
-from .patch import is_safe_path
+from .patch import is_safe_path, normalize_path
 from .prompts import parse_respec, respec_prompt
 from .providers import Completion, Message, ProviderError
 from .state import Store, Ticket, _criterion_key
@@ -63,6 +63,11 @@ class Revision:
     # A complete answer, not a failure to answer — the ticket parks for a human
     # rather than spending another full attempt budget.
     impossible: str = ""
+    # Scope the revision asked for and did not get here: test files holding an
+    # assertion that contradicts a bug ticket's reproduction. Proposing it is
+    # respec's to do; granting it is not, because respec is the role that wants
+    # the ticket to pass. The caller takes these to the reviewer.
+    pending_scope: list[str] = field(default_factory=list)
 
     @property
     def revised(self) -> bool:
@@ -154,7 +159,9 @@ def _protocol_language(text: str) -> set[str]:
     return {phrase for phrase in _PROTOCOL_PHRASES if phrase in lowered}
 
 
-def _refuse_protocol_edits(ticket: Ticket, revision: dict) -> list[tuple[str, str]]:
+def _refuse_protocol_edits(
+    ticket: Ticket, revision: dict, ruled_out: Sequence[tuple[str, str]] = ()
+) -> list[tuple[str, str]]:
     """Drop a revised `spec` or `context` that has taken up formatting rules.
 
     Respec sees a ticket that failed and reaches for the nearest cause. When the
@@ -172,8 +179,8 @@ def _refuse_protocol_edits(ticket: Ticket, revision: dict) -> list[tuple[str, st
     revised. Returns the fields dropped, with the phrase that cost them.
     """
     anchors = {
-        "spec": ticket.original_spec or ticket.spec,
-        "context": ticket.original_context or ticket.context,
+        "spec": _anchor(ticket, ruled_out),
+        "context": ticket.context if ruled_out else (ticket.original_context or ticket.context),
     }
     dropped: list[tuple[str, str]] = []
     for field_name, anchor in anchors.items():
@@ -186,6 +193,61 @@ def _refuse_protocol_edits(ticket: Ticket, revision: dict) -> list[tuple[str, st
     return dropped
 
 
+def _anchor(ticket: Ticket, ruled_out: Sequence[tuple[str, str]] = ()) -> str:
+    """The spec a revision is judged against.
+
+    Normally the ingested original. Every revision is derived from the last, so
+    without a human's text as the fixed point the loop revises away from the
+    plan one plausible step at a time, and each step looks reasonable next to
+    the one before it.
+
+    Not so once a bug ticket has been re-diagnosed. There `original_spec` holds
+    the *first hypothesis* — a cause the loop has since disproved by running a
+    test against it — and anchoring on it drags the ticket back to the
+    explanation it just ruled out. One run did exactly that. It re-diagnosed
+    from the Rust to `web/main.js`, reproduced the bug there, and the next
+    respec reverted the scope to `src/lib.rs` on the reasoning that "the
+    previous revision drifted into build/JS paths, but the original intent and
+    all failures point to a Rust initialization". The executor then blocked,
+    because the code it had been told to change was outside its scope.
+
+    A bug ticket's fixed point was never the first hypothesis anyway — it is
+    the report, which no revision rewrites. Where one exists, the current spec
+    is the live hypothesis and drift from a dead one is the point.
+    """
+    if ruled_out:
+        return ticket.spec
+    return ticket.original_spec or ticket.spec
+
+
+# How much of a ruled-out spec a revision must restate before it counts as
+# proposing that cause again. High, because the alternative failure — refusing
+# a genuinely new hypothesis that happens to share vocabulary with a dead one —
+# costs the ticket its last chance at being diagnosed.
+_REVIVAL_COVERAGE = 0.85
+
+
+def _revives_ruled_out(proposed: str, ruled_out: Sequence[tuple[str, str]]) -> str:
+    """The disproved spec this revision is re-proposing, or "".
+
+    The prompt says not to, and the prompt is not an access control. A planner
+    handed a ticket that has failed a dozen attempts reaches for the reading it
+    finds most natural, which is the one the report's own words suggest — and
+    that is precisely the hypothesis the loop tested first and disproved.
+    """
+    wanted = set(_content_words(proposed))
+    if len(wanted) < _ENTAILMENT_FLOOR:
+        return ""
+    for spec, _why in ruled_out:
+        dead = set(_content_words(spec))
+        if not dead:
+            continue
+        covered = sum(1 for word in dead if word in wanted)
+        if covered / len(dead) >= _REVIVAL_COVERAGE:
+            return spec
+    return ""
+
+
 def _normalise(text: str) -> str:
     """Text reduced to what it says, for asking whether it is still there."""
     return re.sub(r"[^a-z0-9]+", "", text.lower())
@@ -196,14 +258,16 @@ def _normalise(text: str) -> str:
 _DECISION_FLOOR = 24
 
 
-def _dropped_decisions(ticket: Ticket, proposed: str) -> list[str]:
+def _dropped_decisions(
+    ticket: Ticket, proposed: str, ruled_out: Sequence[tuple[str, str]] = ()
+) -> list[str]:
     """Decisions the plan marked as settled that a revised spec no longer states.
 
     Compared on a normalised form, so punctuation and backticks are free to
     change; the words are not. That is the bar the prompt asks for — copy the
     sentence back — and the one a human can check by reading.
     """
-    anchor = ticket.original_spec or ticket.spec
+    anchor = _anchor(ticket, ruled_out)
     kept = _normalise(proposed)
     return [
         decision
@@ -261,7 +325,9 @@ def _content_words(text: str) -> list[str]:
     return [word for word in words if word not in _FILLER]
 
 
-def _spec_entailed(ticket: Ticket, criterion: str) -> bool:
+def _spec_entailed(
+    ticket: Ticket, criterion: str, ruled_out: Sequence[tuple[str, str]] = ()
+) -> bool:
     """Whether a proposed criterion only restates something the spec states.
 
     The reviewer is given the spec and told to reject work that contradicts it,
@@ -281,7 +347,7 @@ def _spec_entailed(ticket: Ticket, criterion: str) -> bool:
     wanted = _content_words(criterion)
     if len(wanted) < _ENTAILMENT_FLOOR:
         return False
-    anchor = ticket.original_spec or ticket.spec
+    anchor = _anchor(ticket, ruled_out)
     for line in anchor.splitlines():
         for sentence in re.split(r"(?<=[.:;])\s+", line):
             stated = set(_content_words(sentence))
@@ -431,6 +497,7 @@ def revise(
     budget: int,
     sources: dict[str, str] | None = None,
     criteria_locked: bool = True,
+    contradiction: dict[str, list[str]] | None = None,
 ) -> Revision:
     """Rewrite one ticket in place from its recorded failures.
 
@@ -460,6 +527,14 @@ def revise(
     if not failures:
         return Revision(ticket.ticket_id, note="nothing recorded to learn from")
 
+    # Causes this ticket has already tested and disproved. Empty for everything
+    # but a re-diagnosed bug ticket, and decisive for one: without it respec
+    # treats the first hypothesis as the human's intent and reverts to it. See
+    # `_anchor`.
+    ruled_out = store.ruled_out(run_id, ticket.ticket_id)
+    run = store.get_run(run_id)
+    report = (run["source"] if run is not None else "") or ""
+
     try:
         completion = call(
             respec_prompt(
@@ -467,6 +542,9 @@ def revise(
                 failures,
                 sources=sources,
                 criteria_locked=criteria_locked,
+                ruled_out=ruled_out,
+                report=report,
+                contradiction=contradiction or {},
             ),
             budget,
         )
@@ -514,7 +592,41 @@ def revise(
 
     # Same reason as the criteria guard below: the prompt forbids it, and the
     # prompt is not an access control.
-    for field_name, phrase in _refuse_protocol_edits(ticket, revision):
+    # Scope over a contradicting test is proposed here and granted elsewhere.
+    # Respec is the role that rewrites a ticket so it can pass, which makes it
+    # the wrong role to also decide that the assertion standing in its way is
+    # wrong. Held out of the revision and handed back for the reviewer to argue.
+    pending_scope: list[str] = []
+    if contradiction and "allowed_files" in revision:
+        gated = {normalize_path(path) for path in contradiction}
+        kept = [p for p in revision["allowed_files"] if normalize_path(p) not in gated]
+        pending_scope = [
+            p for p in revision["allowed_files"] if normalize_path(p) in gated
+        ]
+        if pending_scope:
+            revision["allowed_files"] = kept
+
+    # A revision that re-proposes a cause the loop already disproved by running
+    # a test against it. Refused whole rather than merged, because the scope
+    # comes with it — this is the step that sent a reproduced bug back to a
+    # file containing four `pub mod` lines.
+    revived = _revives_ruled_out(revision.get("spec", ""), ruled_out)
+    if revived:
+        for field_name in ("spec", "allowed_files", "reference_files", "context"):
+            revision.pop(field_name, None)
+        store.log(
+            run_id,
+            f"{ticket.ticket_id}: respec proposed a cause this ticket has "
+            f"already disproved, and the scope that goes with it; refused. The "
+            f"live hypothesis stands. A reproduction that failed against a "
+            f"cause is evidence about that cause, not a reason to return to "
+            f"it:\n  ruled out earlier: {revived.splitlines()[0][:200]}",
+            level="warn",
+            kind="ticket",
+            data={"ticket": ticket.ticket_id, "revived": revived[:2000]},
+        )
+
+    for field_name, phrase in _refuse_protocol_edits(ticket, revision, ruled_out):
         store.log(
             run_id,
             f"{ticket.ticket_id}: respec rewrote {field_name} to describe the "
@@ -532,7 +644,7 @@ def revise(
     # reasoning would produce a spec that contradicts itself.
     dropped: list[str] = []
     if "spec" in revision:
-        dropped = _dropped_decisions(ticket, revision["spec"])
+        dropped = _dropped_decisions(ticket, revision["spec"], ruled_out)
         if dropped:
             revision.pop("spec")
             store.log(
@@ -572,7 +684,7 @@ def revise(
         # Admitted after the ratchet has run, not inside it: the ratchet's rule
         # is about who wrote a criterion, and this one is about whether the
         # reviewer is already enforcing it.
-        admitted = [c for c in minted if _spec_entailed(ticket, c)]
+        admitted = [c for c in minted if _spec_entailed(ticket, c, ruled_out)]
         if admitted:
             revision["criteria"] = revision["criteria"] + admitted
             minted = [c for c in minted if c not in admitted]
@@ -653,6 +765,7 @@ def revise(
             admitted_criteria=admitted,
             refused_decisions=dropped,
             restored_context=restored_context,
+            pending_scope=pending_scope,
         )
 
     for field_name, value in revision.items():
@@ -689,4 +802,5 @@ def revise(
         admitted_criteria=admitted,
         refused_decisions=dropped,
         restored_context=restored_context,
+        pending_scope=pending_scope,
     )

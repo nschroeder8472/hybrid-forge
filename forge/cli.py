@@ -11,6 +11,7 @@
     forge bug "<report>"           reproduce a bug, then fix it
     forge toolchain [--language X] what tests each language; set up what nothing does
     forge criteria [ID --accept N] adopt a criterion respec proposed and lost
+    forge replay [--changed]       re-read past output with today's parsers
     forge prune [--keep N]         delete the artifact trees of old runs
     forge models                   write Modelfiles pinning what config cannot
     forge pause | resume | stop    control a running loop
@@ -34,7 +35,7 @@ import webbrowser
 from collections import Counter
 from pathlib import Path
 
-from . import evidence, modelfiles, respec, toolchain, wizard
+from . import evidence, modelfiles, replay, respec, toolchain, wizard
 from .artifacts import ARTIFACTS_DIR
 from .config import ANY_LANGUAGE, Config, ConfigError, default_config, normalize_language
 from .ingest import ingest as ingest_document
@@ -335,6 +336,17 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     except (ValueError, ProviderError) as exc:
         sys.exit(f"error: {exc}")
 
+    # Same widening a bug ticket gets, for the same reason: what a ticket may
+    # read is not what it may write, and the planner names one list for both.
+    # A feature ticket handed only the file it writes cannot check a call
+    # against the function it calls. Costs nothing on a greenfield plan —
+    # `reading_scope` keeps only files that exist, and on an empty repository
+    # that is none of them.
+    for ticket in tickets:
+        ticket.reference_files = evidence.reading_scope(
+            config.root, ticket.allowed_files, ticket.reference_files
+        )
+
     store = _store(config)
     goal = args.goal or (tickets[0].title if tickets else "ingested plan")
     source = "-" if args.source == "-" else str(Path(args.source).resolve())
@@ -393,17 +405,21 @@ def cmd_go(args: argparse.Namespace) -> int:
             return 1
         store = _store(config)
 
-    run = store.resumable_run()
-    if run is None:
+    # The whole queue, oldest first, not just the newest run. Anything filed
+    # behind a run that then blocked used to wait for a human to notice it, and
+    # `forge status` shows one run, so it was not on screen to be noticed.
+    runs = store.resumable_runs()
+    if not runs:
+        # Nothing is queued anywhere, but a run exhausted with blocked tickets
+        # is still worth entering: it re-reports what needs a human, which is
+        # the long-standing answer to `forge go` on a spent backlog.
+        stalled = store.resumable_run()
+        runs = [stalled] if stalled is not None else []
+    if not runs:
         sys.exit(
             "error: no run to work on. Ingest a spec first:\n"
             "  forge ingest plan.md      (or: forge go --plan plan.md)"
         )
-    run_id = int(run["id"])
-    counts = store.ticket_counts(run_id)
-    remaining = counts.get("pending", 0) + counts.get("running", 0)
-    if run["status"] == "stopped":
-        print(f"Resuming run {run_id} ({remaining} ticket(s) left).")
 
     url = ""
     if config.ui.enabled and not args.no_ui:
@@ -413,7 +429,8 @@ def cmd_go(args: argparse.Namespace) -> int:
         if args.open:
             webbrowser.open(url)
 
-    print(f"Run {run_id}: {run['goal']}")
+    if len(runs) > 1:
+        print(f"{len(runs)} runs queued: {', '.join(str(r['id']) for r in runs)}.")
     if config.loop.retry_cycles:
         cycles = (
             "until the backlog is clean or you stop it"
@@ -424,20 +441,56 @@ def cmd_go(args: argparse.Namespace) -> int:
         print(f"Unfinished tickets will be requeued {cycles}, {respec_note}.")
     print("Ctrl-C stops after the current step.\n")
 
-    orchestrator = Orchestrator(config, store)
-    try:
-        final = orchestrator.run(run_id)
-    except KeyboardInterrupt:
-        store.set_control(CONTROL_KEY, CONTROL_STOP)
-        print("\nStopping after the current step…")
-        final = "stopped"
+    # Shared across the queue so `maxRuntimeSeconds` caps the whole unattended
+    # session, which is what it means, rather than resetting per run.
+    started_at = time.time()
+    outcomes: list[tuple[int, str]] = []
 
-    counts = store.ticket_counts(run_id)
-    print(f"\nFinished: {final}")
-    print(f"  tickets: {json.dumps(counts)}")
-    spent = store.get_control(retries_key(run_id), "0")
-    if spent != "0":
-        print(f"  retry cycles: {spent}")
+    for index, run in enumerate(runs):
+        run_id = int(run["id"])
+        counts = store.ticket_counts(run_id)
+        remaining = counts.get("pending", 0) + counts.get("running", 0)
+        if run["status"] == "stopped":
+            print(f"Resuming run {run_id} ({remaining} ticket(s) left).")
+
+        if index:
+            print()
+        print(f"Run {run_id}: {run['goal']}")
+
+        # One per run. The orchestrator accumulates run-scoped state — which
+        # tickets authored tests, whether project memory has gone away — and
+        # carrying it into the next run would report the last run's tickets in
+        # this one's coverage summary.
+        orchestrator = Orchestrator(config, store, started_at=started_at)
+        try:
+            final = orchestrator.run(run_id)
+        except KeyboardInterrupt:
+            store.set_control(CONTROL_KEY, CONTROL_STOP)
+            print("\nStopping after the current step…")
+            final = "stopped"
+        outcomes.append((run_id, final))
+
+        counts = store.ticket_counts(run_id)
+        label = f"Finished run {run_id}: {final}" if len(runs) > 1 else f"Finished: {final}"
+        print(f"\n{label}")
+        print(f"  tickets: {json.dumps(counts)}")
+        spent = store.get_control(retries_key(run_id), "0")
+        if spent != "0":
+            print(f"  retry cycles: {spent}")
+
+        # `blocked` is not a reason to abandon the rest — that is the stranding
+        # this queue exists to end, and the runs behind it are separate work.
+        # `stopped` and `failed` are: the first is a person asking the loop to
+        # stop, and the second means something outside the backlog is wrong.
+        if final in ("stopped", "failed"):
+            skipped = len(runs) - index - 1
+            if skipped:
+                print(f"  {skipped} queued run(s) left untouched.")
+            break
+
+    if len(runs) > 1:
+        worked = ", ".join(f"{run_id} {status}" for run_id, status in outcomes)
+        print(f"\nFinished: {worked}")
     for row in store.usage_summary():
         line = (
             f"  {row['model']}: {row['calls']} calls, "
@@ -463,7 +516,10 @@ def cmd_go(args: argparse.Namespace) -> int:
         except KeyboardInterrupt:
             print()
 
-    return 0 if final in ("done",) else 1
+    # Green only if the whole queue is green. A drain that broke off early left
+    # runs untouched, which is not a success however the last one ended.
+    drained = len(outcomes) == len(runs)
+    return 0 if drained and all(status == "done" for _, status in outcomes) else 1
 
 
 def _should_wait(args: argparse.Namespace) -> bool:
@@ -636,6 +692,91 @@ def _respec(
     print("Read the revised specs before starting — respec is a suggestion, not a fix.")
 
 
+def cmd_replay(args: argparse.Namespace) -> int:
+    """Re-read a past run's recorded output with the parsers as they stand now.
+
+    The check that unit tests cannot make. A fixture asserts what its author
+    believed the output looked like; the artifacts hold what it actually was,
+    and two parser changes in one afternoon passed their tests and were wrong
+    against the first real recording they met.
+
+    Read-only. Nothing here writes to the repository, the database, or the
+    artifacts.
+    """
+    config = _load(args.root)
+    store = _store(config)
+
+    findings, source = replay.replay(
+        config, store, run_id=args.run, ticket=args.ticket, lens=args.lens
+    )
+    if not findings:
+        print(
+            "Nothing recorded to replay. Artifacts live in "
+            f"{config.config_dir / 'artifacts'} and are written as a run works; "
+            "a run from before they existed leaves only the steps table, and "
+            "`forge prune` removes old ones."
+        )
+        return 0
+
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "run": f.record.run_id,
+                        "ticket": f.record.ticket_id,
+                        "attempt": f.record.attempt,
+                        "step": f.record.step,
+                        "lens": f.lens,
+                        "now": f.now,
+                        "then": f.then,
+                        "changed": f.changed,
+                        "note": f.note,
+                        "origin": f.record.origin,
+                    }
+                    for f in findings
+                ],
+                indent=2,
+            )
+        )
+        return 1 if any(f.changed for f in findings) else 0
+
+    changed = [f for f in findings if f.changed]
+    shown = changed if args.changed else findings
+
+    print(f"Replaying {len(findings)} record(s) from {source}.\n")
+    for finding in shown:
+        record = finding.record
+        mark = "!" if finding.changed else " "
+        where = f"run {record.run_id} {record.ticket_id}"
+        if record.attempt:
+            where += f" attempt {record.attempt}"
+        print(f"{mark} {where} — {record.step} [{finding.lens}]")
+        print(f"      now:  {finding.now}")
+        if finding.then:
+            print(f"      then: {finding.then}")
+        if finding.note:
+            print(f"      note: {finding.note}")
+        print(f"      {record.origin}")
+
+    if args.changed and not changed:
+        print("No record reads differently than it did when it was written.")
+
+    comparable = [f for f in findings if f.changed is not None]
+    print(
+        f"\n{len(changed)} of {len(comparable)} comparable record(s) read "
+        f"differently now; {len(findings) - len(comparable)} had nothing "
+        f"recorded to compare against."
+    )
+    if changed:
+        print(
+            "A difference is not automatically a regression — it is the set of "
+            "past output your change alters the reading of, which is the set "
+            "worth looking at by hand."
+        )
+    return 1 if changed else 0
+
+
 def cmd_prune(args: argparse.Namespace) -> int:
     """Drop the artifact trees of old runs.
 
@@ -776,15 +917,15 @@ def cmd_retry(args: argparse.Namespace) -> int:
     if args.respec:
         _respec(config, store, run_id, reset, notes, allow_criteria=args.respec_criteria)
 
-    # A newer run would shadow this one, since the loop always takes the
-    # highest run id. Say so rather than letting `forge go` look broken.
-    latest = store.latest_run()
-    if latest is not None and int(latest["id"]) != run_id:
+    # A newer run no longer shadows this one — `forge go` drains its queue
+    # oldest first — but it does go first, and a person who just requeued this
+    # run is waiting on it rather than on whatever is in front.
+    ahead = [r for r in store.resumable_runs() if int(r["id"]) < run_id]
+    if ahead:
         print(
-            f"\nwarning: run {latest['id']} is newer and `forge go` will pick it "
-            f"up instead of run {run_id}."
+            f"\nnote: run(s) {', '.join(str(r['id']) for r in ahead)} are queued "
+            f"ahead of run {run_id} and `forge go` works them first."
         )
-        return 0
 
     if args.go:
         return cmd_go(
@@ -847,6 +988,7 @@ def cmd_bug(args: argparse.Namespace) -> int:
     # The first pass spends a little context deciding what to read; the second
     # writes the ticket against the contents.
     sources: dict[str, str] = {}
+    candidates: list[str] = []
     if found:
         print("Looking for where the problem lives...")
         try:
@@ -872,9 +1014,33 @@ def cmd_bug(args: argparse.Namespace) -> int:
     except (ProviderError, ValueError) as exc:
         sys.exit(f"error: {exc}")
 
+    # What the ticket may READ, which is not what it may write. The planner
+    # named one file for both and the roles were then diagnosing a fault
+    # through a keyhole. Writable scope is left exactly as the planner set it.
+    fields["reference_files"] = evidence.reading_scope(
+        config.root,
+        fields["allowed_files"],
+        fields["reference_files"],
+        extra=candidates,
+    )
+    _warn_module_list(config, fields["allowed_files"])
+
     ticket_id = args.id or _next_bug_id(store)
+
+    # Filed onto the open backlog when there is one, rather than into a run of
+    # its own. `forge go` works a single run, so a second report filed before
+    # the first was started used to shadow it: the older run kept its pending
+    # ticket, `forge status` showed only the newer one, and the bug nobody
+    # could see waited for the newer run to finish before it was picked up.
+    # Joining is only ever offered a run that has never been worked, so
+    # nothing in flight is disturbed.
+    existing = store.unstarted_run()
+    run_id = int(existing["id"]) if existing else 0
+    position = store.next_position(run_id) if existing else 0
+
     ticket = Ticket(
         ticket_id=ticket_id,
+        position=position,
         title=fields["title"] or "Bug report",
         kind=TICKET_BUG,
         # Never delegated blindly: a bug in code the project marked off-limits
@@ -891,7 +1057,8 @@ def cmd_bug(args: argparse.Namespace) -> int:
         context=fields["reproduce"],
     )
 
-    run_id = store.create_run(f"bug: {ticket.title}", source=report[:2000])
+    if not existing:
+        run_id = store.create_run(f"bug: {ticket.title}", source=report[:2000])
     store.add_tickets(run_id, [ticket])
     store.log(
         run_id,
@@ -906,7 +1073,11 @@ def cmd_bug(args: argparse.Namespace) -> int:
     except OSError as exc:
         print(f"warning: could not write the ticket file ({exc}).")
 
-    print(f"\nRun {run_id} — {ticket.ticket_id}: {ticket.title}")
+    joined = ""
+    if existing:
+        waiting = len(store.list_tickets(run_id))
+        joined = f"  (added to run {run_id} — {waiting} ticket(s) waiting)"
+    print(f"\nRun {run_id} — {ticket.ticket_id}: {ticket.title}{joined}")
     print(f"  scope     {', '.join(ticket.allowed_files) or '(none named)'}")
     _warn_uncovered(config, ticket.allowed_files)
     if ticket.reference_files:
@@ -929,6 +1100,41 @@ def cmd_bug(args: argparse.Namespace) -> int:
         )
     print("Read the scope above, then: forge go")
     return 0
+
+
+def _warn_module_list(config: Config, paths: list[str]) -> list[str]:
+    """Say when a ticket's writable scope is only re-export files.
+
+    `lib.rs`, `mod.rs`, `__init__.py`, `index.js` declare modules; they hold no
+    behavior to fix. A ticket scoped to one can never succeed, and it fails
+    slowly — the executor cannot see the code it was told to change, so it
+    blocks, and the block reads as a scoping refusal rather than as a mis-scope.
+    One run spent seven retry cycles that way against four `pub mod` lines.
+
+    A warning rather than a correction: which sibling holds the fault is the
+    planner's call to make, not this function's, and the reading scope has
+    already been widened to show it every one of them.
+    """
+    listing = []
+    for path in paths:
+        if any(character in path for character in "*?["):
+            continue
+        candidate = config.root / path
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if evidence.is_module_list(text, candidate.name):
+            listing.append(path)
+    if listing and len(listing) == len([p for p in paths if "*" not in p]):
+        print(
+            f"\nwarning: the only writable file(s) here — {', '.join(listing)} — "
+            f"re-export other modules and contain no behavior to fix. The fault "
+            f"is almost certainly in one of the modules they declare, which the "
+            f"ticket can now read but not write. Widen the scope before running "
+            f"it, or expect the executor to block asking for exactly that."
+        )
+    return listing
 
 
 def _warn_uncovered(config: Config, paths: list[str]) -> list[str]:
@@ -1335,6 +1541,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("status", help="one-shot summary of the current run")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser(
+        "replay",
+        help="re-read a past run's recorded output with the current parsers",
+    )
+    p.add_argument("--run", type=int, help="only this run (default: every recorded run)")
+    p.add_argument("--ticket", help="only this ticket")
+    p.add_argument(
+        "--lens",
+        choices=("all", "parse", "blame"),
+        default="all",
+        help="parse: model replies read as files. blame: command output read as "
+        "diagnostics. (default: all)",
+    )
+    p.add_argument(
+        "--changed",
+        action="store_true",
+        help="list only records that read differently than they did at the time",
+    )
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(func=cmd_replay)
 
     p = sub.add_parser("prune", help="delete the artifact trees of old runs")
     p.add_argument(

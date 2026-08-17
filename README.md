@@ -234,6 +234,12 @@ an overnight run never started.
 reproduce a fault before it is allowed to fix it, and what it refuses to do when
 it cannot.
 
+[docs/LOOP-INVARIANTS.md](docs/LOOP-INVARIANTS.md) is the one to read before
+adding a step, a role, or any check that attributes blame. Nine rules that hold
+across the whole harness — read scope versus write scope, why an anchor the loop
+wrote is not an anchor, why attribution must come from diagnostic blocks and
+never from raw output. Each was learned by breaking it.
+
 [docs/CONFIG.md](docs/CONFIG.md) is the key-by-key reference for
 `.hybridforge/config.json`, with a populated example at
 [templates/config.sample.json](templates/config.sample.json) to copy from.

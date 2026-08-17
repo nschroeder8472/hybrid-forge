@@ -167,6 +167,83 @@ def parse_output(text: str) -> ParsedOutput:
     return ParsedOutput(edits=edits, truncated=truncated)
 
 
+# Every fenced block in a reply, ignoring whether anything named it. Used only
+# to recover a reply that forgot its path line.
+_ANY_BLOCK = re.compile(
+    r"^[ \t]*(?P<fence>`{3,})[^\n]*\n(?P<body>.*?)^[ \t]*(?P=fence)`*[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
+
+# How much of the file already on disk an unlabeled block must still contain
+# before it is believed to be that file rewritten. Measured against real
+# replies: the block quoting one function scored 17%, the block holding the
+# whole file scored 100%. Anything near the middle is a guess and is refused.
+_REWRITE_COVERAGE = 0.8
+
+
+def _anchors(text: str) -> list[str]:
+    """Top-level lines of a source file, whitespace-normalised.
+
+    A crude structural fingerprint — no parser, no language knowledge. Enough
+    to tell "the whole file, edited" from "one function, quoted", which is the
+    only question being asked of it.
+    """
+    found = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or line[:1] in " \t":
+            continue
+        if stripped.startswith(("//", "#", "/*", "*", "<!--")):
+            continue
+        if len(stripped) < 8:
+            continue
+        found.append(re.sub(r"\s+", "", stripped))
+    return found
+
+
+def infer_single_file(text: str, current: str = "") -> str:
+    """The file body in a reply that forgot its path line, or "".
+
+    Only ever called by a caller that has established there is exactly one file
+    this reply could be about — a ticket with one writable path — so the
+    destination is not being guessed. What is being decided is narrower: which
+    fenced block, if any, is that file.
+
+    The failure this exists for is a model that reasons at length, quotes the
+    current code in one fence, and then emits the whole rewritten file in
+    another — correct in every respect except the header line above it. The
+    reply is discarded, the attempt is spent, and asking again produces the same
+    shape, because the format is not what the model got wrong. One ticket lost
+    three of five attempts to it; another lost six of nine.
+
+    Two guards, and both must hold:
+
+    - The block has to be the **largest**, so a quoted fragment loses to the
+      file that contains it.
+    - It has to still contain most of what is **already on disk** — see
+      `_REWRITE_COVERAGE`. Writing a fragment over a whole file is the one
+      outcome worse than discarding the reply, and this is what rules it out.
+
+    A file that does not exist yet is never recovered, however unambiguous the
+    reply looks. With nothing on disk there is no way to tell a whole file from
+    an illustrative snippet, and `\x60\x60\x60python\\nx = 1\\n\x60\x60\x60` would become the
+    entire contents of a new module. A reply meant to be a file that arrived
+    unreadable is a failure, and stays one.
+    """
+    blocks = [match.group("body") for match in _ANY_BLOCK.finditer(text)]
+    blocks = [body for body in blocks if body.strip()]
+    anchors = _anchors(current)
+    if not blocks or not anchors:
+        return ""
+
+    candidate = max(blocks, key=len)
+    flattened = re.sub(r"\s+", "", candidate)
+    retained = sum(1 for anchor in anchors if anchor in flattened)
+    if retained / len(anchors) < _REWRITE_COVERAGE:
+        return ""
+    return candidate
+
+
 def describe_unparsed(text: str) -> str:
     """What went wrong in a reply that yielded no edits, or `""` if nothing did.
 
