@@ -17,6 +17,7 @@
   "userConfig": {
     "memPalaceUrl": {
       "type": "string",
+      "title": "MemPalace MCP URL",
       "description": "URL of the MemPalace MCP endpoint holding prior decisions and conventions. Leave as-is if you do not run one; the spec workflow works without it.",
       "default": "http://localhost:8787/mcp"
     }
