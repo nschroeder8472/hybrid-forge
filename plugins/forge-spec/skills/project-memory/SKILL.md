@@ -14,10 +14,13 @@ human-readable artifacts.
 ```json
 {
   "room": "image-marquee",
-  "executorModel": "qwen3.6:35b-a3b",
-  "testCommand": "cargo test",
-  "lintCommand": "cargo clippy -- -D warnings",
-  "neverDelegate": ["src/auth/**", "src/wasm_bridge.rs"]
+  "commands": {
+    "lint": "cargo clippy --all-targets -- -D warnings",
+    "typecheck": "cargo check --all-targets",
+    "test": "cargo test"
+  },
+  "neverDelegate": ["src/auth/**", "src/wasm_bridge.rs"],
+  "memory": { "url": "http://localhost:8787/mcp", "room": "image-marquee" }
 }
 ```
 
@@ -77,9 +80,9 @@ history.
 
 ```
 .hybridforge/
-├── config.json        # room pointer, commands, never-delegate globs
-├── conventions.md     # human-readable, reviewable in PRs
-└── tickets/           # ticket markdown, one per delegated unit
+├── config.json        # room pointer, verify commands, never-delegate globs
+├── tickets/           # ticket markdown, one per unit of work
+└── run.db             # gitignored — mutable run state, not an artifact
 ```
 
 Never commit the palace database itself. It is a binary index, it produces

@@ -284,13 +284,24 @@ stdlib-only Python — there is nothing else to fetch, on purpose, because a
 failed `pip install` is a bad way to discover at 2am that an overnight run
 never started.
 
-### Optional: the Claude Code plugin
+### Optional: the Claude Code plugins
 
-This adds `/forge-init`, `/forge-plan`, `/forge-ingest`, `/forge-go` and
-`/forge-status` inside Claude Code. The CLI works fine without it.
+Two of them, and neither wraps the CLI:
+
+- **Forge Setup** — `/forge-setup` walks the cold start, from "is it installed"
+  through probing your endpoints to this repo's verify commands.
+- **Forge Spec** — `/forge-spec` designs a feature into a document the loop
+  executes verbatim, and `/forge-spec-check` dry-runs it through the ingest
+  parser before you commit to it.
+
+Running the loop stays in a terminal either way. The CLI works fine without
+both.
+
+Each is its own directory under `plugins/`, so load them separately:
 
 ```bash
-claude --plugin-dir ~/code/hybrid-forge
+claude --plugin-dir ~/code/hybrid-forge/plugins/forge-setup
+claude --plugin-dir ~/code/hybrid-forge/plugins/forge-spec
 ```
 
 Everything in this guide is done from an ordinary terminal, so you can come
@@ -606,14 +617,30 @@ Run 1: 3 ticket(s) planned from your spec.
 Review the tickets, then run `forge go`.
 ```
 
-Inside Claude Code, `/forge-plan add a --json flag to the export command` does
-the same thing conversationally.
+Inside Claude Code, `/forge-spec add a --json flag to the export command`
+designs the same work as a document first — settling the open questions, then
+writing tickets in the shape ingest parses verbatim.
 
 Either way, note the line that says **planned from your spec** or **parsed
 directly from your plan**. If your document already contains ticket-shaped
 sections, they are used verbatim and your acceptance criteria stay in your own
 words. Freeform documents go through the planner model, which means the
 criteria end up in the model's words.
+
+Getting the parsed path is worth the small effort. The shape is a `## AB-001:
+title` header plus `## Spec`, `## Allowed files`, and `## Acceptance criteria`
+sections —
+[`plugins/forge-spec/templates/spec.md`](../plugins/forge-spec/templates/spec.md)
+is a filled-in example. To check a draft before ingesting it, without creating a
+run:
+
+```bash
+python plugins/forge-spec/scripts/check_spec.py plan.md
+```
+
+It reports whether ingest would parse or re-plan the document, which tickets it
+found, and the authoring mistakes that otherwise pass silently — a criterion
+wrapped onto a second line loses everything after the first.
 
 ### Read the backlog before running it
 

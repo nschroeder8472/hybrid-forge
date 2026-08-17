@@ -190,8 +190,13 @@ forge ui                    # dashboard without running the loop
 forge ui --host IP --port N # bind it elsewhere, this run only (no auth!)
 ```
 
-In Claude Code: `/forge-init`, `/forge-plan`, `/forge-ingest`, `/forge-go`,
-`/forge-status`.
+Two Claude Code plugins sit beside the CLI rather than wrapping it. **Forge
+Setup** (`/forge-setup`) handles the cold start — install check, endpoint
+probes, the machine profile, and this repo's verify commands and never-delegate
+list. **Forge Spec** (`/forge-spec`, `/forge-spec-check`) is where a feature
+gets designed into a document `forge ingest` parses verbatim, so the acceptance
+criteria stay in the words a human wrote. Running the loop stays in the
+terminal, where it survives the session.
 
 ## Setup asks once
 
@@ -263,8 +268,8 @@ forge/wizard.py           interactive `forge init` — asks, probes, never hangs
 forge/toolchain.py        reads the repo's CI/docs to find its verify commands
 forge/profile.py          machine-level endpoints, reused by the next repo
 forge/ui/                 dashboard
-mcp_servers/              MCP shim for interactive (non-daemon) delegation
-skills/                   triage rules and memory discipline
+plugins/forge-setup/      Claude Code plugin: machine + repository setup
+plugins/forge-spec/       Claude Code plugin: spec authoring, triage, memory
 tests/                    python -m unittest discover tests
 ```
 

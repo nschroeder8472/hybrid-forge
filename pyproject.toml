@@ -8,13 +8,9 @@ version = "0.2.0"
 description = "Autonomous plan-and-execute coding loop over any models you bring."
 requires-python = ">=3.10"
 # No runtime dependencies on purpose. The daemon has to start on every machine
-# the plugin runs on, and a failed `pip install` is a bad way to find out that
+# a run might live on, and a failed `pip install` is a bad way to find out that
 # an overnight run never began.
 dependencies = []
-
-[project.optional-dependencies]
-# Only the bundled MCP shim needs this; the daemon and CLI do not.
-mcp = ["mcp>=1.0"]
 
 [project.scripts]
 forge = "forge.cli:main"
