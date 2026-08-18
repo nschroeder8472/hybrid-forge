@@ -42,7 +42,7 @@ from . import evidence
 from .artifacts import Artifacts
 from .budget import BudgetGate, Wait
 from .config import ANY_LANGUAGE, Config, ConfigError
-from .failures import distill, errors_naming, files_blamed, signatures
+from .failures import distill, errors_naming, files_blamed, locations, signatures
 from .ingest import write_tickets
 from .memory import MemoryClient, MemoryRefused, MemoryUnavailable, ticket_query
 from .patch import (
@@ -58,6 +58,7 @@ from .patch import (
     matches_any,
     normalize_path,
     parse_output,
+    repo_relative,
 )
 from .providers import (
     Completion,
@@ -705,23 +706,36 @@ class Orchestrator:
         return self._duplicate_guidance(repeated) if repeated else ""
 
     @staticmethod
-    def _signature_scope(signature: str, allowed: list[str]) -> bool:
+    def _signature_scope(
+        signature: str, allowed: list[str], root: Path | str | None = None
+    ) -> bool:
         """Whether a diagnostic points at a file this ticket may write.
 
-        Signatures carry their location — `error: ... --> src/board.rs:21:19` —
-        so the file a complaint is about can be compared against the ticket's
-        own scope. Matching is lowercased because `signatures` folds case, and
-        `Cargo.toml` would otherwise never match `cargo.toml`.
+        Signatures carry their location, so the file a complaint is about can be
+        compared against the ticket's own scope. Matching is lowercased because
+        `signatures` folds case, and `Cargo.toml` would otherwise never match
+        `cargo.toml`.
+
+        Locations are read by `failures.locations`, which knows every spelling a
+        compiler uses. This once read rustc's `-->` marker and nothing else,
+        which made the check silently language-specific: cargo was attributed
+        correctly, and javac, tsc, go, gcc, and pytest — none of which emit
+        `-->` — parsed to no location at all and were therefore all excused. A
+        Java run took seven tickets to green with twenty compile errors standing,
+        because every one of them looked like somebody else's.
+
+        `root` lets an absolute path be recognised as a file inside the
+        repository. Without it a javac diagnostic naming
+        `d:\\repo\\src\\main\\java\\A.java` cannot match the pattern
+        `src/main/java/A.java` that put the file in scope in the first place.
 
         A signature with no parseable location answers False, which leaves the
         failure excusable. That is the safe direction: the alternative blames a
         ticket for something it may have no authority to touch.
         """
         patterns = [pattern.lower() for pattern in allowed]
-        for match in re.finditer(r"-->\s*(\S+)", signature):
-            # Trim the `:line:col` the compiler appends to the path.
-            location = re.sub(r"(?::\d+)+$", "", match.group(1))
-            if location and matches_any(location, patterns):
+        for location in locations(signature):
+            if matches_any(repo_relative(location, root), patterns):
                 return True
         return False
 
@@ -774,7 +788,7 @@ class Orchestrator:
             owned = {
                 signature
                 for signature in found
-                if self._signature_scope(signature, scope)
+                if self._signature_scope(signature, scope, self.config.root)
             }
             if owned:
                 self.store.log(

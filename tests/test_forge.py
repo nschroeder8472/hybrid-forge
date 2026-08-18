@@ -59,8 +59,9 @@ from forge.patch import (
     matches_any,
     normalize_path,
     parse_output,
+    repo_relative,
 )
-from forge.failures import distill, errors_naming, signatures
+from forge.failures import distill, errors_naming, locations, signatures
 from forge.prompts import (
     bug_prompt,
     locate_prompt,
@@ -8262,6 +8263,166 @@ class TestTheBaselineExcuseStopsAtTheTicketsScope(unittest.TestCase):
         self.assertFalse(
             Orchestrator._signature_scope("error: linking failed", ["src/board.rs"])
         )
+
+
+class TestScopeMatchingIsLanguageAgnostic(unittest.TestCase):
+    """Attribution must not depend on which compiler produced the diagnostic.
+
+    It did. `_signature_scope` read locations out of rustc's `-->` marker and
+    nothing else, so cargo was attributed correctly and every other toolchain
+    parsed to no location at all — which the code treats as unattributable, and
+    therefore excusable. A Java run drove seven tickets to `done` with twenty
+    compile errors standing, each cycle's baseline laundering the last cycle's
+    breakage into "pre-existing": 3 errors, then 7, then 13, then 20.
+
+    One case per dialect, because the failure mode is silent: a toolchain whose
+    spelling is not handled does not error, it just stops blaming anyone.
+    """
+
+    # (name, diagnostic, the repo-relative file it is about)
+    DIALECTS = [
+        ("rustc", "error[E0603]: module is private\n  --> src/board.rs:21:19", "src/board.rs"),
+        ("javac", "src/main/java/com/p/Scanner.java:33: error: cannot find symbol", "src/main/java/com/p/Scanner.java"),
+        ("tsc", "src/app/main.ts(33,7): error TS2345: Argument of type 'x'", "src/app/main.ts"),
+        ("gcc", "src/main.c:44:9: error: 'foo' undeclared", "src/main.c"),
+        ("go", "./internal/scan/scan.go:18:2: undefined: Foo", "internal/scan/scan.go"),
+        ("pytest", "E   AssertionError: assert 1 == 2\ntests/test_scan.py:12: in <module>", "tests/test_scan.py"),
+        ("eslint", "src/index.js:7:1: error  Unexpected var", "src/index.js"),
+        ("dotnet", "src/Program.cs(15,20): error CS0103: The name 'x'", "src/Program.cs"),
+        ("kotlin", "e: file:///repo/src/Main.kt:9:5 Unresolved reference", "/repo/src/Main.kt"),
+        ("swift", "Sources/App/main.swift:22:9: error: cannot find 'x'", "Sources/App/main.swift"),
+        ("scala", "src/main/scala/Main.scala:14:20: not found: value x", "src/main/scala/Main.scala"),
+        ("msvc", "src/main.cpp(120): error C2065: undeclared identifier", "src/main.cpp"),
+    ]
+
+    def test_every_dialect_claims_a_file_inside_the_scope(self):
+        for name, diagnostic, owned in self.DIALECTS:
+            with self.subTest(dialect=name):
+                self.assertTrue(
+                    Orchestrator._signature_scope(diagnostic.lower(), [owned]),
+                    f"{name}: a diagnostic about {owned} was not recognised as "
+                    f"in scope, so the ticket that broke it would be excused",
+                )
+
+    def test_every_dialect_still_excuses_a_file_outside_the_scope(self):
+        # The other half: amnesty has to keep working, or a ticket spends its
+        # attempts on an error it has no authority to fix.
+        for name, diagnostic, _owned in self.DIALECTS:
+            with self.subTest(dialect=name):
+                self.assertFalse(
+                    Orchestrator._signature_scope(
+                        diagnostic.lower(), ["some/unrelated/file.txt"]
+                    ),
+                    f"{name}: a diagnostic was blamed on a ticket that cannot "
+                    f"open the file it names",
+                )
+
+
+class TestAbsoluteDiagnosticPathsResolveAgainstTheRepo(unittest.TestCase):
+    """javac and msvc print full paths; scope patterns are repo-relative.
+
+    Without resolving one against the other the two never match, and "no match"
+    means "not this ticket's fault" — so every error a Windows Java build
+    reported was excused, including the ones in the ticket's own files.
+    """
+
+    ROOT = r"D:\repo\project"
+    DIAGNOSTIC = (
+        r"d:\repo\project\src\main\java\com\p\Scanner.java:33: "
+        r"error: cannot find symbol"
+    )
+    OWNED = "src/main/java/com/p/Scanner.java"
+
+    def test_an_absolute_path_inside_the_repo_is_claimed(self):
+        self.assertTrue(
+            Orchestrator._signature_scope(
+                self.DIAGNOSTIC.lower(), [self.OWNED], self.ROOT
+            )
+        )
+
+    def test_the_root_comparison_folds_case(self):
+        # `signatures` lowercases its input; a Windows root does not arrive
+        # lowercased, so a case-sensitive prefix test would never strip.
+        self.assertTrue(
+            Orchestrator._signature_scope(
+                self.DIAGNOSTIC.lower(), [self.OWNED], r"d:\REPO\PROJECT"
+            )
+        )
+
+    def test_without_a_root_the_absolute_path_stays_unmatched(self):
+        # Documents why `root` has to be threaded through at all.
+        self.assertFalse(
+            Orchestrator._signature_scope(self.DIAGNOSTIC.lower(), [self.OWNED])
+        )
+
+    def test_a_path_outside_the_repo_is_not_made_relative(self):
+        # `repo_relative` must narrow what matches, never widen it: a file in
+        # another checkout should not be able to satisfy a repo-relative
+        # pattern by having a similar tail.
+        self.assertFalse(
+            Orchestrator._signature_scope(
+                r"d:\other\project\src\main\java\com\p\Scanner.java:33: error: x",
+                [self.OWNED],
+                self.ROOT,
+            )
+        )
+
+    def test_repo_relative_leaves_a_foreign_absolute_path_alone(self):
+        self.assertEqual(repo_relative("/etc/passwd", self.ROOT), "/etc/passwd")
+
+    def test_repo_relative_strips_only_the_root_prefix(self):
+        self.assertEqual(
+            repo_relative(r"D:\repo\project\src\a.py", self.ROOT), "src/a.py"
+        )
+
+
+class TestLocationsReadsEveryDialect(unittest.TestCase):
+    def test_prose_carrying_no_location_parses_to_nothing(self):
+        # The guard that keeps a ticket from being blamed for a diagnostic that
+        # names no file at all. `expected 2, found 1` must not read as a path.
+        for text in (
+            "error: expected 2 items, found 1",
+            "error: linking with `cc` failed",
+            "AssertionError: assert 1 == 2",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(locations(text), [])
+
+    def test_a_file_uri_is_reduced_to_its_path(self):
+        # kotlinc reports `e: file:///repo/src/Main.kt:9:5`. The `e` ending
+        # `file` was read as a drive letter, yielding `e:///repo/src/Main.kt`.
+        self.assertEqual(
+            locations("e: file:///repo/src/Main.kt:9:5 Unresolved reference"),
+            ["/repo/src/Main.kt"],
+        )
+
+    def test_a_windows_path_keeps_its_drive_and_directories(self):
+        self.assertEqual(
+            locations(r"d:\proj\src\A.java:33: error: cannot find symbol"),
+            ["d:/proj/src/A.java"],
+        )
+
+    def test_the_parenthesised_form_is_a_location(self):
+        self.assertEqual(locations("src/app/main.ts(33,7): error TS2345: x"), ["src/app/main.ts"])
+
+    def test_an_extensionless_path_needs_a_separator(self):
+        # `build/Makefile:12` is a location; a bare `Makefile:12` is not, because
+        # accepting bare words would let prose read as a filename.
+        self.assertEqual(locations("build/Makefile:12: *** missing separator"), ["build/Makefile"])
+        self.assertEqual(locations("Makefile:12: *** missing separator"), [])
+
+
+class TestPytestSignaturesStayDistinctPerFile(unittest.TestCase):
+    def test_the_same_assertion_in_two_files_is_two_signatures(self):
+        # `_block_key` took its location from rustc's `-->` alone, so pytest
+        # failures reading the same message collapsed into one signature — and
+        # a set difference against it forgave a genuinely new failure.
+        one = signatures("E   AssertionError: assert 1 == 2\ntests/test_a.py:12: in <module>")
+        two = signatures("E   AssertionError: assert 1 == 2\ntests/test_b.py:12: in <module>")
+
+        self.assertEqual(len(one), 1)
+        self.assertEqual(len(two), 1)
+        self.assertNotEqual(one, two)
 
 
 class TestBaselineVerifyIsOptional(unittest.TestCase):

@@ -175,6 +175,17 @@ def _block_key(block: list[str]) -> str:
     where = next(
         (line.strip() for line in block[1:] if line.strip().startswith("-->")), ""
     )
+    # Tools that do not draw rustc's arrow still put the location somewhere: on
+    # the head line (javac, tsc, go), or on a line of its own below it (pytest's
+    # `tests/test_scan.py:12: in <module>`). Taking the first line that carries
+    # one keeps the key distinct per file and — because `_signature_scope` reads
+    # the key, not the block — is what lets the location be found at all. Two
+    # pytest failures reading `AssertionError: assert 1 == 2` in different files
+    # collapsed into one signature otherwise, and neither could be attributed.
+    if not where and not locations(head):
+        where = next(
+            (line.strip() for line in block[1:] if locations(line)), ""
+        )
     return re.sub(r"\s+", " ", _VOLATILE.sub("#", f"{head} {where}")).strip().lower()
 
 
@@ -238,11 +249,66 @@ def _clip_lines(lines: list[str], limit: int, *, note: str) -> str:
     return "\n".join(kept)
 
 
-# A `path:line` or `path:line:col` location inside a diagnostic. Deliberately
-# loose about the path shape, because this runs over every toolchain a user can
-# configure; the caller checks the path against the repository before trusting
-# it.
-_LOCATION = re.compile(r"([\w./\\+-]+\.[A-Za-z0-9]{1,5}):(\d+)(?::\d+)?")
+# A file location inside a diagnostic. Deliberately loose about the path shape,
+# because this runs over every toolchain a user can configure; the caller checks
+# the path against the repository before trusting it.
+#
+# Two spellings, because compilers do not agree on one:
+#
+#     rustc / javac / gcc / go / pytest    path/File.java:33:7
+#     tsc / msvc                           path/File.ts(33,7)
+#
+# An optional drive letter is part of the path. Without it `d:\src\a.java` is
+# captured as `\src\a.java`, which no longer shares a prefix with the repository
+# root and so can never be recognised as a file inside it.
+#
+# The extension is what keeps prose out: `error: expected 2, found 1` holds no
+# `word.ext:line`. A path carrying a separator is accepted without one too, so
+# `build/Makefile:12` is a location while a bare `Makefile:12` is not -- the
+# conservative direction, since a false location blames a ticket for a file it
+# may have no authority to touch.
+#
+# The drive letter may not follow a word character. Kotlin opens its
+# diagnostics `e: file:///repo/src/Main.kt:9:5`, and without the guard the `e`
+# ending `file` is read as a drive, yielding `e:///repo/src/Main.kt` — a path
+# matching nothing, which silently excuses every Kotlin error.
+_LOCATION = re.compile(
+    r"((?<![\w])(?:[A-Za-z]:)?[\w./\\+-]*(?:\.[A-Za-z0-9]{1,5}|[/\\][\w+-]+))"
+    r"(?::(\d+)(?::\d+)?|\((\d+)(?:,\d+)?\))"
+)
+
+# `file:///repo/src/Main.kt` (kotlinc, and any tool reporting URIs) carries a
+# scheme that no repository path has. Dropped before matching so the location
+# underneath is an ordinary absolute path.
+_FILE_URI = re.compile(r"\bfile://", re.IGNORECASE)
+
+
+def locations(text: str) -> list[str]:
+    """Every file path this diagnostic text names, in forward-slash form.
+
+    Every attribution in the loop reduces to one question -- which file is this
+    complaint about -- and it has to be answered the same way for every
+    toolchain. It was not: scope matching read locations out of rustc's `-->`
+    marker alone, so cargo was attributed correctly while javac, tsc, go, and
+    pytest, none of which emit `-->`, parsed to nothing at all.
+
+    A signature that parses to nothing is unattributable and therefore
+    excusable. That is the safe direction for one diagnostic and a catastrophe
+    for a whole language: every failure a Java run produced was excused as
+    somebody else's, tickets passed their verify step on a tree that did not
+    compile, and the errors accumulated across seven tickets -- 3, then 7, then
+    13, then 20 -- each cycle's baseline laundering the previous cycle's
+    breakage into "pre-existing".
+
+    Order is preserved and duplicates dropped, so the first location in a
+    diagnostic -- the one compilers put the error at -- is checked first.
+    """
+    found: list[str] = []
+    for match in _LOCATION.finditer(_FILE_URI.sub("", text or "")):
+        path = match.group(1).replace("\\", "/")
+        if path and path not in found:
+            found.append(path)
+    return found
 
 
 def files_blamed(output: str, exclude: set[str] | None = None) -> dict[str, list[str]]:
