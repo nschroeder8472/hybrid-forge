@@ -739,6 +739,74 @@ class Orchestrator:
                 return True
         return False
 
+    def _inherited_failures(
+        self, run_id: int, ticket: Ticket, repro_path: str = ""
+    ) -> dict[str, set[str]]:
+        """What this ticket is allowed to blame on the state it arrived in.
+
+        The baseline is re-taken every cycle, and has to be: tickets run in
+        between, and a ticket that inherits a stale baseline is asked to fix
+        errors another one wrote after it. The cost is that nothing reverts a
+        failed ticket, so on a retry its own breakage is still on disk and a
+        fresh baseline reads it as pre-existing — amnesty for the errors it just
+        wrote, renewed every cycle, so the debt can only grow. A real run went 3
+        errors, then 7, then 13, then 20, and finished with every ticket `done`
+        on a tree that did not compile.
+
+        Subtracting what the ticket has been charged for is what separates
+        "already broken when I got here" from "broken by me last time". Both
+        halves are needed: keep the fresh baseline and a ticket is punished for
+        its neighbours, keep only the first cycle's and it is forgiven for
+        itself.
+        """
+        if not self.config.loop.baseline_verify:
+            return {}
+        baseline = self._baseline_failures(
+            run_id, ticket, extra_scope=[repro_path] if repro_path else []
+        )
+        charged = set(ticket.charged_failures)
+        if not charged:
+            return baseline
+
+        kept: dict[str, set[str]] = {}
+        for name, found in baseline.items():
+            remaining = found - charged
+            if remaining:
+                kept[name] = remaining
+            if len(remaining) != len(found):
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: {len(found) - len(remaining)} {name} "
+                    f"error(s) pre-date this cycle but were introduced by an "
+                    f"earlier one of its own; still its to fix.",
+                    level="warn",
+                    kind="verify",
+                    data={"step": name, "signatures": sorted(found - remaining)[:20]},
+                )
+        return kept
+
+    def _charge(self, run_id: int, ticket: Ticket, found: set[str]) -> None:
+        """Record failures as this ticket's, permanently.
+
+        A charged signature is excluded from every later baseline this ticket
+        takes, which is the whole point: the baseline is re-taken each cycle so
+        that other tickets' breakage stays excused, and without a memory of what
+        this one broke there is no way to tell the two apart. There was not one,
+        and a failed ticket's own errors came back the next cycle wearing the
+        pre-existing label it had just earned them.
+
+        Kept sorted and deduplicated so the persisted list is stable to compare
+        across cycles, and written only when it actually changes — this runs on
+        every verify step of every attempt.
+        """
+        if not found:
+            return
+        merged = sorted(set(ticket.charged_failures) | found)
+        if merged == ticket.charged_failures:
+            return
+        ticket.charged_failures = merged
+        self.store.update_ticket(run_id, ticket)
+
     def _baseline_failures(
         self, run_id: int, ticket: Ticket, extra_scope: Sequence[str] = ()
     ) -> dict[str, set[str]]:
@@ -1591,13 +1659,7 @@ class Orchestrator:
         else:
             repro_path = ""
 
-        pre_existing = (
-            self._baseline_failures(
-                run_id, ticket, extra_scope=[repro_path] if repro_path else []
-            )
-            if self.config.loop.baseline_verify
-            else {}
-        )
+        pre_existing = self._inherited_failures(run_id, ticket, repro_path)
 
         if ticket.kind == TICKET_BUG:
             # Proof is durable, and it has to be: once the fix lands the test
@@ -2538,6 +2600,14 @@ class Orchestrator:
             result = self._shell(run_id, name, command)
             already = inherited.get(name, set())
             introduced = signatures(result.detail) - already if already else set()
+            if not result.ok:
+                # Charged whether or not a baseline existed for this step, and
+                # whether or not the attempt goes on to pass review. These are
+                # the errors standing while this ticket was the one running, and
+                # the loop is single-threaded — no other ticket can have written
+                # them. Recording them here is what stops the next cycle's
+                # baseline from handing them back as somebody else's problem.
+                self._charge(run_id, ticket, signatures(result.detail) - already)
             self._record_step(
                 ticket,
                 f"verify-{name}",

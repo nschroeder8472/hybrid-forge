@@ -8425,6 +8425,128 @@ class TestPytestSignaturesStayDistinctPerFile(unittest.TestCase):
         self.assertNotEqual(one, two)
 
 
+class TestARetryCycleCannotLaunderItsOwnBreakage(unittest.TestCase):
+    """A ticket's own errors must not come back as somebody else's.
+
+    The baseline is re-taken every cycle, which is right: other tickets run in
+    between and their breakage has to keep being excused. But nothing reverts a
+    failed ticket, so on a retry its own errors are still on disk, and a fresh
+    baseline could not tell the two apart. It excused them -- and since the
+    excuse renews every cycle, the debt could only grow. One run went 3 errors,
+    then 7, then 13, then 20, and ended with all seven tickets `done` on a tree
+    that did not compile.
+    """
+
+    OWN = (
+        "error: casting to the same type is unnecessary\n"
+        "  --> web/main.js:12:3\n"
+        "   |\n"
+    )
+    FOREIGN = (
+        "error[E0308]: mismatched types\n"
+        "  --> other/thing.js:9:1\n"
+        "   |\n"
+    )
+
+    def _orchestrator(self, output):
+        orch, _root, run_id = _stub_orchestrator(
+            commands={"lint": "cargo clippy", "typecheck": "", "test": ""}
+        )
+        # Mutable so a test can move the tree between cycles, which is the whole
+        # situation being modelled: the baseline a cycle takes depends on what
+        # the previous cycle left behind.
+        state = {"output": output}
+        orch._shell = lambda *_a, **_k: StepResult(
+            ok=not state["output"], detail=state["output"]
+        )
+        return orch, run_id, state
+
+    def test_a_charged_signature_is_not_excused_on_the_next_cycle(self):
+        # Cycle 1 starts on a clean tree, so it inherits nothing...
+        orch, run_id, state = self._orchestrator("")
+        ticket = Ticket("T-1", allowed_files=["src/board.rs"])
+        orch.store.add_tickets(run_id, [ticket])
+
+        self.assertEqual(orch._inherited_failures(run_id, ticket), {})
+
+        # ...then breaks `web/main.js`, which is outside its scope. Nothing
+        # reverts a failed ticket, so the damage is still there afterwards.
+        orch._charge(run_id, ticket, signatures(self.OWN))
+        state["output"] = self.OWN
+
+        # Cycle 2 takes a fresh baseline and finds the error already on disk.
+        # Before charging existed it was excused here, every cycle, forever.
+        second = orch._inherited_failures(run_id, ticket)
+
+        self.assertEqual(second, {}, "the ticket was forgiven its own breakage")
+
+    def test_another_tickets_breakage_is_still_inherited(self):
+        # The half that must not regress. Amnesty exists so a ticket does not
+        # spend its attempts on a file it has no authority to open.
+        orch, run_id, _state = self._orchestrator(self.FOREIGN)
+        ticket = Ticket("T-1", allowed_files=["src/board.rs"])
+        orch.store.add_tickets(run_id, [ticket])
+        orch._charge(run_id, ticket, signatures(self.OWN))
+
+        inherited = orch._inherited_failures(run_id, ticket)
+
+        self.assertEqual(len(inherited.get("lint", set())), 1)
+
+    def test_charges_survive_a_reload_from_the_store(self):
+        # The laundering happens across cycles, and a cycle is a fresh
+        # `_run_ticket` reading the ticket back out of sqlite. A charge held
+        # only in memory would be forgotten exactly when it is needed.
+        orch, run_id, _state = self._orchestrator(self.OWN)
+        ticket = Ticket("T-1", allowed_files=["src/board.rs"])
+        orch.store.add_tickets(run_id, [ticket])
+        orch._charge(run_id, ticket, signatures(self.OWN))
+
+        reloaded = {t.ticket_id: t for t in orch.store.list_tickets(run_id)}["T-1"]
+
+        self.assertEqual(reloaded.charged_failures, sorted(signatures(self.OWN)))
+        self.assertEqual(orch._inherited_failures(run_id, reloaded), {})
+
+    def test_charging_accumulates_across_cycles(self):
+        orch, run_id, _state = self._orchestrator(self.OWN)
+        ticket = Ticket("T-1", allowed_files=["src/board.rs"])
+        orch.store.add_tickets(run_id, [ticket])
+
+        orch._charge(run_id, ticket, signatures(self.OWN))
+        orch._charge(run_id, ticket, signatures(self.FOREIGN))
+
+        self.assertEqual(
+            set(ticket.charged_failures),
+            signatures(self.OWN) | signatures(self.FOREIGN),
+        )
+
+    def test_charging_the_same_signature_twice_does_not_grow_the_list(self):
+        orch, run_id, _state = self._orchestrator(self.OWN)
+        ticket = Ticket("T-1", allowed_files=["src/board.rs"])
+        orch.store.add_tickets(run_id, [ticket])
+
+        orch._charge(run_id, ticket, signatures(self.OWN))
+        orch._charge(run_id, ticket, signatures(self.OWN))
+
+        self.assertEqual(len(ticket.charged_failures), 1)
+
+    def test_nothing_is_charged_when_the_step_passes(self):
+        orch, run_id, _state = self._orchestrator(self.OWN)
+        ticket = Ticket("T-1", allowed_files=["src/board.rs"])
+        orch.store.add_tickets(run_id, [ticket])
+
+        orch._charge(run_id, ticket, set())
+
+        self.assertEqual(ticket.charged_failures, [])
+
+    def test_baseline_verify_off_still_inherits_nothing(self):
+        orch, run_id, _state = self._orchestrator(self.OWN)
+        orch.config.loop.baseline_verify = False
+        ticket = Ticket("T-1", allowed_files=["src/board.rs"])
+        orch.store.add_tickets(run_id, [ticket])
+
+        self.assertEqual(orch._inherited_failures(run_id, ticket), {})
+
+
 class TestBaselineVerifyIsOptional(unittest.TestCase):
     def test_it_is_on_by_default(self):
         self.assertTrue(LoopSettings().baseline_verify)
