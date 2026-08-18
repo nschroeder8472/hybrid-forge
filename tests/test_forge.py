@@ -8547,6 +8547,175 @@ class TestARetryCycleCannotLaunderItsOwnBreakage(unittest.TestCase):
         self.assertEqual(orch._inherited_failures(run_id, ticket), {})
 
 
+class TestWhatCountsAsATestFile(unittest.TestCase):
+    """Recognising a test must not depend on the language it is written in.
+
+    It did. The rule was a set of globs holding only the snake_case spellings --
+    `test_x`, `x_test`, `x.test` -- plus a `tests/` directory at the repository
+    root: Rust, Go, pytest, jest. A Gradle project keeps `VideoExtensionsTest`
+    under `src/test/java/`, which matched none of them, so a test file the plan
+    had already named was invisible to every decision the loop makes about
+    tests.
+    """
+
+    RECOGNISED = [
+        "src/test/java/com/p/VideoExtensionsTest.java",   # JUnit, Gradle layout
+        "src/test/java/com/p/FakeMainView.java",          # helper, but in the source set
+        "src/test/kotlin/com/p/ScannerSpec.kt",           # Kotest
+        "tests/tt_001_test.rs",                           # rust
+        "tests/pn_001_test.java",                         # what this loop used to invent
+        "src/test_foo.py",                                # pytest
+        "src/foo_test.go",                                # go
+        "src/Foo.test.ts",                                # jest
+        "src/UserTests.cs",                               # NUnit / xUnit
+        "spec/user_spec.rb",                              # rspec
+        "src/Test.java",                                  # the whole name is the word
+    ]
+
+    # Names that merely contain the letters. The capital in `VideoExtensionsTest`
+    # is the only thing separating these, which is why the check cannot be a
+    # glob: `fnmatch` folds case on Windows and not on Linux, so `*Test.*`
+    # matches `latest.js` on one platform and not the other.
+    NOT_RECOGNISED = [
+        "src/main/java/com/p/ScannedFile.java",
+        "src/latest.js",
+        "src/components/Testimonials.jsx",
+        "src/contest.py",
+        "src/protest.rs",
+        "src/main/Attest.java",
+    ]
+
+    def test_a_test_file_is_recognised_in_every_language(self):
+        for path in self.RECOGNISED:
+            with self.subTest(path=path):
+                self.assertTrue(Orchestrator._is_test_path(path))
+
+    def test_a_word_that_merely_contains_test_is_not_one(self):
+        for path in self.NOT_RECOGNISED:
+            with self.subTest(path=path):
+                self.assertFalse(Orchestrator._is_test_path(path))
+
+    def test_recognition_survives_windows_separators(self):
+        self.assertTrue(
+            Orchestrator._is_test_path(r"src\test\java\com\p\ScannedFileTest.java")
+        )
+
+
+class TestTheTesterWritesWhereTheBuildLooks(unittest.TestCase):
+    """A test the build never compiles is not a weaker check, it is no check.
+
+    `gradlew test` collects `src/test/java/**`. Every file the tester wrote
+    landed in `tests/`, so it was never compiled and never run -- one of them
+    imported a package that does not exist and failed nothing for a whole run.
+    Verification silently degraded to review-only while reporting green.
+    """
+
+    def _orchestrator(self):
+        orch, root, _run_id = _stub_orchestrator(
+            commands={"lint": "", "typecheck": "", "test": "gradlew.bat test"}
+        )
+        return orch, root
+
+    def test_several_designated_tests_no_longer_fall_through(self):
+        # The Rust-shaped assumption: one integration test per ticket. Languages
+        # that pair a test class with each production class name several, and
+        # requiring exactly one sent the ticket off to invent a path instead.
+        orch, _root = self._orchestrator()
+        ticket = Ticket(
+            "PN-001",
+            allowed_files=[
+                "src/main/java/com/p/ScannedFile.java",
+                "src/test/java/com/p/ScannedFileTest.java",
+                "src/test/java/com/p/VideoExtensionsTest.java",
+            ],
+        )
+
+        path, _ = orch._test_target(
+            ticket, ["src/main/java/com/p/ScannedFile.java"], None
+        )
+
+        self.assertTrue(path.startswith("src/test/java/"), path)
+
+    def test_the_designated_test_is_paired_with_what_the_ticket_wrote(self):
+        orch, _root = self._orchestrator()
+        ticket = Ticket(
+            "PN-001",
+            allowed_files=[
+                "src/test/java/com/p/ScannedFileTest.java",
+                "src/test/java/com/p/VideoExtensionsTest.java",
+            ],
+        )
+
+        path, _ = orch._test_target(
+            ticket, ["src/main/java/com/p/VideoExtensions.java"], None
+        )
+
+        self.assertEqual(path, "src/test/java/com/p/VideoExtensionsTest.java")
+
+    def test_the_choice_does_not_move_when_the_plan_is_reordered(self):
+        # The path is fixed for the life of the ticket. A second cycle that
+        # picked differently would strand the first cycle's file, owned by
+        # nobody and failing every ticket after it.
+        orch, _root = self._orchestrator()
+        designated = [
+            "src/test/java/com/p/AlphaTest.java",
+            "src/test/java/com/p/BetaTest.java",
+        ]
+        first = orch._test_target(Ticket("T-1", allowed_files=designated), ["x.java"], None)
+        second = orch._test_target(
+            Ticket("T-1", allowed_files=list(reversed(designated))), ["x.java"], None
+        )
+
+        self.assertEqual(first[0], second[0])
+
+    def test_an_invented_jvm_test_lands_in_the_build_source_set(self):
+        orch, _root = self._orchestrator()
+
+        path, _ = orch._test_target(
+            Ticket("PN-001"), ["src/main/java/com/p/A.java"], None, suffix=".java"
+        )
+
+        self.assertEqual(path, "src/test/java/Pn001Test.java")
+
+    def test_an_invented_jvm_test_is_named_so_it_can_compile(self):
+        # javac requires the public type to be declared in a file named after
+        # it, so `pn_001_test.java` cannot hold `Pn001Test` in any directory.
+        self.assertEqual(Orchestrator._test_stem(Ticket("PN-001"), ".java"), "Pn001Test")
+
+    def test_other_languages_keep_the_snake_case_name(self):
+        # `_test` is mandatory for `go test` and one of pytest's two default
+        # collection patterns. Nothing here may change for them.
+        for suffix in (".rs", ".py", ".go", ".ts"):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(
+                    Orchestrator._test_stem(Ticket("TT-001"), suffix), "tt_001_test"
+                )
+
+    def test_a_ticket_can_still_reclaim_a_file_written_under_the_old_name(self):
+        # `_owned_test_files` deletes by name. Narrowing the stems to whatever
+        # this ticket's language answers today would strand every file the loop
+        # wrote before -- including the `tests/pn_001_test.java` files a real
+        # run left behind.
+        orch, root = self._orchestrator()
+        (root / "tests").mkdir()
+        (root / "tests" / "pn_001_test.java").write_text("class X {}", "utf-8")
+        (root / "src" / "test" / "java").mkdir(parents=True)
+        (root / "src" / "test" / "java" / "Pn001Test.java").write_text("class Y {}", "utf-8")
+
+        owned = orch._owned_test_files(Ticket("PN-001"))
+
+        self.assertEqual(
+            owned, ["src/test/java/Pn001Test.java", "tests/pn_001_test.java"]
+        )
+
+    def test_a_file_belonging_to_another_ticket_is_never_reclaimed(self):
+        orch, root = self._orchestrator()
+        (root / "tests").mkdir()
+        (root / "tests" / "pn_002_test.java").write_text("class X {}", "utf-8")
+
+        self.assertEqual(orch._owned_test_files(Ticket("PN-001")), [])
+
+
 class TestBaselineVerifyIsOptional(unittest.TestCase):
     def test_it_is_on_by_default(self):
         self.assertTrue(LoopSettings().baseline_verify)
