@@ -618,6 +618,9 @@ def _respec(
             # code nobody showed it is a guess the executor is then judged on.
             sources=respec.sources_for(config.root, ticket),
             criteria_locked=locked,
+            # So a revised read scope is checked against the tree rather than
+            # taken on the planner's word for where a file lives.
+            root=config.root,
         )
         if result.impossible:
             # Parked rather than requeued: the planner has just explained that

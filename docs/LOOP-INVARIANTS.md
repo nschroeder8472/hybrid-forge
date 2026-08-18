@@ -232,6 +232,140 @@ pairing rule is now `pair_applies` with a test named for it.
 
 ---
 
+## 10. A path handed to a role must resolve, or it is not a hint
+
+`reference_files` exists to be read off disk. `sources_for` skips what it cannot
+open, so a path that does not resolve does not reach the executor as a smaller
+hint — it reaches it as nothing at all, and a reference the executor never saw
+is indistinguishable downstream from one it read and ignored.
+
+Respec names those files from memory. It is shown their contents, never the
+tree, so it writes the package it remembers:
+
+```
+reference_files: src/main/java/com/plexnamer/DirectoryScanner.java
+on disk:         src/main/java/com/plexnamer/domain/DirectoryScanner.java
+```
+
+with the rationale "added minimal stubs for these classes to reference_files".
+The executor, shown nothing, imported `com.plexnamer.DirectoryScanner` — a
+symbol that has never existed — and spent five attempts and the whole retry
+budget being told so by javac, with the same wrong paths handed back each cycle.
+
+**Ground a revised read scope against the tree.** `_ground_references` keeps
+what exists, remaps a path whose filename matches exactly one file in the
+repository, and drops the rest with the drop in the run log. One match only:
+two is a guess, and the caller is better off told the path is wrong.
+
+`allowed_files` is exempt and must stay exempt — a ticket's writable scope is
+where its work is *going*, and most of it does not exist until the ticket runs.
+
+---
+
+## 11. Amnesty is measured, never asserted
+
+What pre-dates a ticket is decided by `_baseline_failures`, per signature, from
+a baseline the harness takes itself and records. A role writing the same claim
+in prose is guessing about a tree it cannot see, and respec did:
+
+> MainPanel.java ... currently has a pre-existing compilation error regarding
+> com.plexnamer.model. Do not modify it ... **Ignore this pre-existing
+> compilation error during verification.**
+
+Every clause was false. The package had never existed, and the error was the
+ticket's own scope failing to compile.
+
+A bad spec is re-derived from the next cycle's failures. A waiver is not: it
+lives in `context`, which survives every revision, and it teaches each new
+attempt to discard the one diagnostic the next revision would be made from — so
+the ticket stops accumulating evidence at all.
+
+**Refuse a waiver on the way in and clear one already in.** Both:
+`_refuse_verification_waivers` drops a revised `spec` or `context` that
+introduces one, judged against the plan's text so a ticket legitimately talking
+about tolerating errors can still be revised; `_disarmed_context` resets a
+context poisoned by an earlier cycle back to the plan's paragraph. Only the
+context — a spec legitimately evolves away from the plan's wording.
+
+---
+
+## 12. A step excused whole is not evidence
+
+The amnesty stops one abandoned file failing an entire backlog, and its cost is
+that an excused step ran no assertion about the ticket in front of it. On a
+compiled language a red typecheck means the test binary was never built: the
+suite did not run, the reviewer read a diff and said yes, and `done` came to
+mean "a model liked the look of it".
+
+One run marked five tickets done that way over a tree where `compileJava` failed
+on the first file it read — each one logging `typecheck still failing, but only
+on errors that pre-date this ticket` — and took 168 minutes and 2.4M tokens to
+do it. The end-of-backlog check caught it, which is to say it caught it after
+every ticket had already been reported green.
+
+**When nothing was verified, stop the run, not the ticket.** `_unverifiable`
+gates on two conditions, and the second is what keeps it off ordinary work:
+
+- Not one verify step passed. A green typecheck beside an excused suite still
+  means the code compiled.
+- Some ticket that may write a red file has already given up. Red owned by a
+  *pending* ticket is a backlog mid-flight — a JVM plan is routinely red between
+  the ticket that calls a class and the one that writes it — and red owned by
+  nobody is an orphan, which `_sweep_orphan_tests` and `_finish` handle. Red
+  owned by a ticket that is out of attempts is the one case where nothing
+  coming will clear it.
+
+The run ends there because the next ticket meets the same wall, and a retry
+cycle only requeues tickets into it. `StepResult.halt` is checked before
+`blocked` on purpose: the note names the red files, and `_widen_scope` reads a
+block note for exactly that.
+
+---
+
+## 13. "The command failed" is not "the code is wrong"
+
+Every diagnosis in the loop assumes the failing command reached the source. A
+launcher that never started breaks that assumption silently, because what it
+prints is not a diagnostic:
+
+```
+FAILURE: Build failed with an exception.
+* What went wrong:
+Gradle requires JVM 17 or later to run. Your build is currently configured to use JVM 8.
+```
+
+`signatures` returns the empty set, so there is nothing to attribute and the
+baseline treats it as excusable; `distill` keeps it whole; and it arrives in the
+executor's prompt as the thing to fix. The executor answers that the build
+environment is misconfigured and writes no files — which is recorded as a reply
+that did not parse, and costs a reprompt and then an attempt. It is right every
+time, and it is charged for being right.
+
+A run did this for ten minutes, thirty model calls and 131k tokens before a line
+of code was written. It also looked like a model problem in the log: 31 replies
+that "did not parse into files", 23 of them from a model refusing to invent
+code for a broken JAVA_HOME.
+
+**Name the environment failure and end the run on it.** `environment_failure`
+holds the spellings — command not found in each shell's wording, a JVM or
+runtime that will not start, a missing interpreter module — and
+`_note_toolchain` records the first. Two conditions, and the second is the
+guard: the output must match, **and** `signatures` must be empty. A suite
+asserting on the text of a shell error is real output about real code and prints
+a diagnostic block beside it.
+
+All three places a verify command runs consult it, and the third matters as much
+as the first: the baseline before a ticket is delegated, the verify step after
+one is, and `_finish`'s final check over a completed backlog — where every
+ticket is green and `backlog complete but typecheck still fails` would read as
+work the loop left undone rather than as a command that never started.
+
+The run ends `failed`, not `blocked`, and the ticket goes back to `pending`:
+nothing is wrong with the backlog, and `forge go` should resume it unchanged
+once the machine is fixed.
+
+---
+
 ## What is bug-loop-specific and what is not
 
 | Mechanism | Scope |
@@ -241,5 +375,9 @@ pairing rule is now `pair_applies` with a test named for it.
 | `_widen_scope` on a blocked ticket | every ticket |
 | `_recover_unlabeled` | every ticket with one writable file |
 | `evidence.reading_scope` | ingest, bug, re-diagnosis |
+| `_ground_references` / `evidence.locate_named` | every respec |
+| `_refuse_verification_waivers` / `_disarmed_context` | every respec |
+| `_unverifiable` / `StepResult.halt` | every ticket |
+| `environment_failure` / `_note_toolchain` | every verify step |
 | `resumable_runs` draining | every command that opens a run |
 | Reproduction, re-diagnosis, contradiction | bug tickets only |

@@ -387,3 +387,67 @@ def errors_naming(text: str, path: str) -> list[str]:
         if entry not in found:
             found.append(entry)
     return found
+
+
+# Output that says the command never ran the code, in the spellings the shells
+# and launchers use. Each phrase is one only a broken invocation prints — a
+# missing binary, an interpreter that will not start, a runtime the launcher
+# cannot find. None of them is something a compiler or a test runner says about
+# source code.
+#
+# The point of naming them is that the loop's whole diagnosis machinery assumes
+# the failing command reached the code. Handed `Gradle requires JVM 17 or later
+# to run. Your build is currently configured to use JVM 8`, it distils it,
+# files it as the ticket's failure, and asks a model to fix it. The model
+# answers — correctly — that this is an environment problem and writes no
+# files, which is then recorded as a reply that did not parse. One run spent
+# ten minutes, thirty model calls and 131k tokens on that exchange before any
+# code was written, and the executor was right every time.
+_ENVIRONMENT = (
+    re.compile(r"^.*: command not found", re.MULTILINE),
+    re.compile(r"is not recognized as an internal or external command", re.IGNORECASE),
+    re.compile(r"The term '[^']+' is not recognized as", re.IGNORECASE),
+    re.compile(r"^(?:/bin/)?s?h: \d*:? ?\S+: not found", re.MULTILINE),
+    re.compile(r"\brequires JVM \d+", re.IGNORECASE),
+    re.compile(r"\bJAVA_HOME\b[^\n]*(?:not set|invalid|does not)", re.IGNORECASE),
+    re.compile(r"Unable to locate a Java Runtime", re.IGNORECASE),
+    re.compile(r"No matching (?:Java )?toolchains found", re.IGNORECASE),
+    re.compile(r"Could not find or load main class", re.IGNORECASE),
+    re.compile(r"^\S*python\S*: No module named \w+", re.MULTILINE),
+    re.compile(r"no such command: `?\w+", re.IGNORECASE),
+    re.compile(r"could not find `Cargo\.toml`", re.IGNORECASE),
+    re.compile(r"^\S+: Permission denied", re.MULTILINE),
+)
+
+
+def environment_failure(output: str) -> str:
+    """The line saying this command never ran the code, or "".
+
+    Answers a question the rest of this module takes for granted: whether the
+    output is *about* the project at all. `signatures` and `files_blamed` both
+    assume a tool that started, read the source, and complained about it. A
+    launcher that cannot find a runtime produces neither a diagnostic nor a
+    location, and everything downstream reads that as "unparseable output",
+    which is excusable — so the failure survives every check the loop has and
+    lands in an executor prompt as work.
+
+    Deliberately not a judgment about severity. It answers "did the toolchain
+    run", and the caller decides what that means; a run is stopped on it,
+    because no ticket can fix a machine.
+
+    Callers must check `signatures(output)` is empty as well. A test suite
+    asserting on the text of a shell error is real output about real code and
+    prints a diagnostic block beside it; a launcher that never started prints
+    nothing else at all.
+    """
+    for pattern in _ENVIRONMENT:
+        found = pattern.search(output or "")
+        if not found:
+            continue
+        # The whole line, not the match: `requires JVM 17` is the fingerprint,
+        # and `Gradle requires JVM 17 or later to run. Your build is currently
+        # configured to use JVM 8` is what a person needs to read.
+        line = (output or "")[: found.start()].rsplit("\n", 1)[-1]
+        line += (output or "")[found.start() :].split("\n", 1)[0]
+        return line.strip()
+    return ""

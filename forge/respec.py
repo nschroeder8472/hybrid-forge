@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
+from .evidence import MAX_LOCATE, locate_named, repo_files
 from .ingest import derive_needs, plan_decisions, whole_file_claims
 from .patch import is_safe_path, normalize_path
 from .prompts import parse_respec, respec_prompt
@@ -108,6 +109,57 @@ def sources_for(root: Path, ticket: Ticket) -> dict[str, str]:
     return found
 
 
+def _ground_references(
+    root: Path, proposed: Sequence[str]
+) -> tuple[list[str], list[tuple[str, str]], list[str]]:
+    """Point a revised read scope at files that are actually there.
+
+    Returns `(kept, remapped, invented)` — the paths to use, the ones moved to
+    where the file really is, and the ones nothing in the repository answers to.
+
+    `reference_files` is the one field whose whole purpose is to be read off
+    disk. A path that does not resolve is not a smaller version of the right
+    answer, it is silence: `sources_for` skips what it cannot open, and the
+    executor is handed a prompt that mentions the file and shows none of it.
+    Nothing downstream notices, because a reference the executor never sees
+    looks exactly like a reference it read and ignored.
+
+    That is how a Java run died. Respec reported "added minimal stubs for these
+    classes to reference_files" and wrote three paths one package short of the
+    real ones. The executor, shown nothing, imported the package the paths
+    implied, and the next five attempts were spent being told by javac that the
+    symbol does not exist — with the same wrong paths handed back every cycle,
+    because nothing checked them.
+
+    `allowed_files` gets no such treatment and must not: a ticket's writable
+    scope is where its work is *going*, and most of those files do not exist
+    until it runs.
+    """
+    kept: list[str] = []
+    remapped: list[tuple[str, str]] = []
+    invented: list[str] = []
+    # Listed once. `locate_named` would otherwise walk the repository per path,
+    # and a revision naming six references would list it six times.
+    pool = repo_files(root, limit=MAX_LOCATE)
+    for path in proposed:
+        candidate = normalize_path(str(path).strip())
+        if not candidate:
+            continue
+        if not is_safe_path(root, candidate):
+            invented.append(candidate)
+            continue
+        if (root / candidate).is_file():
+            kept.append(candidate)
+            continue
+        found = locate_named(root, candidate, files=pool)
+        if found:
+            remapped.append((candidate, found))
+            kept.append(found)
+            continue
+        invented.append(candidate)
+    return list(dict.fromkeys(kept)), remapped, invented
+
+
 # The provenance note the respec prompt puts beside a criterion, in either the
 # emphasised or bare spelling, wherever a planner has echoed it back.
 _PROVENANCE_NOTE = re.compile(
@@ -191,6 +243,138 @@ def _refuse_protocol_edits(
             revision.pop(field_name)
             dropped.append((field_name, sorted(introduced)[0]))
     return dropped
+
+
+# Ways of telling a role that a failing check does not count. Respec sees a
+# ticket that failed on errors it did not cause, and the cheapest revision
+# available is not to fix anything — it is to write down that the failure was
+# already there and may be passed over. That sentence is a claim about the
+# state of the tree, made by a planner that cannot see the tree, and it
+# outlives the cycle that made it.
+#
+# Matched as a verb reaching for a failure rather than on the words alone: a
+# ticket may legitimately say "ignore case", "ignore hidden files", or "skip
+# the header row", and none of those excuse anything.
+_WAIVERS = (
+    (
+        "excusing an error",
+        re.compile(
+            r"\bignor\w*\b[^.\n]{0,80}\b(?:error|failure|diagnostic)s?\b", re.IGNORECASE
+        ),
+    ),
+    (
+        "excusing an error",
+        re.compile(r"\b(?:error|failure)s?\b[^.\n]{0,80}\bignor\w*", re.IGNORECASE),
+    ),
+    (
+        "calling a failure pre-existing",
+        re.compile(
+            r"\bpre-?existing\b[^.\n]{0,60}\b(?:error|failure|breakage)s?\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "leaving a failure unfixed",
+        re.compile(
+            r"\b(?:do not|don't|no need to|need not)\s+"
+            r"(?:try to\s+|attempt to\s+)?(?:fix|repair|address|resolve)\b"
+            r"[^.\n]{0,60}\b(?:error|failure)s?\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "waiving a verify step",
+        re.compile(
+            r"\b(?:skip|bypass|disable|suppress|waive)\w*\b[^.\n]{0,40}"
+            r"\b(?:verification|verify|typecheck|type check|compilation|"
+            r"the tests?|test suite|the build)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "declaring a failure out of scope",
+        re.compile(
+            r"\bnot (?:your|this ticket'?s?|the ticket'?s?)\s+"
+            r"(?:concern|problem|responsibility|job|fault)\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def _waiver_language(text: str) -> set[str]:
+    return {label for label, pattern in _WAIVERS if pattern.search(text or "")}
+
+
+def _refuse_verification_waivers(
+    ticket: Ticket, revision: dict, ruled_out: Sequence[tuple[str, str]] = ()
+) -> list[tuple[str, str]]:
+    """Drop a revised `spec` or `context` that excuses a failing check.
+
+    The sibling of `_refuse_protocol_edits`, against a costlier revision. One
+    run's respec wrote into a ticket's context: "MainPanel.java ... currently
+    has a pre-existing compilation error regarding com.plexnamer.model. Do not
+    modify it ... Ignore this pre-existing compilation error during
+    verification." Every clause of that was wrong. The package had never
+    existed, the error was the ticket's own scope failing to compile, and the
+    sentence told five further attempts and two retry cycles to look past the
+    one diagnostic that said what was broken.
+
+    What makes it worse than an ordinary bad revision is that it is durable. A
+    spec can be re-revised from the next cycle's failures; a context sentence
+    saying the failures do not count teaches every later role to discard the
+    evidence a revision would be made from, so the ticket stops accumulating
+    any.
+
+    Amnesty for pre-existing breakage is a real thing and the harness already
+    grants it — from a baseline it measured itself, per signature, recorded in
+    the step log. It is not a planner's to assert in prose.
+
+    Judged by what the revision introduces, so a plan that legitimately talks
+    about tolerating errors can still be revised. Returns the fields dropped,
+    with the kind of waiver that cost them.
+    """
+    anchors = {
+        "spec": _anchor(ticket, ruled_out),
+        "context": ticket.context if ruled_out else (ticket.original_context or ticket.context),
+    }
+    dropped: list[tuple[str, str]] = []
+    for field_name, anchor in anchors.items():
+        if field_name not in revision:
+            continue
+        introduced = _waiver_language(revision[field_name]) - _waiver_language(anchor)
+        if introduced:
+            revision.pop(field_name)
+            dropped.append((field_name, sorted(introduced)[0]))
+    return dropped
+
+
+def _disarmed_context(ticket: Ticket, ruled_out: Sequence[tuple[str, str]] = ()) -> str:
+    """The context this ticket should carry, once a waiver is stripped from it.
+
+    Returns the ticket's own context unless it has been talked out of caring
+    about a failing check, in which case it returns the plan's paragraph — the
+    empty string included, which is a legitimate restoration for a ticket whose
+    plan gave it no context and whose whole context is a planner's invention.
+
+    The guard above stops a waiver being written. This clears one already
+    written, and both are needed: a ticket carries its context across every
+    cycle, so a sentence that landed before the guard existed — or in a run
+    since resumed — would otherwise go on instructing the executor forever.
+    The plan's paragraph is the fixed point, exactly as it is for
+    `_preserve_plan_context`.
+
+    Only the context, never the spec. A spec legitimately evolves away from the
+    plan's wording and is re-derived from the failures every cycle; the context
+    is the field respec is invited to write freely, which is why it is also the
+    field where a waiver survives unexamined.
+    """
+    if ruled_out:
+        return ticket.context
+    plan = ticket.original_context or ""
+    if _waiver_language(ticket.context) - _waiver_language(plan):
+        return plan
+    return ticket.context
 
 
 def _anchor(ticket: Ticket, ruled_out: Sequence[tuple[str, str]] = ()) -> str:
@@ -498,6 +682,7 @@ def revise(
     sources: dict[str, str] | None = None,
     criteria_locked: bool = True,
     contradiction: dict[str, list[str]] | None = None,
+    root: Path | None = None,
 ) -> Revision:
     """Rewrite one ticket in place from its recorded failures.
 
@@ -509,6 +694,11 @@ def revise(
     `gave_up_note` is the ticket's `blocked_note`, which the requeue clears. For
     a ticket the executor abandoned with `BLOCKED:` it is the only record of
     what it could not decide, and no step was ever logged as failed.
+
+    `root` is the repository, and without it a revised `reference_files` is
+    taken on trust — see `_ground_references` for what that cost. Optional only
+    because a caller may have no tree to check against; every caller in this
+    codebase passes it.
     """
     failures = store.ticket_failures(run_id, ticket.ticket_id)
     # A ticket that never ran has nothing to learn from, and its `blocked_note`
@@ -638,6 +828,80 @@ def revise(
             kind="ticket",
         )
 
+    # A read scope is only worth what the executor can open. Checked against
+    # the tree here rather than trusted, because every role downstream treats
+    # an unreadable reference as no reference at all and says nothing.
+    if root is not None and revision.get("reference_files"):
+        revision["reference_files"], remapped, invented = _ground_references(
+            root, revision["reference_files"]
+        )
+        for wrong, right in remapped:
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: respec asked the executor to read "
+                f"{wrong}, which does not exist; the only file by that name in "
+                f"this repository is {right}, so that is what it will be shown.",
+                level="warn",
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "was": wrong, "now": right},
+            )
+        if invented:
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: respec named {len(invented)} reference "
+                f"file(s) this repository does not contain under any name; "
+                f"dropped. A path that cannot be opened reaches the executor as "
+                f"silence, not as a smaller hint — it is shown nothing and left "
+                f"to guess at the contents:\n"
+                + "\n".join(f"  - {path}" for path in invented[:5]),
+                level="warn",
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "invented": invented},
+            )
+        # Every path it proposed was invented. Keeping the empty list would
+        # strip the read scope the plan gave the ticket on the strength of a
+        # revision that named nothing real.
+        if not revision["reference_files"]:
+            revision.pop("reference_files")
+
+    # The scope the ticket is already carrying, when this revision did not
+    # touch it. A phantom path that landed in an earlier cycle is not
+    # self-correcting: the next respec sees a ticket whose references look
+    # settled, proposes nothing, and the executor is shown the same silence
+    # again. Same reasoning as clearing a stale waiver below.
+    if root is not None and "reference_files" not in revision and ticket.reference_files:
+        grounded, remapped, invented = _ground_references(root, ticket.reference_files)
+        if grounded and grounded != list(ticket.reference_files):
+            revision["reference_files"] = grounded
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: this ticket was carrying "
+                f"{len(remapped) + len(invented)} reference path(s) that do not "
+                f"resolve, left by an earlier revision; corrected where the file "
+                f"was findable by name and dropped where it was not. The "
+                f"executor was being shown nothing for them.",
+                level="warn",
+                kind="ticket",
+                data={
+                    "ticket": ticket.ticket_id,
+                    "remapped": remapped,
+                    "invented": invented,
+                },
+            )
+
+    for field_name, waiver in _refuse_verification_waivers(ticket, revision, ruled_out):
+        store.log(
+            run_id,
+            f"{ticket.ticket_id}: respec rewrote {field_name} to excuse a "
+            f"failing check ({waiver}); dropped. What pre-dates a ticket is "
+            f"measured from a baseline the harness takes itself and recorded "
+            f"per error — a ticket that asserts it in prose is telling every "
+            f"later attempt to look past the diagnostic that says what broke.",
+            level="warn",
+            kind="ticket",
+            data={"ticket": ticket.ticket_id, "field": field_name, "waiver": waiver},
+        )
+
     # A decision is not a criterion, so the ratchet never covered it. Refused
     # whole: a spec revised around a dropped decision has already reasoned from
     # its absence, and keeping the sentence while keeping the rest of that
@@ -671,6 +935,26 @@ def revise(
             level="warn",
             kind="ticket",
         )
+
+    # A waiver that landed in an earlier cycle — before this guard existed, or
+    # in a run since resumed. Cleared here rather than only refused above,
+    # because the context is the one field that survives every revision: left
+    # alone it goes on telling each new attempt that the check it is failing
+    # does not count.
+    if "context" not in revision:
+        disarmed = _disarmed_context(ticket, ruled_out)
+        if disarmed != ticket.context:
+            revision["context"] = disarmed
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: this ticket was carrying a context that "
+                f"excused a failing check, written by an earlier revision. It "
+                f"has been reset to the plan's; the harness decides what "
+                f"pre-dates a ticket, from a baseline it measures.",
+                level="warn",
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "was": ticket.context[:2000]},
+            )
 
     # Instruction-following is not an access control, so provenance is enforced
     # here rather than merely described in the prompt.
