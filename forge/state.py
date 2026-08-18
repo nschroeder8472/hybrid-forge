@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     needs         TEXT NOT NULL DEFAULT '[]',
     dep_stamp     TEXT NOT NULL DEFAULT '{}',
     baseline_tree TEXT NOT NULL DEFAULT '',
+    charged_failures TEXT NOT NULL DEFAULT '[]',
     context       TEXT NOT NULL DEFAULT '',
     blocked_note  TEXT NOT NULL DEFAULT '',
     original_spec     TEXT NOT NULL DEFAULT '',
@@ -189,6 +190,21 @@ class Ticket:
     # re-snapshotting per run measures the ticket against its own output and
     # produces an empty diff for a reviewer that has nothing left to judge.
     baseline_tree: str = ""
+    # Failure signatures this ticket has been seen to introduce, in any cycle.
+    #
+    # The baseline is re-taken every cycle on purpose: other tickets run in
+    # between, and their breakage has to keep being excused or this ticket
+    # spends its attempts on code it may not open. But nothing reverts a failed
+    # ticket, so its own breakage is on disk when the next cycle starts and the
+    # fresh baseline reads it as pre-existing — amnesty for the exact errors it
+    # just wrote. That is not hypothetical: one run's debt climbed 3, 7, 13, 20
+    # across seven tickets, every one of them passing verification.
+    #
+    # Charging is what separates the two. A signature recorded here is never
+    # excused for this ticket again, however many cycles later it is seen,
+    # while a failure that appeared while some other ticket was running is
+    # still inherited normally.
+    charged_failures: list[str] = field(default_factory=list)
     context: str = ""
     blocked_note: str = ""
     # The spec and criteria as the plan was ingested, never rewritten. Respec
@@ -256,6 +272,7 @@ class Ticket:
             "needs": json.dumps(self.needs),
             "dep_stamp": json.dumps(self.dep_stamp),
             "baseline_tree": self.baseline_tree,
+            "charged_failures": json.dumps(self.charged_failures),
             "context": self.context,
             "blocked_note": self.blocked_note,
             "original_spec": self.original_spec,
@@ -281,6 +298,7 @@ class Ticket:
             needs=json.loads(row["needs"]),
             dep_stamp=json.loads(row["dep_stamp"]),
             baseline_tree=row["baseline_tree"],
+            charged_failures=json.loads(row["charged_failures"]),
             context=row["context"],
             blocked_note=row["blocked_note"],
             original_spec=row["original_spec"],
@@ -343,6 +361,7 @@ class Store:
         ("tickets", "needs", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "dep_stamp", "TEXT NOT NULL DEFAULT '{}'"),
         ("tickets", "baseline_tree", "TEXT NOT NULL DEFAULT ''"),
+        ("tickets", "charged_failures", "TEXT NOT NULL DEFAULT '[]'"),
     )
 
     def _migrate(self) -> None:
@@ -532,12 +551,12 @@ class Store:
                     "INSERT OR REPLACE INTO tickets "
                     "(run_id, ticket_id, title, route, kind, status, position, attempts, "
                     " attempt_base, spec, allowed_files, reference_files, criteria, needs, dep_stamp, "
-                    " baseline_tree, context, "
+                    " baseline_tree, charged_failures, context, "
                     " blocked_note, original_spec, original_criteria, original_context, "
                     " updated_at) "
                     "VALUES (:run_id, :ticket_id, :title, :route, :kind, :status, :position, "
                     ":attempts, :attempt_base, :spec, :allowed_files, :reference_files, "
-                    ":criteria, :needs, :dep_stamp, :baseline_tree, :context, "
+                    ":criteria, :needs, :dep_stamp, :baseline_tree, :charged_failures, :context, "
                     ":blocked_note, :original_spec, :original_criteria, :original_context, :now)",
                     {**row, "run_id": run_id, "now": now},
                 )
@@ -591,7 +610,8 @@ class Store:
                 "attempt_base = :attempt_base, spec = :spec, "
                 "allowed_files = :allowed_files, reference_files = :reference_files, "
                 "criteria = :criteria, needs = :needs, dep_stamp = :dep_stamp, "
-                "baseline_tree = :baseline_tree, context = :context, "
+                "baseline_tree = :baseline_tree, "
+                "charged_failures = :charged_failures, context = :context, "
                 "blocked_note = :blocked_note, updated_at = :now "
                 "WHERE run_id = :run_id AND ticket_id = :ticket_id",
                 {**ticket.as_row(), "run_id": run_id, "now": time.time()},

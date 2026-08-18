@@ -350,6 +350,34 @@ def normalize_path(path: str) -> str:
     return normalized
 
 
+def repo_relative(path: str, root: Path | str | None = None) -> str:
+    """Re-express an absolute diagnostic path as repo-relative, if it is inside.
+
+    Compilers disagree on whether to report a path relative to the invocation
+    or in full: rustc prints `src/board.rs`, javac and msvc print
+    `d:\\repo\\src\\main\\java\\A.java`. Scope patterns are repo-relative, so
+    the absolute form matches nothing, and in the loop "matches nothing" means
+    "not this ticket's fault" — a whole toolchain's errors excused for being
+    spelled the way that toolchain spells them.
+
+    Only an exact repository-root prefix is removed, and the comparison folds
+    case because `signatures` lowercases and Windows roots do not. This narrows
+    what a pattern can match rather than widening it: `/etc/passwd` is left
+    absolute and still cannot match a repo-relative pattern, which is the
+    property `normalize_path` refuses to give up.
+    """
+    normalized = normalize_path(path)
+    if root is None:
+        return normalized
+    base = normalize_path(str(root)).rstrip("/")
+    if not base:
+        return normalized
+    prefix = base.lower() + "/"
+    if normalized.lower().startswith(prefix):
+        return normalized[len(prefix):]
+    return normalized
+
+
 def matches_any(path: str, patterns: list[str]) -> bool:
     normalized = normalize_path(path)
     for pattern in patterns:

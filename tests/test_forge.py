@@ -59,8 +59,9 @@ from forge.patch import (
     matches_any,
     normalize_path,
     parse_output,
+    repo_relative,
 )
-from forge.failures import distill, errors_naming, signatures
+from forge.failures import distill, errors_naming, locations, signatures
 from forge.prompts import (
     bug_prompt,
     locate_prompt,
@@ -8262,6 +8263,457 @@ class TestTheBaselineExcuseStopsAtTheTicketsScope(unittest.TestCase):
         self.assertFalse(
             Orchestrator._signature_scope("error: linking failed", ["src/board.rs"])
         )
+
+
+class TestScopeMatchingIsLanguageAgnostic(unittest.TestCase):
+    """Attribution must not depend on which compiler produced the diagnostic.
+
+    It did. `_signature_scope` read locations out of rustc's `-->` marker and
+    nothing else, so cargo was attributed correctly and every other toolchain
+    parsed to no location at all — which the code treats as unattributable, and
+    therefore excusable. A Java run drove seven tickets to `done` with twenty
+    compile errors standing, each cycle's baseline laundering the last cycle's
+    breakage into "pre-existing": 3 errors, then 7, then 13, then 20.
+
+    One case per dialect, because the failure mode is silent: a toolchain whose
+    spelling is not handled does not error, it just stops blaming anyone.
+    """
+
+    # (name, diagnostic, the repo-relative file it is about)
+    DIALECTS = [
+        ("rustc", "error[E0603]: module is private\n  --> src/board.rs:21:19", "src/board.rs"),
+        ("javac", "src/main/java/com/p/Scanner.java:33: error: cannot find symbol", "src/main/java/com/p/Scanner.java"),
+        ("tsc", "src/app/main.ts(33,7): error TS2345: Argument of type 'x'", "src/app/main.ts"),
+        ("gcc", "src/main.c:44:9: error: 'foo' undeclared", "src/main.c"),
+        ("go", "./internal/scan/scan.go:18:2: undefined: Foo", "internal/scan/scan.go"),
+        ("pytest", "E   AssertionError: assert 1 == 2\ntests/test_scan.py:12: in <module>", "tests/test_scan.py"),
+        ("eslint", "src/index.js:7:1: error  Unexpected var", "src/index.js"),
+        ("dotnet", "src/Program.cs(15,20): error CS0103: The name 'x'", "src/Program.cs"),
+        ("kotlin", "e: file:///repo/src/Main.kt:9:5 Unresolved reference", "/repo/src/Main.kt"),
+        ("swift", "Sources/App/main.swift:22:9: error: cannot find 'x'", "Sources/App/main.swift"),
+        ("scala", "src/main/scala/Main.scala:14:20: not found: value x", "src/main/scala/Main.scala"),
+        ("msvc", "src/main.cpp(120): error C2065: undeclared identifier", "src/main.cpp"),
+    ]
+
+    def test_every_dialect_claims_a_file_inside_the_scope(self):
+        for name, diagnostic, owned in self.DIALECTS:
+            with self.subTest(dialect=name):
+                self.assertTrue(
+                    Orchestrator._signature_scope(diagnostic.lower(), [owned]),
+                    f"{name}: a diagnostic about {owned} was not recognised as "
+                    f"in scope, so the ticket that broke it would be excused",
+                )
+
+    def test_every_dialect_still_excuses_a_file_outside_the_scope(self):
+        # The other half: amnesty has to keep working, or a ticket spends its
+        # attempts on an error it has no authority to fix.
+        for name, diagnostic, _owned in self.DIALECTS:
+            with self.subTest(dialect=name):
+                self.assertFalse(
+                    Orchestrator._signature_scope(
+                        diagnostic.lower(), ["some/unrelated/file.txt"]
+                    ),
+                    f"{name}: a diagnostic was blamed on a ticket that cannot "
+                    f"open the file it names",
+                )
+
+
+class TestAbsoluteDiagnosticPathsResolveAgainstTheRepo(unittest.TestCase):
+    """javac and msvc print full paths; scope patterns are repo-relative.
+
+    Without resolving one against the other the two never match, and "no match"
+    means "not this ticket's fault" — so every error a Windows Java build
+    reported was excused, including the ones in the ticket's own files.
+    """
+
+    ROOT = r"D:\repo\project"
+    DIAGNOSTIC = (
+        r"d:\repo\project\src\main\java\com\p\Scanner.java:33: "
+        r"error: cannot find symbol"
+    )
+    OWNED = "src/main/java/com/p/Scanner.java"
+
+    def test_an_absolute_path_inside_the_repo_is_claimed(self):
+        self.assertTrue(
+            Orchestrator._signature_scope(
+                self.DIAGNOSTIC.lower(), [self.OWNED], self.ROOT
+            )
+        )
+
+    def test_the_root_comparison_folds_case(self):
+        # `signatures` lowercases its input; a Windows root does not arrive
+        # lowercased, so a case-sensitive prefix test would never strip.
+        self.assertTrue(
+            Orchestrator._signature_scope(
+                self.DIAGNOSTIC.lower(), [self.OWNED], r"d:\REPO\PROJECT"
+            )
+        )
+
+    def test_without_a_root_the_absolute_path_stays_unmatched(self):
+        # Documents why `root` has to be threaded through at all.
+        self.assertFalse(
+            Orchestrator._signature_scope(self.DIAGNOSTIC.lower(), [self.OWNED])
+        )
+
+    def test_a_path_outside_the_repo_is_not_made_relative(self):
+        # `repo_relative` must narrow what matches, never widen it: a file in
+        # another checkout should not be able to satisfy a repo-relative
+        # pattern by having a similar tail.
+        self.assertFalse(
+            Orchestrator._signature_scope(
+                r"d:\other\project\src\main\java\com\p\Scanner.java:33: error: x",
+                [self.OWNED],
+                self.ROOT,
+            )
+        )
+
+    def test_repo_relative_leaves_a_foreign_absolute_path_alone(self):
+        self.assertEqual(repo_relative("/etc/passwd", self.ROOT), "/etc/passwd")
+
+    def test_repo_relative_strips_only_the_root_prefix(self):
+        self.assertEqual(
+            repo_relative(r"D:\repo\project\src\a.py", self.ROOT), "src/a.py"
+        )
+
+
+class TestLocationsReadsEveryDialect(unittest.TestCase):
+    def test_prose_carrying_no_location_parses_to_nothing(self):
+        # The guard that keeps a ticket from being blamed for a diagnostic that
+        # names no file at all. `expected 2, found 1` must not read as a path.
+        for text in (
+            "error: expected 2 items, found 1",
+            "error: linking with `cc` failed",
+            "AssertionError: assert 1 == 2",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(locations(text), [])
+
+    def test_a_file_uri_is_reduced_to_its_path(self):
+        # kotlinc reports `e: file:///repo/src/Main.kt:9:5`. The `e` ending
+        # `file` was read as a drive letter, yielding `e:///repo/src/Main.kt`.
+        self.assertEqual(
+            locations("e: file:///repo/src/Main.kt:9:5 Unresolved reference"),
+            ["/repo/src/Main.kt"],
+        )
+
+    def test_a_windows_path_keeps_its_drive_and_directories(self):
+        self.assertEqual(
+            locations(r"d:\proj\src\A.java:33: error: cannot find symbol"),
+            ["d:/proj/src/A.java"],
+        )
+
+    def test_the_parenthesised_form_is_a_location(self):
+        self.assertEqual(locations("src/app/main.ts(33,7): error TS2345: x"), ["src/app/main.ts"])
+
+    def test_an_extensionless_path_needs_a_separator(self):
+        # `build/Makefile:12` is a location; a bare `Makefile:12` is not, because
+        # accepting bare words would let prose read as a filename.
+        self.assertEqual(locations("build/Makefile:12: *** missing separator"), ["build/Makefile"])
+        self.assertEqual(locations("Makefile:12: *** missing separator"), [])
+
+
+class TestPytestSignaturesStayDistinctPerFile(unittest.TestCase):
+    def test_the_same_assertion_in_two_files_is_two_signatures(self):
+        # `_block_key` took its location from rustc's `-->` alone, so pytest
+        # failures reading the same message collapsed into one signature — and
+        # a set difference against it forgave a genuinely new failure.
+        one = signatures("E   AssertionError: assert 1 == 2\ntests/test_a.py:12: in <module>")
+        two = signatures("E   AssertionError: assert 1 == 2\ntests/test_b.py:12: in <module>")
+
+        self.assertEqual(len(one), 1)
+        self.assertEqual(len(two), 1)
+        self.assertNotEqual(one, two)
+
+
+class TestARetryCycleCannotLaunderItsOwnBreakage(unittest.TestCase):
+    """A ticket's own errors must not come back as somebody else's.
+
+    The baseline is re-taken every cycle, which is right: other tickets run in
+    between and their breakage has to keep being excused. But nothing reverts a
+    failed ticket, so on a retry its own errors are still on disk, and a fresh
+    baseline could not tell the two apart. It excused them -- and since the
+    excuse renews every cycle, the debt could only grow. One run went 3 errors,
+    then 7, then 13, then 20, and ended with all seven tickets `done` on a tree
+    that did not compile.
+    """
+
+    OWN = (
+        "error: casting to the same type is unnecessary\n"
+        "  --> web/main.js:12:3\n"
+        "   |\n"
+    )
+    FOREIGN = (
+        "error[E0308]: mismatched types\n"
+        "  --> other/thing.js:9:1\n"
+        "   |\n"
+    )
+
+    def _orchestrator(self, output):
+        orch, _root, run_id = _stub_orchestrator(
+            commands={"lint": "cargo clippy", "typecheck": "", "test": ""}
+        )
+        # Mutable so a test can move the tree between cycles, which is the whole
+        # situation being modelled: the baseline a cycle takes depends on what
+        # the previous cycle left behind.
+        state = {"output": output}
+        orch._shell = lambda *_a, **_k: StepResult(
+            ok=not state["output"], detail=state["output"]
+        )
+        return orch, run_id, state
+
+    def test_a_charged_signature_is_not_excused_on_the_next_cycle(self):
+        # Cycle 1 starts on a clean tree, so it inherits nothing...
+        orch, run_id, state = self._orchestrator("")
+        ticket = Ticket("T-1", allowed_files=["src/board.rs"])
+        orch.store.add_tickets(run_id, [ticket])
+
+        self.assertEqual(orch._inherited_failures(run_id, ticket), {})
+
+        # ...then breaks `web/main.js`, which is outside its scope. Nothing
+        # reverts a failed ticket, so the damage is still there afterwards.
+        orch._charge(run_id, ticket, signatures(self.OWN))
+        state["output"] = self.OWN
+
+        # Cycle 2 takes a fresh baseline and finds the error already on disk.
+        # Before charging existed it was excused here, every cycle, forever.
+        second = orch._inherited_failures(run_id, ticket)
+
+        self.assertEqual(second, {}, "the ticket was forgiven its own breakage")
+
+    def test_another_tickets_breakage_is_still_inherited(self):
+        # The half that must not regress. Amnesty exists so a ticket does not
+        # spend its attempts on a file it has no authority to open.
+        orch, run_id, _state = self._orchestrator(self.FOREIGN)
+        ticket = Ticket("T-1", allowed_files=["src/board.rs"])
+        orch.store.add_tickets(run_id, [ticket])
+        orch._charge(run_id, ticket, signatures(self.OWN))
+
+        inherited = orch._inherited_failures(run_id, ticket)
+
+        self.assertEqual(len(inherited.get("lint", set())), 1)
+
+    def test_charges_survive_a_reload_from_the_store(self):
+        # The laundering happens across cycles, and a cycle is a fresh
+        # `_run_ticket` reading the ticket back out of sqlite. A charge held
+        # only in memory would be forgotten exactly when it is needed.
+        orch, run_id, _state = self._orchestrator(self.OWN)
+        ticket = Ticket("T-1", allowed_files=["src/board.rs"])
+        orch.store.add_tickets(run_id, [ticket])
+        orch._charge(run_id, ticket, signatures(self.OWN))
+
+        reloaded = {t.ticket_id: t for t in orch.store.list_tickets(run_id)}["T-1"]
+
+        self.assertEqual(reloaded.charged_failures, sorted(signatures(self.OWN)))
+        self.assertEqual(orch._inherited_failures(run_id, reloaded), {})
+
+    def test_charging_accumulates_across_cycles(self):
+        orch, run_id, _state = self._orchestrator(self.OWN)
+        ticket = Ticket("T-1", allowed_files=["src/board.rs"])
+        orch.store.add_tickets(run_id, [ticket])
+
+        orch._charge(run_id, ticket, signatures(self.OWN))
+        orch._charge(run_id, ticket, signatures(self.FOREIGN))
+
+        self.assertEqual(
+            set(ticket.charged_failures),
+            signatures(self.OWN) | signatures(self.FOREIGN),
+        )
+
+    def test_charging_the_same_signature_twice_does_not_grow_the_list(self):
+        orch, run_id, _state = self._orchestrator(self.OWN)
+        ticket = Ticket("T-1", allowed_files=["src/board.rs"])
+        orch.store.add_tickets(run_id, [ticket])
+
+        orch._charge(run_id, ticket, signatures(self.OWN))
+        orch._charge(run_id, ticket, signatures(self.OWN))
+
+        self.assertEqual(len(ticket.charged_failures), 1)
+
+    def test_nothing_is_charged_when_the_step_passes(self):
+        orch, run_id, _state = self._orchestrator(self.OWN)
+        ticket = Ticket("T-1", allowed_files=["src/board.rs"])
+        orch.store.add_tickets(run_id, [ticket])
+
+        orch._charge(run_id, ticket, set())
+
+        self.assertEqual(ticket.charged_failures, [])
+
+    def test_baseline_verify_off_still_inherits_nothing(self):
+        orch, run_id, _state = self._orchestrator(self.OWN)
+        orch.config.loop.baseline_verify = False
+        ticket = Ticket("T-1", allowed_files=["src/board.rs"])
+        orch.store.add_tickets(run_id, [ticket])
+
+        self.assertEqual(orch._inherited_failures(run_id, ticket), {})
+
+
+class TestWhatCountsAsATestFile(unittest.TestCase):
+    """Recognising a test must not depend on the language it is written in.
+
+    It did. The rule was a set of globs holding only the snake_case spellings --
+    `test_x`, `x_test`, `x.test` -- plus a `tests/` directory at the repository
+    root: Rust, Go, pytest, jest. A Gradle project keeps `VideoExtensionsTest`
+    under `src/test/java/`, which matched none of them, so a test file the plan
+    had already named was invisible to every decision the loop makes about
+    tests.
+    """
+
+    RECOGNISED = [
+        "src/test/java/com/p/VideoExtensionsTest.java",   # JUnit, Gradle layout
+        "src/test/java/com/p/FakeMainView.java",          # helper, but in the source set
+        "src/test/kotlin/com/p/ScannerSpec.kt",           # Kotest
+        "tests/tt_001_test.rs",                           # rust
+        "tests/pn_001_test.java",                         # what this loop used to invent
+        "src/test_foo.py",                                # pytest
+        "src/foo_test.go",                                # go
+        "src/Foo.test.ts",                                # jest
+        "src/UserTests.cs",                               # NUnit / xUnit
+        "spec/user_spec.rb",                              # rspec
+        "src/Test.java",                                  # the whole name is the word
+    ]
+
+    # Names that merely contain the letters. The capital in `VideoExtensionsTest`
+    # is the only thing separating these, which is why the check cannot be a
+    # glob: `fnmatch` folds case on Windows and not on Linux, so `*Test.*`
+    # matches `latest.js` on one platform and not the other.
+    NOT_RECOGNISED = [
+        "src/main/java/com/p/ScannedFile.java",
+        "src/latest.js",
+        "src/components/Testimonials.jsx",
+        "src/contest.py",
+        "src/protest.rs",
+        "src/main/Attest.java",
+    ]
+
+    def test_a_test_file_is_recognised_in_every_language(self):
+        for path in self.RECOGNISED:
+            with self.subTest(path=path):
+                self.assertTrue(Orchestrator._is_test_path(path))
+
+    def test_a_word_that_merely_contains_test_is_not_one(self):
+        for path in self.NOT_RECOGNISED:
+            with self.subTest(path=path):
+                self.assertFalse(Orchestrator._is_test_path(path))
+
+    def test_recognition_survives_windows_separators(self):
+        self.assertTrue(
+            Orchestrator._is_test_path(r"src\test\java\com\p\ScannedFileTest.java")
+        )
+
+
+class TestTheTesterWritesWhereTheBuildLooks(unittest.TestCase):
+    """A test the build never compiles is not a weaker check, it is no check.
+
+    `gradlew test` collects `src/test/java/**`. Every file the tester wrote
+    landed in `tests/`, so it was never compiled and never run -- one of them
+    imported a package that does not exist and failed nothing for a whole run.
+    Verification silently degraded to review-only while reporting green.
+    """
+
+    def _orchestrator(self):
+        orch, root, _run_id = _stub_orchestrator(
+            commands={"lint": "", "typecheck": "", "test": "gradlew.bat test"}
+        )
+        return orch, root
+
+    def test_several_designated_tests_no_longer_fall_through(self):
+        # The Rust-shaped assumption: one integration test per ticket. Languages
+        # that pair a test class with each production class name several, and
+        # requiring exactly one sent the ticket off to invent a path instead.
+        orch, _root = self._orchestrator()
+        ticket = Ticket(
+            "PN-001",
+            allowed_files=[
+                "src/main/java/com/p/ScannedFile.java",
+                "src/test/java/com/p/ScannedFileTest.java",
+                "src/test/java/com/p/VideoExtensionsTest.java",
+            ],
+        )
+
+        path, _ = orch._test_target(
+            ticket, ["src/main/java/com/p/ScannedFile.java"], None
+        )
+
+        self.assertTrue(path.startswith("src/test/java/"), path)
+
+    def test_the_designated_test_is_paired_with_what_the_ticket_wrote(self):
+        orch, _root = self._orchestrator()
+        ticket = Ticket(
+            "PN-001",
+            allowed_files=[
+                "src/test/java/com/p/ScannedFileTest.java",
+                "src/test/java/com/p/VideoExtensionsTest.java",
+            ],
+        )
+
+        path, _ = orch._test_target(
+            ticket, ["src/main/java/com/p/VideoExtensions.java"], None
+        )
+
+        self.assertEqual(path, "src/test/java/com/p/VideoExtensionsTest.java")
+
+    def test_the_choice_does_not_move_when_the_plan_is_reordered(self):
+        # The path is fixed for the life of the ticket. A second cycle that
+        # picked differently would strand the first cycle's file, owned by
+        # nobody and failing every ticket after it.
+        orch, _root = self._orchestrator()
+        designated = [
+            "src/test/java/com/p/AlphaTest.java",
+            "src/test/java/com/p/BetaTest.java",
+        ]
+        first = orch._test_target(Ticket("T-1", allowed_files=designated), ["x.java"], None)
+        second = orch._test_target(
+            Ticket("T-1", allowed_files=list(reversed(designated))), ["x.java"], None
+        )
+
+        self.assertEqual(first[0], second[0])
+
+    def test_an_invented_jvm_test_lands_in_the_build_source_set(self):
+        orch, _root = self._orchestrator()
+
+        path, _ = orch._test_target(
+            Ticket("PN-001"), ["src/main/java/com/p/A.java"], None, suffix=".java"
+        )
+
+        self.assertEqual(path, "src/test/java/Pn001Test.java")
+
+    def test_an_invented_jvm_test_is_named_so_it_can_compile(self):
+        # javac requires the public type to be declared in a file named after
+        # it, so `pn_001_test.java` cannot hold `Pn001Test` in any directory.
+        self.assertEqual(Orchestrator._test_stem(Ticket("PN-001"), ".java"), "Pn001Test")
+
+    def test_other_languages_keep_the_snake_case_name(self):
+        # `_test` is mandatory for `go test` and one of pytest's two default
+        # collection patterns. Nothing here may change for them.
+        for suffix in (".rs", ".py", ".go", ".ts"):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(
+                    Orchestrator._test_stem(Ticket("TT-001"), suffix), "tt_001_test"
+                )
+
+    def test_a_ticket_can_still_reclaim_a_file_written_under_the_old_name(self):
+        # `_owned_test_files` deletes by name. Narrowing the stems to whatever
+        # this ticket's language answers today would strand every file the loop
+        # wrote before -- including the `tests/pn_001_test.java` files a real
+        # run left behind.
+        orch, root = self._orchestrator()
+        (root / "tests").mkdir()
+        (root / "tests" / "pn_001_test.java").write_text("class X {}", "utf-8")
+        (root / "src" / "test" / "java").mkdir(parents=True)
+        (root / "src" / "test" / "java" / "Pn001Test.java").write_text("class Y {}", "utf-8")
+
+        owned = orch._owned_test_files(Ticket("PN-001"))
+
+        self.assertEqual(
+            owned, ["src/test/java/Pn001Test.java", "tests/pn_001_test.java"]
+        )
+
+    def test_a_file_belonging_to_another_ticket_is_never_reclaimed(self):
+        orch, root = self._orchestrator()
+        (root / "tests").mkdir()
+        (root / "tests" / "pn_002_test.java").write_text("class X {}", "utf-8")
+
+        self.assertEqual(orch._owned_test_files(Ticket("PN-001")), [])
 
 
 class TestBaselineVerifyIsOptional(unittest.TestCase):

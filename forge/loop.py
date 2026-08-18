@@ -42,7 +42,7 @@ from . import evidence
 from .artifacts import Artifacts
 from .budget import BudgetGate, Wait
 from .config import ANY_LANGUAGE, Config, ConfigError
-from .failures import distill, errors_naming, files_blamed, signatures
+from .failures import distill, errors_naming, files_blamed, locations, signatures
 from .ingest import write_tickets
 from .memory import MemoryClient, MemoryRefused, MemoryUnavailable, ticket_query
 from .patch import (
@@ -58,6 +58,7 @@ from .patch import (
     matches_any,
     normalize_path,
     parse_output,
+    repo_relative,
 )
 from .providers import (
     Completion,
@@ -705,25 +706,106 @@ class Orchestrator:
         return self._duplicate_guidance(repeated) if repeated else ""
 
     @staticmethod
-    def _signature_scope(signature: str, allowed: list[str]) -> bool:
+    def _signature_scope(
+        signature: str, allowed: list[str], root: Path | str | None = None
+    ) -> bool:
         """Whether a diagnostic points at a file this ticket may write.
 
-        Signatures carry their location — `error: ... --> src/board.rs:21:19` —
-        so the file a complaint is about can be compared against the ticket's
-        own scope. Matching is lowercased because `signatures` folds case, and
-        `Cargo.toml` would otherwise never match `cargo.toml`.
+        Signatures carry their location, so the file a complaint is about can be
+        compared against the ticket's own scope. Matching is lowercased because
+        `signatures` folds case, and `Cargo.toml` would otherwise never match
+        `cargo.toml`.
+
+        Locations are read by `failures.locations`, which knows every spelling a
+        compiler uses. This once read rustc's `-->` marker and nothing else,
+        which made the check silently language-specific: cargo was attributed
+        correctly, and javac, tsc, go, gcc, and pytest — none of which emit
+        `-->` — parsed to no location at all and were therefore all excused. A
+        Java run took seven tickets to green with twenty compile errors standing,
+        because every one of them looked like somebody else's.
+
+        `root` lets an absolute path be recognised as a file inside the
+        repository. Without it a javac diagnostic naming
+        `d:\\repo\\src\\main\\java\\A.java` cannot match the pattern
+        `src/main/java/A.java` that put the file in scope in the first place.
 
         A signature with no parseable location answers False, which leaves the
         failure excusable. That is the safe direction: the alternative blames a
         ticket for something it may have no authority to touch.
         """
         patterns = [pattern.lower() for pattern in allowed]
-        for match in re.finditer(r"-->\s*(\S+)", signature):
-            # Trim the `:line:col` the compiler appends to the path.
-            location = re.sub(r"(?::\d+)+$", "", match.group(1))
-            if location and matches_any(location, patterns):
+        for location in locations(signature):
+            if matches_any(repo_relative(location, root), patterns):
                 return True
         return False
+
+    def _inherited_failures(
+        self, run_id: int, ticket: Ticket, repro_path: str = ""
+    ) -> dict[str, set[str]]:
+        """What this ticket is allowed to blame on the state it arrived in.
+
+        The baseline is re-taken every cycle, and has to be: tickets run in
+        between, and a ticket that inherits a stale baseline is asked to fix
+        errors another one wrote after it. The cost is that nothing reverts a
+        failed ticket, so on a retry its own breakage is still on disk and a
+        fresh baseline reads it as pre-existing — amnesty for the errors it just
+        wrote, renewed every cycle, so the debt can only grow. A real run went 3
+        errors, then 7, then 13, then 20, and finished with every ticket `done`
+        on a tree that did not compile.
+
+        Subtracting what the ticket has been charged for is what separates
+        "already broken when I got here" from "broken by me last time". Both
+        halves are needed: keep the fresh baseline and a ticket is punished for
+        its neighbours, keep only the first cycle's and it is forgiven for
+        itself.
+        """
+        if not self.config.loop.baseline_verify:
+            return {}
+        baseline = self._baseline_failures(
+            run_id, ticket, extra_scope=[repro_path] if repro_path else []
+        )
+        charged = set(ticket.charged_failures)
+        if not charged:
+            return baseline
+
+        kept: dict[str, set[str]] = {}
+        for name, found in baseline.items():
+            remaining = found - charged
+            if remaining:
+                kept[name] = remaining
+            if len(remaining) != len(found):
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: {len(found) - len(remaining)} {name} "
+                    f"error(s) pre-date this cycle but were introduced by an "
+                    f"earlier one of its own; still its to fix.",
+                    level="warn",
+                    kind="verify",
+                    data={"step": name, "signatures": sorted(found - remaining)[:20]},
+                )
+        return kept
+
+    def _charge(self, run_id: int, ticket: Ticket, found: set[str]) -> None:
+        """Record failures as this ticket's, permanently.
+
+        A charged signature is excluded from every later baseline this ticket
+        takes, which is the whole point: the baseline is re-taken each cycle so
+        that other tickets' breakage stays excused, and without a memory of what
+        this one broke there is no way to tell the two apart. There was not one,
+        and a failed ticket's own errors came back the next cycle wearing the
+        pre-existing label it had just earned them.
+
+        Kept sorted and deduplicated so the persisted list is stable to compare
+        across cycles, and written only when it actually changes — this runs on
+        every verify step of every attempt.
+        """
+        if not found:
+            return
+        merged = sorted(set(ticket.charged_failures) | found)
+        if merged == ticket.charged_failures:
+            return
+        ticket.charged_failures = merged
+        self.store.update_ticket(run_id, ticket)
 
     def _baseline_failures(
         self, run_id: int, ticket: Ticket, extra_scope: Sequence[str] = ()
@@ -774,7 +856,7 @@ class Orchestrator:
             owned = {
                 signature
                 for signature in found
-                if self._signature_scope(signature, scope)
+                if self._signature_scope(signature, scope, self.config.root)
             }
             if owned:
                 self.store.log(
@@ -1577,13 +1659,7 @@ class Orchestrator:
         else:
             repro_path = ""
 
-        pre_existing = (
-            self._baseline_failures(
-                run_id, ticket, extra_scope=[repro_path] if repro_path else []
-            )
-            if self.config.loop.baseline_verify
-            else {}
-        )
+        pre_existing = self._inherited_failures(run_id, ticket, repro_path)
 
         if ticket.kind == TICKET_BUG:
             # Proof is durable, and it has to be: once the fix lands the test
@@ -1895,7 +1971,7 @@ class Orchestrator:
         for path, lines in blamed.items():
             if normalize_path(path) in writable:
                 continue
-            if not matches_any(path, self._TEST_GLOBS):
+            if not self._is_test_path(path):
                 continue
             if not (self.config.root / path).is_file():
                 continue
@@ -1979,7 +2055,7 @@ class Orchestrator:
             path
             for path in wanted
             if matches_any(path, self.config.never_delegate)
-            or matches_any(path, self._TEST_GLOBS)
+            or self._is_test_path(path)
         ]
         granted = [path for path in wanted if path not in refused]
         if refused:
@@ -2524,6 +2600,14 @@ class Orchestrator:
             result = self._shell(run_id, name, command)
             already = inherited.get(name, set())
             introduced = signatures(result.detail) - already if already else set()
+            if not result.ok:
+                # Charged whether or not a baseline existed for this step, and
+                # whether or not the attempt goes on to pass review. These are
+                # the errors standing while this ticket was the one running, and
+                # the loop is single-threaded — no other ticket can have written
+                # them. Recording them here is what stops the next cycle's
+                # baseline from handing them back as somebody else's problem.
+                self._charge(run_id, ticket, signatures(result.detail) - already)
             self._record_step(
                 ticket,
                 f"verify-{name}",
@@ -2799,7 +2883,68 @@ class Orchestrator:
         )
 
     # Where tests live, in rough order of how conventional the location is.
-    _TEST_GLOBS = ("tests/**/*", "test/**/*", "**/test_*.*", "**/*_test.*", "**/*.test.*")
+    # What counts as a test file anywhere in the loop: which files the planner
+    # already designated, which one the tester should imitate, what the suite is
+    # written in, and what the executor may never be granted.
+    #
+    # These were the snake-case spellings only — `test_x`, `x_test`, `x.test` —
+    # plus a `tests/` or `test/` directory at the repository root. Every one of
+    # those is a Rust, Go, Python, or JavaScript convention. A Gradle project
+    # keeps `VideoExtensionsTest.java` under `src/test/java/`, which matched
+    # nothing here, so a test file the *plan* had already named was invisible:
+    # `_test_target` fell through to inventing `tests/pn_001_test.java`, a path
+    # no JVM build system compiles. The tester's whole output was written,
+    # never compiled, never run, and every ticket passed a suite that had
+    # silently excluded it.
+    #
+    # `src/test/**` covers the Maven and Gradle layout whatever the file is
+    # called, and the `*Test` / `*Tests` / `*Spec` spellings cover JVM, .NET,
+    # and the spec-style runners. Widening this is safe in the one place it
+    # deletes files — `_owned_test_files` gates on an exact ticket-derived
+    # stem, so a wider search finds the same ticket's file in more places
+    # rather than finding more files.
+    # Candidates to scan for on disk. Deliberately over-broad — `fnmatch` folds
+    # case on Windows and not on Linux, so no glob can tell `VideoExtensionsTest`
+    # from `latest`. Every decision is made by `_is_test_path` instead; these
+    # only decide which files are worth looking at, and a false positive here
+    # costs one `stat`.
+    _TEST_GLOBS = (
+        "tests/**/*", "test/**/*", "spec/**/*", "src/test/**/*",
+        "**/test_*.*", "**/*_test.*", "**/*.test.*",
+        "**/*Test.*", "**/*Tests.*", "**/*Spec.*", "**/*_spec.*", "**/*.spec.*",
+    )
+
+    # A directory whose name says everything under it is a test. `src/test/java`
+    # and `src/test/kotlin` are reached by the bare `test` segment, so the Maven
+    # and Gradle layout needs no rule of its own.
+    _TEST_DIRS = frozenset({"test", "tests", "spec", "specs", "testing"})
+
+    # snake_case and dotted conventions: pytest, go, rust, rspec, jest.
+    # Case-insensitive because none of them depend on capitalisation.
+    _SNAKE_TEST = re.compile(r"^test_|_test$|_spec$|\.test$|\.spec$", re.IGNORECASE)
+
+    # PascalCase conventions: JUnit, NUnit, xUnit, Kotest, ScalaTest.
+    # Case-SENSITIVE, and the capital is the whole point — `VideoExtensionsTest`
+    # is a test and `latest` is not, and lowercasing the two makes them the same
+    # string. The preceding character must be lowercase or a digit so a word
+    # merely *containing* the letters cannot qualify: `Testimonials` does not
+    # end in `Test`, and `contest` has no capital to anchor on.
+    _CAMEL_TEST = re.compile(r"(?:^|[a-z0-9])(?:Test|Tests|Spec|Specs)$")
+
+    # Languages where the filename is not decoration: the public type has to be
+    # declared in a file named after it, so `pn_001_test.java` cannot hold
+    # `Pn001Test` and will not compile whatever directory it sits in.
+    _TYPE_NAMED_SUFFIXES = frozenset({".java", ".kt", ".scala", ".groovy", ".cs"})
+
+    # Where a build expects tests when the repository has none yet to copy. The
+    # Maven layout, which Gradle also adopts, is the only one universal enough
+    # in its ecosystem to assume; everything else gets `tests/`.
+    _TEST_ROOTS = {
+        ".java": "src/test/java",
+        ".kt": "src/test/kotlin",
+        ".scala": "src/test/scala",
+        ".groovy": "src/test/groovy",
+    }
     # Enough to establish framework, imports, and assertion style; not so much
     # that a large suite crowds the criteria out of the tester's window.
     _EXAMPLE_TEST_CHARS = 2000
@@ -2816,6 +2961,36 @@ class Orchestrator:
             "__pycache__", ".tox", ".mypy_cache", ".pytest_cache", ".next",
         }
     )
+
+    @classmethod
+    def _is_test_path(cls, path: str) -> bool:
+        """Whether this path is a test file, in any language's spelling.
+
+        The single answer to a question the loop asks in five places: which
+        files the plan already designated as tests, which one the tester should
+        imitate, what the suite is written in, what the executor may never be
+        granted, and which files can contradict a bug report.
+
+        It used to be `matches_any(path, _TEST_GLOBS)`, and those globs held
+        only the snake_case conventions — `test_x`, `x_test`, `x.test` — plus a
+        `tests/` directory at the repository root. A Gradle project keeps
+        `VideoExtensionsTest.java` under `src/test/java/`, which matched none of
+        them, so a test file the plan had already named was invisible and
+        `_test_target` invented `tests/pn_001_test.java` instead — a path no JVM
+        build compiles. The tester's output was written, never compiled, never
+        run, and every ticket passed a suite that had silently excluded it.
+
+        Globs cannot replace this. `fnmatch` folds case on Windows and not on
+        Linux, so `*Test.*` matches `latest.js` on one platform and not the
+        other; the capital in `VideoExtensionsTest` is exactly the information a
+        case-folding match destroys.
+        """
+        normalized = normalize_path(path)
+        parts = normalized.split("/")
+        if any(part.lower() in cls._TEST_DIRS for part in parts[:-1]):
+            return True
+        stem = Path(parts[-1]).stem
+        return bool(cls._SNAKE_TEST.search(stem) or cls._CAMEL_TEST.search(stem))
 
     def _example_test(
         self, exclude: list[str], suffix: str = ""
@@ -2843,7 +3018,7 @@ class Orchestrator:
                 if suffix and path.suffix.lower() != suffix:
                     continue
                 relative = path.relative_to(self.config.root).as_posix()
-                if relative in written:
+                if relative in written or not self._is_test_path(relative):
                     continue
                 if self._IGNORED_DIRS.intersection(Path(relative).parts[:-1]):
                     continue
@@ -2929,7 +3104,7 @@ class Orchestrator:
                 if not path.is_file() or path.suffix.lower() in self._UNTESTABLE_SUFFIXES:
                     continue
                 relative = path.relative_to(self.config.root).as_posix()
-                if relative in skip:
+                if relative in skip or not self._is_test_path(relative):
                     continue
                 if self._IGNORED_DIRS.intersection(Path(relative).parts[:-1]):
                     continue
@@ -2989,6 +3164,49 @@ class Orchestrator:
                 counts[suffix] += 1
         return counts.most_common(1)[0][0] if counts else ""
 
+    @classmethod
+    def _test_stem(cls, ticket: Ticket, suffix: str) -> str:
+        """The filename this loop gives a test it had to invent a home for.
+
+        Shared with `_owned_test_files`, and it has to be: that is what deletes
+        an unverified test, it finds the file by this exact name, and a stem
+        derived in two places drifts into orphans nothing can reclaim.
+
+        `_test` rather than a bare slug — mandatory for `go test`, one of
+        pytest's two default collection patterns, inert everywhere else. Except
+        where the filename has to match a public type, which rules the
+        underscore out: `pn_001_test.java` cannot declare `Pn001Test`, and javac
+        rejects the file wherever it is put.
+        """
+        slug = cls._ticket_slug(ticket)
+        if suffix.lower() not in cls._TYPE_NAMED_SUFFIXES:
+            return f"{slug}_test"
+        return "".join(part.capitalize() for part in slug.split("_") if part) + "Test"
+
+    @staticmethod
+    def _closest_designated(designated: list[str], written: list[str]) -> str:
+        """Which of the plan's test files this ticket's tests belong in.
+
+        The tester writes one file, so several designated paths need deciding
+        between. Whichever names a file the ticket just wrote is the right one —
+        `ScannedFileTest.java` for a ticket that wrote `ScannedFile.java` — and
+        that reads across languages, because pairing a test with its subject by
+        name is what every convention here already does.
+
+        Sorted rather than left in the plan's order, so the answer cannot move
+        when a respec rewrites `allowed_files`. The path has to be fixed for the
+        life of the ticket: a second cycle that picks differently leaves the
+        first cycle's file behind, owned by nobody, failing every ticket after
+        it.
+        """
+        for path in sorted(designated):
+            stem = Path(path).stem.lower()
+            for source in written:
+                subject = Path(source).stem.lower()
+                if subject and subject != stem and subject in stem:
+                    return path
+        return sorted(designated)[0]
+
     def _test_target(
         self,
         ticket: Ticket,
@@ -3009,13 +3227,21 @@ class Orchestrator:
         # A planner that named a test file in the ticket's own scope has made
         # the decision already; honour it rather than inventing a second home
         # for the same assertions.
+        #
+        # Any number of them, not exactly one. Requiring a lone candidate was a
+        # Rust-shaped assumption: one integration test per ticket. Languages
+        # that pair a test class with each production class routinely designate
+        # several — PN-001 named `ScannedFileTest.java` and
+        # `VideoExtensionsTest.java` — and the ticket then fell through to
+        # inventing `tests/pn_001_test.java`, outside the build's test source
+        # set, where it was never compiled and never run.
         designated = [
             normalize_path(path)
             for path in ticket.allowed_files
-            if not any(ch in path for ch in "*?[") and matches_any(path, self._TEST_GLOBS)
+            if not any(ch in path for ch in "*?[") and self._is_test_path(path)
         ]
-        if len(designated) == 1:
-            return designated[0], ""
+        if designated:
+            return self._closest_designated(designated, written), ""
 
         # Asked before the language question, and it is a different question: a
         # ticket that wrote only a README and two build scripts has nothing to
@@ -3042,13 +3268,17 @@ class Orchestrator:
                 f"command collects {suffix} tests"
             )
 
-        directory = Path(example[0]).parent.as_posix() if example else "tests"
+        if example:
+            directory = Path(example[0]).parent.as_posix()
+        else:
+            # `tests/` is a fine guess in most ecosystems and a wrong one in the
+            # JVM's, where the build compiles a fixed source set and a file
+            # outside it is not a failing test but an invisible one. That is how
+            # a whole run's tester output came to be written, never compiled,
+            # and never run, with every ticket passing the suite that excluded it.
+            directory = self._TEST_ROOTS.get(suffix, "tests")
         prefix = "" if directory in ("", ".") else f"{directory}/"
-        slug = self._ticket_slug(ticket)
-        # `_test` rather than a bare slug: it is mandatory for `go test`, it is
-        # one of pytest's two default collection patterns, and it is inert
-        # everywhere else.
-        return f"{prefix}{slug}_test{suffix}", ""
+        return f"{prefix}{self._test_stem(ticket, suffix)}{suffix}", ""
 
     def _uncovered_languages(self, ticket: Ticket) -> list[str]:
         """Languages this ticket writes that nothing here can test.
@@ -3133,7 +3363,7 @@ class Orchestrator:
         designated = [
             normalize_path(path)
             for path in ticket.allowed_files
-            if not any(ch in path for ch in "*?[") and matches_any(path, self._TEST_GLOBS)
+            if not any(ch in path for ch in "*?[") and self._is_test_path(path)
         ]
         if len(designated) == 1:
             return designated[0], ""
@@ -3534,11 +3764,20 @@ class Orchestrator:
         five retry cycles, thirty-five minutes, and roughly 800k tokens on
         exactly that.
         """
-        stem = f"{self._ticket_slug(ticket)}_test"
+        # Every spelling `_test_stem` can produce, not just the one this
+        # ticket's language would pick today. A file written under an earlier
+        # rule — or before this repository had a test command to read a suffix
+        # off — is still this ticket's to reclaim, and a stem set that narrowed
+        # to the current answer would strand it: owned by nobody, failing every
+        # ticket after it, deletable only by hand.
+        slug = self._ticket_slug(ticket)
+        stems = {f"{slug}_test"} | {
+            self._test_stem(ticket, suffix) for suffix in self._TYPE_NAMED_SUFFIXES
+        }
         found: set[str] = set()
         for pattern in self._TEST_GLOBS:
             for path in self.config.root.glob(pattern):
-                if not path.is_file() or path.stem != stem:
+                if not path.is_file() or path.stem not in stems:
                     continue
                 relative = path.relative_to(self.config.root).as_posix()
                 if self._IGNORED_DIRS.intersection(Path(relative).parts[:-1]):
