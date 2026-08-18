@@ -42,7 +42,14 @@ from . import evidence
 from .artifacts import Artifacts
 from .budget import BudgetGate, Wait
 from .config import ANY_LANGUAGE, Config, ConfigError
-from .failures import distill, errors_naming, files_blamed, locations, signatures
+from .failures import (
+    distill,
+    environment_failure,
+    errors_naming,
+    files_blamed,
+    locations,
+    signatures,
+)
 from .ingest import write_tickets
 from .memory import MemoryClient, MemoryRefused, MemoryUnavailable, ticket_query
 from .patch import (
@@ -184,6 +191,12 @@ class StepResult:
     ok: bool
     detail: str = ""
     blocked: bool = False
+    # Nothing about this attempt could be checked, and nothing about the next
+    # ticket's could be either — the tree is failing every verify step on
+    # errors outside this ticket's scope, so each step it "passes" is a step
+    # that ran no assertion about it. Ends the run rather than the ticket. See
+    # `_unverifiable`.
+    halt: bool = False
 
 
 class Stopped(Exception):
@@ -227,6 +240,18 @@ class Orchestrator:
         # `{ticket_id: {test path: the lines blaming it}}`. Read at respec,
         # which is where retiring an assertion is settled.
         self._contradictions: dict[str, dict[str, list[str]]] = {}
+        # Why the run gave up on verifying anything, once it has. Set when a
+        # ticket's every verify step was excused, which means the project no
+        # longer builds and no later ticket can be checked either. Ends the
+        # run at the first ticket it happens to, rather than at the seventh.
+        # See `_unverifiable`.
+        self._halt = ""
+        # The first verify command that failed without running the code, as
+        # `(step, command, the line that says so)`. A missing binary or a
+        # launcher that will not start is not a defect any ticket can fix, and
+        # handing it to the executor spends a model on an argument it wins.
+        # See `_shell` and `environment_failure`.
+        self._toolchain: tuple[str, str, str] | None = None
 
     # ------------------------------------------------------------------
     # Project memory
@@ -543,6 +568,71 @@ class Orchestrator:
         self.store.end_step(step_id, "ok" if ok else "failed", output)
         return StepResult(ok=ok, detail=output)
 
+    def _note_toolchain(self, name: str, command: str, result: StepResult) -> None:
+        """Record a verify command that never reached the code. First one only.
+
+        Recorded rather than raised: this is called from baseline collection and
+        from verification, and each caller has a ticket half-set-up to leave in
+        a resumable state. `run` ends the run on it — see `_stop_for_toolchain`.
+
+        Both conditions have to hold. A suite asserting on the text of a shell
+        error is real output about real code and prints a diagnostic block
+        beside it; a launcher that never started prints nothing else at all, so
+        an empty `signatures` is what separates the two.
+        """
+        if result.ok or self._toolchain or signatures(result.detail):
+            return
+        reason = environment_failure(result.detail)
+        if reason:
+            self._toolchain = (name, command, reason)
+
+    def _stop_for_toolchain(self, run_id: int) -> str:
+        """End the run because the verify commands cannot run here.
+
+        A failure with no diagnostic in it and a launcher's own words in its
+        place is not evidence about the code. Nothing in the loop reads it that
+        way: `signatures` finds nothing to attribute, so the baseline excuses
+        it, `distill` keeps it whole, and it arrives in the executor's prompt as
+        the thing to fix. The executor then explains that the build environment
+        is misconfigured and writes no files — which is recorded as a reply that
+        did not parse, and costs a reprompt and an attempt.
+
+        A real run did that for ten minutes and thirty model calls before a line
+        of code was written, on `Gradle requires JVM 17 or later to run. Your
+        build is currently configured to use JVM 8`. Every executor reply in
+        that window was right.
+
+        `failed`, not `blocked`: nothing is wrong with the backlog. A ticket
+        interrupted on the way in goes back to `pending` so `forge go` picks it
+        up unchanged, and a backlog that had already finished keeps its tickets
+        green — what is unknown is the state of the tree, not of the work.
+
+        Reached from three places, which is why the message names the command
+        rather than the moment: the baseline before a ticket is delegated, the
+        verify step after one is, and the final check over a finished backlog —
+        where the ordinary red-build message would read as work left undone.
+        """
+        step, command, reason = self._toolchain or ("", "", "")
+        note = (
+            f"the {step} command cannot run on this machine: {reason}"
+        )
+        self.store.set_run_status(run_id, RUN_FAILED, note)
+        self.store.log(
+            run_id,
+            f"Stopping: `{command}` failed without ever reaching the code.\n"
+            f"  {reason}\n"
+            f"No ticket can fix this and nothing has been delegated for it — a "
+            f"model handed a broken toolchain answers, correctly, that the "
+            f"environment is wrong, and that answer costs an attempt. Fix the "
+            f"command or the machine, check it with `forge doctor`, then "
+            f"`forge go`: no ticket was blamed for this and nothing was "
+            f"requeued.",
+            level="error",
+            kind="lifecycle",
+            data={"step": step, "command": command, "reason": reason},
+        )
+        return RUN_FAILED
+
     # The verify steps, in the order a failure is cheapest to diagnose.
     _VERIFY_STEPS = ("lint", "typecheck", "test")
 
@@ -785,6 +875,99 @@ class Orchestrator:
                 )
         return kept
 
+    # A ticket that will not run again in this cycle. Red left behind by one of
+    # these is red nothing in the backlog is still working on.
+    _GAVE_UP = frozenset({TICKET_FAILED, TICKET_BLOCKED, TICKET_SKIPPED})
+
+    def _unverifiable(
+        self, run_id: int, ticket: Ticket, excused: Sequence[str], output: str
+    ) -> str:
+        """Why nothing this ticket did could be checked, or "" if that is fine.
+
+        The amnesty is right and this is its cost. A failure that pre-dates a
+        ticket is excused so one abandoned file cannot fail an entire backlog —
+        but a step excused whole ran no assertion about the ticket in front of
+        it, and when *every* step is in that state the ticket has been checked
+        by nothing. On a compiled language it is worse than it sounds: a red
+        typecheck means the test binary was never built, so the suite did not
+        run at all. The reviewer reads a diff and says yes, and `done` comes to
+        mean "a model liked the look of it".
+
+        A whole run went that way. Two files were left importing a package that
+        has never existed; five tickets after them were verified against a tree
+        that could not compile, each logging `typecheck still failing, but only
+        on errors that pre-date this ticket`, and the backlog reported every one
+        of them green. 168 minutes and 2.4M tokens for a project where
+        `compileJava` fails on the first file it reads.
+
+        Two things have to be true before that is worth stopping a run over, and
+        the second is what keeps this from firing on ordinary work:
+
+        - Not one verify step passed. A ticket with a green typecheck and an
+          excused test suite has still had its code compiled.
+        - Some ticket that may write a red file has already given up. Red owned
+          by a ticket still pending is a backlog mid-flight — a JVM plan is
+          routinely red between the ticket that calls a class and the one that
+          writes it — and red owned by nobody is an orphan, which `_finish` and
+          the orphan sweep already handle. Red owned by a ticket that is out of
+          attempts is the one case where nothing coming will clear it, and
+          every ticket after this one will be marked green against it.
+
+        Returns the note to park on, or "" to carry on as before.
+        """
+        red = sorted(
+            {
+                repo_relative(path, self.config.root).lower()
+                for path in files_blamed(output)
+            }
+        )
+        if not red:
+            # Output nothing could locate. The failure may be real and may be
+            # somebody's, but there is no file to name and no owner to look up,
+            # and stopping a run on an unparseable diagnostic is the wrong
+            # direction to be wrong in.
+            return ""
+
+        owners: dict[str, str] = {}
+        for other in self.store.list_tickets(run_id):
+            patterns = [path.lower() for path in other.allowed_files]
+            if any(matches_any(path, patterns) for path in red):
+                owners[other.ticket_id] = other.status
+        stalled = sorted(
+            ticket_id
+            for ticket_id, status in owners.items()
+            if status in self._GAVE_UP and ticket_id != ticket.ticket_id
+        )
+        if not stalled:
+            return ""
+
+        note = (
+            f"nothing this ticket wrote was compiled or run. Every verify step "
+            f"this project has ({', '.join(excused)}) failed on errors in files "
+            f"the ticket does not own, so each one was excused — and a step "
+            f"excused whole asserts nothing about the work in front of it. "
+            f"Passing review on top of that would record a green nobody checked."
+            f"\n\nThe tree is red on:\n"
+            + "\n".join(f"  - {path}" for path in red[:8])
+            + f"\n\n{', '.join(stalled)} already gave up on those files, so "
+            f"nothing left in this backlog is going to clear them and every "
+            f"ticket after this one would be marked done against a project that "
+            f"does not build. Fix them, then `forge retry`."
+        )
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: {note}",
+            level="error",
+            kind="verify",
+            data={
+                "ticket": ticket.ticket_id,
+                "excused": list(excused),
+                "red": red,
+                "stalled": stalled,
+            },
+        )
+        return note
+
     def _charge(self, run_id: int, ticket: Ticket, found: set[str]) -> None:
         """Record failures as this ticket's, permanently.
 
@@ -837,6 +1020,9 @@ class Orchestrator:
         known: dict[str, set[str]] = {}
         for name, command in self._verify_plan():
             result = self._shell(run_id, f"baseline-{name}", command)
+            # Before anything is attributed. A command that cannot start is the
+            # one failure the baseline must not treat as a fact about the code.
+            self._note_toolchain(name, command, result)
             if result.ok:
                 continue
             found = signatures(result.detail)
@@ -921,6 +1107,28 @@ class Orchestrator:
             while True:
                 self._honor_control(run_id)
                 self._check_runtime(run_id)
+
+                # Checked before the halt and before any ticket, because it is
+                # not a fact about the backlog at all: the machine cannot run
+                # the commands this project is verified with, and every ticket
+                # would fail identically for a reason none of them can fix.
+                if self._toolchain:
+                    return self._stop_for_toolchain(run_id)
+
+                # A tree that fails every check on work outside the running
+                # ticket's scope cannot verify the next ticket either, and a
+                # retry cycle only requeues tickets into the same wall. Ends
+                # the run where the evidence ran out.
+                if self._halt:
+                    self.store.log(
+                        run_id,
+                        f"Stopping: the project no longer builds, and nothing "
+                        f"the loop verifies is verifying anything. "
+                        f"{self._halt}",
+                        level="error",
+                        kind="lifecycle",
+                    )
+                    return self._finish(run_id)
 
                 ticket = self.store.next_ticket(run_id)
                 if ticket is None:
@@ -1242,6 +1450,15 @@ class Orchestrator:
         # build.
         for name, command in self._verify_plan():
             result = self._shell(run_id, f"final-{name}", command)
+            # The last place a broken toolchain can appear, and the one where
+            # mislabelling it is most misleading: every ticket is green, so
+            # "backlog complete but typecheck still fails" reads as work left
+            # undone rather than as a command that could not start. Nothing
+            # reaches here with one already recorded — `run` ends the run on
+            # that before asking for the next ticket.
+            self._note_toolchain(name, command, result)
+            if self._toolchain:
+                return self._stop_for_toolchain(run_id)
             if result.ok:
                 continue
             note = f"backlog complete but {name} still fails"
@@ -1522,6 +1739,9 @@ class Orchestrator:
                 sources=self._sources_for(ticket)[0],
                 criteria_locked=not self.config.loop.respec_criteria,
                 contradiction=self._contradictions.get(ticket.ticket_id),
+                # So a revised read scope is checked against the tree rather
+                # than taken on the planner's word for where a file lives.
+                root=self.config.root,
             )
             if result.impossible:
                 # Spending a full attempt budget on a ticket the planner has
@@ -1661,6 +1881,16 @@ class Orchestrator:
 
         pre_existing = self._inherited_failures(run_id, ticket, repro_path)
 
+        # The baseline has just run this project's own commands. One of them
+        # not starting is not this ticket's defect and not any ticket's, so the
+        # ticket goes back on the backlog untouched and `run` ends the run
+        # before a single delegation is spent arguing with a model that is
+        # right. See `_stop_for_toolchain`.
+        if self._toolchain:
+            ticket.status = TICKET_PENDING
+            self.store.update_ticket(run_id, ticket)
+            return
+
         if ticket.kind == TICKET_BUG:
             # Proof is durable, and it has to be: once the fix lands the test
             # passes, so a second cycle re-running reproduction would find
@@ -1726,6 +1956,18 @@ class Orchestrator:
                 rejections=rejections,
                 repro=repro,
             )
+
+            # Checked before `blocked`, and it must be: the note names the
+            # files the tree is red on, and `_widen_scope` reads a block note
+            # for exactly that. Granting them here would hand this ticket
+            # somebody else's broken file and call it scope.
+            if outcome.halt:
+                self._discard_tests(run_id, ticket, authored)
+                ticket.status = TICKET_BLOCKED
+                ticket.blocked_note = outcome.detail
+                self.store.update_ticket(run_id, ticket)
+                self._halt = outcome.detail
+                return
 
             if outcome.blocked:
                 # The executor's own words, read back before the block is
@@ -2596,8 +2838,19 @@ class Orchestrator:
 
         # --- VERIFY --------------------------------------------------
         inherited = pre_existing or {}
+        # Which steps actually ran an assertion about this ticket, and which
+        # only reported somebody else's breakage. A step in the second list is
+        # not evidence, and a ticket with nothing in the first has been checked
+        # by nothing at all — see `_unverifiable`.
+        proved: list[str] = []
+        excused: list[str] = []
+        excused_output = ""
         for name, command in self._verify_plan():
             result = self._shell(run_id, name, command)
+            # Checked here too, not only at the baseline: `baselineVerify` can
+            # be off, and a toolchain can break mid-run when a ticket edits the
+            # file that configures it.
+            self._note_toolchain(name, command, result)
             already = inherited.get(name, set())
             introduced = signatures(result.detail) - already if already else set()
             if not result.ok:
@@ -2620,6 +2873,7 @@ class Orchestrator:
                 raw=result.detail,
             )
             if result.ok:
+                proved.append(name)
                 continue
 
             # Everything this step is complaining about was already broken when
@@ -2646,6 +2900,8 @@ class Orchestrator:
                         kind="verify",
                         data={"step": name},
                     )
+                    excused.append(name)
+                    excused_output = excused_output or result.detail
                     continue
                 self.store.log(
                     run_id,
@@ -2706,6 +2962,15 @@ class Orchestrator:
             if scope_note:
                 detail += f"\n\n{scope_note}"
             return StepResult(ok=False, detail=detail)
+
+        # Every step the project has was red, and every one of them was excused.
+        # The ticket is about to go to review having had nothing compiled and
+        # nothing run. `_unverifiable` decides whether that is a run-ending
+        # state or an ordinary backlog mid-flight.
+        if excused and not proved:
+            unverifiable = self._unverifiable(run_id, ticket, excused, excused_output)
+            if unverifiable:
+                return StepResult(ok=False, halt=True, detail=unverifiable)
 
         # --- REVIEW --------------------------------------------------
         # The ticket's own files, plus the test file written on its behalf —

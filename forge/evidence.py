@@ -528,3 +528,37 @@ def _matches(root: Path, wanted: list[str]) -> list[str]:
         if lines:
             found.append(f"#### `{term}`\n" + "\n".join(lines))
     return found
+
+
+# How much of a repository is searched for a file named somewhere it is not.
+# Larger than `MAX_FILES`, which caps what goes into a prompt — this only has
+# to answer "is there exactly one file with that name", and a listing that
+# stops early answers it wrongly.
+MAX_LOCATE = 20_000
+
+
+def locate_named(root: Path, path: str, files: Sequence[str] | None = None) -> str:
+    """Where a file that does not exist at `path` actually lives, if anywhere.
+
+    A planner rewriting a ticket names the files the executor has to read, and
+    it names them from memory: it is shown their contents, not the tree. So it
+    writes `src/main/java/com/plexnamer/DirectoryScanner.java` for a class that
+    sits in `.../plexnamer/domain/`, and the path is silently unreadable —
+    `sources_for` skips what it cannot open, the executor is shown nothing, and
+    it guesses the package. One run spent five attempts and a whole retry
+    budget importing `com.plexnamer.DirectoryScanner`, a symbol that has never
+    existed, because the only correction available to it was the compiler
+    saying so again.
+
+    Matched on the filename alone, and only when exactly one file in the
+    repository carries it. That is the case where the intent is not in doubt:
+    the planner named a real file and put it in the wrong directory. Two
+    matches is a guess about which one was meant, and the caller is better off
+    told the path is wrong than pointed at a coin flip.
+    """
+    name = Path(normalize_path(path)).name
+    if not name:
+        return ""
+    pool = repo_files(root, limit=MAX_LOCATE) if files is None else files
+    found = [candidate for candidate in pool if candidate.rsplit("/", 1)[-1] == name]
+    return found[0] if len(found) == 1 else ""
