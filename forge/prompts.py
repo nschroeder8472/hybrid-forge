@@ -64,6 +64,57 @@ Rules:
   formatting, and functions the ticket never mentions included. Rewriting a
   line that already worked is a change the spec did not ask for, and it will be
   rejected at review even when the behavior is identical. Copy first, then add.
+
+The format, exactly. The path goes OUTSIDE the fence, on the line above it:
+
+src/main/java/com/example/Greeter.java
+```java
+package com.example;
+
+public final class Greeter {
+    public String greet(String name) {
+        return "Hello, " + name;
+    }
+}
+```
+
+src/main/java/com/example/Main.java
+```java
+package com.example;
+
+public final class Main {
+    public static void main(String[] args) {
+        System.out.println(new Greeter().greet("world"));
+    }
+}
+```
+
+Nothing else is read. These are the ways a reply gets discarded, and the first
+is by far the most common:
+
+WRONG — the path is inside the fence, as a comment. Nothing is written:
+
+```java
+// src/main/java/com/example/Greeter.java
+package com.example;
+```
+
+WRONG — the path is inside the fence, on the first line. Nothing is written,
+and if it were, that line would become part of the file:
+
+```java
+src/main/java/com/example/Greeter.java
+package com.example;
+```
+
+WRONG — a fenced block with no path anywhere. There is nothing to write it to:
+
+```java
+package com.example;
+```
+
+The path line carries no decoration: no `//`, no `#`, no bullet, no bold, no
+backticks, no heading marks. Just the path, then a newline, then the fence.
 """
 
 TESTER_SYSTEM = """You write tests that encode criteria decided upstream.
@@ -90,7 +141,26 @@ Never:
 - Write anything to a path other than the one file you are told to write.
 
 Output the complete contents of that one test file: the path on its own line,
-then a fenced code block with the whole file.
+then a fenced code block with the whole file. The path goes OUTSIDE the fence,
+on the line above it, carrying no comment marker and no other decoration:
+
+src/test/java/com/example/GreeterTest.java
+```java
+package com.example;
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class GreeterTest {
+    @Test
+    void greets_by_name() {
+        assertEquals("Hello, world", new Greeter().greet("world"));
+    }
+}
+```
+
+A path written inside the fence — as `// src/test/...`, or as a bare first
+line — is not read as a path. Nothing is written and the answer is discarded.
 """
 
 REPRO_SYSTEM = """You write the test that proves a bug is real.
@@ -125,7 +195,26 @@ Never:
 - Write anything to a path other than the one file you are told to write.
 
 Output the complete contents of that one test file: the path on its own line,
-then a fenced code block with the whole file.
+then a fenced code block with the whole file. The path goes OUTSIDE the fence,
+on the line above it, carrying no comment marker and no other decoration:
+
+src/test/java/com/example/GreeterTest.java
+```java
+package com.example;
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class GreeterTest {
+    @Test
+    void greets_by_name() {
+        assertEquals("Hello, world", new Greeter().greet("world"));
+    }
+}
+```
+
+A path written inside the fence — as `// src/test/...`, or as a bare first
+line — is not read as a path. Nothing is written and the answer is discarded.
 """
 
 BUG_PLANNER_SYSTEM = """You turn a bug report into one implementable ticket.

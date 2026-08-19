@@ -776,7 +776,9 @@ class Orchestrator:
         )
         return ParsedOutput(edits=[FileEdit(path=path, content=body)])
 
-    def _malformed_reply(self, parsed: ParsedOutput, text: str) -> str:
+    def _malformed_reply(
+        self, parsed: ParsedOutput, text: str, ticket: Ticket | None = None
+    ) -> str:
         """Why a reply did not parse into files, or `""` if it did.
 
         Only formatting. A `BLOCKED:` reply is a decision, and a reply carrying
@@ -792,9 +794,45 @@ class Orchestrator:
         if parsed.truncated and not parsed.edits:
             return self._fence_guidance(parsed.truncated)
         if parsed.is_empty:
-            return describe_unparsed(text)
+            described = describe_unparsed(text)
+            return f"{described}\n\n{self._header_lines(ticket)}".rstrip() if described else ""
         repeated = duplicate_paths(parsed)
         return self._duplicate_guidance(repeated) if repeated else ""
+
+    def _header_lines(self, ticket: Ticket | None) -> str:
+        """The literal path lines this ticket's reply has to carry, or "".
+
+        Prose about where the path goes is the thing that already failed. Told
+        that the path must be on its own line before the opening fence, one
+        reply moved it from a `//` comment to a bare first line still inside
+        the fence — and dropped two files' `package` declarations while
+        reformatting, losing correct work to a header. Another dropped the path
+        line entirely. The correction was read as "put the path at the top",
+        which is what it says if you cannot already see the fence boundary.
+
+        So the ticket's own paths are written out instead, in the exact shape
+        that parses, for the model to copy rather than construct. The harness
+        knows them — they are the scope it will enforce anyway — and a reply
+        that copies them cannot land outside it.
+
+        Globs are dropped. A scope rule is not a filename, and offering
+        `src/**` as a line to copy invites a file called `src/**`.
+        """
+        if ticket is None:
+            return ""
+        literal = [
+            path for path in ticket.allowed_files if not any(c in path for c in "*?[")
+        ]
+        if not literal:
+            return ""
+        shown = "\n\n".join(f"{path}\n```\n(the whole file)\n```" for path in literal)
+        return (
+            "Copy these path lines exactly. Each one goes on its own line with "
+            "nothing else on it, directly above the opening fence of that "
+            "file's block — outside the fence, not the first line inside it:\n\n"
+            f"{shown}\n\n"
+            "Only the files this ticket actually changes need to appear."
+        )
 
     @staticmethod
     def _signature_scope(
@@ -2657,6 +2695,14 @@ class Orchestrator:
                         prior_turns=prior_turns,
                     ),
                     max_tokens=self._output_budget("executor"),
+                    # Stated rather than left to `_call`'s default, which is
+                    # how the executor came to sample at 0.2 — the highest in
+                    # the pipeline, on the one role whose output has to hit a
+                    # machine-readable format before any of it counts. Every
+                    # other call site chose a number; this one inherited one.
+                    # A model block's own `temperature` still overrides this,
+                    # which is the point of `Provider.temperature`.
+                    temperature=0.0,
                 )
             except ContextOverflow as exc:
                 self.store.end_step(step_id, "failed", str(exc))
@@ -2686,7 +2732,7 @@ class Orchestrator:
                 return StepResult(ok=False, detail=detail)
 
             parsed = parse_output(completion.text)
-            malformed = self._malformed_reply(parsed, completion.text)
+            malformed = self._malformed_reply(parsed, completion.text, ticket)
             if not malformed or not remaining:
                 break
             self.store.log(

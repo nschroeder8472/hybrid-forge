@@ -64,6 +64,24 @@ _FENCE_RUN = re.compile(r"^[ \t]*(?P<ticks>`{3,})[^\n]*$", re.MULTILINE)
 # reply that buried it inside the fence has put in the wrong place.
 _BARE_PATH = re.compile(r"^[ \t]*[`'\"]?[\w./\\+-]+\.[\w+]+[`'\"]?[ \t]*:?[ \t]*$")
 
+# The same path line, wearing whatever comment syntax the file's own language
+# uses. This is the single most common thing an executor does instead of
+# following the protocol, and it is not a mistake the model experiences as one:
+# a million README snippets open with
+#
+#     ```java
+#     // src/main/java/com/plexnamer/domain/MediaKind.java
+#     package com.plexnamer.domain;
+#
+# so it is reproducing the most-attested shape in its training data rather than
+# failing to read an instruction. See `_paths_inside_fences`.
+_INNER_PATH = re.compile(
+    r"^[ \t]*"
+    r"(?://+|\#+|--|;+|/\*+|<!--|\*)?[ \t]*"
+    r"[`'\"]?(?P<path>[\w./\\+-]+\.[\w+]+)[`'\"]?"
+    r"[ \t]*(?::|\*/|-->)?[ \t]*$"
+)
+
 
 def _fence_is_too_short(fence: str, body: str) -> bool:
     """Whether `body` holds a fence that could have closed its own wrapper.
@@ -164,6 +182,100 @@ def parse_output(text: str) -> ParsedOutput:
             truncated.append(path)
             continue
         edits.append(FileEdit(path=path, content=body))
+    if edits or truncated:
+        return ParsedOutput(edits=_drop_repeats(edits), truncated=truncated)
+
+    # Nothing named a file the way the protocol asks. Before giving up, read
+    # the shape the model actually used.
+    rescued = _paths_inside_fences(text)
+    rescued.edits = _drop_repeats(rescued.edits)
+    return rescued
+
+
+def _drop_repeats(edits: list[FileEdit]) -> list[FileEdit]:
+    """Discard a later block that repeats an earlier one byte for byte.
+
+    `duplicate_paths` exists for a real hazard — a file containing its own
+    fence closes the wrapper early, the remainder is re-parsed into blocks
+    named from its prose, and the spurious one is later so it wins. That block
+    is never identical to the first; it is a fragment of a different file.
+
+    A block repeated exactly is the other thing entirely: a model that answered
+    twice. `apply_edits` writes in order, so the second write puts back what
+    the first one did and the outcome is the same file either way — but the
+    duplicate check sees two blocks for one path and spends an attempt asking
+    again. One did, over two identical 2,940-character copies of the same Java
+    class. Collapsing them here keeps the guard pointed at conflicts, which is
+    what it was written to catch.
+    """
+    kept: list[FileEdit] = []
+    seen: dict[str, str] = {}
+    for edit in edits:
+        path = normalize_path(edit.path)
+        if seen.get(path) == edit.content:
+            continue
+        seen[path] = edit.content
+        kept.append(edit)
+    return kept
+
+
+def _paths_inside_fences(text: str) -> ParsedOutput:
+    """Read a reply that put each path on the first line *inside* its fence.
+
+    The protocol wants the path above the opening fence. What models emit is
+    the README shape — the path as the file's first line, usually behind the
+    comment marker of whatever language it is in, sometimes bare. Both are the
+    same mistake, and it is the dominant one: over one Java run, 70% of first
+    replies were unusable and 35% of attempts were lost outright, every one of
+    them to this shape or its bare variant.
+
+    Correcting the model does not work, and the record is worth stating because
+    it is what settled this. Told in as many words that the path must be on its
+    own line *before* the opening fence, one reply moved the path from a `//`
+    comment to a bare first line still inside the fence — and dropped two
+    files' `package` declarations while reformatting, losing correct work to a
+    header. Another dropped the path line entirely. This is
+    `#### src/game.rs` again: the model does not experience the path as
+    missing, so decorations around it are the harness's problem to absorb.
+
+    Only reached when nothing parsed the ordinary way. A reply that named even
+    one file correctly is read as written — mixing the two readings would let a
+    stray comment in a properly-labelled block invent a second edit.
+
+    Two guards, and the first is not optional:
+
+    - **What is left after the path line must look like content.** The
+      catastrophic case is real: one reply was a fence containing the path and
+      nothing else, and writing that would have truncated the file to empty. A
+      fenced directory listing is the same shape. So every remaining non-blank
+      line being itself a path means this block names files rather than being
+      one.
+    - A block whose own contents could have closed its wrapper is reported
+      truncated rather than written, exactly as `parse_output` does — the
+      captured body is a prefix, and applying a prefix is what destroys a file.
+    """
+    edits: list[FileEdit] = []
+    truncated: list[str] = []
+    for match in _ANY_BLOCK.finditer(text):
+        body = match.group("body")
+        lines = body.split("\n")
+        first = next((i for i, line in enumerate(lines) if line.strip()), None)
+        if first is None:
+            continue
+        named = _INNER_PATH.match(lines[first])
+        if not named:
+            continue
+
+        rest = lines[first + 1 :]
+        if not any(line.strip() and not _INNER_PATH.match(line) for line in rest):
+            continue
+
+        path = named.group("path").replace("\\", "/")
+        content = "\n".join(rest).strip("\n") + "\n"
+        if _fence_is_too_short(match.group("fence"), content):
+            truncated.append(path)
+            continue
+        edits.append(FileEdit(path=path, content=content))
     return ParsedOutput(edits=edits, truncated=truncated)
 
 
