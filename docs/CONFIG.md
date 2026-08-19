@@ -329,6 +329,8 @@ run some context, never the run.
 | `respecCriteria` | `false` | Let a respec rewrite the acceptance criteria too. Off: the party being judged does not write the standard it is judged against. Left on, one ticket's criteria drifted until they asserted the opposite of what its author wrote. |
 | `reopenStaleDependents` | `true` | Re-open a ticket that passed on top of a dependency a respec has since rewritten — its `done` was earned against a contract that no longer exists. Can re-open a lot of a backlog after one respec; turn it off to be warned instead. |
 | `preflight` | `true` | Probe every model before the first ticket, so a dead endpoint fails in seconds rather than one ticket at a time. |
+| `requireGreenBaseline` | `true` | Run the verify commands once before the first ticket and refuse to start on a tree that is already red. A failure that pre-dates the run is excused for *every* ticket in it, so the backlog would finish reporting green having compiled nothing — and `_unverifiable` cannot catch it, because red in files no ticket owns has no exhausted owner to point at. Only a failure naming files is gated on: `pytest` exiting 5 on a project with no tests yet is a greenfield run, not a broken one, and is reported instead. Turn it off, or pass `--allow-red-baseline`, for a repository whose red is what the backlog is there to fix. |
+| `quarantineFailed` | `true` | When a ticket gives up, restore the files it wrote to the state it inherited and keep a copy under `.hybridforge/abandoned/run-N/<ticket>/`. Verification is whole-project, so an abandoned file that does not compile is reported to every later ticket — and because it is outside their scope they are excused for it and pass having had nothing compiled. Quarantine keeps the salvage without the poison. Turn it off, or pass `--no-quarantine`, to have a failed ticket's work left in the tree. |
 | `pollSeconds` | `2.0` | Control-channel poll interval while waiting. |
 | `maxRuntimeSeconds` | `0` (off) | Cap on unattended wall-clock time. Covers the whole `forge go`, not each run in its queue — one `go` can drain several runs, and a fresh clock per run would quietly multiply the cap. |
 | `baselineVerify` | `true` | Run the verify commands once before each ticket, so breakage that was already there is not blamed on whichever ticket ran next. Turn off only when a full suite is slow enough that paying it per ticket costs more than the attempts it saves. |
@@ -475,6 +477,8 @@ it is a one-line edit in `roles`.
     "respecCriteria": false,
     "reopenStaleDependents": true,
     "preflight": true,
+    "requireGreenBaseline": true,
+    "quarantineFailed": true,
     "pollSeconds": 2.0,
     "maxRuntimeSeconds": 0,
     "baselineVerify": true,

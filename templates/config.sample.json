@@ -77,6 +77,8 @@
     "respecCriteria": false,
     "reopenStaleDependents": true,
     "preflight": true,
+    "requireGreenBaseline": true,
+    "quarantineFailed": true,
     "pollSeconds": 2.0,
     "maxRuntimeSeconds": 0,
     "baselineVerify": true,

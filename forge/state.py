@@ -185,19 +185,21 @@ class Ticket:
     # earned against a contract that no longer exists.
     dep_stamp: dict[str, str] = field(default_factory=dict)
     # The tree this ticket started from, captured the first time it ran and
-    # kept for its whole life. A retry cycle inherits the previous cycle's work
-    # in the tree — autoCommit is off and nothing reverts a failed ticket — so
-    # re-snapshotting per run measures the ticket against its own output and
-    # produces an empty diff for a reviewer that has nothing left to judge.
+    # kept for its whole life. A retry cycle may inherit the previous cycle's
+    # work in the tree — autoCommit is off, and quarantine cannot revert a
+    # ticket whose baseline tree was never recorded — so re-snapshotting per
+    # run measures the ticket against its own output and produces an empty diff
+    # for a reviewer that has nothing left to judge. It is also what the revert
+    # itself restores from, which is the second reason it must not move.
     baseline_tree: str = ""
     # Failure signatures this ticket has been seen to introduce, in any cycle.
     #
     # The baseline is re-taken every cycle on purpose: other tickets run in
     # between, and their breakage has to keep being excused or this ticket
-    # spends its attempts on code it may not open. But nothing reverts a failed
-    # ticket, so its own breakage is on disk when the next cycle starts and the
-    # fresh baseline reads it as pre-existing — amnesty for the exact errors it
-    # just wrote. That is not hypothetical: one run's debt climbed 3, 7, 13, 20
+    # spends its attempts on code it may not open. But quarantine cannot always
+    # take a failed ticket's work back out, so its own breakage may be on disk
+    # when the next cycle starts and the fresh baseline reads it as
+    # pre-existing — amnesty for the exact errors it just wrote. That is not hypothetical: one run's debt climbed 3, 7, 13, 20
     # across seven tickets, every one of them passing verification.
     #
     # Charging is what separates the two. A signature recorded here is never

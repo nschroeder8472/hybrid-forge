@@ -36,7 +36,7 @@ from collections import Counter
 from pathlib import Path
 
 from . import evidence, modelfiles, replay, respec, toolchain, wizard
-from .artifacts import ARTIFACTS_DIR
+from .artifacts import ARTIFACTS_DIR, GITIGNORE_LINES
 from .config import ANY_LANGUAGE, Config, ConfigError, default_config, normalize_language
 from .ingest import ingest as ingest_document
 from .ingest import write_tickets
@@ -115,8 +115,10 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     gitignore = config.config_dir / ".gitignore"
     # The database is a mutable log, not a reviewable artifact — the tickets
-    # and config are what belong in version control.
-    gitignore.write_text("run.db\nrun.db-wal\nrun.db-shm\n", encoding="utf-8")
+    # and config are what belong in version control. Written from the same
+    # list `Artifacts` repairs against, so a fresh repo does not start one
+    # entry short and get patched on its first run.
+    gitignore.write_text(GITIGNORE_LINES, encoding="utf-8")
 
     print(f"\nWrote {written}")
 
@@ -393,6 +395,10 @@ def cmd_go(args: argparse.Namespace) -> int:
         config.loop.respec_on_retry = False
     if getattr(args, "no_preflight", False):
         config.loop.preflight = False
+    if getattr(args, "allow_red_baseline", False):
+        config.loop.require_green_baseline = False
+    if getattr(args, "no_quarantine", False):
+        config.loop.quarantine_failed = False
 
     store = _store(config)
 
@@ -1509,6 +1515,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip the model probe before the first ticket (default: probe, so "
         "a dead endpoint fails in seconds instead of one ticket at a time)",
+    )
+    p.add_argument(
+        "--allow-red-baseline",
+        action="store_true",
+        help="start even though the verify commands already fail (default: "
+        "refuse, because a failure that pre-dates the run is excused for every "
+        "ticket in it and the backlog would report green over a broken build)",
+    )
+    p.add_argument(
+        "--no-quarantine",
+        action="store_true",
+        help="leave a failed ticket's files in the tree (default: restore them "
+        "and keep a copy under .hybridforge/abandoned/, so one abandoned file "
+        "cannot stop every later ticket from being verified)",
     )
     p.add_argument("--open", action="store_true", help="open the dashboard in a browser")
     p.add_argument(
