@@ -160,6 +160,74 @@ Recovery is only safe with structural evidence, never on shape alone:
 - **Never** into a file that does not exist. With nothing to compare against,
   an illustrative snippet becomes the whole contents of a new module.
 
+### The path inside the fence is the same lesson, at scale
+
+Recovery above is for the reply that forgot its path. The commoner failure is
+the reply that *has* the path and put it one line too low:
+
+```java
+// src/main/java/com/plexnamer/domain/MediaKind.java
+package com.plexnamer.domain;
+```
+
+Sometimes bare rather than behind a comment marker; the two are one mistake.
+Over a Java run of 36 executor attempts, **19 first replies were unusable and 7
+attempts were lost outright**, every one of them to this shape. The model is not
+disobeying — it is reproducing the most-attested shape in its training data, the
+one every README snippet uses.
+
+**Telling it made things worse, and that is the finding.** Corrected in as many
+words that the path must go on its own line *before* the opening fence, one
+reply moved the path from a `//` comment to a bare first line still inside the
+fence — and dropped two files' `package` declarations while reformatting,
+losing correct work to a header. Another dropped the path line entirely. The
+correction reads as "put the path at the top" to anything that cannot already
+see the boundary it is getting wrong.
+
+So the harness absorbs it. `_paths_inside_fences` reads a block whose first line
+names a file, strips that line, and writes the rest. Replayed over the run: 19
+unusable first replies became 7, and 7 lost attempts became 3, with no change to
+any reply that already parsed.
+
+Two guards, and the first is not optional:
+
+- **What is left after the path line must look like content.** One real reply
+  was a fence holding the path and nothing else; reading it as that file would
+  have truncated the file to empty. A fenced directory listing has the same
+  shape. Every remaining non-blank line being itself a path means the block
+  names files rather than being one.
+- **Only when nothing parsed the ordinary way.** A reply that labelled even one
+  file correctly is read as written. Mixing the readings would let a comment
+  inside a properly labelled block invent a second edit out of the file's own
+  first line.
+
+Three things follow from the same evidence and are worth keeping together:
+
+- **Show the format, do not only describe it.** `EXECUTOR_SYSTEM` and
+  `TESTER_SYSTEM` had five prose bullets about the protocol and no example of
+  it. They now carry a worked reply that parses — and the wrong shapes named
+  explicitly, because a strong prior is better displaced than forbidden. A test
+  runs the parser over the prompt itself: an example that does not parse teaches
+  the wrong thing.
+- **Correct with the ticket's own paths, not with prose.** The harness knows
+  them — they are the scope it will enforce anyway — so the reprompt writes them
+  out in the shape that parses, for the model to copy rather than construct.
+  Globs are dropped: a scope rule is not a filename, and offering `src/**` as a
+  line to copy invites a file called `src/**`.
+- **A role whose output must parse should not inherit a sampling default.** The
+  executor reached `temperature` 0.2 through `_call`'s default — the highest in
+  the pipeline, on the one role whose reply has to be machine-readable before
+  any of it counts, while the reviewer chose 0.0 and the tester 0.1. It now
+  states 0.0. A model block's own `temperature` still overrides it, which is the
+  point of `Provider.temperature`.
+
+Related: `duplicate_paths` exists for a file that closes its own fence early and
+gets re-parsed into blocks named from its prose — a spurious block that is never
+identical to the first. A block repeated *byte for byte* is a model that
+answered twice, and `apply_edits` writes in order, so the second write puts back
+what the first did. Collapsing those keeps the guard pointed at conflicts.
+
+
 ---
 
 ## 8. One consumer taking the newest strands every other producer
@@ -451,6 +519,7 @@ the backlog is there to fix.
 | `errors_naming` reading blocks | all three call sites |
 | `_widen_scope` on a blocked ticket | every ticket |
 | `_recover_unlabeled` | every ticket with one writable file |
+| `_paths_inside_fences` / `_drop_repeats` | every executor and tester reply |
 | `evidence.reading_scope` | ingest, bug, re-diagnosis |
 | `_ground_references` / `evidence.locate_named` | every respec |
 | `_refuse_verification_waivers` / `_disarmed_context` | every respec |

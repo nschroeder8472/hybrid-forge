@@ -10416,5 +10416,329 @@ class TestRedLeftBehindEndsTheRunWhereItHappened(unittest.TestCase):
         return orch, run_id, failed
 
 
+
+class TestThePathTheModelPutInsideTheFence(unittest.TestCase):
+    """The protocol wants the path above the opening fence. What models emit is
+    the README shape — the path as the file's first line, usually behind the
+    comment marker of whatever language it is in. Over one Java run, 70% of
+    first replies were unusable and 35% of attempts were lost outright, every
+    one of them to this or its bare variant.
+
+    Correcting the model made it worse. Told the path must go before the fence,
+    one reply moved it from a `//` comment to a bare first line still inside
+    the fence, and dropped two files' `package` declarations while reformatting
+    — losing correct work to a header. Another dropped the path line entirely.
+    """
+
+    def test_a_path_behind_a_comment_marker_still_names_the_file(self):
+        parsed = parse_output(
+            "```java\n"
+            "// src/main/java/com/example/Greeter.java\n"
+            "package com.example;\n"
+            "\n"
+            "public final class Greeter {}\n"
+            "```\n"
+        )
+
+        self.assertEqual(
+            [e.path for e in parsed.edits], ["src/main/java/com/example/Greeter.java"]
+        )
+        # The marker line is the header, not the file. Writing it through would
+        # put a stray comment at the top of every rescued file.
+        self.assertNotIn("Greeter.java", parsed.edits[0].content)
+        self.assertTrue(parsed.edits[0].content.startswith("package com.example;"))
+
+    def test_a_bare_path_on_the_first_line_names_the_file_too(self):
+        # Here the strip is not cosmetic: leaving the line in writes a path
+        # into the source and the file does not compile.
+        parsed = parse_output(
+            "```java\n"
+            "src/main/java/com/example/Greeter.java\n"
+            "package com.example;\n"
+            "\n"
+            "public final class Greeter {}\n"
+            "```\n"
+        )
+
+        self.assertEqual(
+            [e.path for e in parsed.edits], ["src/main/java/com/example/Greeter.java"]
+        )
+        self.assertTrue(parsed.edits[0].content.startswith("package com.example;"))
+
+    def test_every_comment_syntax_the_languages_here_use(self):
+        for marker in ("//", "#", "--", ";", "/*", "<!--", "*"):
+            with self.subTest(marker=marker):
+                parsed = parse_output(
+                    f"```\n{marker} src/app.py\nimport os\n\n\nprint(os.name)\n```\n"
+                )
+                self.assertEqual([e.path for e in parsed.edits], ["src/app.py"])
+
+    def test_a_fence_holding_only_a_path_is_refused(self):
+        # The catastrophic case, and a real reply: a model naming a file it did
+        # not write. Reading it as that file truncates the file to empty.
+        parsed = parse_output(
+            "```java\nsrc/main/java/com/example/Greeter.java\n```\n"
+        )
+
+        self.assertEqual(parsed.edits, [])
+        self.assertTrue(parsed.is_empty)
+
+    def test_a_fenced_listing_of_paths_is_not_a_file(self):
+        parsed = parse_output(
+            "Here are the files I will write:\n\n"
+            "```\nsrc/a.py\nsrc/b.py\nsrc/c.py\n```\n"
+        )
+
+        self.assertEqual(parsed.edits, [])
+
+    def test_a_reply_that_parsed_normally_is_never_re_read(self):
+        # Mixing the two readings would let a comment inside a correctly
+        # labelled block invent a second edit out of the file's own first line.
+        parsed = parse_output(
+            "src/app.py\n"
+            "```python\n"
+            "# src/other.py\n"
+            "import os\n"
+            "```\n"
+        )
+
+        self.assertEqual([e.path for e in parsed.edits], ["src/app.py"])
+        self.assertIn("# src/other.py", parsed.edits[0].content)
+
+    def test_a_shebang_is_not_a_path(self):
+        parsed = parse_output(
+            "```\n#!/usr/bin/env python\nimport os\nprint(os.name)\n```\n"
+        )
+
+        self.assertEqual(parsed.edits, [])
+
+    def test_a_rescued_block_that_could_have_closed_early_is_not_written(self):
+        # Same rule the labelled path already follows: what was captured is a
+        # prefix, and applying a prefix is what destroys the file. Reported as
+        # truncated so the attempt asks for a longer fence rather than writing
+        # a README that stops at its first code sample.
+        parsed = parse_output(
+            "```\n"
+            "# README.md\n"
+            "Run it:\n"
+            "```bash\n"
+            "make\n"
+            "```\n"
+        )
+
+        self.assertEqual(parsed.edits, [])
+        self.assertEqual(parsed.truncated, ["README.md"])
+
+    def test_the_rescue_is_no_more_dangerous_than_the_path_it_stands_in_for(self):
+        # A file whose own fence is the same length as its wrapper closes that
+        # wrapper, and what survives is a prefix — for a labelled block just as
+        # much as a rescued one. The rescue must not be held to a guarantee the
+        # protocol never made, and must not quietly be worse either.
+        body = "Run it:\n```\nmake\n```\n"
+        labelled = parse_output(f"README.md\n```\n{body}```\n")
+        rescued = parse_output(f"```\n# README.md\n{body}```\n")
+
+        self.assertEqual(
+            [(e.path, e.content) for e in labelled.edits],
+            [(e.path, e.content) for e in rescued.edits],
+        )
+        self.assertEqual(labelled.truncated, rescued.truncated)
+
+    def test_the_real_reply_that_cost_a_java_run_its_attempts(self):
+        # Trimmed from PN-001 attempt 1: six files, every one of them named by
+        # a `//` comment on the first line inside its fence. Before this the
+        # whole reply was discarded and the attempt spent.
+        reply = (
+            "I'll implement the domain value types as specified.\n\n"
+            "```java\n"
+            "// src/main/java/com/plexnamer/domain/MediaKind.java\n"
+            "package com.plexnamer.domain;\n\n"
+            "public enum MediaKind {\n    MOVIE,\n    TV,\n    UNKNOWN\n}\n"
+            "```\n\n"
+            "```java\n"
+            "// src/main/java/com/plexnamer/domain/ComplianceStatus.java\n"
+            "package com.plexnamer.domain;\n\n"
+            "public enum ComplianceStatus {\n    COMPLIANT,\n    IGNORED\n}\n"
+            "```\n"
+        )
+
+        parsed = parse_output(reply)
+
+        self.assertEqual(
+            [e.path for e in parsed.edits],
+            [
+                "src/main/java/com/plexnamer/domain/MediaKind.java",
+                "src/main/java/com/plexnamer/domain/ComplianceStatus.java",
+            ],
+        )
+        for edit in parsed.edits:
+            self.assertTrue(edit.content.startswith("package com.plexnamer.domain;"))
+
+
+class TestABlockRepeatedByteForByte(unittest.TestCase):
+    """`duplicate_paths` exists for a real hazard: a file containing its own
+    fence closes the wrapper early, the remainder is re-parsed into blocks
+    named from its prose, and the spurious one is later so it wins. That block
+    is never identical to the first. A block repeated exactly is a model that
+    answered twice, and spending an attempt asking again buys nothing."""
+
+    BODY = "package com.example;\n\npublic final class Greeter {}\n"
+
+    def test_an_identical_repeat_is_collapsed(self):
+        parsed = parse_output(
+            f"src/Greeter.java\n```java\n{self.BODY}```\n"
+            f"src/Greeter.java\n```java\n{self.BODY}```\n"
+        )
+
+        self.assertEqual([e.path for e in parsed.edits], ["src/Greeter.java"])
+        self.assertEqual(duplicate_paths(parsed), [])
+
+    def test_a_repeat_that_differs_is_still_reported(self):
+        parsed = parse_output(
+            f"src/Greeter.java\n```java\n{self.BODY}```\n"
+            "src/Greeter.java\n```java\nsomething else entirely\n```\n"
+        )
+
+        self.assertEqual(duplicate_paths(parsed), ["src/Greeter.java"])
+
+    def test_two_different_files_are_not_a_repeat(self):
+        parsed = parse_output(
+            f"src/A.java\n```java\n{self.BODY}```\n"
+            f"src/B.java\n```java\n{self.BODY}```\n"
+        )
+
+        self.assertEqual([e.path for e in parsed.edits], ["src/A.java", "src/B.java"])
+        self.assertEqual(duplicate_paths(parsed), [])
+
+
+class TestTheCorrectionShowsThePathsRatherThanDescribingThem(unittest.TestCase):
+    """Prose about where the path goes is the thing that already failed. The
+    harness knows the ticket's paths — they are the scope it will enforce
+    anyway — so it writes them out in the shape that parses, for the model to
+    copy rather than construct."""
+
+    def test_the_ticket_s_own_paths_are_in_the_correction(self):
+        orch, _, _ = _stub_orchestrator()
+        ticket = Ticket("T-1", allowed_files=["src/game.py", "src/board.py"])
+
+        note = orch._malformed_reply(
+            parse_output("```python\nx = 1\ny = 2\n```\n"), "```python\nx = 1\n```", ticket
+        )
+
+        self.assertIn("src/game.py", note)
+        self.assertIn("src/board.py", note)
+        self.assertIn("outside the fence", note)
+
+    def test_a_glob_is_never_offered_as_a_line_to_copy(self):
+        # A scope rule is not a filename. Offering `src/**` invites a file
+        # called `src/**`.
+        orch, _, _ = _stub_orchestrator()
+
+        note = orch._header_lines(Ticket("T-1", allowed_files=["src/**", "build.sh"]))
+
+        self.assertIn("build.sh", note)
+        self.assertNotIn("src/**", note)
+
+    def test_a_ticket_whose_scope_is_all_globs_says_nothing(self):
+        orch, _, _ = _stub_orchestrator()
+
+        self.assertEqual(orch._header_lines(Ticket("T-1", allowed_files=["src/**"])), "")
+
+    def test_a_reply_with_no_file_content_at_all_is_still_not_malformed(self):
+        # A ticket whose work is already on disk has nothing to write, and
+        # spending an attempt correcting its format is how a finished ticket
+        # failed three times a cycle.
+        orch, _, _ = _stub_orchestrator()
+
+        note = orch._malformed_reply(
+            parse_output("Everything the spec asks for is already implemented."),
+            "Everything the spec asks for is already implemented.",
+            Ticket("T-1", allowed_files=["src/game.py"]),
+        )
+
+        self.assertEqual(note, "")
+
+
+class TestTheExecutorSamplesAtAChosenTemperature(unittest.TestCase):
+    """The executor reached 0.2 by inheriting `_call`'s default — the highest
+    in the pipeline, on the one role whose output has to hit a machine-readable
+    format before any of it counts. Every other call site chose a number."""
+
+    def test_the_build_call_states_its_own(self):
+        orch, root, run_id = _stub_orchestrator()
+        seen: list[float] = []
+
+        def call(_run, role, _messages, *, max_tokens, temperature=0.2):
+            seen.append(temperature)
+            return Completion(
+                text="src/game.py\n```python\nx = 1\n```", usage=Usage(),
+                finish_reason="stop",
+            )
+
+        orch._call = call
+        orch._attempt(run_id, Ticket("T-1", allowed_files=["src/game.py"]), "")
+
+        self.assertEqual(seen[0], 0.0)
+
+    def test_a_model_block_still_overrides_it(self):
+        # `Provider.temperature` is what lets a model be run the way its
+        # authors intended, and pinning a role must not take that away.
+        from forge.providers.openai_compat import OpenAICompatProvider
+
+        provider = OpenAICompatProvider(
+            "local",
+            {
+                "baseUrl": "http://x:11434/v1",
+                "model": "m",
+                "contextWindow": 8192,
+                "maxOutputTokens": 1024,
+                "temperature": 0.6,
+            },
+        )
+
+        self.assertEqual(provider.temperature(0.0), 0.6)
+
+    def test_without_one_the_role_s_choice_stands(self):
+        from forge.providers.openai_compat import OpenAICompatProvider
+
+        provider = OpenAICompatProvider(
+            "local",
+            {
+                "baseUrl": "http://x:11434/v1",
+                "model": "m",
+                "contextWindow": 8192,
+                "maxOutputTokens": 1024,
+            },
+        )
+
+        self.assertEqual(provider.temperature(0.0), 0.0)
+
+
+class TestTheFormatIsShownAndNotOnlyDescribed(unittest.TestCase):
+    """Prose describing fence boundaries is what the observed failures were
+    answering. A worked example is the correction that does not depend on the
+    model already seeing the boundary it is getting wrong."""
+
+    def test_the_executor_is_shown_a_reply_that_parses(self):
+        from forge.prompts import EXECUTOR_SYSTEM
+
+        # The example in the prompt has to survive the parser the reply will
+        # meet. A worked example that does not parse teaches the wrong shape.
+        parsed = parse_output(EXECUTOR_SYSTEM)
+
+        self.assertIn(
+            "src/main/java/com/example/Greeter.java", [e.path for e in parsed.edits]
+        )
+
+    def test_the_tester_is_shown_one_too(self):
+        from forge.prompts import TESTER_SYSTEM
+
+        parsed = parse_output(TESTER_SYSTEM)
+
+        self.assertIn(
+            "src/test/java/com/example/GreeterTest.java", [e.path for e in parsed.edits]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
