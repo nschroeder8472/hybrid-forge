@@ -41,9 +41,27 @@ from typing import Any
 
 ARTIFACTS_DIR = "artifacts"
 
+# Where a ticket that gave up leaves the work being taken back out of the tree.
+# Under the same directory and under the same gitignore rule, for the same
+# reason: it is untracked, and `_diff()` builds the reviewer's changeset with
+# `git add -N .`. A quarantine that leaked into that would ask the reviewer to
+# approve the abandoned copy of the file alongside the restored one.
+ABANDONED_DIR = "abandoned"
+
 # Entries `.hybridforge/.gitignore` must carry. `run.db*` is what `forge init`
-# has always written; artifacts are new, and older repos will not have it.
-_GITIGNORE_LINES = ("run.db", "run.db-wal", "run.db-shm", ARTIFACTS_DIR + "/")
+# has always written; artifacts and quarantine are newer, and older repos will
+# not have them.
+_GITIGNORE_LINES = (
+    "run.db",
+    "run.db-wal",
+    "run.db-shm",
+    ARTIFACTS_DIR + "/",
+    ABANDONED_DIR + "/",
+)
+
+# The same entries as one file body, for `forge init` to write on a fresh
+# repository rather than starting it a line short of what the loop repairs to.
+GITIGNORE_LINES = "".join(line + "\n" for line in _GITIGNORE_LINES)
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 

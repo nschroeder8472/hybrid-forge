@@ -242,6 +242,39 @@ class LoopSettings:
     # that already passed, or a model slow enough that loading it twice is
     # worth avoiding.
     preflight: bool = True
+    # Run the verify commands once before the first ticket and refuse to start
+    # on a tree that is already red.
+    #
+    # The per-ticket baseline excuses a failure that pre-dates a ticket, which
+    # is what stops one abandoned file from failing an entire backlog. On a
+    # repository that is red *before the run*, that amnesty applies to every
+    # ticket at once: each one is verified against a build that cannot succeed,
+    # each one is excused for it, and the backlog reports green over a project
+    # that does not compile. `_unverifiable` does not catch this — the red is
+    # in files no ticket owns, so there is no exhausted owner to point at — and
+    # `_finish` only finds it after every ticket has been spent.
+    #
+    # Only a failure naming files is worth blocking on. A command that fails
+    # with nothing to attribute — `pytest` exiting 5 on a repository with no
+    # tests yet — is a greenfield run, not a broken one, and is reported rather
+    # than gated. Turn this off for a repository whose red is known and is what
+    # the backlog is there to fix.
+    require_green_baseline: bool = True
+    # Take a ticket's work back out of the tree when it gives up, keeping a
+    # copy under `.hybridforge/abandoned/`.
+    #
+    # Nothing used to revert a failed ticket, on the grounds that a human may
+    # want to salvage what it wrote. The cost was paid by everything after it:
+    # the file stays broken, whole-project verification reports it to every
+    # later ticket, and because it is outside their scope they are excused for
+    # it — so they pass having compiled nothing. One run ended with two files
+    # importing a package that never existed and five tickets green against a
+    # tree where `compileJava` failed on the first file it read.
+    #
+    # Quarantine keeps both: the tree returns to the state the ticket inherited
+    # and the abandoned work is on disk to read. Turn it off to have a failed
+    # ticket's files left in place.
+    quarantine_failed: bool = True
     # Seconds between control-channel checks while waiting.
     poll_seconds: float = 2.0
     # Cap on unattended wall-clock time. 0 disables.
@@ -350,6 +383,8 @@ class Config:
                 loop.get("reopenStaleDependents", True)
             ),
             preflight=bool(loop.get("preflight", True)),
+            require_green_baseline=bool(loop.get("requireGreenBaseline", True)),
+            quarantine_failed=bool(loop.get("quarantineFailed", True)),
             poll_seconds=float(loop.get("pollSeconds", 2.0)),
             max_runtime_seconds=int(loop.get("maxRuntimeSeconds", 0)),
             baseline_verify=bool(loop.get("baselineVerify", True)),
@@ -596,6 +631,8 @@ class Config:
                 "respecCriteria": self.loop.respec_criteria,
                 "reopenStaleDependents": self.loop.reopen_stale_dependents,
                 "preflight": self.loop.preflight,
+                "requireGreenBaseline": self.loop.require_green_baseline,
+                "quarantineFailed": self.loop.quarantine_failed,
                 "pollSeconds": self.loop.poll_seconds,
                 "maxRuntimeSeconds": self.loop.max_runtime_seconds,
                 "baselineVerify": self.loop.baseline_verify,

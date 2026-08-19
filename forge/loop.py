@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 import traceback
 import time
@@ -39,7 +40,7 @@ from typing import Any, Callable, Sequence
 
 from . import respec
 from . import evidence
-from .artifacts import Artifacts
+from .artifacts import ABANDONED_DIR, Artifacts, safe_name
 from .budget import BudgetGate, Wait
 from .config import ANY_LANGUAGE, Config, ConfigError
 from .failures import (
@@ -836,12 +837,18 @@ class Orchestrator:
 
         The baseline is re-taken every cycle, and has to be: tickets run in
         between, and a ticket that inherits a stale baseline is asked to fix
-        errors another one wrote after it. The cost is that nothing reverts a
-        failed ticket, so on a retry its own breakage is still on disk and a
-        fresh baseline reads it as pre-existing — amnesty for the errors it just
+        errors another one wrote after it. The cost is a ticket whose own
+        breakage is still on disk when the next cycle starts, so a fresh
+        baseline reads it as pre-existing — amnesty for the errors it just
         wrote, renewed every cycle, so the debt can only grow. A real run went 3
         errors, then 7, then 13, then 20, and finished with every ticket `done`
         on a tree that did not compile.
+
+        `quarantineFailed` closes most of that: a ticket that gives up has its
+        work taken back out of the tree, so the next cycle usually starts from
+        the state it inherited. It cannot be relied on to — the revert needs a
+        baseline tree to read, and a repository without git has none — so the
+        subtraction below stays load-bearing rather than becoming redundant.
 
         Subtracting what the ticket has been charged for is what separates
         "already broken when I got here" from "broken by me last time". Both
@@ -1010,9 +1017,10 @@ class Orchestrator:
 
         The excuse stops at the edge of the ticket's own scope. A failure in a
         file the ticket may write is one it is able to fix, and on a retry it is
-        usually one the ticket *caused* — nothing reverts a failed ticket, so
-        the next cycle starts with its own breakage on disk and would otherwise
-        collect a baseline that forgives it. That happened: a ticket left four
+        usually one the ticket *caused* — where quarantine could not take the
+        work back out, the next cycle starts with its own breakage on disk and
+        would otherwise collect a baseline that forgives it. That happened: a
+        ticket left four
         clippy errors in `src/board.rs`, was requeued, and passed its lint step
         on the grounds that the errors pre-dated the attempt. They did. It wrote
         them.
@@ -1097,6 +1105,16 @@ class Orchestrator:
                 run_id, RUN_FAILED, f"{len(unreachable)} role(s) unreachable"
             )
             return RUN_FAILED
+
+        # Before the first ticket, and before anything is requeued: a run
+        # cannot verify anything on a tree that was red when it started, and
+        # every ticket in the backlog would be excused for it in turn. See
+        # `_green_baseline`.
+        red = self._green_baseline(run_id)
+        if self._toolchain:
+            return self._stop_for_toolchain(run_id)
+        if red:
+            return self._stop_for_red_baseline(run_id, red)
 
         # Before the first ticket: a human may have requeued something already
         # green since the last run, and whatever was built on top of it was
@@ -1416,6 +1434,107 @@ class Orchestrator:
                     kind="lifecycle",
                 )
         return [name for name, report in checked.items() if report.startswith("FAIL")]
+
+    def _green_baseline(self, run_id: int) -> str:
+        """Refuse to start on a tree that is already red. Returns a note or "".
+
+        Everything the loop knows about who broke what is relative. A failure
+        that pre-dates a ticket is excused so one abandoned file cannot fail an
+        entire backlog, and `_unverifiable` catches the case where that amnesty
+        has swallowed a ticket whole. Neither reaches a repository that was
+        red before the run: the errors are in files no ticket owns, so every
+        ticket inherits them, every ticket is excused for them, and there is no
+        exhausted owner for `_unverifiable` to name. The backlog then reports
+        green over a project that never compiled once, and the only thing that
+        notices is `_finish` — after every ticket has been spent.
+
+        So the tree is checked once, before the first delegation, and the run
+        refuses to start rather than reporting the problem an hour later. The
+        first unit of work on a red repository is fixing the red, and that is a
+        ticket a human writes: the loop cannot scope it, because the files it
+        would have to authorise are precisely the ones nobody has claimed.
+
+        Two failures are deliberately not gated on:
+
+        A command that never reached the code. `_note_toolchain` already
+        recognises those and `run` ends on `_stop_for_toolchain`, which says
+        what is actually wrong instead of blaming the tree.
+
+        A failure naming no file. `pytest` exits 5 on a repository with no
+        tests, `npm test` fails with no script, and a greenfield project is the
+        normal way a backlog starts — it is where this very run began, with an
+        empty repository and a `test` command that had nothing to run. Blocking
+        those would make the gate fire hardest on the runs it has nothing to
+        say about, so an unattributable failure is reported and the run
+        continues. This is the same direction `_unverifiable` and
+        `_signature_scope` are already wrong in, for the same reason.
+        """
+        if not self.config.loop.require_green_baseline:
+            return ""
+
+        failed: list[str] = []
+        output: list[str] = []
+        for name, command in self._verify_plan():
+            result = self._shell(run_id, f"start-{name}", command)
+            self._note_toolchain(name, command, result)
+            if self._toolchain:
+                return ""
+            if not result.ok:
+                failed.append(name)
+                output.append(result.detail)
+        if not failed:
+            return ""
+
+        red = sorted(
+            {
+                repo_relative(path, self.config.root)
+                for path in files_blamed("\n".join(output))
+            }
+        )
+        if not red:
+            self.store.log(
+                run_id,
+                f"{', '.join(failed)} already failed before the first ticket, "
+                f"but named no file. Reported rather than gated: an empty "
+                f"suite on a new project fails this way, and it is how most "
+                f"backlogs start. Nothing before the first ticket is excused "
+                f"for this — every ticket will inherit it.",
+                level="warn",
+                kind="verify",
+                data={"steps": failed},
+            )
+            return ""
+
+        return (
+            f"the project is already red before the first ticket: "
+            f"{', '.join(failed)} fails on files no ticket in this backlog "
+            f"owns.\n\n"
+            + "\n".join(f"  - {path}" for path in red[:8])
+            + (f"\n  ... and {len(red) - 8} more" if len(red) > 8 else "")
+            + "\n\n"
+            + distill("\n".join(output), limit=1500)
+        )
+
+    def _stop_for_red_baseline(self, run_id: int, note: str) -> str:
+        """End the run before anything is delegated. Nothing is spent."""
+        self.store.set_run_status(run_id, RUN_BLOCKED, "the tree was red before the run")
+        self.store.log(
+            run_id,
+            f"Cannot start — {note}\n\n"
+            f"A ticket is only ever judged on the errors it introduces, so "
+            f"every one of these would be excused for every ticket in the "
+            f"backlog. The run would finish reporting green having compiled "
+            f"nothing. Fix the tree first — that is the first ticket, and it "
+            f"is one a human writes, because the files it would have to "
+            f"authorise are the ones no ticket claims — then `forge go`. To "
+            f"start anyway and let the backlog inherit this, set "
+            f"`loop.requireGreenBaseline` to false or pass "
+            f"`--allow-red-baseline`.",
+            level="error",
+            kind="lifecycle",
+            data={"note": note},
+        )
+        return RUN_BLOCKED
 
     def _finish(self, run_id: int) -> str:
         # Order matters here. Parking first turns "pending forever" into a
@@ -1914,6 +2033,10 @@ class Orchestrator:
         # than overwriting something that was already there. Unverified ones
         # are removed if the ticket never passes.
         authored: dict[str, bool] = {}
+        # Every implementation file this ticket has landed, across all of its
+        # attempts. Read only when it gives up, to put the tree back the way it
+        # found it. See `_quarantine`.
+        touched: set[str] = set()
         # Everything that has already failed on this ticket, and every verdict
         # the reviewer has already given it. `failure_context` alone carries
         # only the newest one, which is what lets an executor oscillate — fix A
@@ -1951,7 +2074,7 @@ class Orchestrator:
 
             outcome = self._attempt(
                 run_id, ticket, failure_context, retrieved, baseline,
-                pre_existing=pre_existing, authored=authored,
+                pre_existing=pre_existing, authored=authored, touched=touched,
                 prior_failures=history[-self._PRIOR_FAILURES:],
                 rejections=rejections,
                 repro=repro,
@@ -1963,6 +2086,7 @@ class Orchestrator:
             # somebody else's broken file and call it scope.
             if outcome.halt:
                 self._discard_tests(run_id, ticket, authored)
+                self._quarantine(run_id, ticket, touched)
                 ticket.status = TICKET_BLOCKED
                 ticket.blocked_note = outcome.detail
                 self.store.update_ticket(run_id, ticket)
@@ -1982,6 +2106,7 @@ class Orchestrator:
                     continue
 
                 self._discard_tests(run_id, ticket, authored)
+                self._quarantine(run_id, ticket, touched)
                 ticket.status = TICKET_BLOCKED
                 ticket.blocked_note = outcome.detail
                 self.store.update_ticket(run_id, ticket)
@@ -1991,6 +2116,9 @@ class Orchestrator:
                     level="warn",
                     kind="ticket",
                 )
+                # After the revert, not before: what matters is whether the
+                # tree is still red once this ticket's work is out of it.
+                self._red_left_behind(run_id, ticket)
                 if self.config.loop.stop_on_blocked:
                     raise Stopped()
                 return
@@ -2022,6 +2150,7 @@ class Orchestrator:
 
         ticket.status = TICKET_FAILED
         self._discard_tests(run_id, ticket, authored)
+        self._quarantine(run_id, ticket, touched)
         # Keep why it failed, not just that it did. "exhausted 3 attempts" is
         # the one fact already visible from the attempt count, and discarding
         # the last verification failure throws away the only thing that could
@@ -2037,6 +2166,10 @@ class Orchestrator:
             level="error",
             kind="ticket",
         )
+        # Asked here rather than left for the next ticket to discover halfway
+        # through its own verify step, which is a full attempt spent to learn
+        # something that was already true.
+        self._red_left_behind(run_id, ticket)
         if self.config.loop.stop_on_blocked:
             raise Stopped()
 
@@ -2447,6 +2580,7 @@ class Orchestrator:
         *,
         pre_existing: dict[str, set[str]] | None = None,
         authored: dict[str, bool] | None = None,
+        touched: set[str] | None = None,
         prior_failures: Sequence[str] = (),
         rejections: list[str] | None = None,
         repro: tuple[str, str] | None = None,
@@ -2617,6 +2751,14 @@ class Orchestrator:
                 self.store.end_step(step_id, "failed", str(exc))
                 return StepResult(ok=False, blocked=True, detail=str(exc))
             self.store.end_step(step_id, "ok", "\n".join(written))
+            # Accumulated across every attempt, because quarantine happens
+            # once the ticket has given up and by then the attempt that wrote a
+            # file may be three failures ago. Recorded from `apply_edits`
+            # rather than derived from a diff: these are the literal paths that
+            # landed, so the revert needs no glob expansion and cannot reach a
+            # file this ticket never wrote. See `_quarantine`.
+            if touched is not None:
+                touched.update(written)
             self._record_step(
                 ticket,
                 "apply",
@@ -2989,7 +3131,8 @@ class Orchestrator:
         # Files this attempt wrote that git reports as unchanged, because what
         # was written matched what was already there. On a retry that is most
         # of the ticket: the previous cycle's implementation is still on disk
-        # (autoCommit is off, and nothing reverts a failed ticket), the
+        # (autoCommit is off, and quarantine only reaches a ticket whose
+        # baseline tree could be read), the
         # executor reproduces it exactly, and only the discarded test file
         # shows up as new. A reviewer handed that diff says the implementation
         # is missing and rejects — every attempt, every cycle, forever.
@@ -4059,6 +4202,11 @@ class Orchestrator:
         # happened instead of removals that were attempted.
         if not target.is_file():
             return
+        # Set aside under the same quarantine as the implementation it was
+        # written against, and for the same reason: the assertions have to stop
+        # running, but a human reading the blocked note wants both halves of
+        # what the ticket produced, not the code without the tests.
+        self._keep_a_copy(run_id, ticket, path)
         try:
             target.unlink()
         except OSError as exc:
@@ -4075,6 +4223,257 @@ class Orchestrator:
             f"{ticket.ticket_id}: removed unverified test {path}.",
             level="warn",
             kind="ticket",
+        )
+
+    def _red_left_behind(self, run_id: int, ticket: Ticket) -> None:
+        """Check the tree the moment a ticket gives up, not at the next one.
+
+        `_unverifiable` already refuses to record a green nobody checked, but it
+        can only speak from inside a ticket's verify step — so the ticket after
+        the one that gave up is delegated, tested, verified and only then told
+        that none of it was checked. That is a whole attempt spent to learn
+        something that was true before it started: a run with a red tree and an
+        exhausted owner has no way back, and every model call after that point
+        is spent producing evidence nothing can read.
+
+        Quarantine usually makes this a no-op — the tree goes back to the state
+        the ticket inherited, and the next ticket is verified against a build
+        that works. It is what catches the cases quarantine cannot fix: a
+        repository with no git for the revert to read, a copy that could not be
+        written, or a failure the ticket left in a file it never wrote.
+
+        The ownership rule is the one `_unverifiable` uses, with the ticket that
+        just gave up now counted among the owners rather than excluded from
+        them. Red owned only by tickets still pending is a backlog mid-flight —
+        a JVM plan is routinely red between the ticket that calls a class and
+        the one that writes it. Red owned by nobody is an orphan, which
+        `_finish` and the orphan sweep handle. Red owned by something out of
+        attempts is the one nothing coming will clear.
+        """
+        if self._halt or self._toolchain:
+            return
+        # Nothing runnable is left, so `_finish` runs the same commands next
+        # and reports what it finds. Checking here as well would pay for the
+        # suite twice to reach the same answer.
+        if self.store.next_ticket(run_id) is None:
+            return
+
+        failed: list[str] = []
+        output: list[str] = []
+        for name, command in self._verify_plan():
+            result = self._shell(run_id, f"after-{ticket.ticket_id}-{name}", command)
+            self._note_toolchain(name, command, result)
+            if self._toolchain:
+                return
+            if not result.ok:
+                failed.append(name)
+                output.append(result.detail)
+        if not failed:
+            return
+
+        red = sorted(
+            {
+                repo_relative(path, self.config.root).lower()
+                for path in files_blamed("\n".join(output))
+            }
+        )
+        if not red:
+            # A failure with nothing to attribute. It may be real and it may be
+            # someone's, but there is no file to name and no owner to look up,
+            # and ending a run on an unparseable diagnostic is the wrong
+            # direction to be wrong in.
+            return
+
+        stalled = sorted(
+            other.ticket_id
+            for other in self.store.list_tickets(run_id)
+            if other.status in self._GAVE_UP
+            and any(matches_any(path, [p.lower() for p in other.allowed_files]) for path in red)
+        )
+        if not stalled:
+            return
+
+        self._halt = (
+            f"{ticket.ticket_id} gave up and the tree is still red on files "
+            f"nothing left in this backlog owns:\n"
+            + "\n".join(f"  - {path}" for path in red[:8])
+            + f"\n\n{', '.join(stalled)} already ran out of attempts on those "
+            f"files, so {', '.join(failed)} will fail identically for every "
+            f"ticket after this one — and each of them would be excused for it "
+            f"and recorded green having compiled nothing. Fix them, then "
+            f"`forge retry`."
+        )
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: {self._halt}",
+            level="error",
+            kind="verify",
+            data={"steps": failed, "files": red[:20], "stalled": stalled},
+        )
+
+    def _abandoned_dir(self, run_id: int, ticket: Ticket) -> Path:
+        return (
+            self.config.config_dir
+            / ABANDONED_DIR
+            / f"run-{run_id}"
+            / safe_name(ticket.ticket_id, "ticket")
+        )
+
+    def _keep_a_copy(self, run_id: int, ticket: Ticket, path: str) -> bool:
+        """Save the current contents of `path` under `.hybridforge/abandoned/`.
+
+        Salvage was the whole argument for leaving a failed ticket's work in
+        the tree, and it is a good one: a ticket that failed on its fourth file
+        may have got the first three right, and a human reading the blocked
+        note needs to see what was attempted. Taking the work out of the tree
+        does not have to take it away — it only has to stop it being compiled.
+
+        Returns whether the copy landed. A revert is not performed on a file
+        whose copy could not be written: losing the work is worse than leaving
+        the tree red, and the tree being red is a state the loop already
+        detects and reports.
+        """
+        if not is_safe_path(self.config.root, path):
+            return False
+        source = self.config.root / path
+        if not source.is_file():
+            # Never written, or already gone. Nothing to save and nothing lost.
+            return True
+        target = self._abandoned_dir(run_id, ticket) / normalize_path(path)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            return True
+        except (OSError, shutil.Error) as exc:
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: could not set {path} aside ({exc}); "
+                f"leaving it in the tree rather than discarding it.",
+                level="warn",
+                kind="ticket",
+            )
+            return False
+
+    def _baseline_blob(self, tree: str, path: str) -> bytes | None:
+        """The bytes of `path` in `tree`, or None if it was not there.
+
+        Read as bytes through `git cat-file`, not as text: a ticket may
+        authorise a binary fixture, and round-tripping one through a decode
+        would corrupt the file this method exists to restore faithfully.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "cat-file", "blob", f"{tree}:{normalize_path(path)}"],
+                cwd=self.config.root,
+                capture_output=True,
+                check=False,
+            )
+        except (FileNotFoundError, OSError):
+            return None
+        return result.stdout if result.returncode == 0 else None
+
+    def _quarantine(self, run_id: int, ticket: Ticket, touched: set[str]) -> None:
+        """Take a given-up ticket's work out of the tree, keeping a copy.
+
+        Nothing used to revert a failed ticket. The reasoning was salvage, and
+        the cost was paid by every ticket after it: verification is
+        whole-project, so an abandoned file that does not compile is reported
+        to each of them, and because it is outside their scope the baseline
+        excuses them for it — which means they pass having had nothing
+        compiled and nothing run. A real run went that way and stopped at
+        `PN-005` with two tickets `done`, one out of attempts, and a tree where
+        `compileJava` failed on the first file it read. Everything downstream
+        of the abandoned file was unreachable for the rest of the run.
+
+        What is reverted is only what this ticket's own `apply` steps wrote,
+        recorded path by path rather than inferred from a diff. `baseline_tree`
+        is pinned for the ticket's whole life, so a diff against it on a retry
+        cycle would also name files other tickets landed in between — and a
+        glob in `allowed_files` is a scope rule, not a filename, so expanding
+        one to decide what to delete would reach further than the ticket ever
+        did.
+
+        Restoring means the version in `baseline_tree`, or removal when the
+        file was not there: a ticket that created a file and failed leaves no
+        file. Without a usable baseline nothing is reverted at all — deleting
+        on a guess could take a hand-written file the ticket was extending, and
+        that is not a mistake a copy under `abandoned/` makes up for.
+
+        "Usable" is checked, not assumed. A snapshot is an unreferenced tree
+        object, so `git gc` may prune one out from under a long run — and a
+        tree that cannot be read answers "this path was not in the baseline"
+        for *every* path, which is the answer that deletes files. The tree is
+        proved readable once before anything is touched.
+        """
+        if not self.config.loop.quarantine_failed or not touched:
+            return
+        if not ticket.baseline_tree:
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: no baseline tree was recorded, so its "
+                f"{len(touched)} file(s) stay in the tree as it left them. "
+                f"Whatever they break is now outside every later ticket's "
+                f"scope and will be excused rather than fixed.",
+                level="warn",
+                kind="ticket",
+                data={"files": sorted(touched)},
+            )
+            return
+
+        if self._git("ls-tree", "--name-only", ticket.baseline_tree).returncode != 0:
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: its baseline tree "
+                f"{ticket.baseline_tree[:12]} can no longer be read, so there "
+                f"is nothing to restore from and its {len(touched)} file(s) "
+                f"stay as it left them. Removing them on that basis would "
+                f"delete work no copy of which exists.",
+                level="warn",
+                kind="ticket",
+                data={"files": sorted(touched)},
+            )
+            return
+
+        restored: list[str] = []
+        removed: list[str] = []
+        for path in sorted(touched):
+            if not is_safe_path(self.config.root, path):
+                continue
+            if not self._keep_a_copy(run_id, ticket, path):
+                continue
+            target = self.config.root / path
+            original = self._baseline_blob(ticket.baseline_tree, path)
+            try:
+                if original is None:
+                    if target.is_file():
+                        target.unlink()
+                        removed.append(path)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(original)
+                    restored.append(path)
+            except OSError as exc:
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: could not restore {path} ({exc}); "
+                    f"it stays as the ticket left it.",
+                    level="warn",
+                    kind="ticket",
+                )
+
+        if not restored and not removed:
+            return
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: gave up, so its work was taken back out of "
+            f"the tree — {len(restored)} file(s) restored, {len(removed)} "
+            f"removed. The tree is as this ticket found it, so the tickets "
+            f"after it are verified against a build that is not carrying this "
+            f"failure. A copy of what it wrote is under "
+            f"{ABANDONED_DIR}/run-{run_id}/{safe_name(ticket.ticket_id, 'ticket')}/.",
+            level="warn",
+            kind="ticket",
+            data={"restored": restored, "removed": removed},
         )
 
     def _discard_tests(self, run_id: int, ticket: Ticket, created: dict[str, bool]) -> None:

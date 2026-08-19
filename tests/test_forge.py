@@ -4127,8 +4127,10 @@ class TestOneTestFilePerTicket(unittest.TestCase):
         )
 
         self.assertFalse((root / "tests" / "tt_001_test.rs").exists())
-        # The implementation stays: it is the ticket's own scope, and a human
-        # reading the blocked note needs to see what was attempted.
+        # The implementation stays, because this repository has no git and so
+        # no baseline tree for the revert to read. Where there is one it is
+        # quarantined instead — see
+        # `TestAFailedTicketIsTakenBackOutOfTheTree`, which covers both halves.
         self.assertTrue((root / "src" / "game.rs").exists())
 
     def test_a_retry_is_not_shown_its_own_previous_attempt_as_the_convention(self):
@@ -10084,6 +10086,335 @@ class TestABrokenToolchainIsNotATicketsFault(unittest.TestCase):
         orch._attempt(run_id, Ticket("T-1", allowed_files=["src/game.py"]), "")
 
         self.assertIsNone(orch._toolchain)
+
+
+def _git_orchestrator(commands: dict[str, str] | None = None):
+    """A stub orchestrator over a real git repository.
+
+    `_stub_orchestrator` runs over a bare temp directory, so `_snapshot()`
+    returns "" and anything that reads a baseline tree degrades instead of
+    working. Quarantine is exactly that kind of thing: it restores a file to
+    the version in the ticket's baseline tree, and with no git there is no
+    version to restore to.
+    """
+    orch, root, run_id = _stub_orchestrator(commands)
+    subprocess.run(["git", "init", "-q"], cwd=root, capture_output=True, check=False)
+    return orch, root, run_id
+
+
+class TestAFailedTicketIsTakenBackOutOfTheTree(unittest.TestCase):
+    """Nothing used to revert a failed ticket, on the grounds that a human may
+    want to salvage what it wrote. The cost was paid by everything after it:
+    verification is whole-project, so the abandoned file is reported to every
+    later ticket, and because it is outside their scope the baseline excuses
+    them for it — they pass having had nothing compiled. One run stopped at the
+    fifth ticket with a tree where `compileJava` failed on the first file it
+    read, and everything downstream of the abandoned file was unreachable for
+    the rest of the run."""
+
+    def _give_up(self, orch, run_id, body="broken"):
+        orch.config.loop.max_attempts = 1
+        orch._call = _replies(
+            "src/game.py\n```python\n" + body + "\n```",
+            "REJECT\nnot what the spec asked for",
+        )
+        ticket = Ticket("TT-001", allowed_files=["src/game.py"])
+        orch._work_ticket(run_id, ticket)
+        return ticket
+
+    def test_a_file_it_rewrote_goes_back_to_what_it_inherited(self):
+        orch, root, run_id = _git_orchestrator()
+        (root / "src").mkdir()
+        original = "def go():\n    return 1\n"
+        (root / "src" / "game.py").write_text(original, encoding="utf-8")
+
+        self._give_up(orch, run_id)
+
+        self.assertEqual(
+            (root / "src" / "game.py").read_text(encoding="utf-8"), original
+        )
+
+    def test_a_file_it_created_is_removed(self):
+        orch, root, run_id = _git_orchestrator()
+        # Something for the baseline tree to hold, so the snapshot is not empty.
+        (root / "README.md").write_text("hi\n", encoding="utf-8")
+
+        self._give_up(orch, run_id)
+
+        self.assertFalse((root / "src" / "game.py").exists())
+
+    def test_what_it_wrote_is_kept_where_a_human_can_read_it(self):
+        # Salvage was the whole argument for leaving the work in the tree, and
+        # it is a good one. Taking the work out does not have to take it away.
+        orch, root, run_id = _git_orchestrator()
+        (root / "src").mkdir()
+        (root / "src" / "game.py").write_text("def go():\n    return 1\n", encoding="utf-8")
+
+        self._give_up(orch, run_id, body="the attempt that failed")
+
+        kept = (
+            root / ".hybridforge" / "abandoned" / ("run-" + str(run_id))
+            / "TT-001" / "src" / "game.py"
+        )
+        self.assertTrue(kept.is_file())
+        self.assertIn("the attempt that failed", kept.read_text(encoding="utf-8"))
+
+    def test_the_unverified_test_file_is_kept_beside_it(self):
+        orch, root, run_id = _git_orchestrator()
+        (root / "README.md").write_text("hi\n", encoding="utf-8")
+        orch.config.loop.max_attempts = 1
+        orch._call = _replies(
+            "src/game.py\n```python\nbroken\n```",
+            "tests/tt_001_test.py\n```python\nassert False\n```",
+            "REJECT\nno",
+        )
+
+        orch._work_ticket(
+            run_id,
+            Ticket("TT-001", allowed_files=["src/game.py"], criteria=["go() exists"]),
+        )
+
+        base = root / ".hybridforge" / "abandoned" / ("run-" + str(run_id)) / "TT-001"
+        self.assertFalse((root / "tests" / "tt_001_test.py").exists())
+        self.assertTrue((base / "tests" / "tt_001_test.py").is_file())
+
+    def test_a_file_the_ticket_never_wrote_is_left_alone(self):
+        # The revert reads the paths this ticket's own applies landed, not a
+        # diff against its baseline: that baseline is pinned for the ticket's
+        # whole life, so on a retry cycle a diff would also name work other
+        # tickets did in between.
+        orch, root, run_id = _git_orchestrator()
+        (root / "src").mkdir()
+        (root / "src" / "game.py").write_text("def go():\n    return 1\n", encoding="utf-8")
+        (root / "src" / "other.py").write_text("first\n", encoding="utf-8")
+        ticket = Ticket("TT-001", allowed_files=["src/*.py"])
+        orch.config.loop.max_attempts = 1
+        orch._call = _replies("src/game.py\n```python\nbroken\n```", "REJECT\nno")
+        orch._work_ticket(run_id, ticket)
+        # Written after the baseline, inside the ticket's glob, by nobody here.
+        (root / "src" / "other.py").write_text("second\n", encoding="utf-8")
+
+        orch._quarantine(run_id, ticket, {"src/game.py"})
+
+        self.assertEqual(
+            (root / "src" / "other.py").read_text(encoding="utf-8"), "second\n"
+        )
+
+    def test_without_a_baseline_tree_nothing_is_reverted(self):
+        # Deleting on a guess could take a hand-written file the ticket was
+        # asked to extend, and a copy under abandoned/ does not make up for it.
+        orch, root, run_id = _stub_orchestrator()  # no git, so no baseline tree
+        (root / "src").mkdir()
+        (root / "src" / "game.py").write_text("original\n", encoding="utf-8")
+
+        self._give_up(orch, run_id)
+
+        self.assertEqual(
+            (root / "src" / "game.py").read_text(encoding="utf-8"), "broken\n"
+        )
+
+    def test_a_baseline_tree_that_can_no_longer_be_read_reverts_nothing(self):
+        # A snapshot is an unreferenced tree object, so `git gc` can prune one
+        # out from under a long run. An unreadable tree answers "this path was
+        # not in the baseline" for every path, which is the answer that deletes
+        # files.
+        orch, root, run_id = _git_orchestrator()
+        (root / "src").mkdir()
+        (root / "src" / "game.py").write_text("original\n", encoding="utf-8")
+        ticket = self._give_up(orch, run_id)
+        ticket.baseline_tree = "0" * 40
+        (root / "src" / "game.py").write_text("broken\n", encoding="utf-8")
+
+        orch._quarantine(run_id, ticket, {"src/game.py"})
+
+        self.assertEqual(
+            (root / "src" / "game.py").read_text(encoding="utf-8"), "broken\n"
+        )
+
+    def test_it_can_be_turned_off(self):
+        orch, root, run_id = _git_orchestrator()
+        orch.config.loop.quarantine_failed = False
+        (root / "src").mkdir()
+        (root / "src" / "game.py").write_text("original\n", encoding="utf-8")
+
+        self._give_up(orch, run_id)
+
+        self.assertEqual(
+            (root / "src" / "game.py").read_text(encoding="utf-8"), "broken\n"
+        )
+
+    def test_a_ticket_that_passes_keeps_its_work(self):
+        orch, root, run_id = _git_orchestrator()
+        (root / "src").mkdir()
+        (root / "src" / "game.py").write_text("original\n", encoding="utf-8")
+        orch._call = _replies("src/game.py\n```python\nkept\n```", "ACCEPT\nfine")
+
+        orch._work_ticket(run_id, Ticket("TT-001", allowed_files=["src/game.py"]))
+
+        self.assertEqual(
+            (root / "src" / "game.py").read_text(encoding="utf-8"), "kept\n"
+        )
+
+    def test_the_quarantine_stays_out_of_the_reviewers_diff(self):
+        # `_diff` builds the changeset with `git add -N .`, and `_snapshot`
+        # with `git add -A`. An abandoned copy that leaked into either would
+        # put the previous attempt's file in front of the next reviewer.
+        orch, root, _ = _git_orchestrator()
+        Artifacts(orch.config.config_dir, 1)
+
+        ignored = (root / ".hybridforge" / ".gitignore").read_text(encoding="utf-8")
+
+        self.assertIn("abandoned/", ignored.splitlines())
+
+
+class TestARunWillNotStartOnARedTree(unittest.TestCase):
+    """A failure that pre-dates a ticket is excused so one abandoned file
+    cannot fail an entire backlog. On a repository that was red before the run,
+    that amnesty applies to every ticket at once — and `_unverifiable` cannot
+    catch it, because red in files no ticket owns has no exhausted owner to
+    name. The backlog reports green over a project that never compiled."""
+
+    RED = "src/main/java/A.java:5: error: cannot find symbol\n"
+
+    def _run(self, orch, run_id):
+        orch._preflight = lambda _run: []
+        return orch.run(run_id)
+
+    def _said(self, orch, run_id) -> str:
+        return "\n".join(row["message"] for row in orch.store.events_after(0))
+
+    def test_a_red_tree_stops_the_run_before_anything_is_delegated(self):
+        orch, _, run_id = _stub_orchestrator({"lint": "", "typecheck": "javac", "test": ""})
+        orch._shell = _failing_shell(self.RED)
+        called: list[int] = []
+        orch._call = lambda *a, **k: called.append(1)
+
+        outcome = self._run(orch, run_id)
+
+        self.assertEqual(outcome, "blocked")
+        self.assertEqual(called, [])
+
+    def test_it_says_which_files_and_which_step(self):
+        orch, _, run_id = _stub_orchestrator({"lint": "", "typecheck": "javac", "test": ""})
+        orch._shell = _failing_shell(self.RED)
+
+        self._run(orch, run_id)
+
+        said = self._said(orch, run_id)
+        self.assertIn("typecheck", said)
+        self.assertIn("src/main/java/A.java", said)
+
+    def test_a_failure_naming_no_file_is_reported_rather_than_gated(self):
+        # `pytest` exits 5 on a repository with no tests, and a greenfield
+        # project is the normal way a backlog starts. Gating there would make
+        # this fire hardest on the runs it has nothing to say about.
+        orch, _, run_id = _stub_orchestrator({"lint": "", "typecheck": "", "test": "pytest"})
+        orch._shell = _failing_shell("no tests ran\n")
+
+        self._run(orch, run_id)
+
+        self.assertIn("named no file", self._said(orch, run_id))
+
+    def test_a_green_tree_starts_normally(self):
+        orch, _, run_id = _stub_orchestrator({"lint": "", "typecheck": "javac", "test": ""})
+        orch._shell = lambda _r, _n, _c: StepResult(ok=True, detail="")
+
+        self.assertEqual(self._run(orch, run_id), "done")
+
+    def test_the_gate_can_be_turned_off(self):
+        orch, _, run_id = _stub_orchestrator({"lint": "", "typecheck": "javac", "test": ""})
+        orch.config.loop.require_green_baseline = False
+        orch._shell = _failing_shell(self.RED)
+
+        # Not asserted `done`: `_finish` still refuses to report green over a
+        # red build. What changed is that the run was allowed to get that far.
+        self._run(orch, run_id)
+
+        self.assertNotIn("already red before the first ticket", self._said(orch, run_id))
+
+    def test_a_toolchain_that_cannot_run_is_reported_as_itself(self):
+        # Not as a red tree. `javac: command not found` is not evidence about
+        # the code, and telling a human to fix the tree sends them nowhere.
+        orch, _, run_id = _stub_orchestrator({"lint": "", "typecheck": "javac", "test": ""})
+        orch._shell = _failing_shell(
+            "'javac' is not recognized as an internal or external command\n"
+        )
+
+        outcome = self._run(orch, run_id)
+
+        self.assertEqual(outcome, "failed")
+        self.assertIsNotNone(orch._toolchain)
+
+
+class TestRedLeftBehindEndsTheRunWhereItHappened(unittest.TestCase):
+    """`_unverifiable` already refuses to record a green nobody checked, but it
+    speaks from inside the *next* ticket's verify step — so that ticket is
+    delegated, tested and verified before being told none of it was checked.
+    That is a whole attempt spent to learn something that was already true."""
+
+    RED = "src/game.py:5: error: cannot find symbol\n"
+
+    def test_it_halts_at_the_ticket_that_gave_up(self):
+        orch, run_id, failed = self._backlog()
+        orch._shell = _failing_shell(self.RED)
+
+        orch._red_left_behind(run_id, failed)
+
+        self.assertIn("src/game.py", orch._halt)
+        self.assertIn("TT-001", orch._halt)
+
+    def test_red_nobody_has_given_up_on_is_a_backlog_mid_flight(self):
+        # A JVM plan is routinely red between the ticket that calls a class and
+        # the one that writes it.
+        orch, run_id, failed = self._backlog(owns="src/other.py")
+        orch._shell = _failing_shell(self.RED)
+
+        orch._red_left_behind(run_id, failed)
+
+        self.assertEqual(orch._halt, "")
+
+    def test_a_tree_the_quarantine_cleaned_carries_on(self):
+        orch, run_id, failed = self._backlog()
+        orch._shell = lambda _r, _n, _c: StepResult(ok=True, detail="")
+
+        orch._red_left_behind(run_id, failed)
+
+        self.assertEqual(orch._halt, "")
+
+    def test_an_unattributable_failure_does_not_end_the_run(self):
+        orch, run_id, failed = self._backlog()
+        orch._shell = _failing_shell("build died\n")
+
+        orch._red_left_behind(run_id, failed)
+
+        self.assertEqual(orch._halt, "")
+
+    def test_nothing_runnable_is_left_to_protect(self):
+        # `_finish` runs the same commands next and reports what it finds.
+        # Checking here as well would pay for the suite twice.
+        orch, run_id, failed = self._backlog(pending=False)
+        ran: list[str] = []
+
+        def shell(_run_id, name, _command):
+            ran.append(name)
+            return StepResult(ok=False, detail=self.RED)
+
+        orch._shell = shell
+
+        orch._red_left_behind(run_id, failed)
+
+        self.assertEqual(ran, [])
+        self.assertEqual(orch._halt, "")
+
+    def _backlog(self, owns: str = "src/game.py", pending: bool = True):
+        orch, _, run_id = _stub_orchestrator({"lint": "", "typecheck": "javac", "test": ""})
+        failed = Ticket("TT-001", allowed_files=[owns], status="failed")
+        tickets = [failed]
+        if pending:
+            tickets.append(Ticket("TT-002", allowed_files=["src/next.py"]))
+        orch.store.add_tickets(run_id, tickets)
+        return orch, run_id, failed
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -366,6 +366,83 @@ once the machine is fixed.
 
 ---
 
+## 14. Red the backlog did not start with, and did not cause, is nobody's
+
+Invariant 12 stops the run once a ticket has been checked by nothing. It is the
+last line, not the first: by the time it fires, a ticket has been delegated,
+tested, verified and reviewed to establish something that was true before it
+started. The same red has two earlier moments where it is cheaper to catch, and
+each one was open.
+
+**A ticket that gives up leaves its breakage in the tree.** Nothing reverted a
+failed ticket, on the grounds that a human may want to salvage what it wrote.
+The argument is good; the placement was not. Verification is whole-project, so
+an abandoned file that does not compile is reported to every later ticket, and
+because it is outside their scope the baseline excuses each of them for it —
+which is exactly the state invariant 12 exists to stop the run over. One
+abandoned file therefore ends the run, and everything downstream of it in the
+backlog is unreachable no matter how independent it was.
+
+A Java run went that way. `PN-003` spent five attempts and finished with
+`variable resultBaseName might not have been initialized` in its own file.
+`PN-004` was skipped for depending on it. `PN-005` — a filesystem ticket with no
+relationship to any of it — inherited a red typecheck, therefore a test suite
+that was never built, therefore two excused steps and no evidence, and the run
+stopped there with two of seven tickets done.
+
+**Take the work out of the tree and keep it out of the way.** `_quarantine`
+restores each file the ticket's own `apply` steps wrote to its version in
+`ticket.baseline_tree` — removing it where the baseline had none — and copies
+what was there to `.hybridforge/abandoned/run-N/<ticket>/` first. Salvage
+survives; the compiler stops seeing it. Three details carry the weight:
+
+- **The paths come from the applies, not from a diff.** `baseline_tree` is
+  pinned for the ticket's whole life, so a diff against it on a retry cycle
+  also names work other tickets landed in between. And a glob in
+  `allowed_files` is a scope rule rather than a filename — expanding one to
+  decide what to delete reaches further than the ticket ever did.
+- **No copy, no revert.** A file whose quarantine copy could not be written
+  stays where it is. Losing the work is worse than leaving the tree red, and a
+  red tree is a state the loop already detects.
+- **No baseline tree, no revert.** A repository without git has no version to
+  restore to, and deleting on a guess takes a hand-written file the ticket was
+  asked to extend. This is why the charged-failure subtraction in invariant 11
+  stays load-bearing rather than becoming redundant.
+
+**Ask about the tree where the ticket gave up, not at the next one.**
+`_red_left_behind` runs the verify plan the moment a ticket fails or blocks,
+using invariant 12's ownership rule with the ticket that just gave up counted
+among the owners. Usually a no-op, because quarantine has already made the tree
+green; it is what catches the cases quarantine could not fix. It is skipped when
+nothing runnable is left, because `_finish` runs the same commands next.
+
+**A tree that was red before the run is red for every ticket at once.** This is
+the second gap, and invariant 12 cannot see it at all: red in files no ticket
+owns has no exhausted owner to point at, so `_unverifiable` returns nothing and
+the whole backlog runs verified by nothing until `_finish` says so — after every
+ticket has been spent. `_green_baseline` runs the verify commands once before
+the first delegation and refuses to start.
+
+Two failures are deliberately not gated on, and both follow rules already
+written down here:
+
+- A command that never reached the code. That is invariant 13, and
+  `_stop_for_toolchain` says what is actually wrong instead of blaming the tree.
+- A failure naming no file. `pytest` exits 5 on a repository with no tests and
+  `npm test` fails with no script — a greenfield project is the normal way a
+  backlog starts, and the run that produced this document began on an empty
+  repository. Gating there would make the check fire hardest on the runs it has
+  nothing to say about, so an unattributable failure is reported and the run
+  continues.
+
+The first unit of work on a red repository is fixing the red, and that is a
+ticket a human writes: the loop cannot scope it, because the files it would have
+to authorise are precisely the ones no ticket claims. `requireGreenBaseline` and
+`quarantineFailed` both have off switches for the repository whose red is what
+the backlog is there to fix.
+
+---
+
 ## What is bug-loop-specific and what is not
 
 | Mechanism | Scope |
@@ -378,6 +455,8 @@ once the machine is fixed.
 | `_ground_references` / `evidence.locate_named` | every respec |
 | `_refuse_verification_waivers` / `_disarmed_context` | every respec |
 | `_unverifiable` / `StepResult.halt` | every ticket |
+| `_quarantine` / `_red_left_behind` | every ticket that gives up |
+| `_green_baseline` | once, before the first delegation |
 | `environment_failure` / `_note_toolchain` | every verify step |
 | `resumable_runs` draining | every command that opens a run |
 | Reproduction, re-diagnosis, contradiction | bug tickets only |
