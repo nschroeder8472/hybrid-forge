@@ -86,11 +86,31 @@ profile. Your job is to check what it chose and fix what it could not know.
    ticket burns `maxAttempts` and parks the backlog — which looks like a model
    problem and is not. Leave a field empty rather than filling it with a
    command you have not confirmed; empty is skipped.
-3. Propose a `neverDelegate` list from what is actually in this repo. Look for
-   auth and session handling, migrations, concurrency-heavy modules, published
-   interfaces, CI workflow files, crypto, payment paths. Present it as globs
-   for the user to amend — it is a project-specific extension of the categories
-   in the `delegation-protocol` skill, not a replacement for them.
+3. Propose a `neverDelegate` list from what is actually in this repo — auth and
+   session handling, migrations, concurrency-heavy modules, published
+   interfaces, CI workflow files, crypto, payment paths. One question decides
+   every candidate: **would a wrong edit here still come back green?** The
+   verify commands and the review step already catch anything that turns red,
+   so a path whose breakage fails the build does not belong on this list. What
+   belongs is the silent kind — authorization that still compiles and lets the
+   wrong caller through, a migration that runs clean and drops a column, a
+   workflow edited to stop running the suite at all.
+
+   Do not add a path because it looks infrastructural. Build files, manifests,
+   lockfiles, and project config are where a large share of real bugs live, and
+   listing one costs more than it reads: `forge bug` routes any report scoped to
+   a matching path `claude-only`, so every such bug is filed already parked, for
+   a human to implement by hand. The one build-file case worth listing is a file
+   that can weaken the verify commands themselves — a test task disabled, a
+   source set narrowed — and only when `autoCommit` is on, because a human
+   reading the diff before it lands is the same guard by other means.
+
+   Err narrow. A missing entry costs one diff to read; a wrong entry makes a
+   file permanently undelegatable and the reason is invisible six weeks later.
+   Empty is a legitimate answer for a repo holding nothing sensitive yet.
+   Present it as globs for the user to amend — it is a project-specific
+   extension of the categories in the `delegation-protocol` skill, not a
+   replacement for them.
 4. Set `room` if memory is configured. It scopes every retrieval and write for
    this project; an unscoped query pulls decisions from unrelated projects,
    which is worse than no context because it reads as authoritative.
