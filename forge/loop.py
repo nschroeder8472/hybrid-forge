@@ -44,6 +44,7 @@ from .artifacts import ABANDONED_DIR, Artifacts, safe_name
 from .budget import BudgetGate, Wait
 from .config import ANY_LANGUAGE, Config, ConfigError
 from .failures import (
+    blocks_naming,
     distill,
     environment_failure,
     errors_naming,
@@ -78,6 +79,7 @@ from .providers import (
 )
 from .prompts import (
     CONTEXT_HEADING,
+    EXAMPLE_PATH_PREFIX,
     PRIOR_ATTEMPT_HEADING,
     PRIOR_FAILURES_HEADING,
     PRIOR_VERDICTS_HEADING,
@@ -138,7 +140,68 @@ _UNBUILDABLE = re.compile(
     r"syntaxerror|indentationerror|importerror|modulenotfounderror|"
     r"error\[e\d+\]|cannot find|unresolved|undeclared|not declared|"
     r"no such (?:module|file)|failed to compile|collection error|"
-    r"error: expected|fatal error",
+    # A compiler diagnostic prefixed with the location it is about —
+    # `bug_002_test.java:10: error: class Bug002Test is public, should be
+    # declared in a file named Bug002Test.java`. javac, gcc and tsc all write
+    # this shape, and none of the phrase patterns above covers it: the list had
+    # grown one message at a time and javac's largest family was never in it.
+    #
+    # A failing assertion never looks like this. Every runner indents it under
+    # the test's own name, so the location has no `: error:` after it. The
+    # shape is the signal, so it is unanchored — javac writes an absolute path
+    # and Gradle indents its copy of the same line.
+    r"\.\w+:\d+:\s*error:|"
+    # What Gradle, Maven, kotlinc and scalac say when the compile task fails,
+    # as distinct from the compiler's own line above. `failed to compile` is
+    # cargo's phrasing and does not match either of them.
+    r"compilation (?:failed|error)|"
+    # Anchored off a word character, because JUnit's standard assertion message
+    # is `org.opentest4j.AssertionFailedError: expected <x> but was <y>` — and
+    # an unanchored `error: expected` reads the most ordinary failing assertion
+    # in Java as a test that will not build. It was invisible only because
+    # `errors_naming` could not parse Gradle output either, so the second half
+    # of the gate never held; the moment that was fixed, every Java bug
+    # reproduction would have parked on its own passing-shaped failure.
+    r"(?<![A-Za-z])error: expected|fatal error",
+    re.IGNORECASE,
+)
+
+# A reproduction that built and ran but never reached an assertion: it tried to
+# start a process, open a path, or reach a service, and the environment refused.
+# The distinction from `_UNBUILDABLE` is only in the message — the consequence
+# is identical, and worse for being invisible. A compile error at least looks
+# like a defect in the test; this looks like the bug.
+#
+# One tester wrote `new ProcessBuilder("./gradlew", "jar")` into a reproduction
+# and ran it on Windows. It threw `IOException` at the first line of the test
+# body, every time, and was accepted as proof of a manifest bug. Nine cycles and
+# 47 attempts later the executor had produced the exact `build.gradle` the
+# ticket asked for, more than once, and every one of them was scored a failure.
+#
+# Matched against the lines that name the test file rather than the whole
+# output, because these words are ordinary inside an assertion message — a test
+# that asserts a `FileNotFoundException` is raised says "no such file" while
+# working perfectly.
+_ERRORED = re.compile(
+    r"cannot run program|createprocess error|error=2|"
+    r"ioexception|filenotfound|nosuchfile|no such file or directory|"
+    r"errno 2|errno 13|permission denied|access is denied|"
+    r"connection refused|unknownhost",
+    re.IGNORECASE,
+)
+
+# The test reached an assertion and the assertion is what failed. Checked
+# before `_ERRORED` and overrides it, because several of those phrases are
+# ordinary inside an assertion message: `expected FileNotFoundException to be
+# thrown` says `FileNotFound` while describing a test that ran perfectly, and
+# every one of these words appears in a message some suite writes about a
+# comparison it made.
+#
+# Getting this backwards is the expensive direction. `_ERRORED` firing wrongly
+# parks a bug that was genuinely reproduced, which is a fault the loop reports
+# as the report's own — the hardest kind for a human to see through.
+_ASSERTED = re.compile(
+    r"assert|expected|opentest4j|to equal|to be\b|should (?:be|equal|have)",
     re.IGNORECASE,
 )
 
@@ -236,6 +299,12 @@ class Orchestrator:
         # each: a ticket that blocks again after getting what it asked for is
         # saying something a human should read. See `_widen_scope`.
         self._widened: set[str] = set()
+        # Bug tickets whose reproduction has been retired and rewritten. One
+        # each, for the same reason `_widened` is one each: a second rewrite
+        # would be the loop tuning the contract until the fix it already has
+        # passes, which is the failure the reproduce-first design exists to
+        # prevent. See `_stale_reproduction`.
+        self._reproved: set[str] = set()
         # Bug tickets whose fix works but whose suite fails on an older
         # assertion of the very behavior the report calls a bug, as
         # `{ticket_id: {test path: the lines blaming it}}`. Read at respec,
@@ -539,11 +608,35 @@ class Orchestrator:
     # Shell steps
     # ------------------------------------------------------------------
 
-    def _shell(self, run_id: int, name: str, command: str) -> StepResult:
+    def _shell(
+        self, run_id: int, name: str, command: str, ticket_id: str = ""
+    ) -> StepResult:
+        """Run one of the project's own commands and record what it said.
+
+        `ticket_id` attributes the step to the ticket it was run *for*, and
+        only the attempt's own verify steps pass it. Everything else here —
+        baselines, the run's opening and closing sweeps, the post-ticket check
+        — is a measurement of the tree rather than a verdict on a ticket, and
+        filing those against whoever happened to be holding the backlog is how
+        a passing ticket inherits the previous one's red.
+
+        The distinction is not cosmetic. `ticket_failures` reads this column,
+        and with every shell step filed under `""` it returned nothing for
+        every ticket in the project's history. Three things ran on empty as a
+        result: respec saw `(no recorded step failures)` and revised specs
+        against the block note alone, the executor's cross-cycle
+        `prior_failures` was blank, and `_evidence_fingerprint` took its
+        "nothing has been learned" branch every single time — so the brake that
+        stops a retry cycle repeating the last one could never fire. A run in
+        `new_forge_test` spent 47 attempts across 9 cycles on one ticket
+        against a reproduction that could not pass, and the control row read
+        `none::1787192639.5999246` at the end of it, exactly as it had at the
+        start.
+        """
         if not command.strip():
             return StepResult(ok=True, detail=f"no {name} command configured; skipped")
 
-        step_id = self.store.start_step(run_id, "", name)
+        step_id = self.store.start_step(run_id, ticket_id, name)
         try:
             result = subprocess.run(  # noqa: S602 - user-authored command from their own config
                 command,
@@ -1473,6 +1566,41 @@ class Orchestrator:
                 )
         return [name for name, report in checked.items() if report.startswith("FAIL")]
 
+    def _owners_in_backlog(
+        self, run_id: int, paths: Sequence[str]
+    ) -> dict[str, str]:
+        """Which of `paths` a ticket that has yet to run will be working on.
+
+        Keyed by normalized path, valued with the ticket id, so a caller can
+        both filter and say who. Only tickets that still have a chance to run
+        count: one that is done or out of attempts is not going to clear
+        anything, which is the distinction the red gates exist to draw.
+
+        Two kinds of ownership, and the second is easy to miss. A ticket owns
+        what its `allowed_files` name. A **bug** ticket also owns its
+        reproduction, which appears in no list — it is derived from the ticket
+        id — and which is red *by design* from the moment it is written until
+        the fix lands. A run whose previous attempt left one on disk was
+        refused a start over it, told the tree was red on a file no ticket
+        owned, when the ticket that owned it was the only thing in the backlog.
+        """
+        waiting = [
+            ticket
+            for ticket in self.store.list_tickets(run_id)
+            if ticket.status not in self._GAVE_UP and ticket.status != TICKET_DONE
+        ]
+        owners: dict[str, str] = {}
+        for ticket in waiting:
+            scope = list(ticket.allowed_files) + self._reproduction_of(ticket)
+            patterns = [pattern.lower() for pattern in scope]
+            if not patterns:
+                continue
+            for path in paths:
+                key = normalize_path(path)
+                if key not in owners and matches_any(path, patterns):
+                    owners[key] = ticket.ticket_id
+        return owners
+
     def _green_baseline(self, run_id: int) -> str:
         """Refuse to start on a tree that is already red. Returns a note or "".
 
@@ -1523,13 +1651,13 @@ class Orchestrator:
         if not failed:
             return ""
 
-        red = sorted(
+        blamed = sorted(
             {
                 repo_relative(path, self.config.root)
                 for path in files_blamed("\n".join(output))
             }
         )
-        if not red:
+        if not blamed:
             self.store.log(
                 run_id,
                 f"{', '.join(failed)} already failed before the first ticket, "
@@ -1540,6 +1668,31 @@ class Orchestrator:
                 level="warn",
                 kind="verify",
                 data={"steps": failed},
+            )
+            return ""
+
+        # The sentence this gate prints has always been "files no ticket in
+        # this backlog owns", and until now nothing checked. Red a waiting
+        # ticket already owns is not an orphan — it is the work, and the
+        # argument for refusing to start does not hold over it: the loop can
+        # scope it, because a human already did.
+        owned = self._owners_in_backlog(run_id, blamed)
+        red = [path for path in blamed if normalize_path(path) not in owned]
+        if not red:
+            self.store.log(
+                run_id,
+                f"{', '.join(failed)} is already failing, on files this "
+                f"backlog owns:\n"
+                + "\n".join(f"  - {path} ({owned[normalize_path(path)]})" for path in blamed[:8])
+                + f"\n\nStarted rather than gated. Each of these has a ticket "
+                f"that has not run yet, and clearing them is what those "
+                f"tickets are for — a bug ticket's reproduction is red on "
+                f"purpose until its fix lands, and a plan is routinely red "
+                f"between the ticket that calls a class and the one that "
+                f"writes it.",
+                level="warn",
+                kind="verify",
+                data={"steps": failed, "owned": owned},
             )
             return ""
 
@@ -1881,6 +2034,7 @@ class Orchestrator:
 
         revised: list[Ticket] = []
         for ticket in tickets:
+            reproduction = self._reproduction_of(ticket)
             result = respec.revise(
                 self.store,
                 run_id,
@@ -1893,9 +2047,18 @@ class Orchestrator:
                 # The planner has no filesystem either. Rewriting a spec about
                 # code it cannot see is how a ticket acquired a coordinate
                 # convention the implementation had never used.
-                sources=self._sources_for(ticket)[0],
+                #
+                # A bug ticket's reproduction comes with it. That file is the
+                # standard the ticket is failing against, and respec is the one
+                # place allowed to conclude the standard is what's wrong — a
+                # judgement it cannot make from a runner's summary. Six
+                # consecutive revisions guessed at a jar filename that was
+                # written in plain sight three lines into the test.
+                sources=self._sources_for(ticket, extra=reproduction)[0],
                 criteria_locked=not self.config.loop.respec_criteria,
                 contradiction=self._contradictions.get(ticket.ticket_id),
+                # Readable above, never writable. See `revise`.
+                protected=reproduction,
                 # So a revised read scope is checked against the tree rather
                 # than taken on the planner's word for where a file lives.
                 root=self.config.root,
@@ -2053,8 +2216,62 @@ class Orchestrator:
             # passes, so a second cycle re-running reproduction would find
             # nothing wrong and park a ticket whose work is nearly done.
             proof = self.store.reproduced(run_id, ticket.ticket_id)
+            # A proof is about a file, and it is worth nothing once that file
+            # is not there. Skipping reproduction on the strength of a step log
+            # alone would hand the executor a contract with no assertion behind
+            # it, let the suite pass because nothing is asserting anything, and
+            # record the ticket green having demonstrated nothing — which is
+            # the exact outcome the reproduce-first order exists to prevent.
+            #
+            # It goes missing two ways. Somebody deletes it. Or the path it is
+            # filed at changes under a run already in flight, which is how this
+            # was found: a Java reproduction moved from `bug_002_test.java` to
+            # `Bug002Test.java` when the derivation was fixed, and the cached
+            # proof still answered for the name nothing was written to.
+            if proof and not (self.config.root / repro_path).is_file():
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: this bug was reproduced earlier in "
+                    f"the run, but `{repro_path}` is not on disk now. A proof "
+                    f"is about a file — without it the fix would be checked by "
+                    f"nothing and pass. Reproducing again.",
+                    level="warn",
+                    kind="ticket",
+                    data={"ticket": ticket.ticket_id, "reproduction": repro_path},
+                )
+                self.store.retire_reproduction(run_id, ticket.ticket_id)
+                proof = ""
+            # Durable, but not beyond question. A reproduction that has been
+            # the sole blocker for a whole cycle without varying is the one
+            # part of the arrangement nothing has tested — see
+            # `_stale_reproduction` for the four conditions and the run that
+            # spent 47 attempts against a test that could not pass.
+            superseded = self._stale_reproduction(run_id, ticket, repro_path)
+            if superseded:
+                retired = self._read_if_present(repro_path)
+                self.store.retire_reproduction(run_id, ticket.ticket_id)
+                self._reproved.add(ticket.ticket_id)
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: the reproduction was retired and will "
+                    f"be written again. {superseded}\n\nEvery attempt since it "
+                    f"was written has failed on it and on nothing else, which "
+                    f"makes it the only untested thing in the ticket. The "
+                    f"tester is being asked for a different reproduction of the "
+                    f"same report. If the next one fails the same way, the "
+                    f"report needs a human — this happens once per ticket.",
+                    level="warn",
+                    kind="ticket",
+                    data={
+                        "ticket": ticket.ticket_id,
+                        "reproduction": repro_path,
+                        "retired": retired[:4000],
+                    },
+                )
+                proof = ""
+                superseded = f"{superseded}\n\nThe test that reported it:\n{retired}"
             if not proof:
-                proof = self._prove(run_id, ticket, repro_path)
+                proof = self._prove(run_id, ticket, repro_path, superseded=superseded)
                 if not proof:
                     return
             repro = (repro_path, proof)
@@ -2368,7 +2585,18 @@ class Orchestrator:
         """
         if repro is None:
             return {}
-        blamed = files_blamed(output, exclude=already)
+        # Made repository-relative first, the way every other reader of
+        # `files_blamed` already does it. javac prints the absolute path —
+        # `D:\...\src\test\java\...\bug_002_test.java:10: error:` — and every
+        # comparison below is against a relative one, so on Java none of them
+        # matched: the reproduction failed its own exclusion check, was found
+        # again as a test file outside scope, and the loop reported that the
+        # fix worked and some other assertion contradicted it. The reproduction
+        # had not passed. It had not compiled.
+        blamed = {
+            repo_relative(path, self.config.root): lines
+            for path, lines in files_blamed(output, exclude=already).items()
+        }
         # Whether the reproduction is among the *failures*, which is not the
         # same question as whether the output mentions it. `errors_naming`
         # answers the looser one and matches cargo's `Running tests\bug_002_
@@ -2426,6 +2654,105 @@ class Orchestrator:
             "ticket should be closed.",
         ]
         return "\n".join(lines)
+
+    def _read_if_present(self, path: str) -> str:
+        """The file's contents, or "" if it is gone or unreadable."""
+        try:
+            return (self.config.root / path).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            return ""
+
+    def _stale_reproduction(
+        self, run_id: int, ticket: Ticket, repro_path: str
+    ) -> str:
+        """Why this bug's reproduction is no longer believable, or "".
+
+        A reproduction is a measurement, and the loop treats it as durable
+        because the fix erases the evidence — see `Store.reproduced`. Durable
+        was read as infallible, and there is one shape of run where that is
+        wrong: a whole cycle of attempts, every one of them failing on the
+        reproduction and on nothing else, with the failure byte-identical each
+        time. The reproduction is then the only thing in the arrangement that
+        has not been questioned, and it is the only thing that has not varied.
+
+        The run that produced this had a tester write, on Windows:
+
+            ProcessBuilder pb = new ProcessBuilder("./gradlew", "jar");
+
+        which throws `IOException` before reaching a single assertion. The
+        failure was accepted as proof of the bug, and it could not be cleared
+        by any edit to the one file the ticket owned. Attempt 46 emitted
+        exactly the `build.gradle` the ticket asked for and was scored a
+        failure, as were the 46 around it.
+
+        Four conditions, all necessary, and they are deliberately hard to meet.
+        A full cycle must already have been spent, so this cannot fire on a fix
+        that is merely not finished yet. Every verify failure the ticket has
+        recorded must reduce to the same signature, so a suite that is moving
+        is left alone. That signature must name the reproduction, so a ticket
+        failing on its own broken implementation is not handed a new contract.
+        And the reproduction must be the *only* thing failing — a run that is
+        also red somewhere else has a fix that does not work, which is an
+        ordinary failure and not this.
+
+        What follows a `True` here is not a scope grant. The executor gets
+        nothing new; the tester is asked for a different reproduction of the
+        same report, with the retired one quoted back to it. The contract is
+        rewritten by the role that owns contracts, which is the whole reason
+        this is not simply `allowed_files += repro_path`.
+        """
+        if ticket.ticket_id in self._reproved or not repro_path:
+            return ""
+        # A full cycle of attempts, all spent. `attempt_base` is what the
+        # requeue rolled the previous cycle's attempts into, so this is false
+        # for every attempt of the first cycle and true from the second on.
+        if ticket.attempt_base < self.config.loop.max_attempts:
+            return ""
+
+        failures = [
+            detail
+            for name, detail in self.store.failed_steps(run_id, ticket.ticket_id)
+            if name == "test" or name.startswith("test[")
+        ]
+        if len(failures) < self.config.loop.max_attempts:
+            return ""
+
+        found = {
+            frozenset(signatures(detail)) for detail in failures
+        }
+        if len(found) != 1:
+            return ""
+        (only,) = found
+        if not only:
+            # Nothing parsed as a diagnostic. Unattributable, and the safe
+            # direction for an unattributable failure is always to leave the
+            # evidence standing.
+            return ""
+
+        # Relative first, for the same reason as `_contradicting_tests`: javac
+        # blames an absolute path and every key here is repository-relative.
+        blamed = {
+            repo_relative(path, self.config.root)
+            for path in files_blamed("\n".join(failures))
+        }
+        if not blamed:
+            return ""
+        repro_key = normalize_path(repro_path)
+        base = repro_key.rsplit("/", 1)[-1]
+        for path in blamed:
+            key = normalize_path(path)
+            if key != repro_key and key.rsplit("/", 1)[-1] != base:
+                return ""
+
+        return (
+            f"`{repro_path}` has failed in exactly the same way on every one of "
+            f"the {len(failures)} verify runs this ticket has had, across more "
+            f"than one cycle, and it is the only thing failing. The failure it "
+            f"reports is:\n\n"
+            + "\n".join(f"  {line}" for line in sorted(only)[:6])
+        )
 
     def _widen_scope(self, run_id: int, ticket: Ticket, note: str) -> list[str]:
         """Grant a blocked ticket the file it named, once. Returns what it got.
@@ -2504,7 +2831,12 @@ class Orchestrator:
         return granted
 
     def _scope_guidance(
-        self, ticket: Ticket, rejected: list[str], *, total_loss: bool
+        self,
+        ticket: Ticket,
+        rejected: list[str],
+        *,
+        total_loss: bool,
+        echoed: Sequence[str] = (),
     ) -> str:
         """Tell the executor what was dropped and what it can do about it.
 
@@ -2516,8 +2848,39 @@ class Orchestrator:
 
         Naming the paths, and naming `BLOCKED:` as the way to ask for scope,
         turns a dead end into something the planner can fix at respec time.
+
+        `echoed` is the same mechanism with the opposite diagnosis: paths from
+        the prompt's own format example, which the model copied rather than
+        chose. Told apart because the corrections are opposite — one says "ask
+        for scope if you need it", the other says "you do not need this file at
+        all, stop sending it".
         """
-        lines = [
+        lines: list[str] = []
+        if echoed:
+            lines += [
+                "These edits were a copy of the format example in your "
+                "instructions, and were dropped:",
+                "",
+            ]
+            lines += [f"- {entry}" for entry in echoed]
+            lines += [
+                "",
+                "They are illustrations of the reply format, not files. Do not "
+                "send them again, and do not ask for scope over them — no "
+                "ticket in this project will ever write them.",
+                "",
+            ]
+            if not rejected:
+                lines.append(
+                    "Send only the files this ticket authorizes:"
+                )
+                lines += [f"- {path}" for path in ticket.allowed_files] or ["- (none)"]
+                if total_loss:
+                    lines.insert(
+                        0, "Nothing was written: your reply contained no real edit.\n"
+                    )
+                return "\n".join(lines)
+        lines += [
             "Some of your edits were not written, because the ticket does not "
             "authorize those files:",
             "",
@@ -2635,7 +2998,19 @@ class Orchestrator:
         # --- BUILD ---------------------------------------------------
         # The files this ticket may write must reach the executor whole; it is
         # about to send them back as whole files.
-        sources, oversized = self._sources_for(ticket, whole=ticket.allowed_files)
+        #
+        # The reproduction goes in read-only. It is the contract the attempt is
+        # judged against and the executor may not write it — but it was not
+        # shown either, so the executor was told "your fix is not done until
+        # `bug_001_test.java` passes" and handed a runner's summary of a file
+        # it had never seen. One replied `BLOCKED: ... I cannot determine the
+        # exact cause without seeing the test code`, which was exactly right.
+        # Reading a test you cannot edit is how you find out what it wants.
+        sources, oversized = self._sources_for(
+            ticket,
+            extra=[repro[0]] if repro else None,
+            whole=ticket.allowed_files,
+        )
         if oversized:
             detail = (
                 "This ticket cannot be delegated as written. It authorises "
@@ -2774,11 +3149,32 @@ class Orchestrator:
             scoped = enforce_scope(
                 parsed, ticket.allowed_files, self.config.never_delegate
             )
-            if scoped.rejected:
+            # An echo of the prompt's own format example is not a scope
+            # request, and reporting it as one is worse than dropping it
+            # silently: the planner reads the log, and a path that exists
+            # nowhere in the repository sends it rewriting the spec to solve a
+            # scope problem the ticket does not have. See `EXAMPLE_PATH_PREFIX`.
+            echoed = [
+                entry
+                for entry in scoped.rejected
+                if entry.startswith(EXAMPLE_PATH_PREFIX)
+            ]
+            asked = [entry for entry in scoped.rejected if entry not in echoed]
+            if echoed:
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: the reply carried a copy of the "
+                    f"prompt's format example ({'; '.join(echoed)}) and it was "
+                    f"dropped. A formatting mistake, not a request for scope — "
+                    f"nothing in this ticket needs those paths.",
+                    level="warn",
+                    kind="scope",
+                )
+            if asked:
                 self.store.log(
                     run_id,
                     f"{ticket.ticket_id}: rejected out-of-scope edits: "
-                    f"{'; '.join(scoped.rejected)}",
+                    f"{'; '.join(asked)}",
                     level="warn",
                     kind="scope",
                 )
@@ -2786,7 +3182,7 @@ class Orchestrator:
                 return StepResult(
                     ok=False,
                     detail=self._scope_guidance(
-                        ticket, scoped.rejected, total_loss=True
+                        ticket, asked, total_loss=True, echoed=echoed
                     ),
                 )
 
@@ -2809,7 +3205,7 @@ class Orchestrator:
                 ticket,
                 "apply",
                 "ok",
-                {"written": written, "rejected": scoped.rejected},
+                {"written": written, "rejected": asked, "echoed": echoed},
             )
             # A partial rejection used to be logged and then dropped. The
             # executor saw a successful apply, lint failed on the piece that
@@ -2817,7 +3213,9 @@ class Orchestrator:
             # the same edit every attempt. Carry the rejection forward as
             # verification evidence.
             scope_note = (
-                self._scope_guidance(ticket, scoped.rejected, total_loss=False)
+                self._scope_guidance(
+                    ticket, asked, total_loss=False, echoed=echoed
+                )
                 if scoped.rejected
                 else ""
             )
@@ -3034,7 +3432,7 @@ class Orchestrator:
         excused: list[str] = []
         excused_output = ""
         for name, command in self._verify_plan():
-            result = self._shell(run_id, name, command)
+            result = self._shell(run_id, name, command, ticket.ticket_id)
             # Checked here too, not only at the baseline: `baselineVerify` can
             # be off, and a toolchain can break mid-run when a ticket edits the
             # file that configures it.
@@ -3801,6 +4199,20 @@ class Orchestrator:
         if self.config.loop.stop_on_blocked:
             raise Stopped()
 
+    def _reproduction_of(self, ticket: Ticket) -> list[str]:
+        """This bug ticket's reproduction, if it has one on disk. Else nothing.
+
+        Kept off `_repro_target`'s error path deliberately: both callers run
+        over every kind of ticket, and one that could not have a reproduction
+        must add no file and raise no complaint here.
+        """
+        if ticket.kind != TICKET_BUG:
+            return []
+        path, _why_not = self._repro_target(ticket)
+        if not path or not (self.config.root / path).is_file():
+            return []
+        return [path]
+
     def _repro_target(self, ticket: Ticket) -> tuple[str, str]:
         """Where a bug ticket's reproduction goes, or why it cannot have one.
 
@@ -3843,9 +4255,25 @@ class Orchestrator:
             # project's own suite would assert something that was never wrong.
             return "", self._no_runner_note(ticket, [suffix])
         example = self._example_test([], suffix)
-        directory = Path(example[0]).parent.as_posix() if example else "tests"
+        # `_TEST_ROOTS` for the same reason `_test_target` uses it: `tests/` is
+        # a fine guess in most ecosystems and an invisible one in the JVM's,
+        # where the build compiles a fixed source set and a file outside it is
+        # never run at all.
+        directory = (
+            Path(example[0]).parent.as_posix()
+            if example
+            else self._TEST_ROOTS.get(suffix, "tests")
+        )
         prefix = "" if directory in ("", ".") else f"{directory}/"
-        return f"{prefix}{self._ticket_slug(ticket)}_test{suffix}", ""
+        # `_test_stem`, not a bare slug plus `_test`. Building the name here
+        # instead meant a Java reproduction was filed at `bug_002_test.java`,
+        # and javac rejects any public type in a file not named after it — so
+        # the tester's `public class Bug002Test` could not compile wherever it
+        # was put. It came down to whether the model happened to leave the
+        # class package-private: BUG-001 did and was fine, BUG-002 did not and
+        # the run was over in one cycle. `_test_stem` has spelled this
+        # correctly for the ordinary test path all along.
+        return f"{prefix}{self._test_stem(ticket, suffix)}{suffix}", ""
 
     # Extensions that hold behavior a test suite could have covered. A ticket
     # that cannot reproduce a fault in one language is worth pointing at the
@@ -3888,7 +4316,9 @@ class Orchestrator:
             f"is usually in one of those, and no ticket here can reach it."
         )
 
-    def _prove(self, run_id: int, ticket: Ticket, test_path: str) -> str:
+    def _prove(
+        self, run_id: int, ticket: Ticket, test_path: str, *, superseded: str = ""
+    ) -> str:
         """Demonstrate the fault, re-diagnosing when the explanation is wrong.
 
         Returns the failure that proved it, or "" with the ticket parked.
@@ -3909,9 +4339,17 @@ class Orchestrator:
         actually needs.
         """
         for remaining in range(self.config.loop.bug_hypotheses - 1, -1, -1):
-            outcome = self._reproduce(run_id, ticket, test_path)
+            outcome = self._reproduce(
+                run_id, ticket, test_path, superseded=superseded
+            )
             if outcome.ok:
                 return outcome.detail
+            # Said once. The retired test is evidence about the first ask; a
+            # re-diagnosis has moved the hypothesis, and repeating "your last
+            # one was unrunnable" against a spec it was never written for
+            # invites the tester to fix the old test rather than write a new
+            # one for the new cause.
+            superseded = ""
             if not remaining:
                 self._park(run_id, ticket, self._exhausted(run_id, ticket, outcome.detail))
                 return ""
@@ -4013,7 +4451,9 @@ class Orchestrator:
         self.store.update_ticket(run_id, ticket)
         return ticket
 
-    def _reproduce(self, run_id: int, ticket: Ticket, test_path: str) -> StepResult:
+    def _reproduce(
+        self, run_id: int, ticket: Ticket, test_path: str, *, superseded: str = ""
+    ) -> StepResult:
         """Write a test that fails because of this bug, and prove it fails.
 
         The one step in the loop where a red suite is the result being asked
@@ -4059,6 +4499,7 @@ class Orchestrator:
                         reproduce=ticket.context,
                         own_file_errors=own_file_errors,
                         passed_instead=passed_instead,
+                        superseded=superseded,
                     ),
                     max_tokens=self._output_budget("tester"),
                     temperature=0.1,
@@ -4150,31 +4591,47 @@ class Orchestrator:
             # failing assertion names its own file too and that is the evidence
             # this step exists to collect.
             implicated = errors_naming(result.detail, test_path)
+            # Two ways the test is the problem rather than the evidence: it did
+            # not build, or it built and died before it asserted anything.
+            #
+            # Both are asked of the diagnostics that are *about this file* —
+            # `blocks_naming` — rather than of the whole output. The words are
+            # ordinary elsewhere: a different test reporting `no such file`
+            # while working perfectly used to condemn a reproduction whose own
+            # failure was a clean assertion, because the raw output contained
+            # both facts and nothing required them to be about the same thing.
+            about_it = blocks_naming(result.detail, test_path)
+            errored = bool(_ERRORED.search(about_it)) and not _ASSERTED.search(about_it)
             own_file_errors = (
-                implicated if implicated and _UNBUILDABLE.search(result.detail) else []
+                implicated
+                if implicated and (_UNBUILDABLE.search(about_it) or errored)
+                else []
             )
             if own_file_errors:
-                # A test that will not build fails the command for a reason
-                # that has nothing to do with the bug. Counting that as a
-                # reproduction would hand the executor a compiler error in a
-                # file it cannot even write.
+                # A test that will not build, or that dies before it asserts,
+                # fails the command for a reason that has nothing to do with
+                # the bug. Counting that as a reproduction would hand the
+                # executor a defect in a file it cannot even write.
                 self.store.end_step(
                     step_id,
                     "failed",
-                    "the reproduction does not build:\n" + "\n".join(own_file_errors),
+                    "the reproduction never reached an assertion:\n"
+                    + "\n".join(own_file_errors),
                 )
                 if not remaining:
                     return StepResult(
                         ok=False,
                         blocked=True,
                         detail=(
-                            f"`{test_path}` still does not build, so the bug was "
-                            f"never demonstrated:\n" + "\n".join(own_file_errors[:10])
+                            f"`{test_path}` still fails on itself rather than on "
+                            f"the code, so the bug was never demonstrated:\n"
+                            + "\n".join(own_file_errors[:10])
                         ),
                     )
                 self.store.log(
                     run_id,
-                    f"{ticket.ticket_id}: the reproduction does not build; asking again.",
+                    f"{ticket.ticket_id}: the reproduction failed on its own file "
+                    f"rather than on the bug; asking again.",
                     level="warn",
                     kind="ticket",
                 )

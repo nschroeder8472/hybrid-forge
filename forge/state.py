@@ -762,6 +762,37 @@ class Store:
         ).fetchone()
         return row["detail"] if row else ""
 
+    def failed_steps(self, run_id: int, ticket_id: str) -> list[tuple[str, str]]:
+        """Every failed step this ticket recorded, as `(name, output)`, oldest first.
+
+        `ticket_failures` deduplicates and distils, which is right for prompt
+        material and wrong for the one caller that needs to know how many times
+        the same thing happened rather than what it was.
+        """
+        rows = self._connection.execute(
+            "SELECT name, detail FROM steps "
+            "WHERE run_id = ? AND ticket_id = ? "
+            "AND status = 'failed' AND detail != '' ORDER BY id",
+            (run_id, ticket_id),
+        ).fetchall()
+        return [(row["name"], row["detail"]) for row in rows]
+
+    def retire_reproduction(self, run_id: int, ticket_id: str) -> None:
+        """Stop `reproduced` from answering with a proof no longer trusted.
+
+        Marked rather than deleted. The step keeps its output, so a human
+        reading the run still sees what the retired test reported and why the
+        loop stopped believing it; `reproduced` asks for status `ok` and no
+        longer finds it, so the next pass writes a fresh reproduction.
+        """
+        with self._connection:
+            self._connection.execute(
+                "UPDATE steps SET status = 'superseded' "
+                "WHERE run_id = ? AND ticket_id = ? AND name = 'reproduce' "
+                "AND status = 'ok'",
+                (run_id, ticket_id),
+            )
+
     def steps_for_replay(
         self, run_id: int | None = None, ticket_id: str | None = None
     ) -> list[sqlite3.Row]:

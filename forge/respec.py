@@ -682,6 +682,7 @@ def revise(
     sources: dict[str, str] | None = None,
     criteria_locked: bool = True,
     contradiction: dict[str, list[str]] | None = None,
+    protected: Sequence[str] = (),
     root: Path | None = None,
 ) -> Revision:
     """Rewrite one ticket in place from its recorded failures.
@@ -694,6 +695,13 @@ def revise(
     `gave_up_note` is the ticket's `blocked_note`, which the requeue clears. For
     a ticket the executor abandoned with `BLOCKED:` it is the only record of
     what it could not decide, and no step was ever logged as failed.
+
+    `protected` names paths that may be shown to the planner but must never end
+    up writable, whatever it proposes. A bug ticket's reproduction is one: it
+    is now pasted in as a source, because respec is the role that has to judge
+    whether the standard itself is wrong, and a role that can read a file will
+    sooner or later propose owning it. Reading it is the point; writing it is
+    the thing the whole reproduce-first order exists to prevent.
 
     `root` is the repository, and without it a revised `reference_files` is
     taken on trust — see `_ground_references` for what that cost. Optional only
@@ -735,6 +743,7 @@ def revise(
                 ruled_out=ruled_out,
                 report=report,
                 contradiction=contradiction or {},
+                reproduction=protected,
             ),
             budget,
         )
@@ -786,6 +795,35 @@ def revise(
     # Respec is the role that rewrites a ticket so it can pass, which makes it
     # the wrong role to also decide that the assertion standing in its way is
     # wrong. Held out of the revision and handed back for the reviewer to argue.
+    # Refused outright rather than handed to the reviewer to argue over. A
+    # contradicting test belongs to some earlier ticket and retiring it is a
+    # real decision; this ticket's own reproduction is the contract it is being
+    # measured by, and there is no argument that makes the party under
+    # measurement the right one to rewrite it. When the reproduction really is
+    # what is wrong, `_stale_reproduction` retires it and the *tester* writes
+    # the replacement.
+    if "allowed_files" in revision and protected:
+        guarded = {normalize_path(path) for path in protected}
+        surrendered = [
+            p for p in revision["allowed_files"] if normalize_path(p) in guarded
+        ]
+        if surrendered:
+            revision["allowed_files"] = [
+                p for p in revision["allowed_files"] if normalize_path(p) not in guarded
+            ]
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: respec proposed making "
+                f"{', '.join(surrendered)} writable. That is this ticket's own "
+                f"reproduction — the test it is being judged by — and it is "
+                f"pasted in read-only so the spec can be checked against it, "
+                f"not so it can be edited. Dropped from the scope; the rest of "
+                f"the revision stands.",
+                level="warn",
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "refused": surrendered},
+            )
+
     pending_scope: list[str] = []
     if contradiction and "allowed_files" in revision:
         gated = {normalize_path(path) for path in contradiction}

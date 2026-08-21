@@ -43,7 +43,10 @@ from forge.ingest import (
 from forge.ingest import ingest as ingest_document
 from forge.respec import _merge_criteria, _refuse_protocol_edits
 from forge.loop import (
+    _ASSERTED,
     _DROPPABLE_HEADINGS,
+    _ERRORED,
+    _UNBUILDABLE,
     _droppable,
     CURRENT_RUN_KEY,
     Orchestrator,
@@ -62,9 +65,11 @@ from forge.patch import (
     repo_relative,
 )
 from forge.failures import (
+    blocks_naming,
     distill,
     environment_failure,
     errors_naming,
+    files_blamed,
     locations,
     signatures,
 )
@@ -1212,7 +1217,7 @@ class TestAutomaticRetryCycles(unittest.TestCase):
         orchestrator, store, run_id = self._orchestrator(
             tickets=[Ticket("T-1", status="done")], retry_cycles=-1
         )
-        orchestrator._shell = lambda _run, _name, _cmd: StepResult(ok=False, detail="boom")
+        orchestrator._shell = lambda _run, _name, _cmd, _ticket="": StepResult(ok=False, detail="boom")
 
         self.assertIs(orchestrator._retry_cycle(run_id, "blocked"), False)
         self.assertEqual(store.get_control(f"retries:{run_id}", "0"), "0")
@@ -4288,7 +4293,7 @@ class TestPreExistingBreakageIsNotThisTicketsFault(unittest.TestCase):
         orch, _, run_id = _stub_orchestrator(
             commands={"lint": "", "typecheck": "", "test": "cargo test"}
         )
-        orch._shell = lambda _run, name, cmd: StepResult(ok=True, detail="")
+        orch._shell = lambda _run, name, cmd, _ticket="": StepResult(ok=True, detail="")
 
         self.assertEqual(orch._finish(run_id), "done")
 
@@ -6889,7 +6894,7 @@ class TestAWrongDiagnosisIsReplacedRatherThanParked(unittest.TestCase):
                 )
             return Completion(text="ACCEPT", usage=Usage(), finish_reason="stop")
 
-        def shell(_run_id, name, command):
+        def shell(_run_id, name, command, _ticket=""):
             if not command.strip():
                 return StepResult(ok=True, detail="")
             proven = state["scope"] == reproduces_on
@@ -7023,7 +7028,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
     def _shell_until_fixed(self, root: Path):
         """The suite fails while the bug is on disk and passes once it is not."""
 
-        def shell(_run_id, name, command):
+        def shell(_run_id, name, command, _ticket=""):
             if not command.strip():
                 return StepResult(ok=True, detail="")
             source = root / "src" / "a.py"
@@ -7098,7 +7103,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
 
     def test_a_reproduction_that_passes_proves_nothing_and_parks(self):
         orch, _root, run_id = self._orch()
-        orch._shell = lambda _r, _n, command: StepResult(ok=True, detail="1 passed")
+        orch._shell = lambda _r, _n, command, _ticket="": StepResult(ok=True, detail="1 passed")
         seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
 
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
@@ -7122,7 +7127,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         every time."""
         orch, _root, run_id = self._orch()
         orch.config.loop.retry_cycles = -1
-        orch._shell = lambda _r, _n, _c: StepResult(ok=True, detail="1 passed")
+        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=True, detail="1 passed")
         self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
 
@@ -7138,7 +7143,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         orch, root, run_id = self._orch()
         orch.config.loop.retry_cycles = -1
         orch.config.loop.respec_on_retry = False
-        orch._shell = lambda _r, _n, _c: StepResult(ok=False, detail=self.TEST_FAILURE)
+        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=False, detail=self.TEST_FAILURE)
         self._calls(orch, tester=self._GOOD_TEST, executor="src/a.py\n```python\n# no fix\n```")
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
 
@@ -7155,7 +7160,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         (root / "web" / "main.js").write_text("run()\n", encoding="utf-8")
         (root / "src").mkdir(exist_ok=True)
         (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
-        orch._shell = lambda _r, _n, _c: StepResult(ok=True, detail="1 passed")
+        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=True, detail="1 passed")
         self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
 
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
@@ -7168,7 +7173,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         orch, root, run_id = self._orch()
         (root / "src").mkdir(exist_ok=True)
         (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
-        orch._shell = lambda _r, _n, _c: StepResult(ok=True, detail="1 passed")
+        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=True, detail="1 passed")
         self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
 
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
@@ -7177,7 +7182,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
 
     def test_a_report_too_vague_to_assert_is_handed_back(self):
         orch, _root, run_id = self._orch()
-        orch._shell = lambda _r, _n, _c: StepResult(ok=False, detail=self.TEST_FAILURE)
+        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=False, detail=self.TEST_FAILURE)
         seen = self._calls(
             orch,
             tester="BLOCKED: the report does not say what value was expected",
@@ -7213,7 +7218,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         # it is the one assertion here demonstrated against real behavior, and
         # it is half of what the ticket was for.
         orch, root, run_id = self._orch()
-        orch._shell = lambda _r, _n, _c: StepResult(ok=False, detail=self.TEST_FAILURE)
+        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=False, detail=self.TEST_FAILURE)
         self._calls(
             orch, tester=self._GOOD_TEST, executor="src/a.py\n```python\n# no fix\n```"
         )
@@ -7234,14 +7239,14 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
             "ImportError: cannot import name 'locked'\n"
             "tests/bug_001_test.py:1: in <module>\n"
         )
-        orch._shell = lambda _r, _n, _c: StepResult(ok=False, detail=broken)
+        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=False, detail=broken)
         seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
 
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
 
         stored = orch.store.list_tickets(run_id)[0]
         self.assertEqual(stored.status, TICKET_BLOCKED)
-        self.assertIn("does not build", stored.blocked_note)
+        self.assertIn("fails on itself rather than on the code", stored.blocked_note)
         self.assertEqual(len(seen["tester"]), 2)
         self.assertIn("errors are in the file you are about to write", seen["tester"][1])
 
@@ -7250,6 +7255,12 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         # find nothing wrong and park a ticket whose work is nearly done.
         orch, root, run_id = self._orch()
         orch._shell = self._shell_until_fixed(root)
+        # On disk as well as in the step log. A proof recorded for a file that
+        # was never written is a state no real cycle reaches, and the loop now
+        # reproduces again rather than trusting it — see
+        # `TestAProofIsWorthNothingWithoutItsFile`.
+        (root / "tests").mkdir(parents=True, exist_ok=True)
+        (root / self.REPRO).write_text("def test_x():\n    assert 1\n", encoding="utf-8")
         step = orch.store.start_step(run_id, "BUG-001", "reproduce")
         orch.store.end_step(step, "ok", self.TEST_FAILURE)
         seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
@@ -7278,7 +7289,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
             "error[E0001]: assertion failed\n"
             "  --> tests/bug_001_test.rs:3:1\n"
         )
-        orch._shell = lambda _r, _n, _c: StepResult(ok=False, detail=failure)
+        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=False, detail=failure)
         ticket = orch.store.list_tickets(run_id)[0]
 
         excused = orch._baseline_failures(run_id, ticket)
@@ -7356,7 +7367,7 @@ class TestEveryLanguageIsVerified(unittest.TestCase):
         )
         ran: list[str] = []
 
-        def shell(_run_id, name, command):
+        def shell(_run_id, name, command, _ticket=""):
             ran.append(name)
             failing = name.endswith("[.js]")
             return StepResult(
@@ -8736,7 +8747,7 @@ class TestBaselineVerifyIsOptional(unittest.TestCase):
         orch.config.loop.max_attempts = 1
         ran: list[str] = []
 
-        def shell(_run_id, name, command):
+        def shell(_run_id, name, command, _ticket=""):
             ran.append(name)
             return StepResult(ok=True, detail="")
 
@@ -9311,7 +9322,7 @@ def _failing_shell(output: str):
     fails on `lint` before reaching the step under test.
     """
 
-    def shell(_run_id, name, command):
+    def shell(_run_id, name, command, _ticket=""):
         if not command.strip():
             return StepResult(ok=True, detail=f"no {name} command configured; skipped")
         return StepResult(ok=False, detail=output)
@@ -9892,7 +9903,7 @@ class TestATicketVerifiedByNothingEndsTheRun(unittest.TestCase):
         orch, _, run_id = self._orchestrator()
         orch.config.commands = {"lint": "", "typecheck": "javac", "test": "pytest"}
 
-        def shell(_run_id, name, command):
+        def shell(_run_id, name, command, _ticket=""):
             if not command.strip():
                 return StepResult(ok=True, detail="skipped")
             if name == "test":
@@ -10317,7 +10328,7 @@ class TestARunWillNotStartOnARedTree(unittest.TestCase):
 
     def test_a_green_tree_starts_normally(self):
         orch, _, run_id = _stub_orchestrator({"lint": "", "typecheck": "javac", "test": ""})
-        orch._shell = lambda _r, _n, _c: StepResult(ok=True, detail="")
+        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=True, detail="")
 
         self.assertEqual(self._run(orch, run_id), "done")
 
@@ -10375,7 +10386,7 @@ class TestRedLeftBehindEndsTheRunWhereItHappened(unittest.TestCase):
 
     def test_a_tree_the_quarantine_cleaned_carries_on(self):
         orch, run_id, failed = self._backlog()
-        orch._shell = lambda _r, _n, _c: StepResult(ok=True, detail="")
+        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=True, detail="")
 
         orch._red_left_behind(run_id, failed)
 
@@ -10395,7 +10406,7 @@ class TestRedLeftBehindEndsTheRunWhereItHappened(unittest.TestCase):
         orch, run_id, failed = self._backlog(pending=False)
         ran: list[str] = []
 
-        def shell(_run_id, name, _command):
+        def shell(_run_id, name, _command, _ticket=""):
             ran.append(name)
             return StepResult(ok=False, detail=self.RED)
 
@@ -10727,7 +10738,7 @@ class TestTheFormatIsShownAndNotOnlyDescribed(unittest.TestCase):
         parsed = parse_output(EXECUTOR_SYSTEM)
 
         self.assertIn(
-            "src/main/java/com/example/Greeter.java", [e.path for e in parsed.edits]
+            "EXAMPLE-ONLY/first_file.txt", [e.path for e in parsed.edits]
         )
 
     def test_the_tester_is_shown_one_too(self):
@@ -10736,9 +10747,1144 @@ class TestTheFormatIsShownAndNotOnlyDescribed(unittest.TestCase):
         parsed = parse_output(TESTER_SYSTEM)
 
         self.assertIn(
-            "src/test/java/com/example/GreeterTest.java", [e.path for e in parsed.edits]
+            "EXAMPLE-ONLY/your_test_file.txt", [e.path for e in parsed.edits]
         )
+
+    def test_every_example_path_is_one_no_repository_can_hold(self):
+        """The example is copied by small models, and a copy that lands in a
+        plausible path is indistinguishable from the ticket asking for scope.
+        Rooting every example under the marker is what lets the rejection be
+        reported as the formatting mistake it is."""
+        from forge.prompts import (
+            EXAMPLE_PATH_PREFIX,
+            EXECUTOR_SYSTEM,
+            REPRO_SYSTEM,
+            TESTER_SYSTEM,
+        )
+
+        for prompt in (EXECUTOR_SYSTEM, TESTER_SYSTEM, REPRO_SYSTEM):
+            paths = [e.path for e in parse_output(prompt).edits]
+            self.assertTrue(paths)
+            for path in paths:
+                self.assertTrue(
+                    path.startswith(EXAMPLE_PATH_PREFIX),
+                    f"{path} could be mistaken for a real file",
+                )
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+GRADLE_JUNIT = """> Task :compileJava UP-TO-DATE
+> Task :processResources NO-SOURCE
+> Task :classes UP-TO-DATE
+
+> Task :test FAILED
+
+Bug001Test > jar_has_main_class_manifest() FAILED
+    java.io.IOException at bug_001_test.java:17
+        Caused by: java.io.IOException at bug_001_test.java:17
+
+MainWiringTest > testRowCounts() PASSED
+
+DirectoryScannerTest > testScanEmptyDirectory() PASSED
+
+106 tests completed, 1 failed
+"""
+
+
+class TestGradleOutputIsReadableAtAll(unittest.TestCase):
+    """Every attribution the loop makes runs through `_blocks`, and none of its
+    patterns started on a line Gradle writes. A whole language parsed to zero
+    diagnostics: no signatures for the baseline to compare, no blamed files for
+    scope or contradiction detection, and `distill` falling back to the head of
+    the output — which on a suite of 106 tests is several thousand characters
+    of `PASSED` handed to the executor as the failure to fix."""
+
+    def test_the_failing_test_is_the_diagnostic(self):
+        self.assertIn("java.io.IOException", distill(GRADLE_JUNIT, limit=600))
+
+    def test_the_head_of_the_output_is_no_longer_what_survives(self):
+        # The real output this came from ran to 7,500 characters, nearly all of
+        # it `PASSED`. Padded here to the same shape so `distill` has to choose.
+        padded = GRADLE_JUNIT + "\n".join(
+            f"MainWiringTest > testFiller{i}() PASSED\n" for i in range(200)
+        )
+        self.assertNotIn("MainWiringTest", distill(padded, limit=600))
+
+    def test_the_failure_is_attributed_to_the_file_it_names(self):
+        self.assertIn("bug_001_test.java", files_blamed(GRADLE_JUNIT))
+
+    def test_one_failing_test_is_one_signature(self):
+        # Not three. `> Task :test FAILED` and the trailing tally both end in a
+        # verdict word and would otherwise open blocks of their own — and the
+        # tally counts the suite, so it changes whenever any later ticket adds
+        # a test, which would make identical evidence look new every cycle.
+        found = signatures(GRADLE_JUNIT)
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("bug_001_test.java", next(iter(found)))
+
+    def test_a_signature_survives_the_suite_growing(self):
+        grown = GRADLE_JUNIT.replace("106 tests completed", "204 tests completed")
+        self.assertEqual(signatures(GRADLE_JUNIT), signatures(grown))
+
+    def test_a_stack_frame_implicates_the_file_it_names(self):
+        # JUnit prints the bare file name and no directory anywhere. Matching
+        # only the full path found nothing, so a reproduction that died in its
+        # own first line read as unimplicated and was accepted as proof.
+        self.assertTrue(
+            errors_naming(GRADLE_JUNIT, "src/test/java/com/x/bug_001_test.java")
+        )
+
+    def test_a_file_the_failure_does_not_name_is_still_not_implicated(self):
+        self.assertFalse(errors_naming(GRADLE_JUNIT, "src/main/java/com/x/Main.java"))
+
+    def test_a_full_path_match_is_preferred_over_the_bare_name(self):
+        # Two files share a basename; only one is named in the output. The
+        # fallback must not make the other one implicated too.
+        text = (
+            "FAILED\n"
+            "    java.io.IOException at src/test/java/a/shared_test.java:4\n"
+        )
+        self.assertTrue(errors_naming(text, "src/test/java/a/shared_test.java"))
+        self.assertFalse(errors_naming(text, "src/test/java/b/shared_test.java"))
+
+
+class TestVerifyFailuresBelongToTheTicketThatCausedThem(unittest.TestCase):
+    """Every shell step was recorded against an empty ticket id, so
+    `ticket_failures` returned nothing for every ticket this project has ever
+    run. Three things read it and all three ran on empty: respec revised specs
+    from the block note alone, the executor's cross-cycle history was blank,
+    and `_evidence_fingerprint` took its "nothing has been learned" branch
+    every time — which is the brake that stops a retry cycle from repeating the
+    last one. A run in `new_forge_test` spent 47 attempts across 9 cycles with
+    that control row reading `none::` at both ends.
+
+    Run against the real `_shell`, because a stub replaces the step recording
+    that is the thing under test."""
+
+    # Fails with output the failure parser can attribute, on any platform.
+    RED = (
+        sys.executable
+        + " -c \"import sys; sys.stderr.write('error: boom\\n  --> a.py:1:1\\n');"
+        ' sys.exit(1)"'
+    )
+
+    def _orch(self):
+        orch, root, run_id = _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": self.RED}
+        )
+        orch.config.loop.max_attempts = 1
+        orch.config.loop.baseline_verify = False
+        (root / "a.py").write_text("x = 0\n", encoding="utf-8")
+        orch.store.add_tickets(
+            run_id, [Ticket("T-1", spec="s", allowed_files=["a.py"], criteria=["c"])]
+        )
+        return orch, root, run_id
+
+    def _failed_ticket(self):
+        orch, _root, run_id = self._orch()
+        orch._call = _replies("a.py\n```python\nx = 1\n```", "ACCEPT\nfine")
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+        return orch, run_id
+
+    def test_the_failure_is_filed_against_the_ticket(self):
+        orch, run_id = self._failed_ticket()
+
+        found = orch.store.ticket_failures(run_id, "T-1")
+
+        self.assertTrue(found, "the ticket's own verify failure must be its own")
+        self.assertIn("boom", " ".join(item["detail"] for item in found))
+
+    def test_the_evidence_fingerprint_is_evidence_and_not_a_clock(self):
+        orch, run_id = self._failed_ticket()
+
+        fingerprint = orch._evidence_fingerprint(run_id, ["T-1"])
+
+        self.assertFalse(fingerprint.startswith("none::"))
+        # Stable, so a second cycle failing the same way compares equal and the
+        # retry brake fires. A timestamp never can.
+        self.assertEqual(fingerprint, orch._evidence_fingerprint(run_id, ["T-1"]))
+
+    def test_a_baseline_is_still_nobodys_failure(self):
+        # The baseline measures the tree a ticket arrived in. Filing it against
+        # whoever is holding the backlog is how a passing ticket inherits the
+        # previous one's red.
+        orch, _root, run_id = self._orch()
+
+        orch._baseline_failures(run_id, Ticket("T-1", allowed_files=["a.py"]))
+
+        self.assertEqual(orch.store.ticket_failures(run_id, "T-1"), [])
+
+
+class TestAReproductionThatCannotPassIsNotEvidence(unittest.TestCase):
+    """A reproduction is accepted when it fails, and "it failed" was read as
+    "it demonstrated the bug". Those come apart when the test dies before it
+    asserts anything.
+
+    A tester wrote `new ProcessBuilder("./gradlew", "jar")` into a
+    reproduction and it was run on Windows, where that throws `IOException` at
+    the first line of the test body. That was recorded as proof of a manifest
+    bug. It could not be cleared by any edit to the one file the ticket owned,
+    and the loop spent 47 attempts across 9 cycles finding that out — attempt
+    46 emitting exactly the `build.gradle` the ticket asked for and being
+    scored a failure, like the 46 around it."""
+
+    REPRO = "tests/bug_001_test.py"
+    GOOD_TEST = (
+        "tests/bug_001_test.py\n```python\ndef test_manifest():\n"
+        "    assert main_class() == 'com.x.Main'\n```"
+    )
+    FIX = "src/a.py\n```python\n# fixed\n```"
+
+    ERRORED = (
+        "Bug001Test > manifest() FAILED\n"
+        "    java.io.IOException at bug_001_test.py:2\n"
+    )
+    ASSERTED = (
+        "Bug001Test > manifest() FAILED\n"
+        "    org.opentest4j.AssertionFailedError: expected com.x.Main "
+        "at bug_001_test.py:2\n"
+    )
+
+    def _orch(self):
+        orch, root, run_id = _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": "pytest -q"}
+        )
+        orch.config.loop.max_attempts = 2
+        orch.store.add_tickets(
+            run_id,
+            [
+                Ticket(
+                    "BUG-001",
+                    title="the jar has no Main-Class",
+                    kind=TICKET_BUG,
+                    spec="the manifest should name com.x.Main",
+                    allowed_files=["src/a.py"],
+                    context="the manifest names com.x.Main",
+                )
+            ],
+        )
+        return orch, root, run_id
+
+    def _calls(self, orch):
+        seen: dict[str, list[str]] = {}
+
+        def call(_run_id, role, messages, **_kwargs):
+            seen.setdefault(role, []).append(_joined(messages))
+            text = {"tester": self.GOOD_TEST, "executor": self.FIX}.get(role, "ACCEPT")
+            return Completion(text=text, usage=Usage(), finish_reason="stop")
+
+        orch._call = call
+        return seen
+
+    def test_a_test_that_died_before_asserting_proves_nothing(self):
+        orch, _root, run_id = self._orch()
+        orch._shell = lambda _r, _n, _c, _t="": StepResult(ok=False, detail=self.ERRORED)
+        seen = self._calls(orch)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        stored = orch.store.list_tickets(run_id)[0]
+        self.assertEqual(stored.status, TICKET_BLOCKED)
+        self.assertIn("fails on itself rather than on the code", stored.blocked_note)
+        # Asked twice, then parked. The executor is never reached: there is
+        # nothing to fix, and 47 attempts is what happens when it is.
+        self.assertEqual(len(seen["tester"]), 2)
+        self.assertNotIn("executor", seen)
+
+    def test_a_failing_assertion_in_the_same_file_is_still_the_evidence(self):
+        # The gate has to stay narrow. A test naming its own file while
+        # reporting a failed assertion is the reproduction working, and
+        # treating that as broken parks every bug the loop could have fixed.
+        orch, _root, run_id = self._orch()
+        orch._shell = lambda _r, _n, _c, _t="": StepResult(
+            ok=False, detail=self.ASSERTED
+        )
+        self._calls(orch)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertIn(
+            "AssertionFailedError", orch.store.reproduced(run_id, "BUG-001")
+        )
+
+    def test_the_words_only_count_where_the_test_file_is_named(self):
+        # `no such file` is ordinary inside an assertion message: a test that
+        # asserts a missing-file error says it while working perfectly.
+        orch, _root, run_id = self._orch()
+        elsewhere = (
+            "SomeOtherTest > reads() FAILED\n"
+            "    java.io.IOException: no such file at other_test.py:9\n"
+            "Bug001Test > manifest() FAILED\n"
+            "    AssertionError: expected com.x.Main at bug_001_test.py:2\n"
+        )
+        orch._shell = lambda _r, _n, _c, _t="": StepResult(ok=False, detail=elsewhere)
+        self._calls(orch)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertIn("expected com.x.Main", orch.store.reproduced(run_id, "BUG-001"))
+
+
+class TestAReproductionNothingCanSatisfyIsRetired(unittest.TestCase):
+    """The second half of the same run. A reproduction that gets past the gate
+    and is still unsatisfiable — because it asserts a literal the ticket's own
+    spec contradicts — cannot be caught at the moment it is written. It can only
+    be caught by what happens afterwards: a whole cycle of attempts, every one
+    failing on that file and on nothing else, with the failure identical each
+    time. At that point the reproduction is the only thing in the arrangement
+    that has not varied, and the only thing nothing has questioned.
+
+    Run against the real `_shell`, because the evidence this reads is the step
+    log — which a stubbed shell never writes."""
+
+    REPRO = "tests/bug_001_test.py"
+    GOOD_TEST = (
+        "tests/bug_001_test.py\n```python\ndef test_manifest():\n"
+        "    assert name() == 'plexnamer.jar'\n```"
+    )
+    FIX = "src/a.py\n```python\n# fixed\n```"
+    FAILURE = (
+        "Bug001Test > manifest() FAILED\n"
+        "    AssertionError: plexnamer-0.1.0.jar at bug_001_test.py:2\n"
+    )
+
+    def _orch(self, output=None, *, varying=False):
+        """A repo whose test command fails with `output` every time it runs."""
+        orch, root, run_id = _stub_orchestrator({"lint": "", "typecheck": "", "test": ""})
+        (root / "failure.txt").write_text(output or self.FAILURE, encoding="utf-8")
+        runner = "import sys, pathlib\n"
+        if varying:
+            # A suite that is moving: a different failure every invocation.
+            runner += (
+                "n = pathlib.Path('count.txt')\n"
+                "i = int(n.read_text()) if n.exists() else 0\n"
+                "n.write_text(str(i + 1))\n"
+                "sys.stderr.write('Bug001Test > manifest() FAILED\\n'\n"
+                "    '    AssertionError: run %d at bug_001_test.py:2\\n' % i)\n"
+            )
+        else:
+            runner += (
+                "sys.stderr.write(pathlib.Path('failure.txt')"
+                ".read_text(encoding='utf-8'))\n"
+            )
+        runner += "sys.exit(1)\n"
+        (root / "run_tests.py").write_text(runner, encoding="utf-8")
+        orch.config.commands["test"] = f'"{sys.executable}" run_tests.py'
+        orch.config.loop.max_attempts = 2
+        orch.store.add_tickets(
+            run_id,
+            [
+                Ticket(
+                    "BUG-001",
+                    title="the jar is misnamed",
+                    kind=TICKET_BUG,
+                    spec="the jar should be named plexnamer.jar",
+                    allowed_files=["src/a.py"],
+                    context="the jar is named plexnamer.jar",
+                )
+            ],
+        )
+        return orch, root, run_id
+
+    def _calls(self, orch):
+        seen: dict[str, list[str]] = {}
+
+        def call(_run_id, role, messages, **_kwargs):
+            seen.setdefault(role, []).append(_joined(messages))
+            text = {"tester": self.GOOD_TEST, "executor": self.FIX}.get(role, "ACCEPT")
+            return Completion(text=text, usage=Usage(), finish_reason="stop")
+
+        orch._call = call
+        return seen
+
+    def _cycle(self, orch, run_id):
+        self._calls(orch)
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+    def _requeued(self, orch, run_id):
+        """The ticket as a retry cycle hands it back: attempts rolled over."""
+        orch.store.reset_tickets(run_id, ["BUG-001"])
+        return orch.store.list_tickets(run_id)[0]
+
+    def test_the_first_cycle_leaves_the_reproduction_alone(self):
+        # Nothing is established after one cycle: a fix that is merely not
+        # finished yet looks exactly like this.
+        orch, _root, run_id = self._orch()
+        self._cycle(orch, run_id)
+
+        self.assertTrue(orch.store.reproduced(run_id, "BUG-001"))
+        self.assertEqual(
+            orch._stale_reproduction(
+                run_id, orch.store.list_tickets(run_id)[0], self.REPRO
+            ),
+            "",
+        )
+
+    def test_a_second_cycle_of_the_same_failure_retires_it(self):
+        orch, _root, run_id = self._orch()
+        self._cycle(orch, run_id)
+        ticket = self._requeued(orch, run_id)
+
+        self.assertIn(self.REPRO, orch._stale_reproduction(run_id, ticket, self.REPRO))
+
+    def test_retiring_it_makes_the_tester_write_another(self):
+        orch, _root, run_id = self._orch()
+        self._cycle(orch, run_id)
+        self._requeued(orch, run_id)
+        seen = self._calls(orch)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertTrue(seen.get("tester"), "the tester must be asked again")
+        asked = seen["tester"][0]
+        self.assertIn("earlier reproduction was retired", asked)
+        # The retired test goes with the ask. A tester that cannot see what it
+        # is replacing writes the same thing again.
+        self.assertIn("plexnamer.jar", asked)
+
+    def test_the_executor_is_granted_nothing(self):
+        # The contract is rewritten by the role that owns contracts. Widening
+        # scope over the reproduction instead would let the party being judged
+        # edit the assertion, which is what reproduce-first exists to prevent.
+        orch, _root, run_id = self._orch()
+        self._cycle(orch, run_id)
+        self._requeued(orch, run_id)
+        self._calls(orch)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertEqual(orch.store.list_tickets(run_id)[0].allowed_files, ["src/a.py"])
+
+    def test_it_happens_once_and_not_every_cycle(self):
+        # A second rewrite would be the loop tuning the contract until the fix
+        # it already has passes.
+        orch, _root, run_id = self._orch()
+        self._cycle(orch, run_id)
+        self._requeued(orch, run_id)
+        self._cycle(orch, run_id)
+        ticket = self._requeued(orch, run_id)
+
+        self.assertEqual(orch._stale_reproduction(run_id, ticket, self.REPRO), "")
+
+    def test_a_ticket_that_is_also_red_elsewhere_keeps_its_reproduction(self):
+        # Red in another file means the fix does not work. That is an ordinary
+        # failure, and the reproduction is not what is wrong.
+        orch, _root, run_id = self._orch(
+            self.FAILURE
+            + "OtherTest > x() FAILED\n    AssertionError: wrong at src/a.py:3\n"
+        )
+        self._cycle(orch, run_id)
+        ticket = self._requeued(orch, run_id)
+
+        self.assertEqual(orch._stale_reproduction(run_id, ticket, self.REPRO), "")
+
+    def test_a_suite_that_is_moving_keeps_its_reproduction(self):
+        # A different failure each attempt means something is varying, so the
+        # reproduction is not the only untested thing in the ticket.
+        orch, _root, run_id = self._orch(varying=True)
+        self._cycle(orch, run_id)
+        ticket = self._requeued(orch, run_id)
+
+        self.assertEqual(orch._stale_reproduction(run_id, ticket, self.REPRO), "")
+
+
+class TestTheReproductionIsReadableByTheRolesJudgedAgainstIt(unittest.TestCase):
+    """The reproduction is the contract, and it was shown to nobody. The
+    executor was told "your fix is not done until `bug_001_test.java` passes"
+    and handed a runner's one-line summary of a file it had never seen; one
+    replied `BLOCKED: I cannot determine the exact cause without seeing the
+    test code`, which was exactly right. Respec, deciding whether the standard
+    itself was wrong, spent six revisions guessing at a filename written three
+    lines into that same test.
+
+    Read-only in both places. Reading a test you may not edit is how you find
+    out what it wants."""
+
+    REPRO = "tests/bug_001_test.py"
+    SOURCE = "def test_manifest():\n    assert name() == 'plexnamer.jar'\n"
+
+    def _orch(self):
+        orch, root, run_id = _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": "pytest -q"}
+        )
+        (root / "tests").mkdir()
+        (root / self.REPRO).write_text(self.SOURCE, encoding="utf-8")
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("def name():\n    return 'x'\n", encoding="utf-8")
+        ticket = Ticket(
+            "BUG-001",
+            title="the jar is misnamed",
+            kind=TICKET_BUG,
+            spec="the jar should be named plexnamer.jar",
+            allowed_files=["src/a.py"],
+            attempts=2,
+        )
+        orch.store.add_tickets(run_id, [ticket])
+        return orch, root, run_id, ticket
+
+    def test_the_executor_is_shown_the_test_it_must_satisfy(self):
+        orch, _root, run_id, ticket = self._orch()
+        seen: list[str] = []
+
+        def call(_run_id, role, messages, **_kwargs):
+            if role == "executor":
+                seen.append(_joined(messages))
+            return Completion(
+                text="src/a.py\n```python\ndef name():\n    return 'plexnamer.jar'\n```"
+                if role == "executor"
+                else "ACCEPT",
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        orch._call = call
+        orch._shell = lambda _r, _n, _c, _t="": StepResult(ok=True, detail="1 passed")
+
+        orch._attempt(
+            run_id, ticket, "", "", "", repro=(self.REPRO, "AssertionError: x")
+        )
+
+        self.assertTrue(seen)
+        self.assertIn("plexnamer.jar", seen[0])
+        # Under the read-only heading, not the writable one. The split is what
+        # keeps it readable without becoming editable.
+        reference = seen[0].split("Reference — read only")[-1]
+        self.assertIn(self.REPRO, reference)
+
+    def test_an_ordinary_ticket_is_shown_no_reproduction(self):
+        orch, _root, run_id, _ticket = self._orch()
+        plain = Ticket("T-2", spec="s", allowed_files=["src/a.py"])
+        seen: list[str] = []
+
+        def call(_run_id, role, messages, **_kwargs):
+            if role == "executor":
+                seen.append(_joined(messages))
+            return Completion(text="ACCEPT", usage=Usage(), finish_reason="stop")
+
+        orch._call = call
+        orch._shell = lambda _r, _n, _c, _t="": StepResult(ok=True, detail="")
+
+        orch._attempt(run_id, plain, "", "", "")
+
+        self.assertTrue(seen)
+        self.assertNotIn(self.REPRO, seen[0])
+
+    def test_respec_is_shown_it_and_told_what_it_is(self):
+        orch, _root, _run_id, ticket = self._orch()
+
+        found = orch._reproduction_of(ticket)
+
+        self.assertEqual(found, [self.REPRO])
+        body = respec_prompt(
+            ticket,
+            [{"name": "test", "detail": "AssertionError"}],
+            sources={self.REPRO: self.SOURCE},
+            reproduction=found,
+        )[-1].content
+        self.assertIn("plexnamer.jar", body)
+        self.assertIn("this ticket's reproduction", body)
+        self.assertIn("Do not put it in `allowed_files`", body)
+
+    def test_a_ticket_that_is_not_a_bug_has_none(self):
+        orch, _root, _run_id, _ticket = self._orch()
+
+        self.assertEqual(
+            orch._reproduction_of(Ticket("T-2", spec="s", allowed_files=["src/a.py"])),
+            [],
+        )
+
+    def test_respec_cannot_make_the_reproduction_writable(self):
+        # Reading it is the point; owning it is the thing the whole
+        # reproduce-first order exists to prevent. A role that can read a file
+        # will sooner or later propose owning it, and the prompt saying not to
+        # is not access control.
+        orch, root, run_id, ticket = self._orch()
+        revision = respec.revise(
+            orch.store,
+            run_id,
+            ticket,
+            "exhausted 2 attempts",
+            call=lambda _messages, _limit: Completion(
+                text=json.dumps(
+                    {
+                        "rationale": "the test wants the other name",
+                        "spec": "name it plexnamer-0.1.0.jar",
+                        "allowed_files": ["src/a.py", self.REPRO],
+                    }
+                ),
+                usage=Usage(),
+                finish_reason="stop",
+            ),
+            budget=1024,
+            protected=[self.REPRO],
+            root=root,
+        )
+
+        self.assertNotIn(self.REPRO, orch.store.list_tickets(run_id)[0].allowed_files)
+        self.assertIn("src/a.py", orch.store.list_tickets(run_id)[0].allowed_files)
+        self.assertTrue(revision.changed)
+        messages = " ".join(row["message"] for row in orch.store.events_after(0))
+        self.assertIn("own reproduction", messages)
+
+
+class TestTheFormatExampleIsNotAScopeRequest(unittest.TestCase):
+    """A small model shown a worked example returns the example with its
+    answer. Those edits are rejected for being out of scope, which reads —
+    to the log, to a human, and to the planner at respec — exactly like the
+    ticket asking for a file it needs.
+
+    One run carried a copy of the example in 21 of 47 attempts, and the planner
+    spent six revisions rewriting the spec around two Java files that existed
+    nowhere in the repository. The paths are now rooted somewhere no tree can
+    be, and the rejection is reported as the formatting mistake it is."""
+
+    ECHO = (
+        "EXAMPLE-ONLY/first_file.txt\n```\nthe entire contents\n```\n\n"
+        "src/a.py\n```python\nx = 1\n```"
+    )
+
+    def _orch(self):
+        orch, root, run_id = _stub_orchestrator()
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("x = 0\n", encoding="utf-8")
+        ticket = Ticket("T-1", spec="s", allowed_files=["src/a.py"], criteria=["c"])
+        orch.store.add_tickets(run_id, [ticket])
+        return orch, root, run_id, ticket
+
+    def _attempt(self, orch, run_id, ticket, reply):
+        orch._call = lambda _r, role, _m, **_k: Completion(
+            text=reply if role == "executor" else "ACCEPT\nfine",
+            usage=Usage(),
+            finish_reason="stop",
+        )
+        return orch._attempt(run_id, ticket, "", "", "")
+
+    def test_the_real_edit_still_lands(self):
+        orch, root, run_id, ticket = self._orch()
+
+        self._attempt(orch, run_id, ticket, self.ECHO)
+
+        self.assertEqual((root / "src" / "a.py").read_text(encoding="utf-8"), "x = 1\n")
+        self.assertFalse((root / "EXAMPLE-ONLY").exists())
+
+    def test_it_is_not_logged_as_a_scope_rejection(self):
+        orch, _root, run_id, ticket = self._orch()
+
+        self._attempt(orch, run_id, ticket, self.ECHO)
+
+        messages = [row["message"] for row in orch.store.events_after(0)]
+        joined = " ".join(messages)
+        self.assertIn("copy of the prompt's format example", joined)
+        self.assertNotIn("rejected out-of-scope edits", joined)
+
+    def test_a_real_out_of_scope_edit_is_still_reported_as_one(self):
+        orch, _root, run_id, ticket = self._orch()
+
+        self._attempt(
+            orch,
+            run_id,
+            ticket,
+            "src/b.py\n```python\ny = 2\n```\n\nsrc/a.py\n```python\nx = 1\n```",
+        )
+
+        joined = " ".join(row["message"] for row in orch.store.events_after(0))
+        self.assertIn("rejected out-of-scope edits", joined)
+        self.assertIn("src/b.py", joined)
+
+    def test_the_executor_is_told_it_copied_the_example(self):
+        # It still has to be told, or it sends it again every attempt. Told as
+        # a formatting mistake, not as scope it might ask for.
+        orch, _root, _run_id, ticket = self._orch()
+
+        guidance = orch._scope_guidance(
+            ticket, [], total_loss=True, echoed=["EXAMPLE-ONLY/first_file.txt"]
+        )
+
+        self.assertIn("copy of the format example", guidance)
+        self.assertNotIn("BLOCKED:", guidance)
+
+
+class TestTheReproduceGateSeparatesEvidenceFromAccident(unittest.TestCase):
+    """The gate deciding whether a failing reproduction is evidence or a defect
+    in itself, exercised on the shapes real runners produce.
+
+    Getting it wrong in one direction spends a whole ticket on a test that
+    cannot pass. Getting it wrong in the other parks a bug that really was
+    reproduced, and reports the fault as the report's own — which is the
+    harder one for a human to see through, so the assertion check overrides."""
+
+    JAVA = "src/test/java/com/x/bug_001_test.java"
+    PY = "tests/bug_001_test.py"
+
+    def _is_own_defect(self, output: str, path: str) -> bool:
+        implicated = errors_naming(output, path)
+        about = blocks_naming(output, path)
+        errored = bool(_ERRORED.search(about)) and not _ASSERTED.search(about)
+        return bool(implicated and (_UNBUILDABLE.search(about) or errored))
+
+    def test_a_process_the_test_could_not_start_is_not_the_bug(self):
+        # The original. `new ProcessBuilder("./gradlew", "jar")` on Windows.
+        self.assertTrue(
+            self._is_own_defect(
+                "Bug001Test > manifest() FAILED\n"
+                "    java.io.IOException at bug_001_test.java:17\n",
+                self.JAVA,
+            )
+        )
+
+    def test_a_reproduction_that_will_not_import_is_not_the_bug(self):
+        self.assertTrue(
+            self._is_own_defect(
+                "ImportError: cannot import name 'locked'\n"
+                "tests/bug_001_test.py:1: in <module>\n",
+                self.PY,
+            )
+        )
+
+    def test_a_junit_assertion_failure_is_the_bug(self):
+        self.assertFalse(
+            self._is_own_defect(
+                "Bug001Test > x() FAILED\n"
+                "    org.opentest4j.AssertionFailedError: expected: <a> but was: <b> "
+                "at bug_001_test.java:4\n",
+                self.JAVA,
+            )
+        )
+
+    def test_a_pytest_assertion_failure_is_the_bug(self):
+        self.assertFalse(
+            self._is_own_defect(
+                "FAILED tests/bug_001_test.py::test_x\n"
+                "assert 3 == 1\n"
+                "tests/bug_001_test.py:2: in test_x\n",
+                self.PY,
+            )
+        )
+
+    def test_a_test_asserting_a_file_is_missing_is_the_bug(self):
+        # `expected FileNotFoundException to be thrown` says `FileNotFound`
+        # while describing a test that ran exactly as intended.
+        self.assertFalse(
+            self._is_own_defect(
+                "Bug001Test > x() FAILED\n"
+                "    AssertionFailedError: expected FileNotFoundException to be "
+                "thrown at bug_001_test.java:4\n",
+                self.JAVA,
+            )
+        )
+
+    def test_a_test_asserting_a_timeout_is_the_bug(self):
+        self.assertFalse(
+            self._is_own_defect(
+                "Bug001Test > x() FAILED\n"
+                "    AssertionFailedError: execution timed out after 100 ms "
+                "at bug_001_test.java:4\n",
+                self.JAVA,
+            )
+        )
+
+    def test_somebody_elses_broken_file_is_not_this_reproductions_defect(self):
+        # The raw output carries both facts; nothing used to require them to be
+        # about the same file.
+        self.assertFalse(
+            self._is_own_defect(
+                "OtherTest > y() FAILED\n"
+                "    java.io.IOException: no such file at other_test.java:9\n"
+                "Bug001Test > x() FAILED\n"
+                "    AssertionError: wrong at bug_001_test.java:4\n",
+                self.JAVA,
+            )
+        )
+
+    def test_a_reproduction_nothing_mentions_is_left_standing(self):
+        # Unattributable, and the safe direction for unattributable output is
+        # always to leave the evidence where it is.
+        self.assertFalse(
+            self._is_own_defect("error: something broke\n  --> src/a.py:1:1\n", self.PY)
+        )
+
+
+class TestRedTheBacklogOwnsIsNotAnOrphan(unittest.TestCase):
+    """The gate's own sentence is "files no ticket in this backlog owns", and
+    nothing checked. Red a waiting ticket already owns is not an orphan — it is
+    the work, and the argument for refusing to start does not hold over it: the
+    reason a human has to write the first ticket is that nobody has claimed
+    those files, and here somebody has.
+
+    A bug ticket's reproduction is the sharp case. It is red on purpose from
+    the moment it is written until the fix lands, it appears in no
+    `allowed_files` because it is derived from the ticket id, and a rerun whose
+    previous cycle left one on disk was refused a start over it — told the tree
+    was red on a file no ticket owned, when the ticket that owned it was the
+    only thing in the backlog."""
+
+    RED = "src/main/java/A.java:5: error: cannot find symbol\n"
+
+    def _orch(self, tickets):
+        orch, root, run_id = _stub_orchestrator(
+            {"lint": "", "typecheck": "javac", "test": ""}
+        )
+        orch._preflight = lambda _run: []
+        orch.store.add_tickets(run_id, tickets)
+        return orch, root, run_id
+
+    def _said(self, orch) -> str:
+        return "\n".join(row["message"] for row in orch.store.events_after(0))
+
+    def test_red_a_waiting_ticket_owns_starts_the_run(self):
+        orch, _root, run_id = self._orch(
+            [Ticket("T-1", spec="s", allowed_files=["src/main/java/A.java"])]
+        )
+        orch._shell = _failing_shell(self.RED)
+        orch._call = _replies(
+            "src/main/java/A.java\n```java\nclass A {}\n```", "ACCEPT\nfine"
+        )
+
+        orch.run(run_id)
+
+        said = self._said(orch)
+        self.assertNotIn("already red before the first ticket", said)
+        self.assertIn("on files this backlog owns", said)
+        self.assertIn("T-1", said)
+
+    def test_red_in_a_bug_tickets_own_reproduction_starts_the_run(self):
+        # The rerun that reported this. The file is not in `allowed_files` and
+        # never will be — it is the assertion the ticket is judged by.
+        orch, root, run_id = self._orch(
+            [
+                Ticket(
+                    "BUG-001",
+                    kind=TICKET_BUG,
+                    spec="s",
+                    allowed_files=["src/a.py"],
+                )
+            ]
+        )
+        orch.config.commands["typecheck"] = ""
+        orch.config.commands["test"] = "pytest -q"
+        (root / "tests").mkdir()
+        (root / "tests" / "bug_001_test.py").write_text("assert 0\n", encoding="utf-8")
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("x = 0\n", encoding="utf-8")
+        orch._shell = _failing_shell(
+            "FAILED tests/bug_001_test.py::test_x\n"
+            "assert 3 == 1\n"
+            "tests/bug_001_test.py:2: in test_x\n"
+        )
+        orch._call = _replies("BLOCKED: not today", "BLOCKED: not today")
+
+        orch.run(run_id)
+
+        said = self._said(orch)
+        self.assertNotIn("already red before the first ticket", said)
+        self.assertIn("BUG-001", said)
+
+    def test_red_nobody_owns_still_stops_the_run(self):
+        orch, _root, run_id = self._orch(
+            [Ticket("T-1", spec="s", allowed_files=["src/main/java/B.java"])]
+        )
+        orch._shell = _failing_shell(self.RED)
+        called: list[int] = []
+        orch._call = lambda *a, **k: called.append(1)
+
+        self.assertEqual(orch.run(run_id), "blocked")
+        self.assertIn("already red before the first ticket", self._said(orch))
+        self.assertEqual(called, [])
+
+    def test_an_owner_that_already_gave_up_does_not_count(self):
+        # The distinction the red gates exist to draw. A ticket out of attempts
+        # is not going to clear anything, so its scope is not a promise.
+        orch, _root, run_id = self._orch(
+            [
+                Ticket(
+                    "T-1",
+                    spec="s",
+                    allowed_files=["src/main/java/A.java"],
+                    status=TICKET_FAILED,
+                )
+            ]
+        )
+        orch._shell = _failing_shell(self.RED)
+
+        self.assertEqual(orch.run(run_id), "blocked")
+        self.assertIn("already red before the first ticket", self._said(orch))
+
+    def test_a_finished_owner_does_not_count_either(self):
+        orch, _root, run_id = self._orch(
+            [
+                Ticket(
+                    "T-1",
+                    spec="s",
+                    allowed_files=["src/main/java/A.java"],
+                    status=TICKET_DONE,
+                )
+            ]
+        )
+        orch._shell = _failing_shell(self.RED)
+
+        self.assertEqual(orch.run(run_id), "blocked")
+        self.assertIn("already red before the first ticket", self._said(orch))
+
+    def test_one_owned_file_does_not_excuse_the_rest(self):
+        orch, _root, run_id = self._orch(
+            [Ticket("T-1", spec="s", allowed_files=["src/main/java/A.java"])]
+        )
+        orch._shell = _failing_shell(
+            self.RED + "src/main/java/Orphan.java:2: error: cannot find symbol\n"
+        )
+
+        self.assertEqual(orch.run(run_id), "blocked")
+        said = self._said(orch)
+        self.assertIn("already red before the first ticket", said)
+        self.assertIn("Orphan.java", said)
+        # Only the unowned one is named as the reason to stop.
+        reason = said.split("already red before the first ticket")[-1]
+        self.assertNotIn("A.java", reason.split("\n\n")[1])
+
+
+class TestAReproductionIsFiledWhereItsLanguageCanCompileIt(unittest.TestCase):
+    """`_test_stem` has spelled this correctly for the ordinary test path all
+    along: a filename that has to match a public type cannot carry a slug.
+    `_repro_target` built its own name inline and did not.
+
+    So a Java reproduction was filed at `bug_002_test.java`, and javac rejects
+    any public type in a file not named after it — `public class Bug002Test`
+    could not compile wherever it was put. Whether a run survived came down to
+    whether the model happened to leave the class package-private. BUG-001 did.
+    BUG-002 did not, and the run was over in one cycle."""
+
+    def _orch(self, root_suffix: str, command: str):
+        orch, root, run_id = _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": command}
+        )
+        return orch, root, run_id
+
+    def test_a_java_reproduction_is_named_for_its_class(self):
+        orch, _root, _run_id = self._orch(".java", "gradle test")
+        ticket = Ticket("BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/main/java/A.java"])
+
+        path, why_not = orch._repro_target(ticket)
+
+        self.assertEqual(why_not, "")
+        self.assertTrue(path.endswith("/Bug002Test.java"), path)
+
+    def test_it_lands_in_the_source_set_the_build_compiles(self):
+        # `tests/` is a fine guess in most ecosystems and an invisible one in
+        # the JVM's, where a file outside the fixed source set is never run.
+        orch, _root, _run_id = self._orch(".java", "gradle test")
+        ticket = Ticket("BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/main/java/A.java"])
+
+        path, _ = orch._repro_target(ticket)
+
+        self.assertTrue(path.startswith("src/test/java/"), path)
+
+    def test_languages_without_the_rule_keep_the_slug(self):
+        # `_test` is mandatory for `go test` and one of pytest's two default
+        # collection patterns. Only the type-named languages give it up.
+        orch, _root, _run_id = self._orch(".py", "pytest -q")
+        ticket = Ticket("BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/a.py"])
+
+        path, _ = orch._repro_target(ticket)
+
+        self.assertTrue(path.endswith("bug_002_test.py"), path)
+
+    def test_the_reproduction_and_the_ordinary_test_agree_on_the_name(self):
+        # Two derivations of the same filename drift into orphans nothing can
+        # reclaim: verification runs over the whole project, and a test file no
+        # ticket owns fails every ticket in the backlog.
+        orch, _root, _run_id = self._orch(".java", "gradle test")
+        ticket = Ticket("BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/main/java/A.java"])
+
+        repro, _ = orch._repro_target(ticket)
+
+        self.assertEqual(Path(repro).stem, orch._test_stem(ticket, ".java"))
+
+
+class TestJavacsCompileErrorsAreReadAsCompileErrors(unittest.TestCase):
+    """Two Java-shaped blind spots that only became reachable once the failure
+    parser could see Gradle output at all, and that together turned a
+    reproduction which never compiled into a report that the fix worked."""
+
+    REPRO = "src/test/java/com/x/Bug002Test.java"
+    JAVAC = (
+        "> Task :compileTestJava FAILED\n"
+        "\n"
+        "D:\\proj\\src\\test\\java\\com\\x\\Bug002Test.java:10: error: class "
+        "Bug002Test is public, should be declared in a file named Bug002Test.java\n"
+        "public class Bug002Test {\n"
+        "       ^\n"
+        "1 error\n"
+        "\n"
+        "> Compilation failed; see the compiler output below.\n"
+    )
+
+    def test_a_javac_diagnostic_is_a_test_that_will_not_build(self):
+        # The list had grown one message at a time and javac's largest family —
+        # `path:line: error: <anything>` — was never in it.
+        self.assertTrue(_UNBUILDABLE.search(blocks_naming(self.JAVAC, self.REPRO)))
+
+    def test_a_failing_assertion_is_still_not_a_build_error(self):
+        # Every runner indents an assertion under the test's own name, so the
+        # location never carries `: error:` after it.
+        passing_shape = (
+            "Bug002Test > x() FAILED\n"
+            "    org.opentest4j.AssertionFailedError: expected: <a> but was: <b> "
+            "at Bug002Test.java:4\n"
+        )
+        self.assertFalse(
+            _UNBUILDABLE.search(blocks_naming(passing_shape, self.REPRO))
+        )
+
+    def test_an_absolute_path_is_the_same_file_as_the_relative_one(self):
+        # javac blames `D:\proj\src\test\...`; every key the loop compares
+        # against is repository-relative. On Java none of them matched, so the
+        # reproduction failed its own exclusion check in `_contradicting_tests`,
+        # was found again as a test file outside scope, and the loop announced
+        # that the fix worked and some other assertion contradicted it. The
+        # reproduction had not passed. It had not compiled.
+        orch, root, run_id = _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": "gradle test"}
+        )
+        (root / "src" / "test" / "java" / "com" / "x").mkdir(parents=True)
+        (root / self.REPRO).write_text("class Bug002Test {}\n", encoding="utf-8")
+        ticket = Ticket(
+            "BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/main/java/A.java"]
+        )
+        orch.store.add_tickets(run_id, [ticket])
+        absolute = self.JAVAC.replace("D:\\proj", str(root).replace("/", "\\"))
+
+        found = orch._contradicting_tests(ticket, (self.REPRO, "proof"), absolute)
+
+        self.assertEqual(
+            found,
+            {},
+            "a ticket's own reproduction is never a test that contradicts it",
+        )
+
+    def test_another_files_assertion_is_still_a_contradiction(self):
+        # The exclusion must stay narrow: this is the case the whole mechanism
+        # exists for, and normalizing paths must not switch it off.
+        orch, root, run_id = _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": "gradle test"}
+        )
+        (root / "src" / "test" / "java" / "com" / "x").mkdir(parents=True)
+        (root / self.REPRO).write_text("class Bug002Test {}\n", encoding="utf-8")
+        other = "src/test/java/com/x/LegacyTest.java"
+        (root / other).write_text("class LegacyTest {}\n", encoding="utf-8")
+        ticket = Ticket(
+            "BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/main/java/A.java"]
+        )
+        orch.store.add_tickets(run_id, [ticket])
+        output = (
+            "LegacyTest > oldRule() FAILED\n"
+            "    org.opentest4j.AssertionFailedError: expected: <1> but was: <255> "
+            f"at {str(root).replace('/', chr(92))}\\src\\test\\java\\com\\x\\LegacyTest.java:8\n"
+        )
+
+        found = orch._contradicting_tests(ticket, (self.REPRO, "proof"), output)
+
+        self.assertIn(other, found)
+
+
+class TestAProofIsWorthNothingWithoutItsFile(unittest.TestCase):
+    """`reproduced` is durable because the fix erases the evidence — once the
+    bug is fixed the test passes, and a second cycle re-running reproduction
+    would find nothing wrong and park a ticket whose work is done.
+
+    Durable was read as sufficient. A proof is about a file, and the step log
+    still answers for one that is no longer there: reproduction is skipped, the
+    executor is handed a contract with no assertion behind it, the suite passes
+    because nothing is asserting anything, and the ticket is recorded green
+    having demonstrated nothing. That is the outcome the whole reproduce-first
+    order exists to prevent.
+
+    Two ways it goes missing: somebody deletes it, or the path it is filed at
+    changes under a run already in flight — which is how this was found, when a
+    Java reproduction moved from `bug_002_test.java` to `Bug002Test.java`."""
+
+    REPRO = "tests/bug_002_test.py"
+    GOOD_TEST = (
+        "tests/bug_002_test.py\n```python\ndef test_x():\n    assert name() == 'y'\n```"
+    )
+
+    def _orch(self):
+        orch, root, run_id = _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": "pytest -q"}
+        )
+        orch.config.loop.max_attempts = 1
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("x = 0\n", encoding="utf-8")
+        orch.store.add_tickets(
+            run_id,
+            [Ticket("BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/a.py"])],
+        )
+        return orch, root, run_id
+
+    def _calls(self, orch):
+        seen: dict[str, list[str]] = {}
+
+        def call(_run_id, role, messages, **_kwargs):
+            seen.setdefault(role, []).append(_joined(messages))
+            text = {
+                "tester": self.GOOD_TEST,
+                "executor": "src/a.py\n```python\nx = 1\n```",
+            }.get(role, "ACCEPT")
+            return Completion(text=text, usage=Usage(), finish_reason="stop")
+
+        orch._call = call
+        return seen
+
+    def _reproduce_once(self, orch, root, run_id):
+        """Get a real `reproduce` step recorded, the way a first cycle does."""
+        failing = [True]
+        orch._shell = lambda _r, _n, _c, _t="": StepResult(
+            ok=not failing[0],
+            detail="FAILED tests/bug_002_test.py::test_x\nassert 0 == 1\n"
+            "tests/bug_002_test.py:2: in test_x\n"
+            if failing[0]
+            else "1 passed",
+        )
+        self._calls(orch)
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+        self.assertTrue(orch.store.reproduced(run_id, "BUG-002"))
+        return failing
+
+    def test_a_deleted_reproduction_is_written_again(self):
+        orch, root, run_id = self._orch()
+        self._reproduce_once(orch, root, run_id)
+        (root / self.REPRO).unlink()
+        orch.store.reset_tickets(run_id, ["BUG-002"])
+        seen = self._calls(orch)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertTrue(seen.get("tester"), "the tester must be asked again")
+        self.assertTrue((root / self.REPRO).is_file())
+
+    def test_it_says_why_rather_than_reproducing_silently(self):
+        orch, root, run_id = self._orch()
+        self._reproduce_once(orch, root, run_id)
+        (root / self.REPRO).unlink()
+        orch.store.reset_tickets(run_id, ["BUG-002"])
+        self._calls(orch)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        said = "\n".join(row["message"] for row in orch.store.events_after(0))
+        self.assertIn("is not on disk now", said)
+
+    def test_a_reproduction_still_on_disk_is_not_written_again(self):
+        # The case `reproduced` is durable for: once the fix lands the test
+        # passes, and re-reproducing would park a ticket whose work is done.
+        orch, root, run_id = self._orch()
+        self._reproduce_once(orch, root, run_id)
+        orch.store.reset_tickets(run_id, ["BUG-002"])
+        orch._shell = lambda _r, _n, _c, _t="": StepResult(ok=True, detail="1 passed")
+        seen = self._calls(orch)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertNotIn("tester", seen)

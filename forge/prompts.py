@@ -33,6 +33,17 @@ PRIOR_VERDICTS_HEADING = "## You have already rejected this ticket"
 # the newest. Marked so the gate can drop an old exchange whole.
 PRIOR_ATTEMPT_HEADING = "## That attempt failed"
 
+# The path root every format example in this module uses. A small model shown a
+# worked example will sometimes return the example along with its answer, and
+# those edits are then rejected for being out of scope — which reads, to
+# everything downstream, exactly like the ticket asking for scope it needs. One
+# run's planner spent six revisions rewriting a spec around the two Java files
+# from the example above, neither of which existed in the repository.
+#
+# So the examples are rooted somewhere no real tree can be, and the rejection is
+# reported as what it is: a formatting mistake, not a scope request.
+EXAMPLE_PATH_PREFIX = "EXAMPLE-ONLY/"
+
 EXECUTOR_SYSTEM = """You are the executor in a plan-and-execute pipeline.
 
 A senior engineer has already made the design decisions. Implement the spec
@@ -67,50 +78,41 @@ Rules:
 
 The format, exactly. The path goes OUTSIDE the fence, on the line above it:
 
-src/main/java/com/example/Greeter.java
-```java
-package com.example;
-
-public final class Greeter {
-    public String greet(String name) {
-        return "Hello, " + name;
-    }
-}
+EXAMPLE-ONLY/first_file.txt
+```
+the entire contents of the first file
 ```
 
-src/main/java/com/example/Main.java
-```java
-package com.example;
-
-public final class Main {
-    public static void main(String[] args) {
-        System.out.println(new Greeter().greet("world"));
-    }
-}
+EXAMPLE-ONLY/second_file.txt
 ```
+the entire contents of the second file
+```
+
+Those two `EXAMPLE-ONLY/` paths are the shape of an answer, not part of one.
+Never send them back. Every path in your reply comes from the allowed scope.
 
 Nothing else is read. These are the ways a reply gets discarded, and the first
 is by far the most common:
 
 WRONG — the path is inside the fence, as a comment. Nothing is written:
 
-```java
-// src/main/java/com/example/Greeter.java
-package com.example;
+```
+// EXAMPLE-ONLY/first_file.txt
+the entire contents of the first file
 ```
 
 WRONG — the path is inside the fence, on the first line. Nothing is written,
 and if it were, that line would become part of the file:
 
-```java
-src/main/java/com/example/Greeter.java
-package com.example;
+```
+EXAMPLE-ONLY/first_file.txt
+the entire contents of the first file
 ```
 
 WRONG — a fenced block with no path anywhere. There is nothing to write it to:
 
-```java
-package com.example;
+```
+the entire contents of the first file
 ```
 
 The path line carries no decoration: no `//`, no `#`, no bullet, no bold, no
@@ -144,20 +146,13 @@ Output the complete contents of that one test file: the path on its own line,
 then a fenced code block with the whole file. The path goes OUTSIDE the fence,
 on the line above it, carrying no comment marker and no other decoration:
 
-src/test/java/com/example/GreeterTest.java
-```java
-package com.example;
-
-import org.junit.jupiter.api.Test;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-
-class GreeterTest {
-    @Test
-    void greets_by_name() {
-        assertEquals("Hello, world", new Greeter().greet("world"));
-    }
-}
+EXAMPLE-ONLY/your_test_file.txt
 ```
+the entire contents of the test file
+```
+
+That path is the shape of an answer, not part of one. Write the path you were
+actually given; a reply naming any other is discarded.
 
 A path written inside the fence — as `// src/test/...`, or as a bare first
 line — is not read as a path. Nothing is written and the answer is discarded.
@@ -198,20 +193,13 @@ Output the complete contents of that one test file: the path on its own line,
 then a fenced code block with the whole file. The path goes OUTSIDE the fence,
 on the line above it, carrying no comment marker and no other decoration:
 
-src/test/java/com/example/GreeterTest.java
-```java
-package com.example;
-
-import org.junit.jupiter.api.Test;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-
-class GreeterTest {
-    @Test
-    void greets_by_name() {
-        assertEquals("Hello, world", new Greeter().greet("world"));
-    }
-}
+EXAMPLE-ONLY/your_test_file.txt
 ```
+the entire contents of the test file
+```
+
+That path is the shape of an answer, not part of one. Write the path you were
+actually given; a reply naming any other is discarded.
 
 A path written inside the fence — as `// src/test/...`, or as a bare first
 line — is not read as a path. Nothing is written and the answer is discarded.
@@ -998,6 +986,7 @@ def repro_prompt(
     reproduce: str = "",
     own_file_errors: list[str] | None = None,
     passed_instead: str = "",
+    superseded: str = "",
 ) -> list[Message]:
     """Ask the tester for the test that must fail before anything is fixed.
 
@@ -1085,8 +1074,37 @@ you one, reply `BLOCKED:` and say what you would need.
 ```
 
 They are defects in the test, not evidence about the bug — `{test_path}` is
-yours and nobody else can fix it. A test that will not build cannot reproduce
-anything. Fix exactly what they point at and keep the assertion.
+yours and nobody else can fix it. Either it did not build, or it ran and died
+before it reached an assertion: it tried to start a process, open a path, or
+reach a service, and did not get one. Neither reproduces anything.
+
+Fix exactly what they point at and keep the assertion. If what failed was
+something outside the test process, do not retry it differently — assert on the
+same behavior by a means the running process can observe directly.
+"""
+
+    if superseded:
+        body += f"""
+## An earlier reproduction was retired, and you are replacing it
+
+{superseded}
+
+Read that failure before you write anything. It never reached an assertion, or
+it reached one that no permitted edit could satisfy — either way it measured
+something other than the reported bug, and the fix has been blocked on it
+rather than on the code.
+
+Two things usually cause it. The test depended on something outside the process
+it runs in — a subprocess, a build tool, a path relative to a working directory
+it does not control, a file another task produces. Or it asserted against a
+literal the ticket's own spec contradicts, so the two demands could never both
+hold.
+
+Assert on the same behavior, by different means. Prefer what the running
+process can observe directly over anything it has to launch, and check every
+literal you assert against the spec above. If the report genuinely cannot be
+reproduced without the thing that failed, reply `BLOCKED:` and say so — that is
+a real answer, and it is better than a second reproduction nobody can pass.
 """
 
     body += "\nWrite the test now."
@@ -1631,6 +1649,7 @@ def respec_prompt(
     ruled_out: Sequence[tuple[str, str]] = (),
     report: str = "",
     contradiction: dict[str, list[str]] | None = None,
+    reproduction: Sequence[str] = (),
 ) -> list[Message]:
     """Ask the planner to fix a ticket that its own executor could not satisfy.
 
@@ -1741,6 +1760,23 @@ that contradicts what is here — if the code and the current spec disagree,
 say which one you are changing and why.
 
 {_sources_block(sources)}
+"""
+        if reproduction:
+            listed = ", ".join(f"`{path}`" for path in reproduction)
+            body += f"""
+One of those files is this ticket's reproduction: {listed}. It is the test the
+ticket has been failing, and it is pasted here so you can read what it actually
+demands rather than infer it from a runner's summary. Check every literal your
+spec states — a filename, a path, a count, an order — against what that file
+asserts. A spec that instructs one thing while the reproduction asserts another
+cannot be satisfied by any edit, and six consecutive revisions guessed at a
+filename that was written three lines into a test nobody was shown.
+
+Do not put it in `allowed_files`. It is the standard this ticket is measured
+against, and it will be removed from any scope you propose. If you conclude the
+reproduction itself is what is wrong, say that in `rationale` and leave the spec
+alone — the loop retires a reproduction by having the tester write a new one,
+never by letting the executor edit it.
 """
 
     if contradiction:

@@ -43,6 +43,17 @@ _ERROR = re.compile(
     # with no diagnostic block parsed at all — and a caller reading blocks got
     # nothing back rather than the error.
     r"|\s*[A-Z]\w*(?:Error|Exception)\b\s*:"
+    # Gradle and Maven report a JUnit failure as the test's own name with the
+    # verdict at the end of the line — `Bug001Test > jar_has_main_class()
+    # FAILED` — and put the exception on the indented lines below it. None of
+    # the patterns above start there, so a whole Java run parsed to zero
+    # diagnostic blocks: no signatures, no blamed files, and `distill` falling
+    # back to the head of the output, which on a passing-mostly suite is
+    # several thousand characters of `PASSED`. The executor was shown that as
+    # the failure it was being asked to fix, and every attribution the loop
+    # makes — baseline amnesty, contradiction detection, scope blame — was
+    # blind on the language for as long as it has supported it.
+    r"|.*\s(?:FAILED|ERROR)\s*$"
     r"|FAIL\b|✗|×"                               # assorted test runners
     r")",
     re.IGNORECASE,
@@ -75,7 +86,15 @@ _SUMMARY = re.compile(
     r"(?:\d+ (?:warning|error)s? emitted"
     r"|could not compile"
     r"|test result:"
-    r"|Compiling|Checking|Finished|Running)\b",
+    r"|Compiling|Checking|Finished|Running)\b"
+    # Gradle's task banner. `> Task :test FAILED` ends in FAILED and would
+    # otherwise open a block under the rule above — a block whose head names no
+    # test and whose body is every line until the first real failure.
+    r"|^\s*>\s*Task\b"
+    # Gradle's tally, `106 tests completed, 1 failed`. It ends in `failed` and
+    # names no file, so as a block it is a signature that changes whenever the
+    # suite grows — which would make every cycle's evidence look new.
+    r"|^\s*\d+ tests? completed\b",
     re.IGNORECASE,
 )
 
@@ -346,6 +365,50 @@ def files_blamed(output: str, exclude: set[str] | None = None) -> dict[str, list
     return blamed
 
 
+def blocks_naming(text: str, path: str) -> str:
+    """The diagnostic blocks that name `path`, joined. "" when none do.
+
+    Between `errors_naming`, which returns only the lines carrying the name,
+    and the raw output, which carries everybody's. Both extremes are wrong for
+    the one question this answers — *why* did the run fail on this file — and
+    they are wrong in opposite directions.
+
+    The lines alone lose the diagnosis. Python reports
+
+        ImportError: cannot import name 'locked'
+        tests/bug_001_test.py:1: in <module>
+
+    with the cause on one line and the file on the next, so a caller matching
+    "does this look like a build error" against the matched line alone sees a
+    location and nothing else.
+
+    The raw output borrows somebody else's. A reproduction failing on a
+    perfectly good assertion was condemned as unbuildable because a different
+    test, further up the same run, had reported `no such file` — the file was
+    named, an unbuildable-looking phrase existed somewhere, and the two were
+    never required to be about the same thing.
+
+    The block is the unit that gets that right: it is exactly one diagnostic,
+    with its own continuation lines and nobody else's.
+    """
+    if not path:
+        return ""
+    blocks, _ = _blocks((text or "").splitlines())
+    wanted = {path.replace("\\", "/").lower(), path.replace("/", "\\").lower()}
+    base = path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    bare = re.compile(rf"(?<![\w./\\-]){re.escape(base)}") if base else None
+
+    def about(block: list[str]) -> bool:
+        joined = "\n".join(block).lower()
+        if any(name in joined for name in wanted):
+            return True
+        # Same bare-name fallback as `errors_naming`, and for the same reason:
+        # JUnit prints stack frames with no directory at all.
+        return bool(bare and bare.search(joined))
+
+    return "\n".join("\n".join(block) for block in blocks if about(block))
+
+
 def errors_naming(text: str, path: str) -> list[str]:
     """Lines of a verify failure that name `path`, with their message.
 
@@ -373,10 +436,32 @@ def errors_naming(text: str, path: str) -> list[str]:
     wanted = {path.replace("\\", "/").lower(), path.replace("/", "\\").lower()}
     blocks, _ = _blocks(text.splitlines())
     lines = [line for block in blocks for line in block]
+
+    def names_it(line: str) -> bool:
+        return any(name in line for name in wanted)
+
+    # JUnit prints a stack frame as the bare file name — `java.io.IOException
+    # at bug_001_test.java:17` — with no directory anywhere in the output. The
+    # full-path match then finds nothing, so a reproduction that died on its
+    # own first line read as unimplicated and was accepted as proof of the bug.
+    #
+    # Two things keep the fallback from over-matching. It is tried only when
+    # the full path found nothing, so a toolchain that prints paths keeps the
+    # stricter answer. And the bare name has to appear *bare*: a name preceded
+    # by a path separator belongs to some other directory's file, which is how
+    # `a/shared_test.java` would otherwise implicate `b/shared_test.java`.
+    if not any(names_it(line.lower()) for line in lines):
+        base = path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if base:
+            bare = re.compile(rf"(?<![\w./\\-]){re.escape(base)}")
+
+            def names_it(line: str) -> bool:  # noqa: F811
+                return bool(bare.search(line))
+
     found: list[str] = []
     for index, raw in enumerate(lines):
         lowered = raw.lower()
-        if not any(name in lowered for name in wanted):
+        if not names_it(lowered):
             continue
         # The message this location belongs to, if the line above is one.
         preceding = lines[index - 1].strip() if index else ""
