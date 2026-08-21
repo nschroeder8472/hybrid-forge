@@ -2216,6 +2216,31 @@ class Orchestrator:
             # passes, so a second cycle re-running reproduction would find
             # nothing wrong and park a ticket whose work is nearly done.
             proof = self.store.reproduced(run_id, ticket.ticket_id)
+            # A proof is about a file, and it is worth nothing once that file
+            # is not there. Skipping reproduction on the strength of a step log
+            # alone would hand the executor a contract with no assertion behind
+            # it, let the suite pass because nothing is asserting anything, and
+            # record the ticket green having demonstrated nothing — which is
+            # the exact outcome the reproduce-first order exists to prevent.
+            #
+            # It goes missing two ways. Somebody deletes it. Or the path it is
+            # filed at changes under a run already in flight, which is how this
+            # was found: a Java reproduction moved from `bug_002_test.java` to
+            # `Bug002Test.java` when the derivation was fixed, and the cached
+            # proof still answered for the name nothing was written to.
+            if proof and not (self.config.root / repro_path).is_file():
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: this bug was reproduced earlier in "
+                    f"the run, but `{repro_path}` is not on disk now. A proof "
+                    f"is about a file — without it the fix would be checked by "
+                    f"nothing and pass. Reproducing again.",
+                    level="warn",
+                    kind="ticket",
+                    data={"ticket": ticket.ticket_id, "reproduction": repro_path},
+                )
+                self.store.retire_reproduction(run_id, ticket.ticket_id)
+                proof = ""
             # Durable, but not beyond question. A reproduction that has been
             # the sole blocker for a whole cycle without varying is the one
             # part of the arrangement nothing has tested — see

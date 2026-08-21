@@ -7255,6 +7255,12 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         # find nothing wrong and park a ticket whose work is nearly done.
         orch, root, run_id = self._orch()
         orch._shell = self._shell_until_fixed(root)
+        # On disk as well as in the step log. A proof recorded for a file that
+        # was never written is a state no real cycle reaches, and the loop now
+        # reproduces again rather than trusting it — see
+        # `TestAProofIsWorthNothingWithoutItsFile`.
+        (root / "tests").mkdir(parents=True, exist_ok=True)
+        (root / self.REPRO).write_text("def test_x():\n    assert 1\n", encoding="utf-8")
         step = orch.store.start_step(run_id, "BUG-001", "reproduce")
         orch.store.end_step(step, "ok", self.TEST_FAILURE)
         seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
@@ -11781,3 +11787,104 @@ class TestJavacsCompileErrorsAreReadAsCompileErrors(unittest.TestCase):
         found = orch._contradicting_tests(ticket, (self.REPRO, "proof"), output)
 
         self.assertIn(other, found)
+
+
+class TestAProofIsWorthNothingWithoutItsFile(unittest.TestCase):
+    """`reproduced` is durable because the fix erases the evidence — once the
+    bug is fixed the test passes, and a second cycle re-running reproduction
+    would find nothing wrong and park a ticket whose work is done.
+
+    Durable was read as sufficient. A proof is about a file, and the step log
+    still answers for one that is no longer there: reproduction is skipped, the
+    executor is handed a contract with no assertion behind it, the suite passes
+    because nothing is asserting anything, and the ticket is recorded green
+    having demonstrated nothing. That is the outcome the whole reproduce-first
+    order exists to prevent.
+
+    Two ways it goes missing: somebody deletes it, or the path it is filed at
+    changes under a run already in flight — which is how this was found, when a
+    Java reproduction moved from `bug_002_test.java` to `Bug002Test.java`."""
+
+    REPRO = "tests/bug_002_test.py"
+    GOOD_TEST = (
+        "tests/bug_002_test.py\n```python\ndef test_x():\n    assert name() == 'y'\n```"
+    )
+
+    def _orch(self):
+        orch, root, run_id = _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": "pytest -q"}
+        )
+        orch.config.loop.max_attempts = 1
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("x = 0\n", encoding="utf-8")
+        orch.store.add_tickets(
+            run_id,
+            [Ticket("BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/a.py"])],
+        )
+        return orch, root, run_id
+
+    def _calls(self, orch):
+        seen: dict[str, list[str]] = {}
+
+        def call(_run_id, role, messages, **_kwargs):
+            seen.setdefault(role, []).append(_joined(messages))
+            text = {
+                "tester": self.GOOD_TEST,
+                "executor": "src/a.py\n```python\nx = 1\n```",
+            }.get(role, "ACCEPT")
+            return Completion(text=text, usage=Usage(), finish_reason="stop")
+
+        orch._call = call
+        return seen
+
+    def _reproduce_once(self, orch, root, run_id):
+        """Get a real `reproduce` step recorded, the way a first cycle does."""
+        failing = [True]
+        orch._shell = lambda _r, _n, _c, _t="": StepResult(
+            ok=not failing[0],
+            detail="FAILED tests/bug_002_test.py::test_x\nassert 0 == 1\n"
+            "tests/bug_002_test.py:2: in test_x\n"
+            if failing[0]
+            else "1 passed",
+        )
+        self._calls(orch)
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+        self.assertTrue(orch.store.reproduced(run_id, "BUG-002"))
+        return failing
+
+    def test_a_deleted_reproduction_is_written_again(self):
+        orch, root, run_id = self._orch()
+        self._reproduce_once(orch, root, run_id)
+        (root / self.REPRO).unlink()
+        orch.store.reset_tickets(run_id, ["BUG-002"])
+        seen = self._calls(orch)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertTrue(seen.get("tester"), "the tester must be asked again")
+        self.assertTrue((root / self.REPRO).is_file())
+
+    def test_it_says_why_rather_than_reproducing_silently(self):
+        orch, root, run_id = self._orch()
+        self._reproduce_once(orch, root, run_id)
+        (root / self.REPRO).unlink()
+        orch.store.reset_tickets(run_id, ["BUG-002"])
+        self._calls(orch)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        said = "\n".join(row["message"] for row in orch.store.events_after(0))
+        self.assertIn("is not on disk now", said)
+
+    def test_a_reproduction_still_on_disk_is_not_written_again(self):
+        # The case `reproduced` is durable for: once the fix lands the test
+        # passes, and re-reproducing would park a ticket whose work is done.
+        orch, root, run_id = self._orch()
+        self._reproduce_once(orch, root, run_id)
+        orch.store.reset_tickets(run_id, ["BUG-002"])
+        orch._shell = lambda _r, _n, _c, _t="": StepResult(ok=True, detail="1 passed")
+        seen = self._calls(orch)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertNotIn("tester", seen)
