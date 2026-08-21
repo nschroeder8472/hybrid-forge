@@ -11637,3 +11637,147 @@ class TestRedTheBacklogOwnsIsNotAnOrphan(unittest.TestCase):
         # Only the unowned one is named as the reason to stop.
         reason = said.split("already red before the first ticket")[-1]
         self.assertNotIn("A.java", reason.split("\n\n")[1])
+
+
+class TestAReproductionIsFiledWhereItsLanguageCanCompileIt(unittest.TestCase):
+    """`_test_stem` has spelled this correctly for the ordinary test path all
+    along: a filename that has to match a public type cannot carry a slug.
+    `_repro_target` built its own name inline and did not.
+
+    So a Java reproduction was filed at `bug_002_test.java`, and javac rejects
+    any public type in a file not named after it — `public class Bug002Test`
+    could not compile wherever it was put. Whether a run survived came down to
+    whether the model happened to leave the class package-private. BUG-001 did.
+    BUG-002 did not, and the run was over in one cycle."""
+
+    def _orch(self, root_suffix: str, command: str):
+        orch, root, run_id = _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": command}
+        )
+        return orch, root, run_id
+
+    def test_a_java_reproduction_is_named_for_its_class(self):
+        orch, _root, _run_id = self._orch(".java", "gradle test")
+        ticket = Ticket("BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/main/java/A.java"])
+
+        path, why_not = orch._repro_target(ticket)
+
+        self.assertEqual(why_not, "")
+        self.assertTrue(path.endswith("/Bug002Test.java"), path)
+
+    def test_it_lands_in_the_source_set_the_build_compiles(self):
+        # `tests/` is a fine guess in most ecosystems and an invisible one in
+        # the JVM's, where a file outside the fixed source set is never run.
+        orch, _root, _run_id = self._orch(".java", "gradle test")
+        ticket = Ticket("BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/main/java/A.java"])
+
+        path, _ = orch._repro_target(ticket)
+
+        self.assertTrue(path.startswith("src/test/java/"), path)
+
+    def test_languages_without_the_rule_keep_the_slug(self):
+        # `_test` is mandatory for `go test` and one of pytest's two default
+        # collection patterns. Only the type-named languages give it up.
+        orch, _root, _run_id = self._orch(".py", "pytest -q")
+        ticket = Ticket("BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/a.py"])
+
+        path, _ = orch._repro_target(ticket)
+
+        self.assertTrue(path.endswith("bug_002_test.py"), path)
+
+    def test_the_reproduction_and_the_ordinary_test_agree_on_the_name(self):
+        # Two derivations of the same filename drift into orphans nothing can
+        # reclaim: verification runs over the whole project, and a test file no
+        # ticket owns fails every ticket in the backlog.
+        orch, _root, _run_id = self._orch(".java", "gradle test")
+        ticket = Ticket("BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/main/java/A.java"])
+
+        repro, _ = orch._repro_target(ticket)
+
+        self.assertEqual(Path(repro).stem, orch._test_stem(ticket, ".java"))
+
+
+class TestJavacsCompileErrorsAreReadAsCompileErrors(unittest.TestCase):
+    """Two Java-shaped blind spots that only became reachable once the failure
+    parser could see Gradle output at all, and that together turned a
+    reproduction which never compiled into a report that the fix worked."""
+
+    REPRO = "src/test/java/com/x/Bug002Test.java"
+    JAVAC = (
+        "> Task :compileTestJava FAILED\n"
+        "\n"
+        "D:\\proj\\src\\test\\java\\com\\x\\Bug002Test.java:10: error: class "
+        "Bug002Test is public, should be declared in a file named Bug002Test.java\n"
+        "public class Bug002Test {\n"
+        "       ^\n"
+        "1 error\n"
+        "\n"
+        "> Compilation failed; see the compiler output below.\n"
+    )
+
+    def test_a_javac_diagnostic_is_a_test_that_will_not_build(self):
+        # The list had grown one message at a time and javac's largest family —
+        # `path:line: error: <anything>` — was never in it.
+        self.assertTrue(_UNBUILDABLE.search(blocks_naming(self.JAVAC, self.REPRO)))
+
+    def test_a_failing_assertion_is_still_not_a_build_error(self):
+        # Every runner indents an assertion under the test's own name, so the
+        # location never carries `: error:` after it.
+        passing_shape = (
+            "Bug002Test > x() FAILED\n"
+            "    org.opentest4j.AssertionFailedError: expected: <a> but was: <b> "
+            "at Bug002Test.java:4\n"
+        )
+        self.assertFalse(
+            _UNBUILDABLE.search(blocks_naming(passing_shape, self.REPRO))
+        )
+
+    def test_an_absolute_path_is_the_same_file_as_the_relative_one(self):
+        # javac blames `D:\proj\src\test\...`; every key the loop compares
+        # against is repository-relative. On Java none of them matched, so the
+        # reproduction failed its own exclusion check in `_contradicting_tests`,
+        # was found again as a test file outside scope, and the loop announced
+        # that the fix worked and some other assertion contradicted it. The
+        # reproduction had not passed. It had not compiled.
+        orch, root, run_id = _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": "gradle test"}
+        )
+        (root / "src" / "test" / "java" / "com" / "x").mkdir(parents=True)
+        (root / self.REPRO).write_text("class Bug002Test {}\n", encoding="utf-8")
+        ticket = Ticket(
+            "BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/main/java/A.java"]
+        )
+        orch.store.add_tickets(run_id, [ticket])
+        absolute = self.JAVAC.replace("D:\\proj", str(root).replace("/", "\\"))
+
+        found = orch._contradicting_tests(ticket, (self.REPRO, "proof"), absolute)
+
+        self.assertEqual(
+            found,
+            {},
+            "a ticket's own reproduction is never a test that contradicts it",
+        )
+
+    def test_another_files_assertion_is_still_a_contradiction(self):
+        # The exclusion must stay narrow: this is the case the whole mechanism
+        # exists for, and normalizing paths must not switch it off.
+        orch, root, run_id = _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": "gradle test"}
+        )
+        (root / "src" / "test" / "java" / "com" / "x").mkdir(parents=True)
+        (root / self.REPRO).write_text("class Bug002Test {}\n", encoding="utf-8")
+        other = "src/test/java/com/x/LegacyTest.java"
+        (root / other).write_text("class LegacyTest {}\n", encoding="utf-8")
+        ticket = Ticket(
+            "BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/main/java/A.java"]
+        )
+        orch.store.add_tickets(run_id, [ticket])
+        output = (
+            "LegacyTest > oldRule() FAILED\n"
+            "    org.opentest4j.AssertionFailedError: expected: <1> but was: <255> "
+            f"at {str(root).replace('/', chr(92))}\\src\\test\\java\\com\\x\\LegacyTest.java:8\n"
+        )
+
+        found = orch._contradicting_tests(ticket, (self.REPRO, "proof"), output)
+
+        self.assertIn(other, found)

@@ -140,6 +140,21 @@ _UNBUILDABLE = re.compile(
     r"syntaxerror|indentationerror|importerror|modulenotfounderror|"
     r"error\[e\d+\]|cannot find|unresolved|undeclared|not declared|"
     r"no such (?:module|file)|failed to compile|collection error|"
+    # A compiler diagnostic prefixed with the location it is about —
+    # `bug_002_test.java:10: error: class Bug002Test is public, should be
+    # declared in a file named Bug002Test.java`. javac, gcc and tsc all write
+    # this shape, and none of the phrase patterns above covers it: the list had
+    # grown one message at a time and javac's largest family was never in it.
+    #
+    # A failing assertion never looks like this. Every runner indents it under
+    # the test's own name, so the location has no `: error:` after it. The
+    # shape is the signal, so it is unanchored — javac writes an absolute path
+    # and Gradle indents its copy of the same line.
+    r"\.\w+:\d+:\s*error:|"
+    # What Gradle, Maven, kotlinc and scalac say when the compile task fails,
+    # as distinct from the compiler's own line above. `failed to compile` is
+    # cargo's phrasing and does not match either of them.
+    r"compilation (?:failed|error)|"
     # Anchored off a word character, because JUnit's standard assertion message
     # is `org.opentest4j.AssertionFailedError: expected <x> but was <y>` — and
     # an unanchored `error: expected` reads the most ordinary failing assertion
@@ -2545,7 +2560,18 @@ class Orchestrator:
         """
         if repro is None:
             return {}
-        blamed = files_blamed(output, exclude=already)
+        # Made repository-relative first, the way every other reader of
+        # `files_blamed` already does it. javac prints the absolute path —
+        # `D:\...\src\test\java\...\bug_002_test.java:10: error:` — and every
+        # comparison below is against a relative one, so on Java none of them
+        # matched: the reproduction failed its own exclusion check, was found
+        # again as a test file outside scope, and the loop reported that the
+        # fix worked and some other assertion contradicted it. The reproduction
+        # had not passed. It had not compiled.
+        blamed = {
+            repo_relative(path, self.config.root): lines
+            for path, lines in files_blamed(output, exclude=already).items()
+        }
         # Whether the reproduction is among the *failures*, which is not the
         # same question as whether the output mentions it. `errors_naming`
         # answers the looser one and matches cargo's `Running tests\bug_002_
@@ -2680,7 +2706,12 @@ class Orchestrator:
             # evidence standing.
             return ""
 
-        blamed = files_blamed("\n".join(failures))
+        # Relative first, for the same reason as `_contradicting_tests`: javac
+        # blames an absolute path and every key here is repository-relative.
+        blamed = {
+            repo_relative(path, self.config.root)
+            for path in files_blamed("\n".join(failures))
+        }
         if not blamed:
             return ""
         repro_key = normalize_path(repro_path)
@@ -4199,9 +4230,25 @@ class Orchestrator:
             # project's own suite would assert something that was never wrong.
             return "", self._no_runner_note(ticket, [suffix])
         example = self._example_test([], suffix)
-        directory = Path(example[0]).parent.as_posix() if example else "tests"
+        # `_TEST_ROOTS` for the same reason `_test_target` uses it: `tests/` is
+        # a fine guess in most ecosystems and an invisible one in the JVM's,
+        # where the build compiles a fixed source set and a file outside it is
+        # never run at all.
+        directory = (
+            Path(example[0]).parent.as_posix()
+            if example
+            else self._TEST_ROOTS.get(suffix, "tests")
+        )
         prefix = "" if directory in ("", ".") else f"{directory}/"
-        return f"{prefix}{self._ticket_slug(ticket)}_test{suffix}", ""
+        # `_test_stem`, not a bare slug plus `_test`. Building the name here
+        # instead meant a Java reproduction was filed at `bug_002_test.java`,
+        # and javac rejects any public type in a file not named after it — so
+        # the tester's `public class Bug002Test` could not compile wherever it
+        # was put. It came down to whether the model happened to leave the
+        # class package-private: BUG-001 did and was fine, BUG-002 did not and
+        # the run was over in one cycle. `_test_stem` has spelled this
+        # correctly for the ordinary test path all along.
+        return f"{prefix}{self._test_stem(ticket, suffix)}{suffix}", ""
 
     # Extensions that hold behavior a test suite could have covered. A ticket
     # that cannot reproduce a fault in one language is worth pointing at the
