@@ -11269,7 +11269,7 @@ class TestTheReproductionIsReadableByTheRolesJudgedAgainstIt(unittest.TestCase):
     def test_respec_is_shown_it_and_told_what_it_is(self):
         orch, _root, _run_id, ticket = self._orch()
 
-        found = orch._repro_for_respec(ticket)
+        found = orch._reproduction_of(ticket)
 
         self.assertEqual(found, [self.REPRO])
         body = respec_prompt(
@@ -11286,7 +11286,7 @@ class TestTheReproductionIsReadableByTheRolesJudgedAgainstIt(unittest.TestCase):
         orch, _root, _run_id, _ticket = self._orch()
 
         self.assertEqual(
-            orch._repro_for_respec(Ticket("T-2", spec="s", allowed_files=["src/a.py"])),
+            orch._reproduction_of(Ticket("T-2", spec="s", allowed_files=["src/a.py"])),
             [],
         )
 
@@ -11499,3 +11499,141 @@ class TestTheReproduceGateSeparatesEvidenceFromAccident(unittest.TestCase):
         self.assertFalse(
             self._is_own_defect("error: something broke\n  --> src/a.py:1:1\n", self.PY)
         )
+
+
+class TestRedTheBacklogOwnsIsNotAnOrphan(unittest.TestCase):
+    """The gate's own sentence is "files no ticket in this backlog owns", and
+    nothing checked. Red a waiting ticket already owns is not an orphan — it is
+    the work, and the argument for refusing to start does not hold over it: the
+    reason a human has to write the first ticket is that nobody has claimed
+    those files, and here somebody has.
+
+    A bug ticket's reproduction is the sharp case. It is red on purpose from
+    the moment it is written until the fix lands, it appears in no
+    `allowed_files` because it is derived from the ticket id, and a rerun whose
+    previous cycle left one on disk was refused a start over it — told the tree
+    was red on a file no ticket owned, when the ticket that owned it was the
+    only thing in the backlog."""
+
+    RED = "src/main/java/A.java:5: error: cannot find symbol\n"
+
+    def _orch(self, tickets):
+        orch, root, run_id = _stub_orchestrator(
+            {"lint": "", "typecheck": "javac", "test": ""}
+        )
+        orch._preflight = lambda _run: []
+        orch.store.add_tickets(run_id, tickets)
+        return orch, root, run_id
+
+    def _said(self, orch) -> str:
+        return "\n".join(row["message"] for row in orch.store.events_after(0))
+
+    def test_red_a_waiting_ticket_owns_starts_the_run(self):
+        orch, _root, run_id = self._orch(
+            [Ticket("T-1", spec="s", allowed_files=["src/main/java/A.java"])]
+        )
+        orch._shell = _failing_shell(self.RED)
+        orch._call = _replies(
+            "src/main/java/A.java\n```java\nclass A {}\n```", "ACCEPT\nfine"
+        )
+
+        orch.run(run_id)
+
+        said = self._said(orch)
+        self.assertNotIn("already red before the first ticket", said)
+        self.assertIn("on files this backlog owns", said)
+        self.assertIn("T-1", said)
+
+    def test_red_in_a_bug_tickets_own_reproduction_starts_the_run(self):
+        # The rerun that reported this. The file is not in `allowed_files` and
+        # never will be — it is the assertion the ticket is judged by.
+        orch, root, run_id = self._orch(
+            [
+                Ticket(
+                    "BUG-001",
+                    kind=TICKET_BUG,
+                    spec="s",
+                    allowed_files=["src/a.py"],
+                )
+            ]
+        )
+        orch.config.commands["typecheck"] = ""
+        orch.config.commands["test"] = "pytest -q"
+        (root / "tests").mkdir()
+        (root / "tests" / "bug_001_test.py").write_text("assert 0\n", encoding="utf-8")
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("x = 0\n", encoding="utf-8")
+        orch._shell = _failing_shell(
+            "FAILED tests/bug_001_test.py::test_x\n"
+            "assert 3 == 1\n"
+            "tests/bug_001_test.py:2: in test_x\n"
+        )
+        orch._call = _replies("BLOCKED: not today", "BLOCKED: not today")
+
+        orch.run(run_id)
+
+        said = self._said(orch)
+        self.assertNotIn("already red before the first ticket", said)
+        self.assertIn("BUG-001", said)
+
+    def test_red_nobody_owns_still_stops_the_run(self):
+        orch, _root, run_id = self._orch(
+            [Ticket("T-1", spec="s", allowed_files=["src/main/java/B.java"])]
+        )
+        orch._shell = _failing_shell(self.RED)
+        called: list[int] = []
+        orch._call = lambda *a, **k: called.append(1)
+
+        self.assertEqual(orch.run(run_id), "blocked")
+        self.assertIn("already red before the first ticket", self._said(orch))
+        self.assertEqual(called, [])
+
+    def test_an_owner_that_already_gave_up_does_not_count(self):
+        # The distinction the red gates exist to draw. A ticket out of attempts
+        # is not going to clear anything, so its scope is not a promise.
+        orch, _root, run_id = self._orch(
+            [
+                Ticket(
+                    "T-1",
+                    spec="s",
+                    allowed_files=["src/main/java/A.java"],
+                    status=TICKET_FAILED,
+                )
+            ]
+        )
+        orch._shell = _failing_shell(self.RED)
+
+        self.assertEqual(orch.run(run_id), "blocked")
+        self.assertIn("already red before the first ticket", self._said(orch))
+
+    def test_a_finished_owner_does_not_count_either(self):
+        orch, _root, run_id = self._orch(
+            [
+                Ticket(
+                    "T-1",
+                    spec="s",
+                    allowed_files=["src/main/java/A.java"],
+                    status=TICKET_DONE,
+                )
+            ]
+        )
+        orch._shell = _failing_shell(self.RED)
+
+        self.assertEqual(orch.run(run_id), "blocked")
+        self.assertIn("already red before the first ticket", self._said(orch))
+
+    def test_one_owned_file_does_not_excuse_the_rest(self):
+        orch, _root, run_id = self._orch(
+            [Ticket("T-1", spec="s", allowed_files=["src/main/java/A.java"])]
+        )
+        orch._shell = _failing_shell(
+            self.RED + "src/main/java/Orphan.java:2: error: cannot find symbol\n"
+        )
+
+        self.assertEqual(orch.run(run_id), "blocked")
+        said = self._said(orch)
+        self.assertIn("already red before the first ticket", said)
+        self.assertIn("Orphan.java", said)
+        # Only the unowned one is named as the reason to stop.
+        reason = said.split("already red before the first ticket")[-1]
+        self.assertNotIn("A.java", reason.split("\n\n")[1])

@@ -1551,6 +1551,41 @@ class Orchestrator:
                 )
         return [name for name, report in checked.items() if report.startswith("FAIL")]
 
+    def _owners_in_backlog(
+        self, run_id: int, paths: Sequence[str]
+    ) -> dict[str, str]:
+        """Which of `paths` a ticket that has yet to run will be working on.
+
+        Keyed by normalized path, valued with the ticket id, so a caller can
+        both filter and say who. Only tickets that still have a chance to run
+        count: one that is done or out of attempts is not going to clear
+        anything, which is the distinction the red gates exist to draw.
+
+        Two kinds of ownership, and the second is easy to miss. A ticket owns
+        what its `allowed_files` name. A **bug** ticket also owns its
+        reproduction, which appears in no list — it is derived from the ticket
+        id — and which is red *by design* from the moment it is written until
+        the fix lands. A run whose previous attempt left one on disk was
+        refused a start over it, told the tree was red on a file no ticket
+        owned, when the ticket that owned it was the only thing in the backlog.
+        """
+        waiting = [
+            ticket
+            for ticket in self.store.list_tickets(run_id)
+            if ticket.status not in self._GAVE_UP and ticket.status != TICKET_DONE
+        ]
+        owners: dict[str, str] = {}
+        for ticket in waiting:
+            scope = list(ticket.allowed_files) + self._reproduction_of(ticket)
+            patterns = [pattern.lower() for pattern in scope]
+            if not patterns:
+                continue
+            for path in paths:
+                key = normalize_path(path)
+                if key not in owners and matches_any(path, patterns):
+                    owners[key] = ticket.ticket_id
+        return owners
+
     def _green_baseline(self, run_id: int) -> str:
         """Refuse to start on a tree that is already red. Returns a note or "".
 
@@ -1601,13 +1636,13 @@ class Orchestrator:
         if not failed:
             return ""
 
-        red = sorted(
+        blamed = sorted(
             {
                 repo_relative(path, self.config.root)
                 for path in files_blamed("\n".join(output))
             }
         )
-        if not red:
+        if not blamed:
             self.store.log(
                 run_id,
                 f"{', '.join(failed)} already failed before the first ticket, "
@@ -1618,6 +1653,31 @@ class Orchestrator:
                 level="warn",
                 kind="verify",
                 data={"steps": failed},
+            )
+            return ""
+
+        # The sentence this gate prints has always been "files no ticket in
+        # this backlog owns", and until now nothing checked. Red a waiting
+        # ticket already owns is not an orphan — it is the work, and the
+        # argument for refusing to start does not hold over it: the loop can
+        # scope it, because a human already did.
+        owned = self._owners_in_backlog(run_id, blamed)
+        red = [path for path in blamed if normalize_path(path) not in owned]
+        if not red:
+            self.store.log(
+                run_id,
+                f"{', '.join(failed)} is already failing, on files this "
+                f"backlog owns:\n"
+                + "\n".join(f"  - {path} ({owned[normalize_path(path)]})" for path in blamed[:8])
+                + f"\n\nStarted rather than gated. Each of these has a ticket "
+                f"that has not run yet, and clearing them is what those "
+                f"tickets are for — a bug ticket's reproduction is red on "
+                f"purpose until its fix lands, and a plan is routinely red "
+                f"between the ticket that calls a class and the one that "
+                f"writes it.",
+                level="warn",
+                kind="verify",
+                data={"steps": failed, "owned": owned},
             )
             return ""
 
@@ -1959,7 +2019,7 @@ class Orchestrator:
 
         revised: list[Ticket] = []
         for ticket in tickets:
-            reproduction = self._repro_for_respec(ticket)
+            reproduction = self._reproduction_of(ticket)
             result = respec.revise(
                 self.store,
                 run_id,
@@ -4083,11 +4143,11 @@ class Orchestrator:
         if self.config.loop.stop_on_blocked:
             raise Stopped()
 
-    def _repro_for_respec(self, ticket: Ticket) -> list[str]:
+    def _reproduction_of(self, ticket: Ticket) -> list[str]:
         """This bug ticket's reproduction, if it has one on disk. Else nothing.
 
-        Kept off `_repro_target`'s error path deliberately: respec runs over
-        every kind of ticket, and a ticket that could not have a reproduction
+        Kept off `_repro_target`'s error path deliberately: both callers run
+        over every kind of ticket, and one that could not have a reproduction
         must add no file and raise no complaint here.
         """
         if ticket.kind != TICKET_BUG:
