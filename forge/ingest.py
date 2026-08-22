@@ -91,6 +91,15 @@ Rules:
   is pasted into the prompt read-only. A ticket that says "read src/api.rs"
   without listing it there is asking for something the executor cannot do, and
   it will guess instead.
+- **Never paraphrase a table.** When the specification states a legend, an
+  alphabet, an error-message list, a status-code mapping or any other lookup
+  table, copy it into the ticket's spec verbatim — every row, spelled exactly
+  as written. Summarising one is not compression, it is deletion: the executor
+  cannot recover a row it was never shown, and a rule like "reject bad input
+  with the exact error strings" names no strings at all. One specification
+  listed eighteen legal characters and seven exact error messages; the ticket
+  said "with exact error strings", and the implementation shipped four of the
+  eighteen and invented every message.
 
 Reply with a single JSON object and nothing else:
 
@@ -386,6 +395,71 @@ def graph_problems(tickets: list[Ticket]) -> list[str]:
 
     # Same pair can surface from either end of a cycle; report each once.
     return list(dict.fromkeys(problems))
+
+
+# Below this many tickets, "nothing depends on anything" carries no
+# information: two or three new modules with no declared order is an ordinary
+# small plan. The shape only becomes diagnosable once there are enough tickets
+# that at least one real dependency is near-certain — and the run this exists
+# for had fifteen.
+_SHAPE_FLOOR = 4
+
+
+def undeclared_order(root: Path, tickets: list[Ticket]) -> str:
+    """Why this backlog looks like a file list rather than a plan, or "".
+
+    A backlog where nothing depends on anything is either genuinely parallel or
+    a planner that decomposed by file instead of by unit of work. Told apart by
+    what the tickets are *doing*: a batch of independent fixes to files that
+    already exist is ordinary and stays quiet, while a set of new modules being
+    built together almost always has one that defines what the others use.
+
+    That second shape is what shipped the defect. Fifteen tickets, fifteen
+    files that did not exist, `needs: []` on every one of them. Nothing
+    sequenced the shared type ahead of its consumers and no ticket owned it, so
+    each module in turn reached for it, invented its own name for it — `types`,
+    `geometry`, `model/rect`, `models/level_model` — and imported a file
+    nothing would ever write.
+
+    A warning rather than a refusal, and the reason is that the evidence is
+    circumstantial. It is the one check in this family reasoning from the
+    *absence* of something rather than the presence of it: genuinely parallel
+    greenfield backlogs exist, they are just rare, and being told about a real
+    one costs a reader five seconds.
+
+    `derive_needs` has already run, so a shared writable file has been ordered
+    and is not what this is about. What is left is the dependency nobody could
+    see from the paths alone.
+    """
+    if len(tickets) < _SHAPE_FLOOR:
+        return ""
+    if any(ticket.needs for ticket in tickets):
+        return ""
+
+    concrete = [
+        path
+        for ticket in tickets
+        for path in ticket.allowed_files
+        if not any(character in path for character in "*?[")
+    ]
+    if not concrete:
+        return ""
+    new = [path for path in concrete if not (root / path).exists()]
+    # Most of the work has to be greenfield. A backlog of independent fixes to
+    # code that already exists is exactly the case this must not fire on.
+    if len(new) * 2 <= len(concrete):
+        return ""
+
+    return (
+        f"{len(tickets)} tickets, {len(new)} files that do not exist yet, and "
+        f"not one `needs` between them. That is a plan in which nothing is "
+        f"built on anything — possible, and rare.\n"
+        f"  If any of these modules shares a type, a constant or a helper with "
+        f"another, say which one writes it first. A backlog of this shape "
+        f"once had every ticket reach for the same shared module, invent a "
+        f"different name for it, and import a file no ticket was ever going "
+        f"to create."
+    )
 
 
 def parse_plan(text: str) -> list[Ticket]:

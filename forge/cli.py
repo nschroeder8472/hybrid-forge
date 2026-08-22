@@ -37,9 +37,17 @@ from pathlib import Path
 
 from . import evidence, modelfiles, replay, respec, toolchain, wizard
 from .artifacts import ARTIFACTS_DIR, GITIGNORE_LINES
-from .config import ANY_LANGUAGE, Config, ConfigError, default_config, normalize_language
+from .config import (
+    ANY_LANGUAGE,
+    Config,
+    ConfigError,
+    Workspace,
+    default_config,
+    normalize_language,
+    normalize_workspace_root,
+)
 from .ingest import ingest as ingest_document
-from .ingest import write_tickets
+from .ingest import undeclared_order, write_tickets
 from .loop import (
     CONTROL_KEY,
     CONTROL_PAUSE,
@@ -264,17 +272,23 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _report_coverage(config: Config) -> list[str]:
-    """What runs against each language in the project, and what does not.
+    """What runs against each language of each build, and what does not.
 
-    A repository is not one language, and the loop's verification is only as
-    wide as its commands. Printing the matrix is what makes a gap visible
-    before it becomes a ticket that passed on review alone over code nothing
-    ever ran.
+    A repository is not one language and not one build, and the loop's
+    verification is only as wide as its commands. Printing the matrix is what
+    makes a gap visible before it becomes a ticket checked by reading.
+
+    The list of files no workspace owns is the other half, and it is the one
+    worth scanning first. A root that resolves to nothing owns nothing, every
+    file falls through to whichever workspace does match, and the config looks
+    entirely reasonable while a whole build goes unverified — the typo is
+    refused at load, but a root that is real and simply wrong is not, and this
+    is where it shows.
 
     Returns the extensions with no test command, so the caller can say so.
     """
     census = Counter(
-        suffix
+        (workspace.root if (workspace := config.workspace_for(path)) else None, suffix)
         for path in evidence.repo_files(config.root, limit=4000)
         if (suffix := Path(path).suffix.lower()) in _SOURCE_SUFFIXES
     )
@@ -287,24 +301,98 @@ def _report_coverage(config: Config) -> list[str]:
             print(f"  {name} command: {shown or '(none configured)'}")
         return []
 
-    width = max(len(suffix) for suffix in census)
+    uncovered: list[str] = []
+    for workspace in config.workspaces:
+        counts = {
+            suffix: count
+            for (root, suffix), count in census.items()
+            if root == workspace.root
+        }
+        # Named only when there is more than one, so a single-build project's
+        # doctor output reads exactly as it did before workspaces existed.
+        if len(config.workspaces) > 1:
+            print(f"\n  workspace {workspace.root}")
+        if not counts:
+            print("    (no source files)")
+            continue
+        uncovered.extend(_print_matrix(config, workspace, counts))
+
+    _report_typecheck_gaps(config, census)
+
+    orphans = sorted(
+        {
+            suffix
+            for (root, suffix), _count in census.items()
+            if root is None
+        }
+    )
+    if orphans:
+        print(
+            f"\n  owned by no workspace: {', '.join(orphans)}\n"
+            f"    Nothing lints, type-checks or tests these. A ticket writing "
+            f"one is refused at ingest."
+        )
+    return uncovered
+
+
+def _report_typecheck_gaps(config: Config, census) -> None:
+    """Languages whose test command does not type-check them, and nothing else does.
+
+    Reported, never gated — the same weight `LANGUAGE-COVERAGE.md` gives lint,
+    and for the same reason: a project that has decided not to type-check its
+    Python has decided, and `--skip` says so on the record.
+
+    Worth reporting at all because of what an empty one cost. `cargo test` and
+    `go test` compile the project, so a missing entry there is a redundancy;
+    `npm test` loads the modules its tests reach and nothing else, so a missing
+    entry there is a hole the size of every file no test imports. One run put
+    4,000 lines through that hole.
+    """
+    gaps: list[str] = []
+    # `root` is `None` for a file no workspace owns, which sorts against a
+    # string and raises. Those are the orphan list's business, not this one's.
+    owned = {key: count for key, count in census.items() if key[0] is not None}
+    for (root, suffix), _count in sorted(owned.items()):
+        workspace = next((w for w in config.workspaces if w.root == root), None)
+        if workspace is None:
+            continue
+        suggested = workspace.unchecked(suffix)
+        if not suggested:
+            continue
+        where = "" if workspace.is_repo_root or len(config.workspaces) == 1 else f" in {root}"
+        gaps.append(f"    {suffix}{where}  —  try `{suggested[0]}`")
+    if not gaps:
+        return
+    print(
+        "\n  no type check:\n"
+        + "\n".join(gaps)
+        + "\n    Their test command loads the modules its tests reach and nothing\n"
+        "    else, so a file no test imports is parsed by nothing here.\n"
+        "    Set one:   forge toolchain --kind typecheck --language <lang>\n"
+        "    Or not:    forge toolchain --kind typecheck --language <lang> --skip"
+    )
+
+
+def _print_matrix(config: Config, workspace, census: dict[str, int]) -> list[str]:
+    """One build's language matrix. Returns its uncovered extensions."""
+    width = max(max(len(suffix) for suffix in census), 8)
     print("\n  language  files  test / lint")
     uncovered: list[str] = []
     for suffix, count in sorted(census.items(), key=lambda item: (-item[1], item[0])):
-        test, how = config.covering("test", suffix)
-        lint, _ = config.covering("lint", suffix)
-        if not test and not config.exempt("test", suffix):
+        test, how = workspace.covering("test", suffix)
+        lint, _ = workspace.covering("lint", suffix)
+        if not test and not workspace.exempt("test", suffix):
             uncovered.append(suffix)
         # A catch-all that cannot run the language is worse than none: it reads
         # as coverage in every report and proves nothing about the files.
-        if config.exempt("test", suffix):
+        if workspace.exempt("test", suffix):
             shown = "(none — declared)"
         else:
             shown = test or (
                 "(no test command" + (f" — the one configured {how})" if how else ")")
             )
         print(
-            f"  {suffix:<{max(width, 8)}}  {count:>5}  {shown}"
+            f"  {suffix:<{width}}  {count:>5}  {shown}"
             + ("  (catch-all)" if how == "catch-all" else "")
             + (f"  |  {lint}" if lint else "")
         )
@@ -315,7 +403,7 @@ def _report_coverage(config: Config) -> list[str]:
 # could assert. A stylesheet with no runner is not a gap.
 _SOURCE_SUFFIXES = frozenset(
     """.rs .py .js .mjs .cjs .jsx .ts .tsx .go .rb .java .kt .swift .c .cc .cpp
-    .h .hpp .cs .php .sh .ps1 .lua .ex .exs .scala .dart""".split()
+    .h .hpp .cs .php .sh .ps1 .lua .ex .exs .scala .dart .gd""".split()
 )
 
 
@@ -344,10 +432,35 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     # against the function it calls. Costs nothing on a greenfield plan —
     # `reading_scope` keeps only files that exist, and on an empty repository
     # that is none of them.
+    #
+    # The specification itself goes first, when the backlog was planned from
+    # one. `reading_scope` takes `reference` in order and caps the rest, so
+    # first is what guarantees it survives.
+    origin = _source_reference(config, args.source, how)
     for ticket in tickets:
+        references = list(ticket.reference_files)
+        if origin and origin not in references:
+            references.insert(0, origin)
         ticket.reference_files = evidence.reading_scope(
-            config.root, ticket.allowed_files, ticket.reference_files
+            config.root, ticket.allowed_files, references
         )
+
+    unverifiable = _workspace_problems(config, tickets)
+    if unverifiable:
+        sys.exit(
+            "error: this backlog cannot be verified as written:\n  "
+            + "\n  ".join(unverifiable)
+            + "\n\nNothing was ingested. `forge doctor` shows what each build "
+            "covers."
+        )
+
+    _warn_missing_manifests(config, tickets)
+
+    # Said after `derive_needs` has run, so a shared writable file has already
+    # been ordered and is not what this is about.
+    shape = undeclared_order(config.root, tickets)
+    if shape:
+        print(f"\nwarning: {shape}")
 
     store = _store(config)
     goal = args.goal or (tickets[0].title if tickets else "ingested plan")
@@ -375,6 +488,36 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
     print("\nReview the tickets, then run `forge go`.")
     return 0
+
+
+def _source_reference(config: Config, source: str, how: str) -> str:
+    """The specification a planned backlog came from, as a readable path.
+
+    Empty for anything that is not one: stdin has no path, a document outside
+    the repository cannot be pasted from one, and a backlog *parsed* from a
+    ticket-shaped document already carries that document's words verbatim —
+    attaching it there would show every ticket every other ticket's spec, for
+    nothing.
+
+    The planned path is where it matters, because that is the lossy one. A
+    planner reads a specification and writes a summary of it; the executor is
+    then handed the summary and never sees the source. One run put a
+    seven-hundred-line spec through that: section 2 of it was labelled
+    normative and held the complete legal alphabet as a table of eighteen
+    characters, the seven exact error strings, and the order the checks run in.
+    What reached the executor was "reject bad input with exact error strings",
+    naming none of them, and every ticket in the backlog had
+    `reference_files: []`. The document that generated a backlog is, by
+    construction, the most relevant reference for every ticket in it.
+    """
+    if how != "planned" or source == "-":
+        return ""
+    try:
+        path = Path(source).resolve()
+        relative = path.relative_to(config.root)
+    except (OSError, ValueError):
+        return ""
+    return relative.as_posix() if path.is_file() else ""
 
 
 def cmd_go(args: argparse.Namespace) -> int:
@@ -1088,6 +1231,9 @@ def cmd_bug(args: argparse.Namespace) -> int:
         joined = f"  (added to run {run_id} — {waiting} ticket(s) waiting)"
     print(f"\nRun {run_id} — {ticket.ticket_id}: {ticket.title}{joined}")
     print(f"  scope     {', '.join(ticket.allowed_files) or '(none named)'}")
+    for problem in _workspace_problems(config, [ticket]):
+        print(f"\nwarning: {problem}")
+    _warn_missing_manifests(config, [ticket])
     _warn_uncovered(config, ticket.allowed_files)
     if ticket.reference_files:
         print(f"  reads     {', '.join(ticket.reference_files)}")
@@ -1146,6 +1292,60 @@ def _warn_module_list(config: Config, paths: list[str]) -> list[str]:
     return listing
 
 
+def _workspace_problems(config: Config, tickets: list) -> list[str]:
+    """Tickets no build can verify, in the words a person can act on.
+
+    Two shapes, and they need different fixes:
+
+    A ticket whose writable files land in **no** workspace has no command of
+    any kind — not a missing runner but a missing build, which `forge
+    toolchain` cannot supply. Only reachable in a repository that declares
+    `workspaces` and leaves a gap in them; the implicit root workspace claims
+    everything, so a project that never heard of the feature never sees this.
+
+    A ticket whose writable files land in **two** is a scoping error. Each
+    build has its own commands and its own working directory, so only one of
+    them can verify it, and which one is an accident of resolution order.
+
+    Ingest is where these are free. The loop parks such a ticket when it
+    reaches it, which is correct and late — by then a run exists, a human has
+    walked away, and the answer was knowable before a token was spent.
+    """
+    problems: list[str] = []
+    for ticket in tickets:
+        found, unowned = config.workspaces_for(ticket.allowed_files)
+        if unowned:
+            roots = ", ".join(workspace.root for workspace in config.workspaces)
+            problems.append(
+                f"{ticket.ticket_id} writes {', '.join(unowned[:4])}, which no "
+                f"workspace owns (declared roots: {roots}). No build here would "
+                f"lint, type-check or test it."
+            )
+        if len(found) > 1:
+            roots = ", ".join(sorted(workspace.root for workspace in found))
+            problems.append(
+                f"{ticket.ticket_id} writes into {len(found)} builds ({roots}). "
+                f"Each has its own commands and working directory, so only one "
+                f"of them can verify it — split it into one ticket per build."
+            )
+    return problems
+
+
+def _warn_missing_manifests(config: Config, tickets: list) -> list[str]:
+    """Say which languages this backlog writes that nothing here can build.
+
+    At ingest, because that is the moment the fix — one more ticket, ordered
+    first — costs nothing. See `toolchain.manifest_gaps` for why it warns
+    rather than refuses.
+    """
+    gaps = toolchain.manifest_gaps(config, tickets)
+    for gap in gaps:
+        print(f"\nwarning: {gap}")
+    if gaps:
+        print("  Add the build file as a ticket of its own, before the ones that need it.")
+    return gaps
+
+
 def _warn_uncovered(config: Config, paths: list[str]) -> list[str]:
     """Say up front when planned work lands in a language nothing tests.
 
@@ -1163,7 +1363,13 @@ def _warn_uncovered(config: Config, paths: list[str]) -> list[str]:
             if not any(ch in path for ch in "*?[")
             and (suffix := Path(path).suffix.lower())
             and suffix in _SOURCE_SUFFIXES
-            and not config.covers("test", suffix)
+            # Asked of the build that owns the file. Repository-wide, one
+            # workspace's runner answers for another's files, which is the
+            # absorption the feature exists to stop surviving inside the
+            # warning meant to catch it. A file no build owns is
+            # `_workspace_problems`, which refuses rather than warns.
+            and (workspace := config.workspace_for(path)) is not None
+            and not workspace.covers("test", suffix)
         }
     )
     if uncovered:
@@ -1231,23 +1437,34 @@ def cmd_toolchain(args: argparse.Namespace) -> int:
     language = args.language if args.language.startswith(".") else f".{args.language.lstrip('.')}"
     suffixes = normalize_language(args.language)
     kind = args.kind
+    workspace = _target_workspace(config, getattr(args, "workspace", ""))
 
     if args.skip:
         # On the record, and readable as one: `false` cannot be mistaken for a
         # command, and the gate stops asking about a language somebody has
         # already decided about.
-        return _write_command(config, kind, language, False, suffixes=suffixes)
+        return _write_command(
+            config, workspace, kind, language, False, suffixes=suffixes
+        )
 
     if args.set:
-        return _write_command(config, kind, language, args.set, suffixes=suffixes)
+        return _write_command(
+            config, workspace, kind, language, args.set, suffixes=suffixes
+        )
 
     try:
         provider = config.provider_for("planner")
     except (ConfigError, ValueError) as exc:
         sys.exit(f"error: {exc}")
 
-    print(f"Reading this repository for its {language} commands...")
-    detection = toolchain.detect(config.root, provider, language=language)
+    where = "this repository" if workspace.is_repo_root else workspace.root
+    print(f"Reading {where} for its {language} commands...")
+    # From inside the build. A subproject states its own commands in its own
+    # `package.json` and its own README, and the repository root's answer for
+    # them is the answer for a different project.
+    detection = toolchain.detect(
+        workspace.path(config.root), provider, language=language
+    )
     if not detection.ok:
         sys.exit(
             f"error: {detection.error}\n"
@@ -1276,24 +1493,67 @@ def cmd_toolchain(args: argparse.Namespace) -> int:
             f"  forge toolchain --language {language} --accept"
         )
         return 0
-    return _write_command(config, kind, language, proposed, suffixes=suffixes)
+    return _write_command(
+        config, workspace, kind, language, proposed, suffixes=suffixes
+    )
+
+
+def _target_workspace(config: Config, wanted: str) -> Workspace:
+    """Which build `forge toolchain` is talking about.
+
+    A repository with one build needs no answer and is never asked. With
+    several, the question has to be answered explicitly: writing a command into
+    the wrong build is worse than writing none, because it reports as coverage
+    for files that command cannot see — which is the failure this whole feature
+    exists to remove.
+    """
+    if wanted:
+        root = normalize_workspace_root(wanted)
+        for workspace in config.workspaces:
+            if workspace.root == root:
+                return workspace
+        sys.exit(
+            f"error: no workspace with root {wanted!r}. Declared: "
+            + ", ".join(w.root for w in config.workspaces)
+        )
+    if len(config.workspaces) == 1:
+        return config.workspaces[0]
+    sys.exit(
+        "error: this repository declares "
+        f"{len(config.workspaces)} builds, so a command has to say which one "
+        "it belongs to:\n  "
+        + "\n  ".join(
+            f"forge toolchain --workspace {w.root} --language <lang>"
+            for w in config.workspaces
+        )
+    )
 
 
 def _write_command(
-    config: Config, kind: str, language: str, command: str | bool, suffixes=()
+    config: Config,
+    workspace: Workspace,
+    kind: str,
+    language: str,
+    command: str | bool,
+    suffixes=(),
 ) -> int:
-    """Put one language's command into config, turning a string into a map.
+    """Put one language's command into one build, turning a string into a map.
 
     An existing single command becomes the `*` entry rather than being
     replaced: it was covering everything, and this is adding a language beside
     it, not taking its place.
+
+    Written into the workspace rather than into the top-level `commands`. That
+    used to be the only place it could go, and under a config that declares
+    `workspaces` the top-level block is read by nothing — so the write
+    succeeded, printed a confirmation, and changed no behaviour at all.
     """
-    existing = config.commands.get(kind, "")
+    existing = workspace.commands.get(kind, "")
     block = {ANY_LANGUAGE: existing} if isinstance(existing, str) and existing else dict(existing or {})
     for key in suffixes or (language,):
         if key != ANY_LANGUAGE:
             block[key] = command
-    config.commands[kind] = block
+    workspace.commands[kind] = block
 
     try:
         config.validate()
@@ -1301,7 +1561,8 @@ def _write_command(
         sys.exit(f"error: {exc}")
 
     written = config.write()
-    print(f"\nWrote {written}")
+    where = "" if workspace.is_repo_root else f" in {workspace.root}"
+    print(f"\nWrote {written}{where}")
     if command is False:
         print(f"  commands.{kind}[{language}] = false  (nothing runs it, on purpose)")
         print("\nTickets writing it are no longer blocked. Their work is checked")
@@ -1609,6 +1870,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="test",
         choices=("test", "lint", "typecheck"),
         help="which command to set (default: test)",
+    )
+    p.add_argument(
+        "--workspace",
+        default="",
+        metavar="ROOT",
+        help="which build the command belongs to, when the repo declares several",
     )
     p.add_argument(
         "--set", default="", metavar="CMD", help="write this command, without asking a model"

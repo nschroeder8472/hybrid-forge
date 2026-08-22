@@ -76,8 +76,18 @@ test could assert, and the gate exists to catch a language nobody thought about
 — not to stall a backlog over `build.sh`. The distinction it draws is between a
 decision on the record and an oversight, and only the second is worth blocking.
 
-`typecheck` legitimately has no entry for some languages. That is a covered
-language with no type checker, not a gap — the gate below is about `test`.
+`typecheck` legitimately has no entry for **some** languages, and the
+distinction turned out to matter. `cargo test`, `go test` and `gradle test`
+compile the project before running any of it, so a Rust, Go or JVM project with
+no `typecheck` entry is missing nothing and asking for one is noise.
+
+`npm test` and `pytest` do not. They load the modules their tests reach and
+nothing else, so a file no test imports is parsed by nothing at all — which is
+how 4,000 lines of TypeScript with sixteen imports of modules that did not exist
+passed every step of a run. For those languages a missing `typecheck` is a hole,
+and `forge doctor` and the run log both say so. It is still not a gate: a
+project that has decided against a type checker has decided, and
+`forge toolchain --kind typecheck --language X --skip` says so on the record.
 
 ---
 
@@ -194,6 +204,12 @@ decision the loop gets to make on its own.
 Same map, same normalisation, one difference: a missing `lint` or `typecheck`
 entry is not a gate. Lint is quality; tests are proof. An uncovered language
 blocks the ticket; an unlinted one is reported at run end and no more.
+
+A missing `typecheck` is reported harder than a missing `lint`, and only for the
+languages whose test command does not compile them — `TYPECHECKERS` in
+`config.py` holds the list, and it is deliberately short. `Workspace.unchecked`
+answers the question; `forge doctor` prints it under `no type check`, and the
+run logs it once at the start.
 
 ---
 

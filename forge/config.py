@@ -32,11 +32,16 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .budget import RateLimitPolicy
+# `neverDelegate`'s matcher, reused for a workspace's `excludes` so the two
+# spellings of "these paths, please" behave identically. `patch` imports
+# nothing from this package, so this cannot cycle.
+from .patch import matches_any
 from .providers import Provider, build_provider
 
 CONFIG_DIR = ".hybridforge"
@@ -96,6 +101,32 @@ _LANGUAGE_ALIASES = {
     "ps1": "powershell",
     "ex": "elixir",
 }
+
+# Languages whose test command does **not** type-check the project, and the
+# checker their ecosystem settled on.
+#
+# The distinction this draws is the whole point of it. `cargo test`, `go test`
+# and `gradle test` compile the code before running any of it, so a project
+# with no `typecheck` entry for Rust, Go or Java is not missing anything — the
+# test command already did it, and asking for a second one would be noise.
+#
+# TypeScript and Python are different: their test commands load the modules the
+# tests reach and nothing else. A file no test imports is never parsed by
+# anything, which is exactly how 4,000 lines with sixteen imports of modules
+# that do not exist passed a run. `tsc --noEmit` would have found every one of
+# them in about two seconds with no model involved.
+#
+# Deliberately short. A language belongs here only when its ecosystem has one
+# near-universal answer; a list of plausible checkers for every language would
+# turn a real gap into a wall of suggestions.
+TYPECHECKERS: dict[str, tuple[str, ...]] = {
+    ".ts": ("tsc --noEmit",),
+    ".tsx": ("tsc --noEmit",),
+    ".mts": ("tsc --noEmit",),
+    ".cts": ("tsc --noEmit",),
+    ".py": ("mypy .", "pyright"),
+}
+
 
 # A command that names one of these is running that language and no other, so a
 # key claiming otherwise is a configuration mistake worth catching at startup
@@ -194,6 +225,223 @@ def normalize_language(key: str) -> tuple[str, ...]:
     return (raw if raw.startswith(".") else f".{raw}",)
 
 
+# ----------------------------------------------------------------------
+# Verify commands, over one `commands` block
+# ----------------------------------------------------------------------
+#
+# These were methods on `Config` and are now functions, because a `commands`
+# block is no longer a property of the repository — it is a property of a
+# workspace, and there can be several. The behaviour is unchanged; `Config`
+# and `Workspace` both call through here so the two can never drift.
+
+
+def _commands_for(commands: dict[str, Any], kind: str) -> dict[str, str]:
+    """One verify step's commands, keyed by extension, plus `*`.
+
+    A plain string means what it always did — every language, one command — so
+    no config changes meaning by being read here.
+    """
+    raw = commands.get(kind, "")
+    if isinstance(raw, str):
+        return {ANY_LANGUAGE: raw.strip()} if raw.strip() else {}
+    found: dict[str, str] = {}
+    for key, value in (raw or {}).items():
+        if _is_exemption(value):
+            continue
+        command = str(value or "").strip()
+        if not command:
+            continue
+        for suffix in normalize_language(str(key)):
+            found[suffix] = command
+    return found
+
+
+def _command_for(commands: dict[str, Any], kind: str, path: str) -> str:
+    """The command that verifies one file's language, or "" if none does."""
+    resolved = _commands_for(commands, kind)
+    suffix = Path(path).suffix.lower() if path else ""
+    return resolved.get(suffix) or resolved.get(ANY_LANGUAGE, "")
+
+
+def _exempt(commands: dict[str, Any], kind: str, suffix: str) -> bool:
+    """Whether this language is declared as one nothing needs to run."""
+    raw = commands.get(kind, "")
+    if isinstance(raw, str):
+        return False
+    wanted = suffix.lower()
+    for key, value in (raw or {}).items():
+        if _is_exemption(value) and wanted in normalize_language(str(key)):
+            return True
+    return False
+
+
+def _covering(commands: dict[str, Any], kind: str, suffix: str) -> tuple[str, str]:
+    """`(command, how)` for one extension: 'exact', 'catch-all', or ''."""
+    if _exempt(commands, kind, suffix):
+        return "", "declared as needing none"
+    resolved = _commands_for(commands, kind)
+    suffix = suffix.lower()
+    exact = resolved.get(suffix)
+    if exact:
+        return exact, "exact"
+    fallback = resolved.get(ANY_LANGUAGE, "")
+    if not fallback:
+        return "", ""
+    mismatch = _wrong_language(suffix, fallback)
+    if mismatch:
+        return "", f"runs {mismatch}"
+    return fallback, "catch-all"
+
+
+def _validate_commands(commands: dict[str, Any], where: str) -> None:
+    """Refuse a `commands` block that cannot mean what it says.
+
+    `where` names the block in the error, so a message about a workspace's
+    commands says which workspace rather than pointing at a key that appears
+    several times in the file.
+    """
+    for kind, raw in commands.items():
+        if not isinstance(raw, (str, dict)):
+            raise ConfigError(
+                f"{where}.{kind} is {type(raw).__name__}; expected a "
+                f'command string, or a map of language to command like '
+                f'{{".rs": "cargo test", ".js": "node --test"}}.'
+            )
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if _is_exemption(value):
+                    continue
+                if not isinstance(value, str):
+                    raise ConfigError(
+                        f"{where}.{kind}.{key} is {type(value).__name__}; "
+                        f"expected a command string."
+                    )
+        for suffix, command in _commands_for(commands, kind).items():
+            mismatch = _wrong_language(suffix, command)
+            if mismatch:
+                raise ConfigError(
+                    f"{where}.{kind} runs {command!r} for {suffix} files, "
+                    f"but that command runs {mismatch}. A command keyed to "
+                    f"a language it cannot run fails every ticket in that "
+                    f"language and reports it as the ticket's fault."
+                )
+
+
+# The root of a repository that declares no workspaces of its own.
+REPO_ROOT = "."
+
+
+def normalize_workspace_root(raw: str) -> str:
+    """A workspace root as a repo-relative posix path, or `.` for the root.
+
+    Normalised on the way in so `"./tools/path-forge"`, `"tools/path-forge/"`
+    and `"tools\\path-forge"` are one workspace rather than three that each
+    claim the same files.
+    """
+    text = str(raw or "").strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    text = text.rstrip("/")
+    return text or REPO_ROOT
+
+
+@dataclass
+class Workspace:
+    """One build inside the repository: a root, its commands, what it disowns.
+
+    Not a language and not a module. A workspace is a directory that owns a
+    manifest and a set of commands that only work when run from inside it —
+    `npm test` under a `package.json`, `cargo test` under a `Cargo.toml`. The
+    distinction the loop needs is that its commands run with `cwd` set here,
+    and that the files under it are verified by these commands and no others.
+
+    A repository declaring no workspaces has exactly one, at `.`, holding the
+    top-level `commands`. Every code path then resolves to what it did before
+    workspaces existed, which is what makes this safe to land in one commit.
+    """
+
+    root: str = REPO_ROOT
+    commands: dict[str, Any] = field(default_factory=dict)
+    # Paths this workspace does not own despite sitting beneath it. A child
+    # workspace's root is excluded implicitly; this is for the rest. Without
+    # it a root workspace's `tests/` glob swallows a subproject's `tests/`,
+    # which is how one repository's gdUnit4 command came to "collect" — and
+    # silently ignore — 4,000 lines of TypeScript.
+    excludes: list[str] = field(default_factory=list)
+
+    @property
+    def is_repo_root(self) -> bool:
+        return self.root == REPO_ROOT
+
+    @property
+    def name(self) -> str:
+        """Short label for a step name. `.` is the repository itself."""
+        return self.root.rsplit("/", 1)[-1] if not self.is_repo_root else REPO_ROOT
+
+    def path(self, root: Path) -> Path:
+        """Absolute path of this workspace's root."""
+        return root if self.is_repo_root else root / self.root
+
+    @property
+    def prefix(self) -> str:
+        """What to prepend to a path this workspace reports about itself.
+
+        Empty at the repository root, where a workspace-relative path already
+        is a repo-relative one.
+        """
+        return "" if self.is_repo_root else f"{self.root}/"
+
+    def contains(self, path: str) -> bool:
+        """Whether `path` — repo-relative — sits inside this workspace's root.
+
+        Says nothing about ownership: an ancestor workspace contains a child's
+        files too. `Config.workspace_for` resolves that by longest prefix.
+        """
+        candidate = str(path or "").replace("\\", "/").lstrip("./")
+        if self.is_repo_root:
+            return bool(candidate)
+        return candidate == self.root or candidate.startswith(f"{self.root}/")
+
+    # -- verify commands, scoped to this workspace ---------------------
+
+    def commands_for(self, kind: str) -> dict[str, str]:
+        return _commands_for(self.commands, kind)
+
+    def command_for(self, kind: str, path: str) -> str:
+        return _command_for(self.commands, kind, path)
+
+    def exempt(self, kind: str, suffix: str) -> bool:
+        return _exempt(self.commands, kind, suffix)
+
+    def covering(self, kind: str, suffix: str) -> tuple[str, str]:
+        return _covering(self.commands, kind, suffix)
+
+    def covers(self, kind: str, suffix: str) -> bool:
+        return bool(self.covering(kind, suffix)[0])
+
+    def unchecked(self, suffix: str) -> tuple[str, ...]:
+        """The type checker this build has no command for, or `()`.
+
+        Answers only for the languages in `TYPECHECKERS` — the ones whose test
+        command does not compile the project, so that a missing entry is a hole
+        rather than a redundancy. An exemption silences it: a project that has
+        decided not to type-check its Python has decided, and the difference
+        between a decision and an oversight is the one thing worth reporting.
+        """
+        suffix = suffix.lower()
+        if suffix not in TYPECHECKERS:
+            return ()
+        if self.exempt("typecheck", suffix) or self.covers("typecheck", suffix):
+            return ()
+        # A language with no test command either has a bigger problem, already
+        # reported, or is one nothing here runs at all. Saying "its test
+        # command does not check the whole project" about a build with no test
+        # command is a sentence that does not parse.
+        if not self.covers("test", suffix):
+            return ()
+        return TYPECHECKERS[suffix]
+
+
 @dataclass
 class LoopSettings:
     """Knobs governing how hard the loop tries before handing back to a human."""
@@ -242,6 +490,29 @@ class LoopSettings:
     # that already passed, or a model slow enough that loading it twice is
     # worth avoiding.
     preflight: bool = True
+    # Prove, rather than infer, that each build's test command reads each
+    # language *this backlog will write*. Writes an unparseable file, runs the
+    # command over it, requires the command to go red *and* to name the file,
+    # deletes it.
+    #
+    # Scoped to the backlog rather than the tree because the tree is full of
+    # languages nobody is asking about: a Godot repository with one Python
+    # helper script has `.py` present, nothing that runs it, and no ticket that
+    # cares. Blocking on that is `build.sh` all over again.
+    #
+    # Inference was the alternative and it is what shipped the defect: coverage
+    # was read off the text of a command against a table of known runners, and a
+    # runner the table has never heard of answers "covered" for every language
+    # in the repository. One gdUnit4 launcher reported itself as the test
+    # command for 4,000 lines of TypeScript and exited 0 fifteen times.
+    #
+    # Costs one command invocation per language per build, once per run, and
+    # ends the run rather than the ticket when a build fails it. Off is for a
+    # suite slow enough that paying it at startup is worse than finding out
+    # later, or a language whose canary the runner legitimately ignores —
+    # `forge toolchain --language X --skip` is the narrower way to say the
+    # second, and says it on the record.
+    preflight_canary: bool = True
     # Run the verify commands once before the first ticket and refuse to start
     # on a tree that is already red.
     #
@@ -319,6 +590,37 @@ class UISettings:
     enabled: bool = True
 
 
+def _workspace_from(block: Any, index: int) -> Workspace:
+    """One `workspaces[]` entry, or a ConfigError naming which one is wrong."""
+    where = f"workspaces[{index}]"
+    if not isinstance(block, dict):
+        raise ConfigError(
+            f"{where} is {type(block).__name__}; expected an object with a "
+            f'"root" and a "commands".'
+        )
+    raw_root = block.get("root", REPO_ROOT)
+    if not isinstance(raw_root, str):
+        raise ConfigError(f"{where}.root is {type(raw_root).__name__}; expected a path.")
+    root = normalize_workspace_root(raw_root)
+    if root.startswith("/") or root.startswith("..") or re.match(r"^[A-Za-z]:", root):
+        # An absolute or escaping root would have the loop run a command
+        # outside the repository it is verifying, and attribute the result to
+        # a ticket in it.
+        raise ConfigError(
+            f"{where}.root is {raw_root!r}; expected a path inside the "
+            f'repository, like "tools/path-forge" or ".".'
+        )
+    commands = block.get("commands", {}) or {}
+    if not isinstance(commands, dict):
+        raise ConfigError(
+            f"{where}.commands is {type(commands).__name__}; expected an object."
+        )
+    excludes = block.get("excludes", []) or []
+    if not isinstance(excludes, list) or any(not isinstance(e, str) for e in excludes):
+        raise ConfigError(f"{where}.excludes must be a list of path patterns.")
+    return Workspace(root=root, commands=commands, excludes=list(excludes))
+
+
 @dataclass
 class Config:
     root: Path
@@ -331,6 +633,53 @@ class Config:
     memory: dict[str, Any] = field(default_factory=dict)
     loop: LoopSettings = field(default_factory=LoopSettings)
     ui: UISettings = field(default_factory=UISettings)
+    # What the config file declared, or `None` for a repository that declared
+    # nothing. Read through `workspaces`, never directly.
+    _declared_workspaces: list[Workspace] | None = None
+
+    @property
+    def workspaces(self) -> list[Workspace]:
+        """The builds in this repository. Never empty.
+
+        A repository that declares none has exactly one, at `.`, holding
+        `commands` — and it is *derived* on each access rather than stored.
+        Storing it aliased a dict, so `config.commands = {...}` left the
+        workspace holding the block that was replaced, and the loop verified
+        against commands nobody had configured any more. Deriving it means
+        there is one copy of the truth and no way to update half of it.
+        """
+        if self._declared_workspaces is not None:
+            return self._declared_workspaces
+        return [Workspace(root=REPO_ROOT, commands=self.commands)]
+
+    @property
+    def _explicit_workspaces(self) -> bool:
+        return self._declared_workspaces is not None
+
+    def declare_workspaces(self, workspaces: list[Workspace]) -> None:
+        """Say this repository holds these builds, and check that it can.
+
+        The way a caller that is not `load` — the wizard, a test — declares
+        them, so nobody has to reach past the property to do it. Validated on
+        the spot: a root that resolves to nothing owns no files, and a config
+        written with one looks entirely reasonable while a whole build goes
+        unverified.
+
+        Passing an empty list clears the declaration, which puts the
+        repository back to the implicit single workspace over `commands`.
+        """
+        if not workspaces:
+            self._declared_workspaces = None
+            return
+        self._declared_workspaces = list(workspaces)
+        if self.commands:
+            # Same refusal `load` makes, for the same reason: the top-level
+            # block would be read by nothing and would look configured.
+            raise ConfigError(
+                "cannot declare workspaces while a top-level `commands` block "
+                "is set — move it into the workspace whose root is '.'."
+            )
+        self._validate_workspaces()
 
     # ------------------------------------------------------------------
 
@@ -371,6 +720,33 @@ class Config:
             memory=data.get("memory", {}) or {},
         )
 
+        declared = data.get("workspaces")
+        if declared is not None:
+            if not isinstance(declared, list):
+                raise ConfigError(
+                    f"`workspaces` is {type(declared).__name__}; expected a list "
+                    f'of {{"root": "...", "commands": {{...}}}} objects.'
+                )
+            if config.commands:
+                # Both spellings present is not a merge, it is a question with
+                # no answer: the top-level block would be read by nothing and
+                # would look configured. The repository root is a workspace
+                # like any other and should say so.
+                raise ConfigError(
+                    "config declares both `workspaces` and a top-level "
+                    "`commands`. Move the top-level block into the workspace "
+                    'whose root is ".", or delete `workspaces` to keep using '
+                    "it as-is."
+                )
+            if not declared:
+                raise ConfigError(
+                    "`workspaces` is empty. Delete the key to use the "
+                    "repository root, or declare at least one build."
+                )
+            config._declared_workspaces = [
+                _workspace_from(block, index) for index, block in enumerate(declared)
+            ]
+
         loop = data.get("loop", {}) or {}
         config.loop = LoopSettings(
             max_attempts=int(loop.get("maxAttempts", 3)),
@@ -383,6 +759,7 @@ class Config:
                 loop.get("reopenStaleDependents", True)
             ),
             preflight=bool(loop.get("preflight", True)),
+            preflight_canary=bool(loop.get("preflightCanary", True)),
             require_green_baseline=bool(loop.get("requireGreenBaseline", True)),
             quarantine_failed=bool(loop.get("quarantineFailed", True)),
             poll_seconds=float(loop.get("pollSeconds", 2.0)),
@@ -414,31 +791,8 @@ class Config:
                 f"back to a human), a positive count, or -1 (retry until the "
                 f"backlog is clean or the run is stopped)."
             )
-        for kind, raw in self.commands.items():
-            if not isinstance(raw, (str, dict)):
-                raise ConfigError(
-                    f"commands.{kind} is {type(raw).__name__}; expected a "
-                    f'command string, or a map of language to command like '
-                    f'{{".rs": "cargo test", ".js": "node --test"}}.'
-                )
-            if isinstance(raw, dict):
-                for key, value in raw.items():
-                    if _is_exemption(value):
-                        continue
-                    if not isinstance(value, str):
-                        raise ConfigError(
-                            f"commands.{kind}.{key} is {type(value).__name__}; "
-                            f"expected a command string."
-                        )
-            for suffix, command in self.commands_for(kind).items():
-                mismatch = _wrong_language(suffix, command)
-                if mismatch:
-                    raise ConfigError(
-                        f"commands.{kind} runs {command!r} for {suffix} files, "
-                        f"but that command runs {mismatch}. A command keyed to "
-                        f"a language it cannot run fails every ticket in that "
-                        f"language and reports it as the ticket's fault."
-                    )
+        _validate_commands(self.commands, "commands")
+        self._validate_workspaces()
 
         if self.loop.bug_hypotheses < 1:
             raise ConfigError(
@@ -468,6 +822,126 @@ class Config:
     # Verify commands
     # ------------------------------------------------------------------
 
+    def _validate_workspaces(self) -> None:
+        """Refuse a workspace layout the loop would silently misread.
+
+        A root that does not exist is the dangerous one. It resolves nothing,
+        every file falls through to whichever workspace does match, and the
+        config looks entirely reasonable while a whole build goes unverified —
+        which is the failure workspaces exist to prevent, reintroduced by a
+        typo.
+        """
+        seen: dict[str, int] = {}
+        for index, workspace in enumerate(self.workspaces):
+            if workspace.root in seen:
+                raise ConfigError(
+                    f"workspaces[{index}].root is {workspace.root!r}, which "
+                    f"workspaces[{seen[workspace.root]}] already claims. Two "
+                    f"workspaces cannot own the same files."
+                )
+            seen[workspace.root] = index
+            if self._explicit_workspaces:
+                _validate_commands(workspace.commands, f"workspaces[{index}].commands")
+                path = workspace.path(self.root)
+                if not path.is_dir():
+                    raise ConfigError(
+                        f"workspaces[{index}].root is {workspace.root!r}, which "
+                        f"is not a directory in this repository. A root that "
+                        f"resolves to nothing owns no files, so its build is "
+                        f"never verified and nothing says so."
+                    )
+
+    # ------------------------------------------------------------------
+    # Workspace resolution
+    # ------------------------------------------------------------------
+
+    def workspace_for(self, path: str) -> Workspace | None:
+        """The workspace owning one repo-relative path, longest root first.
+
+        `None` means no declared build claims the file. That is only reachable
+        when workspaces are declared explicitly and none of them covers it —
+        the implicit root workspace claims everything, so a repository that
+        never heard of this feature never sees it.
+
+        The empty answer is the point of the feature. Under the old model an
+        unclaimed file was absorbed by whatever catch-all was configured, and
+        absorption reads as coverage: a Godot launcher reported itself as the
+        test command for 4,000 lines of TypeScript it could not see.
+        """
+        candidate = str(path or "").replace("\\", "/").lstrip("./")
+        if not candidate:
+            return None
+        owner: Workspace | None = None
+        for workspace in self.workspaces:
+            if not workspace.contains(candidate):
+                continue
+            if workspace.excludes and matches_any(candidate, list(workspace.excludes)):
+                continue
+            # A child workspace's root is excluded from its ancestors
+            # implicitly, which longest-prefix already expresses.
+            if owner is None or len(workspace.root) > len(owner.root):
+                owner = workspace
+        return owner
+
+    def workspaces_for(self, paths: Sequence[str]) -> tuple[list[Workspace], list[str]]:
+        """`(workspaces these paths touch, paths no workspace owns)`.
+
+        Both halves are answers a caller needs. A ticket whose files land in
+        two workspaces is a scoping error; a ticket with unowned files is one
+        nothing can verify. Phase 1 reports; the gates that refuse on either
+        are phase 4.
+        """
+        found: list[Workspace] = []
+        unowned: list[str] = []
+        for path in paths:
+            if any(character in str(path) for character in "*?["):
+                # A glob in `allowed_files` names no particular file, so it
+                # cannot be resolved to a build. Left to the caller.
+                continue
+            workspace = self.workspace_for(str(path))
+            if workspace is None:
+                unowned.append(str(path))
+            elif workspace not in found:
+                found.append(workspace)
+        return found, unowned
+
+    def workspace_for_ticket(self, paths: Sequence[str]) -> Workspace:
+        """The single workspace a ticket's writable files belong to.
+
+        Falls back to the repository root when the files resolve to nothing —
+        a ticket writing only globs, or a backlog whose scope has not been
+        checked yet. Phase 4 refuses those at ingest instead; until then the
+        old behaviour (verify from the repository root) is the safe default,
+        because it is what every run before workspaces did.
+        """
+        found, _ = self.workspaces_for(paths)
+        if len(found) == 1:
+            return found[0]
+        return self.root_workspace
+
+    @property
+    def root_workspace(self) -> Workspace:
+        """The workspace at `.`, or the first declared one if there is none.
+
+        A repository whose only build lives in a subdirectory has no workspace
+        at `.`, and the run-level sweeps still need somewhere to stand.
+        """
+        for workspace in self.workspaces:
+            if workspace.is_repo_root:
+                return workspace
+        return self.workspaces[0]
+
+    # ------------------------------------------------------------------
+    # Verify commands
+    # ------------------------------------------------------------------
+    #
+    # These answer across every workspace, which is what a caller asking "does
+    # this project test anything at all" means. A caller holding a *path* has
+    # a build to ask about and should ask that workspace directly —
+    # `config.workspace_for(path).covers(...)`. The gates move onto that in
+    # phase 4; today a single-workspace repository cannot tell the difference,
+    # which is the property that makes phase 1 a no-op for existing configs.
+
     def commands_for(self, kind: str) -> dict[str, str]:
         """One verify step's commands, keyed by extension, plus `*`.
 
@@ -480,30 +954,26 @@ class Config:
 
         A plain string still means what it always did — every language, one
         command — so no existing config changes meaning by being read here.
+
+        Across workspaces the maps are merged, first declaration winning, so
+        "is anything configured for this step" stays answerable without a path.
         """
-        raw = self.commands.get(kind, "")
-        if isinstance(raw, str):
-            return {ANY_LANGUAGE: raw.strip()} if raw.strip() else {}
-        found: dict[str, str] = {}
-        for key, value in (raw or {}).items():
-            if _is_exemption(value):
-                continue
-            command = str(value or "").strip()
-            if not command:
-                continue
-            for suffix in normalize_language(str(key)):
-                found[suffix] = command
-        return found
+        merged: dict[str, str] = {}
+        for workspace in self.workspaces:
+            for suffix, command in workspace.commands_for(kind).items():
+                merged.setdefault(suffix, command)
+        return merged
 
     def command_for(self, kind: str, path: str) -> str:
         """The command that verifies one file's language, or "" if none does.
 
-        A catch-all answers for anything with no entry of its own, which is
-        what makes a one-language project's single string keep working.
+        Resolved through the file's own workspace, so a path in a subproject
+        gets that subproject's command rather than the repository root's.
         """
-        commands = self.commands_for(kind)
-        suffix = Path(path).suffix.lower() if path else ""
-        return commands.get(suffix) or commands.get(ANY_LANGUAGE, "")
+        workspace = self.workspace_for(path)
+        if workspace is None:
+            return ""
+        return workspace.command_for(kind, path)
 
     def exempt(self, kind: str, suffix: str) -> bool:
         """Whether this language is declared as one nothing needs to run.
@@ -514,15 +984,11 @@ class Config:
         stall a backlog over `build.sh`. Saying so in config is a decision on
         the record; leaving the key out is an oversight, and those are exactly
         what this feature exists to surface.
+
+        Exempt anywhere is exempt: one workspace declaring `.sh` as needing no
+        runner is a decision on the record about shell scripts.
         """
-        raw = self.commands.get(kind, "")
-        if isinstance(raw, str):
-            return False
-        wanted = suffix.lower()
-        for key, value in (raw or {}).items():
-            if _is_exemption(value) and wanted in normalize_language(str(key)):
-                return True
-        return False
+        return any(workspace.exempt(kind, suffix) for workspace in self.workspaces)
 
     def covers(self, kind: str, suffix: str) -> bool:
         """Whether this step has something that genuinely runs the extension.
@@ -540,21 +1006,23 @@ class Config:
         The empty answer is the interesting one — it is what a gate and a
         coverage report are both asking about. A catch-all that cannot run the
         language answers empty and says why in `how`.
+
+        The best answer any workspace gives, because the question has no path
+        in it and so no single build to ask. `exact` beats `catch-all` beats
+        nothing.
         """
         if self.exempt(kind, suffix):
             return "", "declared as needing none"
-        commands = self.commands_for(kind)
-        suffix = suffix.lower()
-        exact = commands.get(suffix)
-        if exact:
-            return exact, "exact"
-        fallback = commands.get(ANY_LANGUAGE, "")
-        if not fallback:
-            return "", ""
-        mismatch = _wrong_language(suffix, fallback)
-        if mismatch:
-            return "", f"runs {mismatch}"
-        return fallback, "catch-all"
+        best = ("", "")
+        for workspace in self.workspaces:
+            command, how = workspace.covering(kind, suffix)
+            if how == "exact":
+                return command, how
+            if command and not best[0]:
+                best = (command, how)
+            elif not best[0] and not best[1] and how:
+                best = ("", how)
+        return best
 
     def model_block(self, name: str) -> dict[str, Any]:
         """A model's config with project-scoped defaults filled in.
@@ -631,6 +1099,7 @@ class Config:
                 "respecCriteria": self.loop.respec_criteria,
                 "reopenStaleDependents": self.loop.reopen_stale_dependents,
                 "preflight": self.loop.preflight,
+                "preflightCanary": self.loop.preflight_canary,
                 "requireGreenBaseline": self.loop.require_green_baseline,
                 "quarantineFailed": self.loop.quarantine_failed,
                 "pollSeconds": self.loop.poll_seconds,
@@ -641,6 +1110,19 @@ class Config:
             },
             "ui": {"host": self.ui.host, "port": self.ui.port, "enabled": self.ui.enabled},
         }
+        if self._explicit_workspaces:
+            # Written only when the file said so. A repository that declares
+            # no workspaces round-trips to the file it had, without acquiring
+            # a key describing a feature it does not use.
+            payload.pop("commands", None)
+            payload["workspaces"] = [
+                {
+                    "root": workspace.root,
+                    "commands": workspace.commands,
+                    **({"excludes": workspace.excludes} if workspace.excludes else {}),
+                }
+                for workspace in self.workspaces
+            ]
         path = self.config_dir / CONFIG_FILE
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         return path
