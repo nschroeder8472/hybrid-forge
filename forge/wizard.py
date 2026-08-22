@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import toolchain
-from .config import CONFIG_DIR, CONFIG_FILE, ROLES, Config
+from .config import CONFIG_DIR, CONFIG_FILE, REPO_ROOT, ROLES, Config, Workspace
 from .memory import MemoryClient
 from .profile import Profile
 from .providers import build_provider
@@ -237,9 +237,17 @@ def _report(ok: bool, detail: str) -> None:
 
 
 def detect_commands(
-    root: Path, models: dict[str, dict[str, Any]], roles: dict[str, str]
+    root: Path,
+    models: dict[str, dict[str, Any]],
+    roles: dict[str, str],
+    where: Path | None = None,
 ) -> toolchain.Detection:
     """Ask the planner model what this repo's verify commands are.
+
+    `where` reads a subdirectory instead: a build with its own manifest states
+    its own commands in its own files, and the repository root's answer for
+    them is the answer for a different project. The model still runs with the
+    repository as its `cwd`, because that is where the checkout is.
 
     Uses the planner because it is the reading-and-judgment role and is usually
     the strongest model configured. The repo root is passed through to a
@@ -262,7 +270,7 @@ def detect_commands(
     except Exception as exc:  # noqa: BLE001 - a bad block is a failed detection
         return toolchain.Detection(error=f"could not build the planner model: {exc}")
 
-    return toolchain.detect(root, provider)
+    return toolchain.detect(where or root, provider)
 
 
 # ----------------------------------------------------------------------
@@ -278,6 +286,11 @@ class Answers:
     memory: dict[str, Any] = field(default_factory=dict)
     room: str = ""
     never_delegate: list[str] = field(default_factory=list)
+    # Empty for the ordinary single-build repository, which is most of them.
+    # Filled only when the tree holds more than one manifest and the person
+    # says yes to configuring them separately — at which point `commands`
+    # stays empty, because the two spellings are exclusive.
+    workspaces: list[Workspace] = field(default_factory=list)
 
 
 TOTAL_STEPS = 5
@@ -312,6 +325,8 @@ def run(root: Path, profile: Profile, prompter: Prompter) -> tuple[Config, Profi
         never_delegate=answers.never_delegate,
         memory=answers.memory,
     )
+    if answers.workspaces:
+        config.declare_workspaces(answers.workspaces)
     config.ui.port = profile.ui_port
 
     heading(5, TOTAL_STEPS, "Review")
@@ -518,13 +533,15 @@ def _ask_repo(answers: Answers, root: Path, prompter: Prompter) -> None:
     say("is skipped — which is better than a command that does not work, because")
     say("a failing check re-delegates the ticket rather than reporting itself.")
 
-    suggested = _detect_or_ask(answers, root, prompter)
-
-    answers.commands = {
-        "lint": prompter.ask("\nlint", suggested.get("lint", "")),
-        "typecheck": prompter.ask("typecheck", suggested.get("typecheck", "")),
-        "test": prompter.ask("test", suggested.get("test", "")),
-    }
+    builds = _ask_builds(root, prompter)
+    if builds:
+        answers.workspaces = [
+            Workspace(root=build, commands=_ask_commands(answers, root, prompter, build))
+            for build in builds
+        ]
+        answers.commands = {}
+    else:
+        answers.commands = _ask_commands(answers, root, prompter, REPO_ROOT)
 
     say("\nPaths the executor must never touch, comma-separated.")
     say("Auth, migrations, and crypto belong here.")
@@ -532,7 +549,55 @@ def _ask_repo(answers: Answers, root: Path, prompter: Prompter) -> None:
     answers.never_delegate = [p.strip() for p in raw.split(",") if p.strip()]
 
 
-def _detect_or_ask(answers: Answers, root: Path, prompter: Prompter) -> dict[str, str]:
+def _ask_builds(root: Path, prompter: Prompter) -> list[str]:
+    """Which directories to configure as separate builds. Empty means one.
+
+    Discovery proposes; the person decides. A directory holding a
+    `package.json` is strong evidence of a build and no evidence at all about
+    whether they want it verified separately — a repository with one manifest
+    at its root is the ordinary case and has to keep behaving like one, so the
+    question is not even asked unless the tree holds two.
+
+    Saying no is a real answer and the default is yes only because the
+    alternative is what shipped the defect: one command set claiming authority
+    over a subproject with a different toolchain, which reads as coverage for
+    files it cannot see.
+    """
+    found = toolchain.discover_workspaces(root)
+    if len(found) < 2:
+        return []
+
+    say("\nThis repository looks like more than one build:")
+    for build in found:
+        say(f"  {build}")
+    say("Each has its own manifest, so each needs its own commands, run from")
+    say("its own directory. Configured as one build, whichever command is set")
+    say("at the root would claim the others' files and report as covering them.")
+
+    if not prompter.confirm("\nConfigure them separately", default=True):
+        say("  keeping one set of commands for the whole repository.")
+        return []
+    return found
+
+
+def _ask_commands(
+    answers: Answers, root: Path, prompter: Prompter, build: str
+) -> dict[str, str]:
+    """One build's three commands, detected from inside it and confirmed."""
+    where = root if build == REPO_ROOT else root / build
+    if build != REPO_ROOT:
+        say(f"\n\033[1m{build}\033[0m")
+    suggested = _detect_or_ask(answers, root, prompter, where=where)
+    return {
+        "lint": prompter.ask("\nlint", suggested.get("lint", "")),
+        "typecheck": prompter.ask("typecheck", suggested.get("typecheck", "")),
+        "test": prompter.ask("test", suggested.get("test", "")),
+    }
+
+
+def _detect_or_ask(
+    answers: Answers, root: Path, prompter: Prompter, where: Path | None = None
+) -> dict[str, str]:
     """Offer model-backed detection, returning defaults for the command prompts.
 
     Declining, failing, or finding nothing all produce the same thing: empty
@@ -541,13 +606,14 @@ def _detect_or_ask(answers: Answers, root: Path, prompter: Prompter) -> dict[str
     """
     blank = {"lint": "", "typecheck": "", "test": ""}
 
+    subject = "this repo" if where is None or where == root else where.name
     if not prompter.confirm(
-        "\nRead this repo's CI config and docs to find them", default=True
+        f"\nRead {subject}'s CI config and docs to find them", default=True
     ):
         return blank
 
     say("  reading…")
-    detection = detect_commands(root, answers.models, answers.roles)
+    detection = detect_commands(root, answers.models, answers.roles, where=where)
 
     if not detection.ok:
         say(f"  \033[33mskipped\033[0m  {detection.error}")
@@ -573,12 +639,17 @@ def _detect_or_ask(answers: Answers, root: Path, prompter: Prompter) -> dict[str
 
 def _preview(config: Config) -> str:
     """Render the config the way it will land on disk, indented for reading."""
-    payload = {
+    payload: dict[str, Any] = {
         "room": config.room,
         "models": config.models,
         "roles": config.roles,
-        "commands": config.commands,
-        "neverDelegate": config.never_delegate,
-        "memory": config.memory,
     }
+    if config._explicit_workspaces:
+        payload["workspaces"] = [
+            {"root": w.root, "commands": w.commands} for w in config.workspaces
+        ]
+    else:
+        payload["commands"] = config.commands
+    payload["neverDelegate"] = config.never_delegate
+    payload["memory"] = config.memory
     return "\n".join("  " + line for line in json.dumps(payload, indent=2).splitlines())

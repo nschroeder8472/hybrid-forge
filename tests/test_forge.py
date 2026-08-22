@@ -25,10 +25,17 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from types import SimpleNamespace
 
-from forge import cli, evidence, modelfiles, replay, respec
+from forge import cli, evidence, imports, modelfiles, replay, respec, toolchain
 from forge.artifacts import Artifacts
 from forge.budget import BudgetGate, ContextOverflow, RateLimitPolicy
-from forge.config import ROLES, Config, ConfigError, LoopSettings, UISettings
+from forge.config import (
+    ROLES,
+    Config,
+    ConfigError,
+    LoopSettings,
+    UISettings,
+    Workspace,
+)
 from forge.ingest import (
     derive_needs,
     graph_problems,
@@ -39,6 +46,7 @@ from forge.ingest import (
     render_ticket,
     shared_file_conflicts,
     tickets_from_json,
+    undeclared_order,
 )
 from forge.ingest import ingest as ingest_document
 from forge.respec import _merge_criteria, _refuse_protocol_edits
@@ -71,7 +79,9 @@ from forge.failures import (
     errors_naming,
     files_blamed,
     locations,
+    reroot,
     signatures,
+    test_count,
 )
 from forge.prompts import (
     bug_prompt,
@@ -1217,7 +1227,7 @@ class TestAutomaticRetryCycles(unittest.TestCase):
         orchestrator, store, run_id = self._orchestrator(
             tickets=[Ticket("T-1", status="done")], retry_cycles=-1
         )
-        orchestrator._shell = lambda _run, _name, _cmd, _ticket="": StepResult(ok=False, detail="boom")
+        orchestrator._shell = lambda _run, _name, _cmd, _ticket="", **_kwargs: StepResult(ok=False, detail="boom")
 
         self.assertIs(orchestrator._retry_cycle(run_id, "blocked"), False)
         self.assertEqual(store.get_control(f"retries:{run_id}", "0"), "0")
@@ -4293,7 +4303,7 @@ class TestPreExistingBreakageIsNotThisTicketsFault(unittest.TestCase):
         orch, _, run_id = _stub_orchestrator(
             commands={"lint": "", "typecheck": "", "test": "cargo test"}
         )
-        orch._shell = lambda _run, name, cmd, _ticket="": StepResult(ok=True, detail="")
+        orch._shell = lambda _run, name, cmd, _ticket="", **_kwargs: StepResult(ok=True, detail="")
 
         self.assertEqual(orch._finish(run_id), "done")
 
@@ -6894,7 +6904,7 @@ class TestAWrongDiagnosisIsReplacedRatherThanParked(unittest.TestCase):
                 )
             return Completion(text="ACCEPT", usage=Usage(), finish_reason="stop")
 
-        def shell(_run_id, name, command, _ticket=""):
+        def shell(_run_id, name, command, _ticket="", **_kwargs):
             if not command.strip():
                 return StepResult(ok=True, detail="")
             proven = state["scope"] == reproduces_on
@@ -7028,7 +7038,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
     def _shell_until_fixed(self, root: Path):
         """The suite fails while the bug is on disk and passes once it is not."""
 
-        def shell(_run_id, name, command, _ticket=""):
+        def shell(_run_id, name, command, _ticket="", **_kwargs):
             if not command.strip():
                 return StepResult(ok=True, detail="")
             source = root / "src" / "a.py"
@@ -7103,7 +7113,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
 
     def test_a_reproduction_that_passes_proves_nothing_and_parks(self):
         orch, _root, run_id = self._orch()
-        orch._shell = lambda _r, _n, command, _ticket="": StepResult(ok=True, detail="1 passed")
+        orch._shell = lambda _r, _n, command, _ticket="", **_kwargs: StepResult(ok=True, detail="1 passed")
         seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
 
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
@@ -7127,7 +7137,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         every time."""
         orch, _root, run_id = self._orch()
         orch.config.loop.retry_cycles = -1
-        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=True, detail="1 passed")
+        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(ok=True, detail="1 passed")
         self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
 
@@ -7143,7 +7153,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         orch, root, run_id = self._orch()
         orch.config.loop.retry_cycles = -1
         orch.config.loop.respec_on_retry = False
-        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=False, detail=self.TEST_FAILURE)
+        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(ok=False, detail=self.TEST_FAILURE)
         self._calls(orch, tester=self._GOOD_TEST, executor="src/a.py\n```python\n# no fix\n```")
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
 
@@ -7160,7 +7170,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         (root / "web" / "main.js").write_text("run()\n", encoding="utf-8")
         (root / "src").mkdir(exist_ok=True)
         (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
-        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=True, detail="1 passed")
+        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(ok=True, detail="1 passed")
         self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
 
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
@@ -7173,7 +7183,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         orch, root, run_id = self._orch()
         (root / "src").mkdir(exist_ok=True)
         (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
-        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=True, detail="1 passed")
+        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(ok=True, detail="1 passed")
         self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
 
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
@@ -7182,7 +7192,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
 
     def test_a_report_too_vague_to_assert_is_handed_back(self):
         orch, _root, run_id = self._orch()
-        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=False, detail=self.TEST_FAILURE)
+        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(ok=False, detail=self.TEST_FAILURE)
         seen = self._calls(
             orch,
             tester="BLOCKED: the report does not say what value was expected",
@@ -7218,7 +7228,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         # it is the one assertion here demonstrated against real behavior, and
         # it is half of what the ticket was for.
         orch, root, run_id = self._orch()
-        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=False, detail=self.TEST_FAILURE)
+        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(ok=False, detail=self.TEST_FAILURE)
         self._calls(
             orch, tester=self._GOOD_TEST, executor="src/a.py\n```python\n# no fix\n```"
         )
@@ -7239,7 +7249,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
             "ImportError: cannot import name 'locked'\n"
             "tests/bug_001_test.py:1: in <module>\n"
         )
-        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=False, detail=broken)
+        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(ok=False, detail=broken)
         seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
 
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
@@ -7289,7 +7299,7 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
             "error[E0001]: assertion failed\n"
             "  --> tests/bug_001_test.rs:3:1\n"
         )
-        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=False, detail=failure)
+        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(ok=False, detail=failure)
         ticket = orch.store.list_tickets(run_id)[0]
 
         excused = orch._baseline_failures(run_id, ticket)
@@ -7313,13 +7323,22 @@ class TestEveryLanguageIsVerified(unittest.TestCase):
             path.write_text("x\n", encoding="utf-8")
         return orch, root, run_id
 
+    @staticmethod
+    def _steps(orch, ticket=None):
+        """The plan as `(name, command)`, which is what these tests are about.
+
+        Which workspace each step runs in is `TestOneBuildPerWorkspace`'s
+        subject; here it would be noise in every expectation.
+        """
+        return [(step.name, step.command) for step in orch._verify_plan(ticket)]
+
     def test_both_languages_run(self):
         orch, _root, _run_id = self._orch(
             {"lint": "", "typecheck": "", "test": {".rs": "cargo test", ".js": "node --test"}}
         )
 
         self.assertEqual(
-            orch._verify_plan(), [("test[.js]", "node --test"), ("test[.rs]", "cargo test")]
+            self._steps(orch), [("test[.js]", "node --test"), ("test[.rs]", "cargo test")]
         )
 
     def test_a_language_the_project_does_not_have_is_not_run(self):
@@ -7330,7 +7349,7 @@ class TestEveryLanguageIsVerified(unittest.TestCase):
             files=("src/a.rs",),
         )
 
-        self.assertEqual(orch._verify_plan(), [("test", "cargo test")])
+        self.assertEqual(self._steps(orch), [("test", "cargo test")])
 
     def test_a_ticket_that_writes_the_first_file_of_a_language_activates_it(self):
         # Read per attempt rather than cached: the verify step after the one
@@ -7342,21 +7361,21 @@ class TestEveryLanguageIsVerified(unittest.TestCase):
         (root / "web").mkdir()
         (root / "web" / "main.js").write_text("x\n", encoding="utf-8")
 
-        self.assertIn(("test[.js]", "node --test"), orch._verify_plan())
+        self.assertIn(("test[.js]", "node --test"), self._steps(orch))
 
     def test_one_command_keeps_its_plain_name(self):
         # A one-language project's step log and dashboard read exactly as
         # before; only a project that genuinely has two gets the suffix.
         orch, _root, _run_id = self._orch({"lint": "", "typecheck": "", "test": "cargo test"})
 
-        self.assertEqual(orch._verify_plan(), [("test", "cargo test")])
+        self.assertEqual(self._steps(orch), [("test", "cargo test")])
 
     def test_the_same_command_under_two_keys_runs_once(self):
         orch, _root, _run_id = self._orch(
             {"lint": "", "typecheck": "", "test": {".rs": "make check", ".js": "make check"}}
         )
 
-        self.assertEqual(orch._verify_plan(), [("test", "make check")])
+        self.assertEqual(self._steps(orch), [("test", "make check")])
 
     def test_each_language_is_attributed_to_its_own_step(self):
         # The amnesty compares a step's failures against that same step's
@@ -7367,7 +7386,7 @@ class TestEveryLanguageIsVerified(unittest.TestCase):
         )
         ran: list[str] = []
 
-        def shell(_run_id, name, command, _ticket=""):
+        def shell(_run_id, name, command, _ticket="", **_kwargs):
             ran.append(name)
             failing = name.endswith("[.js]")
             return StepResult(
@@ -7383,6 +7402,2438 @@ class TestEveryLanguageIsVerified(unittest.TestCase):
         self.assertEqual(ran, ["baseline-test[.js]", "baseline-test[.rs]"])
         self.assertIn("test[.js]", baseline)
         self.assertNotIn("test[.rs]", baseline)
+
+
+
+def _workspace_repo(workspaces, files=(), commands=None):
+    """A temp repo whose config declares `workspaces`, plus the files named."""
+    root = Path(tempfile.mkdtemp())
+    (root / ".hybridforge").mkdir()
+    payload = {
+        "models": {"m": {"kind": "openai", "model": "x"}},
+        "roles": {r: "m" for r in ROLES},
+    }
+    if workspaces is not None:
+        payload["workspaces"] = workspaces
+    if commands is not None:
+        payload["commands"] = commands
+    for name in files:
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x\n", encoding="utf-8")
+    (root / ".hybridforge" / "config.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    return root
+
+
+class TestOneBuildPerWorkspace(unittest.TestCase):
+    """A repository is not one build. One command set claiming authority over a
+    subproject with its own toolchain is how a Godot launcher reported itself as
+    the test command for 4,000 lines of TypeScript it could not see: fifteen
+    tickets green, `all tickets complete`, nothing ever compiled."""
+
+    def test_a_config_without_workspaces_has_exactly_one_at_the_root(self):
+        # The property that makes this safe to land: a repository that never
+        # heard of workspaces behaves as it always did.
+        root = _workspace_repo(None, commands={"test": "pytest -q"})
+        config = Config.load(root)
+
+        self.assertEqual([w.root for w in config.workspaces], ["."])
+        self.assertEqual(config.workspaces[0].commands_for("test"), {"*": "pytest -q"})
+        self.assertEqual(config.command_for("test", "src/a.py"), "pytest -q")
+
+    def test_the_implicit_workspace_follows_a_reassigned_commands_block(self):
+        # It is derived, not stored. Storing it aliased a dict, so replacing
+        # `config.commands` left the workspace holding the block that had been
+        # replaced and the loop verified against commands nobody had configured.
+        root = _workspace_repo(None, commands={"test": "pytest -q"})
+        config = Config.load(root)
+
+        config.commands = {"test": "cargo test"}
+
+        self.assertEqual(config.workspaces[0].commands_for("test"), {"*": "cargo test"})
+
+    def test_each_file_resolves_to_the_build_that_owns_it(self):
+        root = _workspace_repo(
+            [
+                {"root": ".", "commands": {"test": "godot --headless"}},
+                {"root": "tools/path-forge", "commands": {"test": "npm test"}},
+            ],
+            files=("scripts/game.gd", "tools/path-forge/src/parser/level.ts"),
+        )
+        config = Config.load(root)
+
+        self.assertEqual(config.workspace_for("scripts/game.gd").root, ".")
+        self.assertEqual(
+            config.workspace_for("tools/path-forge/src/parser/level.ts").root,
+            "tools/path-forge",
+        )
+
+    def test_the_longest_root_wins(self):
+        # `.` contains the subproject's files too. Ownership is the deepest
+        # claim, not the first one.
+        root = _workspace_repo(
+            [
+                {"root": "tools", "commands": {"test": "a"}},
+                {"root": ".", "commands": {"test": "b"}},
+                {"root": "tools/path-forge", "commands": {"test": "c"}},
+            ],
+            files=("tools/path-forge/src/a.ts", "tools/other/a.ts"),
+        )
+        config = Config.load(root)
+
+        self.assertEqual(config.command_for("test", "tools/path-forge/src/a.ts"), "c")
+        self.assertEqual(config.command_for("test", "tools/other/a.ts"), "a")
+
+    def test_a_file_no_workspace_owns_resolves_to_nothing(self):
+        # The whole point. Under the old model an unclaimed file was absorbed
+        # by whatever catch-all was configured, and absorption reads as
+        # coverage everywhere downstream.
+        root = _workspace_repo(
+            [{"root": "tools/path-forge", "commands": {"test": "npm test"}}],
+            files=("tools/path-forge/src/a.ts", "scripts/game.gd"),
+        )
+        config = Config.load(root)
+
+        self.assertIsNone(config.workspace_for("scripts/game.gd"))
+        self.assertEqual(config.command_for("test", "scripts/game.gd"), "")
+
+    def test_excludes_stop_a_root_swallowing_what_it_disowns(self):
+        root = _workspace_repo(
+            [{"root": ".", "commands": {"test": "a"}, "excludes": ["vendor/**"]}],
+            files=("vendor/lib/a.py",),
+        )
+        config = Config.load(root)
+
+        self.assertIsNone(config.workspace_for("vendor/lib/a.py"))
+
+    def test_a_root_that_is_not_a_directory_is_refused(self):
+        # The dangerous typo: it resolves nothing, every file falls through to
+        # whichever workspace does match, and the config looks entirely
+        # reasonable while a whole build goes unverified.
+        root = _workspace_repo([{"root": "tools/path-forg", "commands": {}}])
+
+        with self.assertRaises(ConfigError) as caught:
+            Config.load(root)
+
+        self.assertIn("not a directory", str(caught.exception))
+
+    def test_two_workspaces_cannot_claim_the_same_root(self):
+        root = _workspace_repo(
+            [{"root": ".", "commands": {}}, {"root": "./", "commands": {}}]
+        )
+
+        with self.assertRaises(ConfigError) as caught:
+            Config.load(root)
+
+        self.assertIn("already claims", str(caught.exception))
+
+    def test_a_root_outside_the_repository_is_refused(self):
+        for bad in ("../elsewhere", "/etc", "C:/windows"):
+            with self.subTest(root=bad):
+                root = _workspace_repo([{"root": bad, "commands": {}}])
+                with self.assertRaises(ConfigError):
+                    Config.load(root)
+
+    def test_declaring_both_spellings_is_refused(self):
+        # Not a merge: the top-level block would be read by nothing and would
+        # look configured.
+        root = _workspace_repo(
+            [{"root": ".", "commands": {"test": "a"}}], commands={"test": "b"}
+        )
+
+        with self.assertRaises(ConfigError) as caught:
+            Config.load(root)
+
+        self.assertIn("both `workspaces` and a top-level", str(caught.exception))
+
+    def test_an_empty_workspace_list_is_refused(self):
+        root = _workspace_repo([])
+
+        with self.assertRaises(ConfigError):
+            Config.load(root)
+
+    def test_a_workspace_command_keyed_to_a_language_it_cannot_run_is_refused(self):
+        # The per-language check from LANGUAGE-COVERAGE.md, now per workspace,
+        # and the error says which workspace rather than pointing at a key that
+        # appears several times in the file.
+        root = _workspace_repo([{"root": ".", "commands": {"test": {".js": "cargo test"}}}])
+
+        with self.assertRaises(ConfigError) as caught:
+            Config.load(root)
+
+        self.assertIn("workspaces[0].commands.test", str(caught.exception))
+
+    def test_workspaces_survive_a_write(self):
+        root = _workspace_repo(
+            [
+                {"root": ".", "commands": {"test": "a"}},
+                {"root": "tools", "commands": {"test": "b"}, "excludes": ["tools/x/**"]},
+            ],
+            files=("tools/a.py",),
+        )
+        Config.load(root).write()
+
+        reloaded = Config.load(root)
+        self.assertEqual([w.root for w in reloaded.workspaces], [".", "tools"])
+        self.assertEqual(reloaded.workspaces[1].excludes, ["tools/x/**"])
+
+    def test_a_config_without_workspaces_does_not_grow_the_key(self):
+        root = _workspace_repo(None, commands={"test": "pytest -q"})
+        Config.load(root).write()
+
+        written = json.loads(
+            (root / ".hybridforge" / "config.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("workspaces", written)
+        self.assertEqual(written["commands"], {"test": "pytest -q"})
+
+
+class TestVerifyRunsInsideItsOwnBuild(unittest.TestCase):
+    """`npm test` needs the directory holding its `package.json`. Run from the
+    repository root it either fails outright or, worse, finds a different
+    project's manifest and reports on that instead."""
+
+    def _orch(self):
+        root = _workspace_repo(
+            [
+                {"root": ".", "commands": {"test": "gd-test"}},
+                {"root": "tools/path-forge", "commands": {"test": "npm test"}},
+            ],
+            files=("scripts/game.gd", "tools/path-forge/src/a.ts"),
+        )
+        config = Config.load(root)
+        store = Store(root / "t.db")
+        return Orchestrator(config, store), root, store.create_run("goal")
+
+    def test_the_plan_covers_every_build(self):
+        orch, _root, _run_id = self._orch()
+
+        self.assertEqual(
+            [(s.name, s.command, s.workspace.root) for s in orch._verify_plan()],
+            [
+                ("test", "gd-test", "."),
+                ("test[path-forge]", "npm test", "tools/path-forge"),
+            ],
+        )
+
+    def test_a_ticket_is_verified_by_its_own_build_only(self):
+        # A ticket cannot break a build it cannot write to, and verifying it
+        # against one is how a red Godot tree came to fail a TypeScript ticket.
+        orch, _root, _run_id = self._orch()
+        ticket = Ticket("T-1", allowed_files=["tools/path-forge/src/a.ts"])
+
+        self.assertEqual(
+            [(s.name, s.command) for s in orch._verify_plan(ticket)],
+            [("test[path-forge]", "npm test")],
+        )
+
+    def test_a_command_runs_from_its_workspace_root(self):
+        orch, root, run_id = self._orch()
+        workspace = orch.config.workspace_for("tools/path-forge/src/a.ts")
+
+        result = orch._shell(
+            run_id,
+            "test",
+            "python -c \"import os; print(os.getcwd())\"",
+            workspace=workspace,
+        )
+
+        self.assertEqual(
+            Path(result.detail.strip()).resolve(),
+            (root / "tools" / "path-forge").resolve(),
+        )
+
+    def test_a_language_present_only_in_a_sibling_build_is_not_run(self):
+        # A build's runner is relevant because of the files it owns. Counting a
+        # sibling build's files is how a suite ends up running on an empty match.
+        root = _workspace_repo(
+            [
+                {"root": ".", "commands": {"test": {".py": "pytest"}}},
+                {"root": "web", "commands": {"test": {".js": "npm test"}}},
+            ],
+            files=("a.py", "web/main.js"),
+        )
+        orch = Orchestrator(Config.load(root), Store(root / "t.db"))
+
+        self.assertEqual(
+            [(s.name, s.workspace.root) for s in orch._verify_plan()],
+            [("test", "."), ("test[web]", "web")],
+        )
+
+    def test_one_build_keeps_the_plain_step_name(self):
+        # A single-build project's step log and dashboard read exactly as
+        # before. Step names are compared across a run — the baseline keys by
+        # them — so they must be stable, not merely readable.
+        orch, root, _run_id = _stub_orchestrator({"test": "pytest"})
+        (root / "a.py").write_text("x\n", encoding="utf-8")
+
+        self.assertEqual([s.name for s in orch._verify_plan()], ["test"])
+
+
+class TestTheCanaryMeasuresCoverageInsteadOfGuessing(unittest.TestCase):
+    """Coverage was read off the *text* of a command against a table of known
+    runners, and a runner the table has never heard of answers "covered" for
+    every language in the repository. A gdUnit4 launcher reported itself as the
+    test command for 4,000 lines of TypeScript and exited 0 fifteen times.
+
+    A file that cannot parse settles it without the table: a command that stays
+    green over it does not read that language."""
+
+    def _orch(
+        self, commands, files=("a.py",), workspaces=None, loop=None, tickets=None
+    ):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        payload = {
+            "models": {"m": {"kind": "openai", "model": "x"}},
+            "roles": {r: "m" for r in ROLES},
+            "loop": loop or {},
+        }
+        if workspaces is not None:
+            payload["workspaces"] = workspaces
+        else:
+            payload["commands"] = commands
+        for name in files:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x\n", encoding="utf-8")
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+        config = Config.load(root)
+        store = Store(root / "t.db")
+        run_id = store.create_run("goal")
+        # The canary is scoped to what the backlog writes, so a backlog is part
+        # of the fixture: one ticket per file, which is the shape these are all
+        # about anyway.
+        store.add_tickets(
+            run_id,
+            tickets
+            if tickets is not None
+            else [
+                Ticket(f"T-{index}", allowed_files=[name])
+                for index, name in enumerate(files, start=1)
+            ],
+        )
+        return Orchestrator(config, store), root, run_id
+
+    def test_a_command_that_ignores_the_language_is_caught(self):
+        # The gdUnit4 shape: a launcher that globs a directory, ignores the
+        # files in it, and exits 0.
+        orch, _root, run_id = self._orch({"test": "gdunit-launcher"})
+        orch._shell = lambda *_a, **_k: StepResult(ok=True, detail="0 tests")
+
+        problems = orch._canary(run_id)
+
+        self.assertEqual(len(problems), 1)
+        self.assertIn("stayed green over", problems[0])
+        self.assertIn("does not run .py", problems[0])
+        self.assertIn("forge toolchain --language .py", problems[0])
+
+    def test_a_command_that_runs_the_language_passes(self):
+        orch, _root, run_id = self._orch({"test": "pytest"})
+
+        def shell(_run, _name, _command, _ticket="", **_kwargs):
+            return StepResult(
+                ok=False,
+                detail="tests/forge_preflight_canary_test.py:1: SyntaxError",
+            )
+
+        orch._shell = shell
+
+        self.assertEqual(orch._canary(run_id), [])
+
+    def test_a_red_that_names_no_file_is_told_apart_from_a_gap(self):
+        # Red with the canary and red without it is the tree's state, not an
+        # answer about the language. `requireGreenBaseline` is that gate.
+        orch, _root, run_id = self._orch({"test": "pytest"})
+        seen = []
+
+        def shell(_run, name, _command, _ticket="", **_kwargs):
+            seen.append(name)
+            return StepResult(ok=False, detail="ERROR: could not import conftest")
+
+        orch._shell = shell
+
+        self.assertEqual(orch._canary(run_id), [])
+        self.assertEqual(seen, ["canary[.py]", "canary[.py]-control"])
+
+    def test_a_build_whose_failures_name_nothing_is_refused(self):
+        # It reads the language, and no failure in it can ever be attributed:
+        # the amnesty excuses every one as somebody else's and each ticket
+        # passes a step that asserted nothing.
+        orch, _root, run_id = self._orch({"test": "pytest"})
+
+        def shell(_run, name, _command, _ticket="", **_kwargs):
+            if name.endswith("-control"):
+                return StepResult(ok=True, detail="")
+            return StepResult(ok=False, detail="FAILED (errors=1)")
+
+        orch._shell = shell
+
+        problems = orch._canary(run_id)
+
+        self.assertEqual(len(problems), 1)
+        self.assertIn("without naming it", problems[0])
+
+    def test_the_canary_is_removed_whatever_happens(self):
+        orch, root, run_id = self._orch({"test": "pytest"})
+        during = []
+
+        def shell(_run, _name, _command, _ticket="", **_kwargs):
+            during.append((root / "tests" / "forge_preflight_canary_test.py").exists())
+            raise RuntimeError("boom")
+
+        orch._shell = shell
+
+        with self.assertRaises(RuntimeError):
+            orch._canary(run_id)
+
+        self.assertEqual(during, [True], "the canary must be on disk while it runs")
+        self.assertFalse((root / "tests" / "forge_preflight_canary_test.py").exists())
+
+    def test_a_canary_a_killed_run_left_behind_is_cleared_and_reused(self):
+        orch, root, run_id = self._orch({"test": "pytest"})
+        stale = root / "tests" / "forge_preflight_canary_test.py"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text(Orchestrator._CANARY_BODY, encoding="utf-8")
+        orch._shell = lambda *_a, **_k: StepResult(
+            ok=False, detail="tests/forge_preflight_canary_test.py:1: SyntaxError"
+        )
+
+        self.assertEqual(orch._canary(run_id), [])
+        self.assertFalse(stale.exists())
+
+    def test_somebody_elses_file_at_that_path_is_never_overwritten(self):
+        orch, root, run_id = self._orch({"test": "pytest"})
+        theirs = root / "tests" / "forge_preflight_canary_test.py"
+        theirs.parent.mkdir(parents=True, exist_ok=True)
+        theirs.write_text("# mine\n", encoding="utf-8")
+        orch._shell = lambda *_a, **_k: StepResult(ok=True, detail="")
+
+        self.assertEqual(orch._canary(run_id), [])
+        self.assertEqual(theirs.read_text(encoding="utf-8"), "# mine\n")
+
+    def test_a_language_declared_as_needing_no_runner_is_left_alone(self):
+        orch, _root, run_id = self._orch(
+            {"test": {".py": "pytest", ".sh": False}}, files=("a.py", "build.sh")
+        )
+        asked = []
+
+        def shell(_run, name, _command, _ticket="", **_kwargs):
+            asked.append(name)
+            return StepResult(ok=False, detail="tests/forge_preflight_canary_test.py:1: E")
+
+        orch._shell = shell
+        orch._canary(run_id)
+
+        self.assertEqual(asked, ["canary[.py]"])
+
+    def test_a_language_with_no_command_is_phase_fours_problem_not_this_one(self):
+        # Nothing to measure. Refusing here would report the same gap twice,
+        # from the place with less to say about it.
+        orch, _root, run_id = self._orch(
+            {"test": {".py": "pytest"}}, files=("a.py", "web/main.js")
+        )
+        asked = []
+
+        def shell(_run, name, _command, _ticket="", **_kwargs):
+            asked.append(name)
+            return StepResult(ok=False, detail="tests/forge_preflight_canary_test.py:1: E")
+
+        orch._shell = shell
+        orch._canary(run_id)
+
+        self.assertEqual(asked, ["canary[.py]"])
+
+    def test_a_language_no_ticket_writes_is_not_blocked_on(self):
+        # Found by running the real thing: a Godot repository with one Python
+        # helper script beside its `project.godot` has `.py` present, nothing
+        # that runs it, and no ticket that cares — and a canary scoped to the
+        # *tree* blocked the run on it. That is "stalling a backlog over
+        # build.sh" with a louder stop. What the backlog declares it will write
+        # is the set whose verification has to mean anything.
+        orch, _root, run_id = self._orch(
+            {"test": "gdunit-launcher"},
+            files=("helper.py", "src/level.ts"),
+            tickets=[Ticket("T-1", allowed_files=["src/level.ts"])],
+        )
+        orch._shell = lambda *_a, **_k: StepResult(ok=True, detail="")
+
+        problems = orch._canary(run_id)
+
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("does not run .ts", problems[0])
+
+    def test_a_ticket_that_already_finished_asks_for_nothing(self):
+        # A retry cycle re-enters `run`. Re-measuring a language only the done
+        # tickets wrote pays for a suite to answer a question nobody is asking.
+        orch, _root, run_id = self._orch(
+            {"test": "gdunit-launcher"},
+            tickets=[Ticket("T-1", allowed_files=["a.py"], status=TICKET_DONE)],
+        )
+        orch._shell = lambda *_a, **_k: self.fail("should not run")
+
+        self.assertEqual(orch._canary(run_id), [])
+
+    def test_each_build_is_measured_separately(self):
+        orch, _root, run_id = self._orch(
+            None,
+            files=("a.py", "web/main.js"),
+            workspaces=[
+                {"root": ".", "commands": {"test": "pytest"}, "excludes": ["web/**"]},
+                {"root": "web", "commands": {"test": "npm test"}},
+            ],
+        )
+        asked = []
+
+        def shell(_run, name, _command, _ticket="", **_kwargs):
+            asked.append(name)
+            return StepResult(ok=True, detail="")
+
+        orch._shell = shell
+        problems = orch._canary(run_id)
+
+        self.assertEqual(asked, ["canary[.py]", "canary[web:.js]"])
+        self.assertEqual(len(problems), 2)
+
+    def test_the_canary_goes_where_that_builds_tests_already_live(self):
+        # A canary the runner never looks at proves nothing about the runner.
+        orch, root, _run_id = self._orch(None, files=("web/main.js",), workspaces=[
+            {"root": "web", "commands": {"test": "npm test"}},
+        ])
+        spec = root / "web" / "spec" / "main_test.js"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text("test('x', () => {});\n", encoding="utf-8")
+
+        path = orch._canary_path(orch.config.workspaces[0], ".js")
+
+        self.assertEqual(path, "web/spec/forge_preflight_canary_test.js")
+
+    def test_a_jvm_canary_is_named_after_its_type(self):
+        # javac rejects any public type in a file not named for it, before
+        # reading a line of the contents — a red naming the file, which would
+        # pass this check without the suite ever having run.
+        orch, _root, _run_id = self._orch({"test": "gradle test"}, files=("A.java",))
+
+        path = orch._canary_path(orch.config.root_workspace, ".java")
+
+        self.assertEqual(path, "src/test/java/ForgePreflightCanaryTest.java")
+
+    def test_turning_it_off_skips_it(self):
+        orch, _root, run_id = self._orch(
+            {"test": "pytest"}, loop={"preflightCanary": False}
+        )
+        orch._shell = lambda *_a, **_k: self.fail("should not run")
+
+        self.assertEqual(orch._canary(run_id), [])
+
+    def test_the_model_preflight_switch_does_not_turn_it_off(self):
+        # Deliberately separate knobs. `preflight` probes the models; this
+        # measures the tree, and someone who skips the model probe because
+        # they just ran `forge doctor` has said nothing about whether their
+        # test command reads their code.
+        orch, _root, run_id = self._orch({"test": "pytest"}, loop={"preflight": False})
+        orch._shell = lambda *_a, **_k: StepResult(ok=True, detail="")
+
+        self.assertEqual(len(orch._canary(run_id)), 1)
+
+    def test_the_run_stops_before_anything_is_delegated(self):
+        orch, _root, run_id = self._orch(
+            {"test": "gdunit-launcher"}, loop={"preflight": False}
+        )
+        orch._shell = lambda *_a, **_k: StepResult(ok=True, detail="")
+
+        outcome = orch.run(run_id)
+
+        self.assertEqual(outcome, "blocked")
+        self.assertEqual(orch.store.list_tickets(run_id)[0].status, TICKET_PENDING)
+
+    def test_the_reason_reaches_the_run_log(self):
+        orch, _root, run_id = self._orch(
+            {"test": "gdunit-launcher"}, loop={"preflight": False}
+        )
+        orch._shell = lambda *_a, **_k: StepResult(ok=True, detail="")
+
+        orch.run(run_id)
+
+        said = "\n".join(row["message"] for row in orch.store.events_after(0, limit=500))
+        self.assertIn("verification here would prove nothing", said)
+        self.assertIn("loop.preflightCanary", said)
+
+
+class TestTheCanaryAgainstRealToolchains(unittest.TestCase):
+    """The measurement is only worth its cost if it is right about a real
+    runner. These drive the canary through an actual `python -m unittest
+    discover` rather than a stub: the whole claim is that the loop stops
+    guessing about coverage, and a stubbed exit code would be a guess with
+    extra steps.
+
+    They also caught three defects a stub could not have. The canary body was
+    prose, so CPython reported an unterminated string literal at an apostrophe
+    on line 3 instead of the deliberate garbage on line 1, and an em-dash in it
+    came back as U+FFFD through the subprocess decode. And the attribution
+    check used `errors_naming`, which reads locations out of diagnostic blocks
+    and found neither of the two places the runner had named the file."""
+
+    PASSING_TEST = (
+        "import unittest\n"
+        "\n"
+        "\n"
+        "class Real(unittest.TestCase):\n"
+        "    def test_passes(self):\n"
+        "        self.assertTrue(True)\n"
+    )
+
+    def _repo(self, command, tests_dir="tests"):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / "pkg.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (root / tests_dir).mkdir(parents=True, exist_ok=True)
+        (root / tests_dir / "real_test.py").write_text(
+            self.PASSING_TEST, encoding="utf-8"
+        )
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x"}},
+                    "roles": {r: "m" for r in ROLES},
+                    "commands": {"test": command},
+                }
+            ),
+            encoding="utf-8",
+        )
+        config = Config.load(root)
+        store = Store(root / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(run_id, [Ticket("T-1", allowed_files=["pkg.py"])])
+        return Orchestrator(config, store), root, run_id
+
+    def _discover(self, where):
+        return f'"{sys.executable}" -m unittest discover -s {where} -p "*_test.py"'
+
+    def test_a_real_runner_that_collects_the_canary_passes(self):
+        orch, root, run_id = self._repo(self._discover("tests"))
+
+        self.assertEqual(orch._canary(run_id), [])
+        self.assertFalse((root / "tests" / "forge_preflight_canary_test.py").exists())
+
+    def test_a_real_runner_that_looks_elsewhere_is_caught(self):
+        # The gdUnit4 shape, with a runner that genuinely exists: the canary
+        # goes where this project keeps its tests, the command collects a
+        # different directory, and it passes reporting nothing wrong.
+        orch, root, run_id = self._repo(self._discover("elsewhere"))
+        (root / "elsewhere").mkdir()
+        (root / "elsewhere" / "other_test.py").write_text(
+            self.PASSING_TEST.replace("Real", "Other"), encoding="utf-8"
+        )
+
+        problems = orch._canary(run_id)
+
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("stayed green", problems[0])
+        self.assertIn("does not run .py", problems[0])
+
+    def test_the_real_failure_names_the_canary(self):
+        # Not merely red — red saying which file, which is the half that keeps
+        # the amnesty able to tell this ticket's breakage from the last one's.
+        orch, root, run_id = self._repo(self._discover("tests"))
+        path = orch._canary_path(orch.config.root_workspace, ".py")
+        absolute = root / path
+        absolute.parent.mkdir(parents=True, exist_ok=True)
+        absolute.write_text(Orchestrator._CANARY_BODY, encoding="utf-8")
+
+        result = orch._shell(run_id, "test", self._discover("tests"))
+
+        self.assertFalse(result.ok)
+        self.assertTrue(orch._names_the_canary(result.detail, path), result.detail)
+
+    def test_the_canary_body_is_pure_ascii(self):
+        # It is decoded out of a subprocess by every toolchain the loop meets,
+        # and a character that does not survive that round trip turns the
+        # diagnostic into a mystery.
+        Orchestrator._CANARY_BODY.encode("ascii")
+        self.assertNotIn("'", Orchestrator._CANARY_BODY)
+        self.assertNotIn('"', Orchestrator._CANARY_BODY)
+
+    def test_the_body_says_what_it_is_and_that_deleting_it_is_safe(self):
+        # It can outlive the run that wrote it: a killed process, a full disk,
+        # a read-only tree. Whoever finds it is owed an explanation rather than
+        # a mystery that breaks their build.
+        body = Orchestrator._CANARY_BODY.lower()
+        self.assertIn("hybrid-forge", body)
+        self.assertIn("deleting it is safe", body)
+
+
+class TestAFailureKeepsItsAddress(unittest.TestCase):
+    """A command run inside a workspace prints paths relative to that
+    directory, and every attribution in the loop matches repo-relative ones.
+    Without re-rooting, the `cwd` change un-attributes every failure in a
+    subproject: the diagnostic names nothing, the baseline excuses it as
+    unattributable, and the attempt goes green over a build that does not
+    compile — the exact failure workspaces exist to remove, reintroduced by the
+    fix for it."""
+
+    def _repo(self) -> Path:
+        root = Path(tempfile.mkdtemp())
+        (root / "tools" / "path-forge" / "src").mkdir(parents=True)
+        (root / "tools" / "path-forge" / "src" / "level.ts").write_text(
+            "x\n", encoding="utf-8"
+        )
+        return root
+
+    def test_a_workspace_relative_path_becomes_repo_relative(self):
+        root = self._repo()
+        output = "src/level.ts(12,5): error TS2307: Cannot find module."
+
+        rerooted = reroot(output, "tools/path-forge/", root)
+
+        self.assertIn("tools/path-forge/src/level.ts(12,5)", rerooted)
+        self.assertIn("Cannot find module", rerooted)
+
+    def test_the_rerooted_path_is_what_blame_matches(self):
+        root = self._repo()
+        output = "src/level.ts(12,5): error TS2307: Cannot find module."
+
+        rerooted = reroot(output, "tools/path-forge/", root)
+
+        self.assertEqual(
+            sorted(files_blamed(rerooted)), ["tools/path-forge/src/level.ts"]
+        )
+        self.assertTrue(errors_naming(rerooted, "tools/path-forge/src/level.ts"))
+
+    def test_the_unrerooted_path_matches_nothing_the_ticket_owns(self):
+        # Why this ships with the cwd change rather than after it.
+        root = self._repo()
+        output = "src/level.ts(12,5): error TS2307: Cannot find module."
+
+        self.assertFalse(errors_naming(output, "tools/path-forge/src/level.ts"))
+
+    def test_a_root_workspace_failure_is_untouched(self):
+        root = self._repo()
+        output = "src/level.ts(12,5): error TS2307: Cannot find module."
+
+        self.assertEqual(reroot(output, "", root), output)
+        self.assertEqual(reroot(output, ".", root), output)
+
+    def test_an_absolute_path_is_left_alone(self):
+        root = self._repo()
+        absolute = str(root / "tools" / "path-forge" / "src" / "level.ts")
+        output = f"{absolute}:12:5: error: boom"
+
+        self.assertEqual(reroot(output, "tools/path-forge/", root), output)
+
+    def test_a_path_already_relative_to_the_repository_is_left_alone(self):
+        root = self._repo()
+        output = "tools/path-forge/src/level.ts(12,5): error TS2307: boom."
+
+        self.assertEqual(reroot(output, "tools/path-forge/", root), output)
+
+    def test_a_path_that_is_not_a_file_here_is_left_alone(self):
+        # The safety valve. A runner's internal module names, a URL, a version
+        # string: the cost of missing one is the behaviour we had, the cost of
+        # inventing one is blaming a ticket for another build's file.
+        root = self._repo()
+        output = "node:internal/modules/cjs/loader:1145\nsrc/gone.ts:4:1: error: boom"
+
+        rerooted = reroot(output, "tools/path-forge/", root)
+
+        self.assertIn("node:internal/modules/cjs/loader:1145", rerooted)
+        self.assertIn("src/gone.ts:4:1", rerooted)
+        self.assertNotIn("tools/path-forge/src/gone.ts", rerooted)
+
+    def test_the_separator_the_toolchain_used_survives(self):
+        root = self._repo()
+        output = "src\\level.ts(12,5): error TS2307: boom."
+
+        rerooted = reroot(output, "tools/path-forge/", root)
+
+        self.assertIn("tools\\path-forge\\src\\level.ts(12,5)", rerooted)
+
+    def test_a_subproject_failure_reaches_the_ticket_that_owns_it(self):
+        # End to end through `_shell`: the step re-roots, so the baseline
+        # comparison and the scope check both see a path the ticket's
+        # `allowed_files` names.
+        root = self._repo()
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x"}},
+                    "roles": {r: "m" for r in ROLES},
+                    "workspaces": [
+                        {"root": "tools/path-forge", "commands": {"test": "x"}}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        config = Config.load(root)
+        orch = Orchestrator(config, Store(root / "t.db"))
+        workspace = config.workspace_for("tools/path-forge/src/level.ts")
+        script = "print('src/level.ts(1,1): error TS1005: boom.')"
+
+        result = orch._shell(
+            orch.store.create_run("g"),
+            "test",
+            f'python -c "{script}"',
+            workspace=workspace,
+        )
+
+        self.assertEqual(
+            sorted(files_blamed(result.detail)), ["tools/path-forge/src/level.ts"]
+        )
+
+
+class TestAFileNoBuildOwnsIsRefused(unittest.TestCase):
+    """The fail-closed half, and the reason the key exists. Absorption is the
+    alternative: under one repository-wide command set a subproject's files are
+    claimed by whatever catch-all sits at the root, and a claim reads as
+    coverage everywhere downstream. Saying "nothing here owns this" costs a
+    person one line of config; guessing costs a backlog."""
+
+    def _orch(self, workspaces, files=()):
+        root = _workspace_repo(workspaces, files=files)
+        store = Store(root / "t.db")
+        return Orchestrator(Config.load(root), store), root, store.create_run("g")
+
+    def _two_builds(self, files=("tools/path-forge/src/a.ts", "scripts/game.gd")):
+        return self._orch(
+            [
+                {"root": "tools/path-forge", "commands": {"test": "npm test"}},
+                {"root": "scripts", "commands": {"test": "godot --headless"}},
+            ],
+            files=files,
+        )
+
+    def test_a_ticket_outside_every_build_is_parked_before_anything_is_spent(self):
+        orch, _root, run_id = self._two_builds()
+        ticket = Ticket("T-1", allowed_files=["docs/site/app.ts"])
+        orch.store.add_tickets(run_id, [ticket])
+
+        orch._work_ticket(run_id, ticket)
+
+        parked = orch.store.list_tickets(run_id)[0]
+        self.assertEqual(parked.status, TICKET_BLOCKED)
+        self.assertIn("no workspace owns", parked.blocked_note)
+        self.assertIn("docs/site/app.ts", parked.blocked_note)
+
+    def test_the_note_names_the_roots_that_do_exist(self):
+        orch, _root, run_id = self._two_builds()
+        ticket = Ticket("T-1", allowed_files=["docs/site/app.ts"])
+
+        note = orch._no_workspace_note(ticket, ["docs/site/app.ts"])
+
+        self.assertIn("tools/path-forge", note)
+        self.assertIn("scripts", note)
+        self.assertIn('"root": "docs/site"', note)
+
+    def test_a_ticket_inside_a_build_is_not_touched_by_the_gate(self):
+        orch, _root, _run_id = self._two_builds()
+        ticket = Ticket("T-1", allowed_files=["tools/path-forge/src/a.ts"])
+
+        self.assertEqual(orch._unowned_files(ticket), [])
+
+    def test_a_repository_that_declares_no_workspaces_never_sees_this(self):
+        # The implicit root workspace claims everything, so a project that
+        # never heard of the feature cannot be blocked by it.
+        orch, _root, _run_id = self._orch(None, files=("a.py",))
+        ticket = Ticket("T-1", allowed_files=["anywhere/at/all.py"])
+
+        self.assertEqual(orch._unowned_files(ticket), [])
+
+    def test_a_ticket_spanning_two_builds_is_parked(self):
+        # Each build has its own commands and its own working directory, so
+        # only one of them can verify it, and which one is an accident of
+        # resolution order.
+        orch, _root, run_id = self._two_builds()
+        ticket = Ticket(
+            "T-1", allowed_files=["tools/path-forge/src/a.ts", "scripts/game.gd"]
+        )
+        orch.store.add_tickets(run_id, [ticket])
+
+        orch._work_ticket(run_id, ticket)
+
+        parked = orch.store.list_tickets(run_id)[0]
+        self.assertEqual(parked.status, TICKET_BLOCKED)
+        self.assertIn("2 builds", parked.blocked_note)
+        self.assertIn("Split it", parked.blocked_note)
+
+    def test_the_uncovered_gate_asks_the_files_own_build(self):
+        # Repository-wide, one workspace's runner answers for another's files
+        # — the absorption this feature exists to stop, surviving inside the
+        # gate meant to catch it.
+        orch, _root, _run_id = self._orch(
+            [
+                {"root": "core", "commands": {"test": "pytest"}},
+                {"root": "web", "commands": {"test": {".py": "pytest"}}},
+            ],
+            files=("core/a.py", "web/main.js"),
+        )
+        ticket = Ticket("T-1", allowed_files=["web/main.js"])
+
+        self.assertEqual(orch._uncovered_languages(ticket), [".js"])
+
+    def test_a_glob_names_no_file_and_is_left_alone(self):
+        orch, _root, _run_id = self._two_builds()
+        ticket = Ticket("T-1", allowed_files=["docs/**/*.ts"])
+
+        self.assertEqual(orch._unowned_files(ticket), [])
+
+
+class TestIngestRefusesABacklogNothingCanVerify(unittest.TestCase):
+    """The loop parks such a ticket when it reaches it, which is correct and
+    late: by then a run exists, a human has walked away, and the answer was
+    knowable before a token was spent."""
+
+    def _config(self, workspaces, files=()):
+        return Config.load(_workspace_repo(workspaces, files=files))
+
+    def test_a_ticket_no_build_owns_is_reported(self):
+        config = self._config(
+            [{"root": "tools/path-forge", "commands": {"test": "npm test"}}],
+            files=("tools/path-forge/src/a.ts",),
+        )
+
+        problems = cli._workspace_problems(
+            config, [Ticket("PF-001", allowed_files=["src/parser/level.ts"])]
+        )
+
+        self.assertEqual(len(problems), 1)
+        self.assertIn("PF-001", problems[0])
+        self.assertIn("no workspace owns", problems[0])
+
+    def test_a_ticket_spanning_two_builds_is_reported(self):
+        config = self._config(
+            [
+                {"root": "core", "commands": {"test": "pytest"}},
+                {"root": "web", "commands": {"test": "npm test"}},
+            ],
+            files=("core/a.py", "web/main.js"),
+        )
+
+        problems = cli._workspace_problems(
+            config, [Ticket("T-1", allowed_files=["core/a.py", "web/main.js"])]
+        )
+
+        self.assertEqual(len(problems), 1)
+        self.assertIn("2 builds", problems[0])
+        self.assertIn("split it", problems[0].lower())
+
+    def test_a_correctly_configured_two_build_backlog_is_not_refused(self):
+        config = self._config(
+            [
+                {"root": "core", "commands": {"test": "pytest"}},
+                {"root": "web", "commands": {"test": "npm test"}},
+            ],
+            files=("core/a.py", "web/main.js"),
+        )
+
+        problems = cli._workspace_problems(
+            config,
+            [
+                Ticket("T-1", allowed_files=["core/a.py"]),
+                Ticket("T-2", allowed_files=["web/main.js"]),
+            ],
+        )
+
+        self.assertEqual(problems, [])
+
+    def test_a_repository_without_workspaces_is_never_refused(self):
+        config = self._config(None, files=("a.py",))
+
+        problems = cli._workspace_problems(
+            config, [Ticket("T-1", allowed_files=["anywhere/at/all.py"])]
+        )
+
+        self.assertEqual(problems, [])
+
+
+class TestDoctorShowsEachBuild(unittest.TestCase):
+    """A root that resolves to nothing owns nothing, every file falls through
+    to whichever workspace does match, and the config looks entirely
+    reasonable while a whole build goes unverified. The typo is refused at
+    load; a root that is real and simply wrong is not, and this is where it
+    shows."""
+
+    def _report(self, workspaces, files, commands=None):
+        root = _workspace_repo(workspaces, files=files, commands=commands)
+        config = Config.load(root)
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            uncovered = cli._report_coverage(config)
+        return captured.getvalue(), uncovered
+
+    def test_each_build_gets_its_own_matrix(self):
+        printed, _uncovered = self._report(
+            [
+                {"root": "core", "commands": {"test": "pytest"}},
+                {"root": "web", "commands": {"test": "npm test"}},
+            ],
+            files=("core/a.py", "web/main.js"),
+        )
+
+        self.assertIn("workspace core", printed)
+        self.assertIn("workspace web", printed)
+        self.assertIn("pytest", printed)
+        self.assertIn("npm test", printed)
+
+    def test_files_no_build_owns_are_named(self):
+        printed, _uncovered = self._report(
+            [{"root": "core", "commands": {"test": "pytest"}}],
+            files=("core/a.py", "stray/thing.ts"),
+        )
+
+        self.assertIn("owned by no workspace", printed)
+        self.assertIn(".ts", printed)
+
+    def test_a_gdscript_repository_is_not_reported_as_empty(self):
+        # It read "(no source files)" over a repository full of GDScript, and
+        # every gate asked nothing about it, because the suffix tables had
+        # never heard of `.gd`. That is the same shape as the Godot launcher
+        # answering for TypeScript: a language nothing in the loop can see is
+        # a language nothing in the loop can check.
+        printed, uncovered = self._report(
+            None, files=("scripts/game.gd",), commands={"test": "godot --headless"}
+        )
+
+        self.assertIn(".gd", printed)
+        self.assertNotIn("no source files", printed)
+        self.assertEqual(uncovered, [])
+
+    def test_a_single_build_reads_as_it_always_did(self):
+        # No workspace headings, because there is nothing to distinguish.
+        printed, uncovered = self._report(None, files=("a.py",), commands={"test": "pytest"})
+
+        self.assertNotIn("workspace", printed)
+        self.assertIn("language  files  test / lint", printed)
+        self.assertEqual(uncovered, [])
+
+
+class TestATestFileGoesWhereItsOwnBuildLooks(unittest.TestCase):
+    """Framework is a hard constraint, and it is a constraint per build. A
+    subproject with its own `package.json` has its own runner and its own
+    layout, and the repository root's suite is not an example of them: a test
+    written to the wrong convention is not a failing test but an invisible
+    one."""
+
+    def _orch(self):
+        root = _workspace_repo(
+            [
+                {"root": "core", "commands": {"test": "pytest"}},
+                {"root": "web", "commands": {"test": "npm test"}},
+            ],
+            files=("core/a.py", "web/main.js"),
+        )
+        for name, body in (
+            ("core/tests/a_test.py", "def test_a():\n    assert True\n"),
+            ("web/spec/main_test.js", "test('x', () => {});\n"),
+        ):
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+        store = Store(root / "t.db")
+        return Orchestrator(Config.load(root), store), root, store.create_run("g")
+
+    def test_the_example_comes_from_the_tickets_own_build(self):
+        orch, _root, _run_id = self._orch()
+        web = orch.config.workspace_for("web/main.js")
+
+        example = orch._example_test([], ".js", workspace=web)
+
+        self.assertIsNotNone(example)
+        self.assertEqual(example[0], "web/spec/main_test.js")
+
+    def test_another_builds_suite_is_not_offered_as_the_convention(self):
+        orch, _root, _run_id = self._orch()
+        core = orch.config.workspace_for("core/a.py")
+
+        self.assertIsNone(orch._example_test([], ".js", workspace=core))
+
+    def test_an_invented_home_lands_inside_the_build(self):
+        # `tests/` at the repository root is not collected by a subproject's
+        # runner, and a file the owning build never looks at is invisible in
+        # exactly the way this rule exists to prevent.
+        orch, root, _run_id = self._orch()
+        (root / "web" / "spec" / "main_test.js").unlink()
+        ticket = Ticket("T-1", allowed_files=["web/main.js"])
+
+        path, reason = orch._test_target(ticket, ["web/main.js"], None, ".js")
+
+        self.assertEqual(reason, "")
+        self.assertTrue(path.startswith("web/"), path)
+
+
+class TestDiscoveringTheBuildsInATree(unittest.TestCase):
+    """`toolchain.EVIDENCE_GLOBS` already knew where a project writes its
+    commands down; it only ever looked at the repository root. Walking for the
+    manifests that mark a *build* proposes the list a person would otherwise
+    have to write by hand — and proposes it, never decides it."""
+
+    def _tree(self, *paths):
+        root = Path(tempfile.mkdtemp())
+        for name in paths:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}\n", encoding="utf-8")
+        return root
+
+    def test_a_single_build_repository_proposes_nothing_to_choose(self):
+        # Fewer than two is the ordinary case and must stay silent: a
+        # repository with one `package.json` at its root is not a monorepo and
+        # is never asked about one.
+        root = self._tree("package.json", "src/a.ts")
+
+        self.assertEqual(toolchain.discover_workspaces(root), ["."])
+
+    def test_two_builds_are_found_with_the_root_first(self):
+        root = self._tree(
+            "project.godot", "scripts/game.gd", "tools/path-forge/package.json"
+        )
+
+        self.assertEqual(
+            toolchain.discover_workspaces(root), [".", "tools/path-forge"]
+        )
+
+    def test_a_repository_with_no_manifest_proposes_nothing(self):
+        root = self._tree("README.md", "notes.txt")
+
+        self.assertEqual(toolchain.discover_workspaces(root), [])
+
+    def test_generated_directories_are_never_proposed(self):
+        # `node_modules` alone holds thousands of `package.json` files, every
+        # one of which would otherwise be proposed as a build here.
+        root = self._tree(
+            "package.json",
+            "node_modules/left-pad/package.json",
+            "target/debug/Cargo.toml",
+            "dist/package.json",
+            ".venv/pyproject.toml",
+        )
+
+        self.assertEqual(toolchain.discover_workspaces(root), ["."])
+
+    def test_a_build_nested_too_deep_is_left_to_a_human(self):
+        # A monorepo nests four deep and the person configuring one will say so
+        # by hand. The case this exists for is `tools/path-forge` beside a game.
+        root = self._tree("package.json", "a/b/c/d/package.json")
+
+        self.assertEqual(
+            toolchain.discover_workspaces(root, max_depth=2), ["."]
+        )
+
+    def test_a_readme_is_not_a_build(self):
+        # `EVIDENCE_GLOBS` reads one for commands, which is a different
+        # question: a README states commands and is not a build, and proposing
+        # a workspace around every markdown file would bury the two that matter.
+        root = self._tree("package.json", "docs/README.md", "docs/CONTRIBUTING.md")
+
+        self.assertEqual(toolchain.discover_workspaces(root), ["."])
+
+
+class TestSettingUpOneBuildsCommands(unittest.TestCase):
+    """`forge toolchain` wrote into the top-level `commands`, which under a
+    config that declares `workspaces` is read by nothing — so the write
+    succeeded, printed a confirmation, and changed no behaviour at all."""
+
+    class _Planner:
+        name = "planner"
+        kind = "stub"
+        reply = ""
+
+        def __init__(self, *_a, **_k):
+            pass
+
+        def complete(self, _messages, **_kwargs):
+            return SimpleNamespace(text=type(self).reply, usage=None)
+
+    def _repo(self, workspaces, files=("core/a.py", "web/main.js")):
+        return _workspace_repo(workspaces, files=files)
+
+    def _two_builds(self):
+        return self._repo(
+            [
+                {"root": "core", "commands": {"test": "pytest"}},
+                {"root": "web", "commands": {}},
+            ]
+        )
+
+    def _run(self, root, *argv, reply=""):
+        planner = self._Planner()
+        type(planner).reply = reply
+        parsed = cli.build_parser().parse_args(["--root", str(root), "toolchain", *argv])
+        out = io.StringIO()
+        with unittest.mock.patch.object(Config, "provider_for", lambda self, role: planner):
+            with contextlib.redirect_stdout(out):
+                parsed.func(parsed)
+        return out.getvalue()
+
+    def test_a_command_lands_in_the_build_it_was_asked_for(self):
+        root = self._two_builds()
+
+        self._run(root, "--workspace", "web", "--language", ".js", "--set", "npm test")
+
+        config = Config.load(root)
+        self.assertEqual(config.command_for("test", "web/main.js"), "npm test")
+        # And nowhere else. A command in the wrong build reports as coverage
+        # for files it cannot see.
+        self.assertEqual(config.command_for("test", "core/a.py"), "pytest")
+
+    def test_the_top_level_block_is_not_written_to(self):
+        root = self._two_builds()
+
+        self._run(root, "--workspace", "web", "--language", ".js", "--set", "npm test")
+
+        written = json.loads(
+            (root / ".hybridforge" / "config.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("commands", written)
+        # Every extension JavaScript owns, which is what a language key has
+        # always expanded to — a `.mjs` file nothing claims is a language the
+        # loop reports as having no runner.
+        self.assertEqual(
+            written["workspaces"][1]["commands"]["test"][".js"], "npm test"
+        )
+        self.assertEqual(
+            written["workspaces"][1]["commands"]["test"][".mjs"], "npm test"
+        )
+
+    def test_several_builds_and_no_choice_is_refused(self):
+        root = self._two_builds()
+
+        with self.assertRaises(SystemExit) as caught:
+            self._run(root, "--language", ".js", "--set", "npm test")
+
+        self.assertIn("--workspace core", str(caught.exception))
+        self.assertIn("--workspace web", str(caught.exception))
+
+    def test_a_root_that_is_not_a_workspace_is_refused(self):
+        root = self._two_builds()
+
+        with self.assertRaises(SystemExit) as caught:
+            self._run(root, "--workspace", "nope", "--language", ".js", "--set", "x")
+
+        self.assertIn("no workspace with root", str(caught.exception))
+
+    def test_one_build_needs_no_choice(self):
+        root = _workspace_repo(None, files=("a.py",), commands={"test": "pytest"})
+
+        self._run(root, "--language", ".js", "--set", "npm test")
+
+        self.assertEqual(
+            Config.load(root).command_for("test", "web/main.js"), "npm test"
+        )
+
+    def test_detection_reads_the_build_not_the_repository(self):
+        # A subproject states its own commands in its own files, and the
+        # repository root's answer for them is the answer for another project.
+        root = self._two_builds()
+        seen = []
+
+        def detect(where, _provider, **kwargs):
+            seen.append(Path(where))
+            return toolchain.Detection(commands={"test": "npm test"}, confidence="high")
+
+        with unittest.mock.patch.object(toolchain, "detect", detect):
+            self._run(root, "--workspace", "web", "--language", ".js")
+
+        self.assertEqual(seen, [(root / "web")])
+
+    def test_nothing_is_written_without_the_accept_flag(self):
+        root = self._two_builds()
+
+        def detect(_where, _provider, **kwargs):
+            return toolchain.Detection(commands={"test": "npm test"}, confidence="high")
+
+        with unittest.mock.patch.object(toolchain, "detect", detect):
+            printed = self._run(root, "--workspace", "web", "--language", ".js")
+
+        self.assertIn("Nothing was written", printed)
+        self.assertEqual(Config.load(root).command_for("test", "web/main.js"), "")
+
+    def test_accepting_writes_it_into_that_build(self):
+        root = self._two_builds()
+
+        def detect(_where, _provider, **kwargs):
+            return toolchain.Detection(commands={"test": "npm test"}, confidence="high")
+
+        with unittest.mock.patch.object(toolchain, "detect", detect):
+            self._run(root, "--workspace", "web", "--language", ".js", "--accept")
+
+        self.assertEqual(
+            Config.load(root).command_for("test", "web/main.js"), "npm test"
+        )
+
+
+class TestFindingImportsThatPointAtNothing(unittest.TestCase):
+    """A model writing one file of a larger design imports the rest of it. That
+    is correct until *no* ticket writes the rest: the file lands, apply
+    succeeds, the reviewer reads a diff that looks right, and the ticket goes
+    green over code that cannot be loaded. One run did it fifteen times, over
+    sixteen imports and eight invented module paths."""
+
+    def _tree(self, files: dict[str, str]) -> Path:
+        root = Path(tempfile.mkdtemp())
+        for name, body in files.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+        return root
+
+    # -- TypeScript and JavaScript ------------------------------------
+
+    def test_the_import_that_shipped_the_defect(self):
+        root = self._tree(
+            {"src/parser/level.ts": "import { Vec2 } from '../types';\n"}
+        )
+
+        self.assertEqual(
+            imports.unresolved(root, ["src/parser/level.ts"]),
+            [("src/parser/level.ts", "../types")],
+        )
+
+    def test_an_import_that_resolves_is_not_reported(self):
+        root = self._tree(
+            {
+                "src/decor/scatter.ts": "import { PCG32 } from './prng';\n",
+                "src/decor/prng.ts": "export class PCG32 {}\n",
+            }
+        )
+
+        self.assertEqual(imports.unresolved(root, ["src/decor/scatter.ts"]), [])
+
+    def test_every_spelling_of_a_javascript_import_is_seen(self):
+        root = self._tree(
+            {
+                "a.js": (
+                    "import x from './one';\n"
+                    "const y = require('./two');\n"
+                    "const z = await import('./three');\n"
+                    "export { q } from './four';\n"
+                    "import './five';\n"
+                )
+            }
+        )
+
+        found = [target for _path, target in imports.unresolved(root, ["a.js"])]
+
+        self.assertEqual(
+            found, ["./one", "./two", "./three", "./four", "./five"]
+        )
+
+    def test_a_package_specifier_is_nobody_here_to_judge(self):
+        # A bare specifier is a package or resolves through a tsconfig alias
+        # this cannot see. Guessing about those produces false failures, and a
+        # false failure costs an attempt and blames code that was never broken.
+        root = self._tree(
+            {"a.ts": "import React from 'react';\nimport { z } from '@/types';\n"}
+        )
+
+        self.assertEqual(imports.unresolved(root, ["a.ts"]), [])
+
+    def test_a_directory_import_resolves_through_its_index(self):
+        root = self._tree(
+            {
+                "src/a.ts": "import { x } from './model';\n",
+                "src/model/index.ts": "export const x = 1;\n",
+            }
+        )
+
+        self.assertEqual(imports.unresolved(root, ["src/a.ts"]), [])
+
+    def test_an_extension_the_target_omits_is_tried(self):
+        root = self._tree(
+            {
+                "src/a.ts": "import { x } from './b';\n",
+                "src/b.tsx": "export const x = 1;\n",
+            }
+        )
+
+        self.assertEqual(imports.unresolved(root, ["src/a.ts"]), [])
+
+    def test_a_commented_out_import_names_nothing(self):
+        # The whole value of the check is that a failure it produces is worth
+        # acting on.
+        root = self._tree(
+            {
+                "a.ts": (
+                    "// import { x } from '../gone';\n"
+                    "/* import { y } from '../also-gone'; */\n"
+                    "export const z = 1;\n"
+                )
+            }
+        )
+
+        self.assertEqual(imports.unresolved(root, ["a.ts"]), [])
+
+    # -- Python --------------------------------------------------------
+
+    def test_a_relative_python_import_that_names_nothing(self):
+        root = self._tree({"pkg/a.py": "from .missing import thing\n"})
+
+        self.assertEqual(
+            imports.unresolved(root, ["pkg/a.py"]), [("pkg/a.py", ".missing")]
+        )
+
+    def test_a_relative_python_import_that_resolves(self):
+        root = self._tree(
+            {"pkg/a.py": "from .b import thing\n", "pkg/b.py": "thing = 1\n"}
+        )
+
+        self.assertEqual(imports.unresolved(root, ["pkg/a.py"]), [])
+
+    def test_a_package_import_resolves_through_its_init(self):
+        root = self._tree(
+            {
+                "pkg/a.py": "from .sub import thing\n",
+                "pkg/sub/__init__.py": "thing = 1\n",
+            }
+        )
+
+        self.assertEqual(imports.unresolved(root, ["pkg/a.py"]), [])
+
+    def test_two_dots_climb_one_package(self):
+        root = self._tree(
+            {"pkg/sub/a.py": "from ..b import thing\n", "pkg/b.py": "thing = 1\n"}
+        )
+
+        self.assertEqual(imports.unresolved(root, ["pkg/sub/a.py"]), [])
+
+    def test_python_is_read_with_a_parser_not_a_pattern(self):
+        # A regex finds `from .` inside a docstring. The standard library
+        # parses the file exactly, so this cannot.
+        root = self._tree(
+            {"pkg/a.py": '"""Example:\n\n    from .gone import thing\n"""\n'}
+        )
+
+        self.assertEqual(imports.unresolved(root, ["pkg/a.py"]), [])
+
+    def test_a_python_file_that_does_not_parse_yields_nothing(self):
+        # It has a worse problem than an unresolved import, and the toolchain
+        # will say so.
+        root = self._tree({"pkg/a.py": "def (\n"})
+
+        self.assertEqual(imports.unresolved(root, ["pkg/a.py"]), [])
+
+    # -- Rust, Go, C ---------------------------------------------------
+
+    def test_a_rust_mod_naming_no_file(self):
+        root = self._tree({"src/lib.rs": "mod missing;\npub mod also_missing;\n"})
+
+        self.assertEqual(
+            [t for _p, t in imports.unresolved(root, ["src/lib.rs"])],
+            ["missing", "also_missing"],
+        )
+
+    def test_a_rust_mod_that_resolves_either_way(self):
+        root = self._tree(
+            {
+                "src/lib.rs": "mod beside;\nmod folder;\n",
+                "src/beside.rs": "",
+                "src/folder/mod.rs": "",
+            }
+        )
+
+        self.assertEqual(imports.unresolved(root, ["src/lib.rs"]), [])
+
+    def test_an_inline_rust_module_names_no_file(self):
+        # `mod x { … }` declares a module in place. A pattern without the
+        # semicolon reports every one of them.
+        root = self._tree({"src/lib.rs": "mod tests {\n    fn a() {}\n}\n"})
+
+        self.assertEqual(imports.unresolved(root, ["src/lib.rs"]), [])
+
+    def test_a_c_include_relative_to_its_own_directory(self):
+        root = self._tree({"src/a.c": '#include "gone.h"\n#include <stdio.h>\n'})
+
+        self.assertEqual(
+            imports.unresolved(root, ["src/a.c"]), [("src/a.c", "gone.h")]
+        )
+
+    def test_an_angle_bracket_include_is_the_include_paths_business(self):
+        root = self._tree({"src/a.c": "#include <stdio.h>\n"})
+
+        self.assertEqual(imports.unresolved(root, ["src/a.c"]), [])
+
+    def test_a_go_relative_import(self):
+        root = self._tree({"main.go": 'import "./internal/gone"\n'})
+
+        self.assertEqual(
+            imports.unresolved(root, ["main.go"]), [("main.go", "./internal/gone")]
+        )
+
+    # -- the backlog -----------------------------------------------------
+
+    def test_a_module_another_ticket_will_write_is_not_a_miss(self):
+        # A declared future file. Failing an attempt over it would make a
+        # correct plan unrunnable — writing the caller before the callee is
+        # ordinary, and `needs` is what sequences them.
+        root = self._tree({"src/a.ts": "import { x } from './b';\n"})
+
+        self.assertEqual(
+            imports.unresolved(root, ["src/a.ts"], known={"src/b.ts"}), []
+        )
+
+    def test_a_language_with_no_rule_here_is_never_a_miss(self):
+        root = self._tree({"scripts/game.gd": 'const X = preload("res://gone.gd")\n'})
+
+        self.assertEqual(imports.unresolved(root, ["scripts/game.gd"]), [])
+
+
+class TestTheLoopRefusesAnAttemptThatImportsNothing(unittest.TestCase):
+    """The cheapest check in the loop, and the one that would have caught the
+    worst run. Returned as executor guidance rather than a park: the import may
+    be a typo the next attempt fixes, and where it is not, the executor has a
+    `BLOCKED:` protocol for asking for the file — which is the right request
+    and one a human can act on."""
+
+    def _orch(self, files: dict[str, str], tickets):
+        orch, root, run_id = _stub_orchestrator({"test": ""})
+        for name, body in files.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+        orch.store.add_tickets(run_id, tickets)
+        return orch, root, run_id
+
+    def test_the_attempt_is_told_exactly_which_imports_are_dead(self):
+        orch, _root, run_id = self._orch(
+            {"src/parser/level.ts": "import { Vec2 } from '../types';\n"},
+            [Ticket("PF-001", allowed_files=["src/parser/level.ts"])],
+        )
+        ticket = orch.store.list_tickets(run_id)[0]
+
+        note = orch._dangling_imports(run_id, ticket, ["src/parser/level.ts"])
+
+        self.assertIn("src/parser/level.ts imports '../types'", note)
+        self.assertIn("no ticket in this backlog is going to create one", note)
+        self.assertIn("BLOCKED:", note)
+        self.assertIn("src/parser/level.ts", note)  # its scope, for the ask
+
+    def test_a_module_a_later_ticket_owns_passes(self):
+        orch, _root, run_id = self._orch(
+            {"src/parser/level.ts": "import { Vec2 } from '../types';\n"},
+            [
+                Ticket("PF-001", allowed_files=["src/parser/level.ts"]),
+                Ticket("PF-000", allowed_files=["src/types.ts"]),
+            ],
+        )
+        ticket = orch.store.list_tickets(run_id)[0]
+
+        self.assertEqual(
+            orch._dangling_imports(run_id, ticket, ["src/parser/level.ts"]), ""
+        )
+
+    def test_an_undeclared_dependency_is_said_out_loud(self):
+        # Not a failure — the file is coming. But until it arrives this ticket
+        # is verified against a module that is not there, and `needs` is where
+        # that ordering was supposed to be written down.
+        orch, _root, run_id = self._orch(
+            {"src/parser/level.ts": "import { Vec2 } from '../types';\n"},
+            [
+                Ticket("PF-001", allowed_files=["src/parser/level.ts"]),
+                Ticket("PF-000", allowed_files=["src/types.ts"]),
+            ],
+        )
+        ticket = orch.store.list_tickets(run_id)[0]
+
+        orch._dangling_imports(run_id, ticket, ["src/parser/level.ts"])
+
+        said = "\n".join(row["message"] for row in orch.store.events_after(0, limit=200))
+        self.assertIn("PF-000 has yet to write", said)
+        self.assertIn("does not wait for", said)
+
+    def test_a_declared_dependency_is_not_worth_saying(self):
+        orch, _root, run_id = self._orch(
+            {"src/parser/level.ts": "import { Vec2 } from '../types';\n"},
+            [
+                Ticket(
+                    "PF-001",
+                    allowed_files=["src/parser/level.ts"],
+                    needs=["PF-000"],
+                ),
+                Ticket("PF-000", allowed_files=["src/types.ts"]),
+            ],
+        )
+        ticket = orch.store.list_tickets(run_id)[0]
+
+        orch._dangling_imports(run_id, ticket, ["src/parser/level.ts"])
+
+        said = "\n".join(row["message"] for row in orch.store.events_after(0, limit=200))
+        self.assertNotIn("does not wait for", said)
+
+    def test_a_healthy_attempt_says_nothing(self):
+        orch, _root, run_id = self._orch(
+            {
+                "src/decor/scatter.ts": "import { PCG32 } from './prng';\n",
+                "src/decor/prng.ts": "export class PCG32 {}\n",
+            },
+            [Ticket("T-1", allowed_files=["src/decor/scatter.ts"])],
+        )
+        ticket = orch.store.list_tickets(run_id)[0]
+
+        self.assertEqual(
+            orch._dangling_imports(run_id, ticket, ["src/decor/scatter.ts"]), ""
+        )
+
+    def test_the_whole_failed_backlog_is_caught_on_its_first_file(self):
+        # Fifteen tickets went green over this. The first one fails here.
+        orch, _root, run_id = self._orch(
+            {
+                "src/parser/level.ts": "import { Vec2 } from '../types';\n",
+                "src/parser/validation.ts": "import { Level } from '../types';\n",
+                "src/renderer/logical.ts": "import { Level } from '../model/level';\n",
+            },
+            [
+                Ticket("PF-001", allowed_files=["src/parser/level.ts"]),
+                Ticket("PF-002", allowed_files=["src/parser/validation.ts"]),
+                Ticket("PF-003", allowed_files=["src/renderer/logical.ts"]),
+            ],
+        )
+
+        blocked = [
+            ticket.ticket_id
+            for ticket in orch.store.list_tickets(run_id)
+            if orch._dangling_imports(run_id, ticket, ticket.allowed_files)
+        ]
+
+        self.assertEqual(blocked, ["PF-001", "PF-002", "PF-003"])
+
+
+class TestALanguageNothingTypeChecks(unittest.TestCase):
+    """`cargo test` and `go test` compile the project before running any of it,
+    so a missing `typecheck` entry there is a redundancy. `npm test` and
+    `pytest` load the modules their tests reach and nothing else, so a missing
+    entry there is a hole the size of every file no test imports — and one run
+    put 4,000 lines through it, sixteen of them importing modules that did not
+    exist. `tsc --noEmit` would have found every one in about two seconds."""
+
+    def _workspace(self, commands) -> Workspace:
+        return Workspace(root=".", commands=commands)
+
+    def test_typescript_with_no_type_check_is_a_gap(self):
+        workspace = self._workspace({"test": "npm test"})
+
+        self.assertEqual(workspace.unchecked(".ts"), ("tsc --noEmit",))
+
+    def test_python_with_no_type_check_is_a_gap(self):
+        workspace = self._workspace({"test": "pytest"})
+
+        self.assertEqual(workspace.unchecked(".py")[0], "mypy .")
+
+    def test_a_compiled_language_is_not_a_gap(self):
+        # `cargo test` compiles before it runs. Asking for a second command
+        # that does the same thing is noise, and noise is what makes a real
+        # report worth ignoring.
+        workspace = self._workspace({"test": "cargo test"})
+
+        self.assertEqual(workspace.unchecked(".rs"), ())
+        self.assertEqual(workspace.unchecked(".go"), ())
+        self.assertEqual(workspace.unchecked(".java"), ())
+
+    def test_a_configured_type_check_closes_it(self):
+        workspace = self._workspace(
+            {"test": "npm test", "typecheck": "tsc --noEmit"}
+        )
+
+        self.assertEqual(workspace.unchecked(".ts"), ())
+
+    def test_a_type_check_for_another_language_does_not_close_it(self):
+        workspace = self._workspace(
+            {"test": "npm test", "typecheck": {".py": "mypy ."}}
+        )
+
+        self.assertEqual(workspace.unchecked(".ts"), ("tsc --noEmit",))
+
+    def test_declaring_that_it_needs_none_closes_it(self):
+        # The difference between a decision and an oversight, which is the only
+        # thing worth reporting.
+        workspace = self._workspace({"test": "npm test", "typecheck": {".ts": False}})
+
+        self.assertEqual(workspace.unchecked(".ts"), ())
+
+    def test_a_language_with_no_test_command_is_not_reported_here(self):
+        # "Its test command does not check the whole project" is a sentence
+        # that does not parse about a build with no test command, and the
+        # missing test command is the bigger problem, reported elsewhere.
+        workspace = self._workspace({"test": {".js": "npm test"}})
+
+        self.assertEqual(workspace.unchecked(".ts"), ())
+
+    def test_the_run_says_so_once_at_the_start(self):
+        root = _workspace_repo(
+            None, files=("src/a.ts",), commands={"test": "npm test"}
+        )
+        store = Store(root / "t.db")
+        orch = Orchestrator(Config.load(root), store)
+        run_id = store.create_run("g")
+        store.add_tickets(run_id, [Ticket("T-1", allowed_files=["src/a.ts"])])
+
+        orch._note_typecheck_gaps(run_id)
+
+        said = "\n".join(row["message"] for row in store.events_after(0, limit=200))
+        self.assertIn("Nothing type-checks .ts", said)
+        self.assertIn("tsc --noEmit", said)
+        self.assertIn("--skip", said)
+
+    def test_it_is_scoped_to_what_the_backlog_writes(self):
+        # A stray script in a language nobody is touching is not worth a line
+        # of anyone's attention — the same rule the canary follows.
+        root = _workspace_repo(
+            None, files=("src/a.ts", "helper.py"), commands={"test": "npm test"}
+        )
+        store = Store(root / "t.db")
+        orch = Orchestrator(Config.load(root), store)
+        run_id = store.create_run("g")
+        store.add_tickets(run_id, [Ticket("T-1", allowed_files=["src/a.ts"])])
+
+        orch._note_typecheck_gaps(run_id)
+
+        said = "\n".join(row["message"] for row in store.events_after(0, limit=200))
+        self.assertIn(".ts", said)
+        self.assertNotIn(".py", said)
+
+    def test_it_never_blocks_the_run(self):
+        # Reported, never gated — the weight `LANGUAGE-COVERAGE.md` gives lint,
+        # and for the same reason: a project that has decided not to
+        # type-check has decided.
+        root = _workspace_repo(
+            None, files=("src/a.ts",), commands={"test": "npm test"}
+        )
+        store = Store(root / "t.db")
+        orch = Orchestrator(Config.load(root), store)
+        run_id = store.create_run("g")
+        store.add_tickets(run_id, [Ticket("T-1", allowed_files=["src/a.ts"])])
+
+        self.assertIsNone(orch._note_typecheck_gaps(run_id))
+
+    def test_doctor_names_it_and_the_command_that_closes_it(self):
+        root = _workspace_repo(
+            None, files=("src/a.ts",), commands={"test": "npm test"}
+        )
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            cli._report_coverage(Config.load(root))
+        printed = captured.getvalue()
+
+        self.assertIn("no type check", printed)
+        self.assertIn("tsc --noEmit", printed)
+        self.assertIn("--kind typecheck", printed)
+
+    def test_doctor_stops_naming_it_once_it_is_skipped(self):
+        root = _workspace_repo(
+            None, files=("src/a.ts",), commands={"test": "npm test"}
+        )
+        parsed = cli.build_parser().parse_args(
+            ["--root", str(root), "toolchain", "--kind", "typecheck",
+             "--language", ".ts", "--skip"]
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            parsed.func(parsed)
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            cli._report_coverage(Config.load(root))
+
+        self.assertNotIn("no type check", captured.getvalue())
+
+    def test_doctor_says_nothing_about_a_compiled_project(self):
+        root = _workspace_repo(
+            None, files=("src/a.rs",), commands={"test": "cargo test"}
+        )
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            cli._report_coverage(Config.load(root))
+
+        self.assertNotIn("no type check", captured.getvalue())
+
+
+class TestTheSpecificationReachesTheExecutor(unittest.TestCase):
+    """A planner reads a specification and writes a summary of it; the executor
+    is handed the summary and never sees the source. One run put a
+    seven-hundred-line spec through that. Section 2 was labelled normative and
+    held the complete legal alphabet as a table of eighteen characters, the
+    seven exact error strings, and the order the checks run in. What reached
+    the executor was "reject bad input with exact error strings", naming none
+    of them — and every ticket in that backlog had `reference_files: []`."""
+
+    def _repo(self) -> Path:
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / "Docs").mkdir()
+        (root / "Docs" / "spec.md").write_text("# Spec\n", encoding="utf-8")
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x"}},
+                    "roles": {r: "m" for r in ROLES},
+                    "commands": {"test": "pytest"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return root
+
+    def test_a_planned_backlog_carries_the_document_it_came_from(self):
+        root = self._repo()
+        config = Config.load(root)
+
+        self.assertEqual(
+            cli._source_reference(config, str(root / "Docs" / "spec.md"), "planned"),
+            "Docs/spec.md",
+        )
+
+    def test_a_parsed_backlog_does_not(self):
+        # It already carries that document's words verbatim. Attaching it would
+        # show every ticket every other ticket's spec, for nothing.
+        root = self._repo()
+        config = Config.load(root)
+
+        self.assertEqual(
+            cli._source_reference(config, str(root / "Docs" / "spec.md"), "parsed"), ""
+        )
+
+    def test_stdin_has_no_path_to_attach(self):
+        root = self._repo()
+
+        self.assertEqual(cli._source_reference(Config.load(root), "-", "planned"), "")
+
+    def test_a_document_outside_the_repository_cannot_be_pasted_from_one(self):
+        root = self._repo()
+        elsewhere = Path(tempfile.mkdtemp()) / "spec.md"
+        elsewhere.write_text("# Spec\n", encoding="utf-8")
+
+        self.assertEqual(
+            cli._source_reference(Config.load(root), str(elsewhere), "planned"), ""
+        )
+
+    def test_a_path_that_is_not_a_file_is_not_attached(self):
+        root = self._repo()
+
+        self.assertEqual(
+            cli._source_reference(Config.load(root), str(root / "Docs"), "planned"), ""
+        )
+
+    def test_it_goes_first_so_the_reading_cap_cannot_drop_it(self):
+        # `reading_scope` takes `reference` in order and caps the rest at
+        # twelve. First is what guarantees it survives.
+        root = self._repo()
+        for index in range(20):
+            (root / f"sibling_{index}.py").write_text("x = 1\n", encoding="utf-8")
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+        kept = evidence.reading_scope(
+            root,
+            ["src/a.py"],
+            ["Docs/spec.md"] + [f"sibling_{i}.py" for i in range(20)],
+        )
+
+        self.assertEqual(kept[0], "Docs/spec.md")
+
+
+class TestAnOverlongReferenceKeepsWhatCannotBeLost(unittest.TestCase):
+    """Head truncation is right for code and wrong for a specification. The
+    binding part of a spec sits wherever its author put it, and a document
+    whose section 2 is normative survives a head cut only by luck. One did: the
+    run this exists for would have lost 16,000 characters off the end of a
+    40,000 character spec, and the eighteen-row table it needed happened to sit
+    at character 2,888."""
+
+    def _orch(self):
+        orch, root, _run_id = _stub_orchestrator({"test": ""})
+        return orch, root
+
+    def _long_spec(self) -> str:
+        filler = "Prose that says nothing in particular. " * 40
+        head = "# Specification\n\n" + (filler + "\n") * 400
+        tail = (
+            "\n## 9. Legend\n\n"
+            "| Char | Meaning |\n"
+            "|---|---|\n"
+            "| `I` | Ice |\n"
+            "| `U` | Blue door |\n"
+        )
+        return head + tail
+
+    def test_a_table_past_the_limit_survives(self):
+        orch, root = self._orch()
+        text = self._long_spec()
+        self.assertGreater(len(text), orch._SOURCE_LIMIT)
+
+        trimmed = orch._trim_reference("Docs/spec.md", text)
+
+        self.assertIn("| `I` | Ice |", trimmed)
+        self.assertIn("| `U` | Blue door |", trimmed)
+        self.assertIn("## 9. Legend", trimmed)
+
+    def test_the_gap_is_marked_so_nobody_reads_it_as_whole(self):
+        orch, _root = self._orch()
+
+        trimmed = orch._trim_reference("Docs/spec.md", self._long_spec())
+
+        self.assertIn("omitted", trimmed)
+        self.assertIn("out of context", trimmed)
+        self.assertIn("do not return it", trimmed)
+
+    def test_it_stays_inside_the_limit(self):
+        orch, _root = self._orch()
+
+        trimmed = orch._trim_reference("Docs/spec.md", self._long_spec())
+
+        self.assertLessEqual(len(trimmed), orch._SOURCE_LIMIT + 400)
+
+    def test_code_is_head_truncated_exactly_as_before(self):
+        # A source file spliced from two ends reads as a whole file with
+        # functions that do not exist, and the executor is being asked to write
+        # against it.
+        orch, _root = self._orch()
+        code = "\n".join(f"def f_{i}(): return {i}" for i in range(4000))
+
+        trimmed = orch._trim_reference("src/a.py", code)
+
+        self.assertTrue(trimmed.startswith("def f_0()"))
+        self.assertIn("truncated at", trimmed)
+        self.assertNotIn("omitted", trimmed)
+
+    def test_a_prose_file_with_nothing_binding_falls_back_to_the_head(self):
+        orch, _root = self._orch()
+        text = ("just words and more words " * 60 + "\n") * 60
+
+        trimmed = orch._trim_reference("notes.md", text)
+
+        self.assertNotIn("omitted", trimmed)
+        self.assertIn("truncated at", trimmed)
+
+    def test_the_document_reaches_the_ticket_that_names_it(self):
+        orch, root = self._orch()
+        (root / "Docs").mkdir()
+        (root / "Docs" / "spec.md").write_text(self._long_spec(), encoding="utf-8")
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        ticket = Ticket(
+            "T-1",
+            allowed_files=["src/a.py"],
+            reference_files=["Docs/spec.md"],
+        )
+
+        sources, _oversized = orch._sources_for(ticket)
+
+        self.assertIn("| `U` | Blue door |", sources["Docs/spec.md"])
+
+
+class TestCountingWhatARunnerSaidItRan(unittest.TestCase):
+    """`None` is a real answer. Reading "no number printed" as "no tests ran"
+    fails every `go test` in existence; reading it as "fine" is the failure
+    being fixed."""
+
+    def test_the_runners_that_say(self):
+        for output, expected in (
+            ("===== 5 passed, 1 skipped in 0.3s =====", 5),
+            ("collected 12 items\n\n....\n12 passed", 12),
+            ("Ran 997 tests in 60s\n\nOK", 997),
+            ("test result: ok. 26 passed; 0 failed", 26),
+            (" Tests  8 passed (8)", 8),
+            ("  4 passing (12ms)", 4),
+            ("# tests 3\n# pass 3\n# fail 0", 3),
+            ("7 tests completed", 7),
+            ("Tests run: 15, Failures: 0", 15),
+            ("9 examples, 0 failures", 9),
+        ):
+            with self.subTest(output=output):
+                self.assertEqual(test_count(output), expected)
+
+    def test_a_runner_that_prints_no_count_says_so(self):
+        self.assertIsNone(test_count("ok  \tgithub.com/x/y\t0.012s"))
+        self.assertIsNone(test_count(""))
+
+    def test_the_largest_number_wins(self):
+        # pytest prints `collected 12 items` and then `12 passed`; a suite that
+        # grew shows the growth in whichever number is biggest.
+        self.assertEqual(test_count("collected 12 items\n5 passed, 7 failed"), 12)
+
+
+class TestAGreenThatRanNoneOfTheTicketsTests(unittest.TestCase):
+    """A green from a command whose output never mentions the file is not
+    evidence about that file. One run recorded fifteen of them: the tester
+    wrote `node:test` suites into a directory a gdUnit4 launcher globbed and
+    ignored, the launcher exited 0 every time, and every ticket was marked
+    verified by a command that had read none of its tests."""
+
+    def _orch(self, baseline: dict[str, int] | None = None):
+        orch, _root, run_id = _stub_orchestrator({"test": "pytest"})
+        orch._baseline_counts = dict(baseline or {})
+        return orch, run_id, Ticket("T-1", allowed_files=["src/a.py"])
+
+    def test_a_suite_that_did_not_grow_is_caught(self):
+        orch, run_id, ticket = self._orch({"test": 12})
+
+        note = orch._test_was_collected(
+            run_id, ticket, "test", "tests/t_1_test.py", True, "12 passed"
+        )
+
+        self.assertIn("same 12 test(s)", note)
+        self.assertIn("tests/t_1_test.py", note)
+        self.assertIn("not being collected", note)
+
+    def test_a_suite_that_grew_is_fine(self):
+        orch, run_id, ticket = self._orch({"test": 12})
+
+        self.assertEqual(
+            orch._test_was_collected(
+                run_id, ticket, "test", "tests/t_1_test.py", True, "13 passed"
+            ),
+            "",
+        )
+
+    def test_output_naming_the_file_settles_it_without_counting(self):
+        # Most runners print the file they are running, and this is the
+        # ordinary case.
+        orch, run_id, ticket = self._orch({"test": 12})
+
+        self.assertEqual(
+            orch._test_was_collected(
+                run_id,
+                ticket,
+                "test",
+                "tests/t_1_test.py",
+                True,
+                "PASS tests/t_1_test.py\n12 passed",
+            ),
+            "",
+        )
+
+    def test_a_retry_is_not_a_suite_that_failed_to_grow(self):
+        # The way this check goes wrong. On a second attempt the previous
+        # attempt's test file is already on disk and already in the baseline,
+        # so the count stays where it was and is entirely correct to.
+        orch, run_id, ticket = self._orch({"test": 12})
+
+        self.assertEqual(
+            orch._test_was_collected(
+                run_id, ticket, "test", "tests/t_1_test.py", False, "12 passed"
+            ),
+            "",
+        )
+
+    def test_a_ticket_that_authored_no_test_is_not_asked(self):
+        orch, run_id, ticket = self._orch({"test": 12})
+
+        self.assertEqual(
+            orch._test_was_collected(run_id, ticket, "test", "", True, "12 passed"), ""
+        )
+
+    def test_a_runner_with_no_count_cannot_be_asked(self):
+        # `go test` prints `ok pkg 0.01s`. Cannot tell is reported as cannot
+        # tell — the preflight canary is what establishes the command reads the
+        # language at all.
+        orch, run_id, ticket = self._orch({})
+
+        note = orch._test_was_collected(
+            run_id, ticket, "test", "tests/t_1_test.go", True, "ok  pkg  0.01s"
+        )
+
+        self.assertEqual(note, "")
+        said = "\n".join(row["message"] for row in orch.store.events_after(0, limit=100))
+        self.assertIn("prints no test count", said)
+
+    def test_it_says_that_only_once_a_run(self):
+        orch, run_id, ticket = self._orch({})
+        for _ in range(4):
+            orch._test_was_collected(
+                run_id, ticket, "test", "tests/t_1_test.go", True, "ok  pkg"
+            )
+
+        said = [
+            row["message"]
+            for row in orch.store.events_after(0, limit=100)
+            if "prints no test count" in row["message"]
+        ]
+        self.assertEqual(len(said), 1)
+
+    def test_a_baseline_with_no_count_cannot_be_compared_against(self):
+        orch, run_id, ticket = self._orch({})
+
+        self.assertEqual(
+            orch._test_was_collected(
+                run_id, ticket, "test", "tests/t_1_test.py", True, "12 passed"
+            ),
+            "",
+        )
+
+    def test_the_baseline_records_a_count_from_a_passing_step(self):
+        # It is not about failures at all, so it is captured whether or not the
+        # step passed — and a green baseline is the common case.
+        orch, _root, run_id = _stub_orchestrator({"test": "pytest"})
+        orch._shell = lambda *_a, **_k: StepResult(ok=True, detail="12 passed")
+
+        orch._baseline_failures(run_id, Ticket("T-1", allowed_files=["src/a.py"]))
+
+        self.assertEqual(orch._baseline_counts.get("test"), 12)
+
+    def test_the_baseline_is_retaken_for_each_ticket(self):
+        orch, _root, run_id = _stub_orchestrator({"test": "pytest"})
+        orch._baseline_counts = {"test": 999}
+        orch._shell = lambda *_a, **_k: StepResult(ok=True, detail="ok, no numbers")
+
+        orch._baseline_failures(run_id, Ticket("T-2", allowed_files=["src/a.py"]))
+
+        self.assertEqual(orch._baseline_counts, {})
+
+
+class TestTheCollectionCheckAgainstARealRunner(unittest.TestCase):
+    """Driven through an actual `python -m unittest discover`, because the
+    claim is about what a runner does and a stubbed exit code is a guess with
+    extra steps. This is the Puzzle Path shape exactly: a test file written
+    where the command does not look, and a green reported anyway."""
+
+    PASSING = (
+        "import unittest\n"
+        "\n"
+        "\n"
+        "class T(unittest.TestCase):\n"
+        "    def test_a(self):\n"
+        "        self.assertTrue(True)\n"
+    )
+
+    def _repo(self, discover_dir: str):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / "suite").mkdir()
+        (root / "suite" / "existing_test.py").write_text(
+            self.PASSING, encoding="utf-8"
+        )
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        command = (
+            f'"{sys.executable}" -m unittest discover '
+            f'-s {discover_dir} -p "*_test.py"'
+        )
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x"}},
+                    "roles": {r: "m" for r in ROLES},
+                    "commands": {"test": command},
+                    "loop": {"preflight": False, "preflightCanary": False},
+                }
+            ),
+            encoding="utf-8",
+        )
+        config = Config.load(root)
+        store = Store(root / "t.db")
+        return Orchestrator(config, store), root, store.create_run("g"), command
+
+    def _trial(self, discover_dir: str, test_dir: str):
+        orch, root, run_id, command = self._repo(discover_dir)
+        ticket = Ticket("T-1", allowed_files=["src/a.py"], criteria=["x"])
+        orch._baseline_failures(run_id, ticket)
+
+        written = root / test_dir / "t_1_test.py"
+        written.parent.mkdir(parents=True, exist_ok=True)
+        written.write_text(
+            self.PASSING.replace("test_a", "test_new"), encoding="utf-8"
+        )
+        result = orch._shell(run_id, "test", command)
+
+        return result, orch._test_was_collected(
+            run_id, ticket, "test", f"{test_dir}/t_1_test.py", True, result.detail
+        )
+
+    def test_a_file_the_runner_collects_passes(self):
+        result, note = self._trial("suite", "suite")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(note, "")
+
+    def test_a_file_the_runner_never_looks_at_is_caught(self):
+        # Green, and it ran none of the tests the ticket just wrote. Fifteen
+        # tickets were recorded verified on exactly this.
+        result, note = self._trial("suite", "tests/decor")
+
+        self.assertTrue(result.ok, "the command really does pass")
+        self.assertIn("not being collected", note)
+        self.assertIn("tests/decor/t_1_test.py", note)
+
+
+class TestABacklogNothingCanBuild(unittest.TestCase):
+    """Fifteen tickets wrote 4,000 lines of TypeScript into a repository with
+    no `package.json`, no `tsconfig.json`, and no ticket owning either — so
+    nothing could compile, type-check or test a line of it, and every gate
+    downstream read the absence of complaints as the absence of a problem."""
+
+    def _config(self, files, workspaces=None, commands=None):
+        return Config.load(
+            _workspace_repo(workspaces, files=files, commands=commands or {"test": ""})
+            if workspaces is None
+            else _workspace_repo(workspaces, files=files)
+        )
+
+    def test_the_backlog_that_shipped_the_defect(self):
+        config = self._config(["project.godot", "scripts/game.gd"])
+
+        gaps = toolchain.manifest_gaps(
+            config, [Ticket("PF-001", allowed_files=["src/parser/level.ts"])]
+        )
+
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("package.json", gaps[0])
+        self.assertIn("nothing here builds it", gaps[0])
+
+    def test_a_ticket_that_creates_the_manifest_closes_it(self):
+        # Writing the build file and the first module it builds is an ordinary
+        # way to start.
+        config = self._config(["project.godot"])
+
+        gaps = toolchain.manifest_gaps(
+            config,
+            [
+                Ticket("PF-000", allowed_files=["package.json"]),
+                Ticket("PF-001", allowed_files=["src/parser/level.ts"]),
+            ],
+        )
+
+        self.assertEqual(gaps, [])
+
+    def test_a_manifest_already_on_disk_closes_it(self):
+        config = self._config(["project.godot", "package.json"])
+
+        self.assertEqual(
+            toolchain.manifest_gaps(
+                config, [Ticket("T-1", allowed_files=["src/a.ts"])]
+            ),
+            [],
+        )
+
+    def test_either_spelling_of_the_manifest_counts(self):
+        config = self._config(["deno.json"])
+
+        self.assertEqual(
+            toolchain.manifest_gaps(
+                config, [Ticket("T-1", allowed_files=["src/a.ts"])]
+            ),
+            [],
+        )
+
+    def test_it_looks_inside_the_build_that_owns_the_files(self):
+        config = self._config(
+            ["project.godot", "tools/path-forge/package.json"],
+            workspaces=[
+                {"root": ".", "commands": {"test": "godot"}, "excludes": ["tools/**"]},
+                {"root": "tools/path-forge", "commands": {"test": "npm test"}},
+            ],
+        )
+
+        self.assertEqual(
+            toolchain.manifest_gaps(
+                config,
+                [Ticket("T-1", allowed_files=["tools/path-forge/src/a.ts"])],
+            ),
+            [],
+        )
+
+    def test_a_manifest_in_the_wrong_build_does_not_count(self):
+        config = self._config(
+            ["package.json", "tools/path-forge/README.md"],
+            workspaces=[
+                {"root": ".", "commands": {"test": "x"}, "excludes": ["tools/**"]},
+                {"root": "tools/path-forge", "commands": {"test": "npm test"}},
+            ],
+        )
+
+        gaps = toolchain.manifest_gaps(
+            config, [Ticket("T-1", allowed_files=["tools/path-forge/src/a.ts"])]
+        )
+
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("tools/path-forge", gaps[0])
+
+    def test_a_language_with_no_opinion_is_never_reported(self):
+        # Python is the instructive omission: a directory of standalone `.py`
+        # files with no `pyproject.toml` is ordinary and runs perfectly, so
+        # listing it would report a hole in half the repositories that exist.
+        config = self._config(["project.godot"])
+
+        for path in ("tools/build.py", "lib/a.rb", "src/main.c", "run.sh"):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    toolchain.manifest_gaps(
+                        config, [Ticket("T-1", allowed_files=[path])]
+                    ),
+                    [],
+                )
+
+    def test_each_language_and_build_is_named_once(self):
+        config = self._config(["project.godot"])
+
+        gaps = toolchain.manifest_gaps(
+            config,
+            [
+                Ticket("PF-001", allowed_files=["src/a.ts"]),
+                Ticket("PF-002", allowed_files=["src/b.ts"]),
+                Ticket("PF-003", allowed_files=["src/c.ts", "src/d.tsx"]),
+            ],
+        )
+
+        self.assertEqual(len(gaps), 1)
+
+    def test_a_glob_names_no_file_and_is_skipped(self):
+        config = self._config(["project.godot"])
+
+        self.assertEqual(
+            toolchain.manifest_gaps(
+                config, [Ticket("T-1", allowed_files=["src/**/*.ts"])]
+            ),
+            [],
+        )
+
+    def test_the_run_says_it_too(self):
+        # A run is often started long after the backlog was filed, by somebody
+        # who never saw the ingest output.
+        root = _workspace_repo(None, files=("project.godot",), commands={"test": ""})
+        store = Store(root / "t.db")
+        orch = Orchestrator(Config.load(root), store)
+        run_id = store.create_run("g")
+        store.add_tickets(run_id, [Ticket("PF-001", allowed_files=["src/a.ts"])])
+
+        orch._note_manifest_gaps(run_id)
+
+        said = "\n".join(row["message"] for row in store.events_after(0, limit=100))
+        self.assertIn("nothing here builds it", said)
+        self.assertIn("as a ticket of its own", said)
+
+    def test_a_finished_ticket_is_not_still_asking(self):
+        root = _workspace_repo(None, files=("project.godot",), commands={"test": ""})
+        store = Store(root / "t.db")
+        orch = Orchestrator(Config.load(root), store)
+        run_id = store.create_run("g")
+        store.add_tickets(
+            run_id,
+            [Ticket("PF-001", allowed_files=["src/a.ts"], status=TICKET_DONE)],
+        )
+
+        orch._note_manifest_gaps(run_id)
+
+        said = "\n".join(row["message"] for row in store.events_after(0, limit=100))
+        self.assertNotIn("nothing here builds it", said)
+
+    def test_it_warns_rather_than_refusing(self):
+        # A refusal here has no escape hatch: `commands` has an exemption
+        # spelling for a language nothing runs, and there is none for "this
+        # project builds its TypeScript with a Makefile and no package.json",
+        # which is unusual and not wrong.
+        root = _workspace_repo(None, files=("project.godot",), commands={"test": ""})
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            gaps = cli._warn_missing_manifests(
+                Config.load(root), [Ticket("PF-001", allowed_files=["src/a.ts"])]
+            )
+
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("warning:", captured.getvalue())
+        self.assertIn("as a ticket of its own", captured.getvalue())
+
+
+class TestABacklogThatIsAFileListRatherThanAPlan(unittest.TestCase):
+    """Fifteen tickets, fifteen files that did not exist, `needs: []` on every
+    one of them. Nothing sequenced the shared type ahead of its consumers and
+    no ticket owned it, so each module in turn reached for it, invented its own
+    name for it — `types`, `geometry`, `model/rect`, `models/level_model` — and
+    imported a file nothing would ever write."""
+
+    def _greenfield(self) -> Path:
+        return Path(tempfile.mkdtemp())
+
+    def _existing(self, count: int) -> Path:
+        root = Path(tempfile.mkdtemp())
+        for index in range(count):
+            path = root / "src" / f"mod_{index}.py"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x = 1\n", encoding="utf-8")
+        return root
+
+    def test_the_shape_that_shipped_the_defect(self):
+        tickets = [
+            Ticket(f"PF-{i:03d}", allowed_files=[f"src/mod_{i}.ts"])
+            for i in range(15)
+        ]
+
+        note = undeclared_order(self._greenfield(), tickets)
+
+        self.assertIn("15 tickets", note)
+        self.assertIn("not one `needs`", note)
+        self.assertIn("which one writes it first", note)
+
+    def test_independent_fixes_to_code_that_exists_are_ordinary(self):
+        # The case this must not fire on. A batch of unrelated bug fixes is
+        # genuinely parallel, and saying so about it would train a reader to
+        # skip the warning.
+        root = self._existing(15)
+        tickets = [
+            Ticket(f"BUG-{i:03d}", allowed_files=[f"src/mod_{i}.py"])
+            for i in range(15)
+        ]
+
+        self.assertEqual(undeclared_order(root, tickets), "")
+
+    def test_a_small_backlog_carries_no_information(self):
+        # Two or three new modules with no declared order is an ordinary small
+        # plan, and the shape says nothing about it.
+        tickets = [Ticket(f"T-{i}", allowed_files=[f"new_{i}.ts"]) for i in range(3)]
+
+        self.assertEqual(undeclared_order(self._greenfield(), tickets), "")
+
+    def test_one_declared_edge_is_enough_to_stay_quiet(self):
+        # The complaint is that *nothing* is built on anything. A plan that
+        # sequences its shared module has answered the question.
+        tickets = [Ticket("T-0", allowed_files=["src/types.ts"])] + [
+            Ticket(f"T-{i}", allowed_files=[f"src/mod_{i}.ts"], needs=["T-0"])
+            for i in range(1, 8)
+        ]
+
+        self.assertEqual(undeclared_order(self._greenfield(), tickets), "")
+
+    def test_mostly_existing_files_stays_quiet(self):
+        # Greenfield is the discriminator, and it has to be a majority: one new
+        # file among ten edits is not a new subsystem.
+        root = self._existing(10)
+        tickets = [
+            Ticket(f"T-{i}", allowed_files=[f"src/mod_{i}.py"]) for i in range(10)
+        ] + [Ticket("T-99", allowed_files=["src/brand_new.py"])]
+
+        self.assertEqual(undeclared_order(root, tickets), "")
+
+    def test_a_backlog_of_globs_names_no_files_to_judge(self):
+        tickets = [Ticket(f"T-{i}", allowed_files=["src/**/*.ts"]) for i in range(9)]
+
+        self.assertEqual(undeclared_order(self._greenfield(), tickets), "")
+
+    def test_the_real_fifteen_ticket_backlog(self):
+        # Reconstructed from the run: fifteen tickets, eighteen files, no edges.
+        backlog = [
+            Ticket("PF-001", allowed_files=["src/parser/level.ts"]),
+            Ticket("PF-002", allowed_files=["src/parser/validation.ts"]),
+            Ticket("PF-003", allowed_files=["src/renderer/logical.ts"]),
+            Ticket("PF-004", allowed_files=["src/theme/manifest.ts"]),
+            Ticket("PF-005", allowed_files=["src/renderer/themed/atlas.ts"]),
+            Ticket("PF-006", allowed_files=["src/renderer/themed/walls.ts"]),
+            Ticket("PF-007", allowed_files=["src/renderer/themed/islands.ts"]),
+            Ticket("PF-008", allowed_files=["src/renderer/themed/forest.ts"]),
+            Ticket("PF-009", allowed_files=["src/decor/prng.ts", "src/decor/scatter.ts"]),
+            Ticket("PF-010", allowed_files=["tests/decor/golden_fixture_test.ts"]),
+            Ticket("PF-011", allowed_files=["src/ui/palette.ts", "src/ui/tools.ts"]),
+            Ticket("PF-012", allowed_files=["src/ui/undo.ts", "src/editor/resize.ts"]),
+            Ticket("PF-013", allowed_files=["src/ui/validation_strip.ts"]),
+            Ticket("PF-014", allowed_files=["src/camera/framing.ts"]),
+            Ticket("PF-015", allowed_files=["src/io/filesystem.ts"]),
+        ]
+
+        note = undeclared_order(self._greenfield(), backlog)
+
+        self.assertIn("15 tickets", note)
+        self.assertIn("18 files", note)
 
 
 class TestATicketNothingCanRunDoesNotRun(unittest.TestCase):
@@ -8747,7 +11198,7 @@ class TestBaselineVerifyIsOptional(unittest.TestCase):
         orch.config.loop.max_attempts = 1
         ran: list[str] = []
 
-        def shell(_run_id, name, command, _ticket=""):
+        def shell(_run_id, name, command, _ticket="", **_kwargs):
             ran.append(name)
             return StepResult(ok=True, detail="")
 
@@ -9322,7 +11773,7 @@ def _failing_shell(output: str):
     fails on `lint` before reaching the step under test.
     """
 
-    def shell(_run_id, name, command, _ticket=""):
+    def shell(_run_id, name, command, _ticket="", **_kwargs):
         if not command.strip():
             return StepResult(ok=True, detail=f"no {name} command configured; skipped")
         return StepResult(ok=False, detail=output)
@@ -9903,7 +12354,7 @@ class TestATicketVerifiedByNothingEndsTheRun(unittest.TestCase):
         orch, _, run_id = self._orchestrator()
         orch.config.commands = {"lint": "", "typecheck": "javac", "test": "pytest"}
 
-        def shell(_run_id, name, command, _ticket=""):
+        def shell(_run_id, name, command, _ticket="", **_kwargs):
             if not command.strip():
                 return StepResult(ok=True, detail="skipped")
             if name == "test":
@@ -10328,7 +12779,7 @@ class TestARunWillNotStartOnARedTree(unittest.TestCase):
 
     def test_a_green_tree_starts_normally(self):
         orch, _, run_id = _stub_orchestrator({"lint": "", "typecheck": "javac", "test": ""})
-        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=True, detail="")
+        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(ok=True, detail="")
 
         self.assertEqual(self._run(orch, run_id), "done")
 
@@ -10386,7 +12837,7 @@ class TestRedLeftBehindEndsTheRunWhereItHappened(unittest.TestCase):
 
     def test_a_tree_the_quarantine_cleaned_carries_on(self):
         orch, run_id, failed = self._backlog()
-        orch._shell = lambda _r, _n, _c, _ticket="": StepResult(ok=True, detail="")
+        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(ok=True, detail="")
 
         orch._red_left_behind(run_id, failed)
 
@@ -10981,7 +13432,7 @@ class TestAReproductionThatCannotPassIsNotEvidence(unittest.TestCase):
 
     def test_a_test_that_died_before_asserting_proves_nothing(self):
         orch, _root, run_id = self._orch()
-        orch._shell = lambda _r, _n, _c, _t="": StepResult(ok=False, detail=self.ERRORED)
+        orch._shell = lambda _r, _n, _c, _t="", **_kwargs: StepResult(ok=False, detail=self.ERRORED)
         seen = self._calls(orch)
 
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
@@ -10999,7 +13450,7 @@ class TestAReproductionThatCannotPassIsNotEvidence(unittest.TestCase):
         # reporting a failed assertion is the reproduction working, and
         # treating that as broken parks every bug the loop could have fixed.
         orch, _root, run_id = self._orch()
-        orch._shell = lambda _r, _n, _c, _t="": StepResult(
+        orch._shell = lambda _r, _n, _c, _t="", **_kwargs: StepResult(
             ok=False, detail=self.ASSERTED
         )
         self._calls(orch)
@@ -11020,7 +13471,7 @@ class TestAReproductionThatCannotPassIsNotEvidence(unittest.TestCase):
             "Bug001Test > manifest() FAILED\n"
             "    AssertionError: expected com.x.Main at bug_001_test.py:2\n"
         )
-        orch._shell = lambda _r, _n, _c, _t="": StepResult(ok=False, detail=elsewhere)
+        orch._shell = lambda _r, _n, _c, _t="", **_kwargs: StepResult(ok=False, detail=elsewhere)
         self._calls(orch)
 
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
@@ -11241,7 +13692,7 @@ class TestTheReproductionIsReadableByTheRolesJudgedAgainstIt(unittest.TestCase):
             )
 
         orch._call = call
-        orch._shell = lambda _r, _n, _c, _t="": StepResult(ok=True, detail="1 passed")
+        orch._shell = lambda _r, _n, _c, _t="", **_kwargs: StepResult(ok=True, detail="1 passed")
 
         orch._attempt(
             run_id, ticket, "", "", "", repro=(self.REPRO, "AssertionError: x")
@@ -11265,7 +13716,7 @@ class TestTheReproductionIsReadableByTheRolesJudgedAgainstIt(unittest.TestCase):
             return Completion(text="ACCEPT", usage=Usage(), finish_reason="stop")
 
         orch._call = call
-        orch._shell = lambda _r, _n, _c, _t="": StepResult(ok=True, detail="")
+        orch._shell = lambda _r, _n, _c, _t="", **_kwargs: StepResult(ok=True, detail="")
 
         orch._attempt(run_id, plain, "", "", "")
 
@@ -11840,7 +14291,7 @@ class TestAProofIsWorthNothingWithoutItsFile(unittest.TestCase):
     def _reproduce_once(self, orch, root, run_id):
         """Get a real `reproduce` step recorded, the way a first cycle does."""
         failing = [True]
-        orch._shell = lambda _r, _n, _c, _t="": StepResult(
+        orch._shell = lambda _r, _n, _c, _t="", **_kwargs: StepResult(
             ok=not failing[0],
             detail="FAILED tests/bug_002_test.py::test_x\nassert 0 == 1\n"
             "tests/bug_002_test.py:2: in test_x\n"
@@ -11882,7 +14333,7 @@ class TestAProofIsWorthNothingWithoutItsFile(unittest.TestCase):
         orch, root, run_id = self._orch()
         self._reproduce_once(orch, root, run_id)
         orch.store.reset_tickets(run_id, ["BUG-002"])
-        orch._shell = lambda _r, _n, _c, _t="": StepResult(ok=True, detail="1 passed")
+        orch._shell = lambda _r, _n, _c, _t="", **_kwargs: StepResult(ok=True, detail="1 passed")
         seen = self._calls(orch)
 
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])

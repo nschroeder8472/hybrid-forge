@@ -36,13 +36,15 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, NamedTuple, Sequence
 
+from . import imports
+from . import toolchain
 from . import respec
 from . import evidence
 from .artifacts import ABANDONED_DIR, Artifacts, safe_name
 from .budget import BudgetGate, Wait
-from .config import ANY_LANGUAGE, Config, ConfigError
+from .config import ANY_LANGUAGE, REPO_ROOT, Config, ConfigError, Workspace
 from .failures import (
     blocks_naming,
     distill,
@@ -50,7 +52,9 @@ from .failures import (
     errors_naming,
     files_blamed,
     locations,
+    reroot,
     signatures,
+    test_count,
 )
 from .ingest import write_tickets
 from .memory import MemoryClient, MemoryRefused, MemoryUnavailable, ticket_query
@@ -250,6 +254,19 @@ def retries_key(run_id: int) -> str:
     return f"retries:{run_id}"
 
 
+class VerifyStep(NamedTuple):
+    """One verify command, and the build it belongs to.
+
+    A tuple because every call site iterates the plan and unpacks it; named
+    because `workspace` is the third element and a bare 3-tuple at six call
+    sites is how the wrong one gets passed to `_shell`.
+    """
+
+    name: str
+    command: str
+    workspace: Workspace
+
+
 @dataclass
 class StepResult:
     ok: bool
@@ -322,6 +339,15 @@ class Orchestrator:
         # handing it to the executor spends a model on an argument it wins.
         # See `_shell` and `environment_failure`.
         self._toolchain: tuple[str, str, str] | None = None
+        # How many tests each verify step reported before the current ticket's
+        # tester wrote anything, keyed by step name and re-taken per ticket. A
+        # suite that does not grow when a new test file is added is a suite
+        # that is not collecting it. See `_test_was_collected`.
+        self._baseline_counts: dict[str, int] = {}
+        # Whether this run has already said that its test command prints no
+        # count it can read. Once is information; once per ticket trains a
+        # reader to skip it.
+        self._count_unavailable = False
 
     # ------------------------------------------------------------------
     # Project memory
@@ -609,9 +635,28 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _shell(
-        self, run_id: int, name: str, command: str, ticket_id: str = ""
+        self,
+        run_id: int,
+        name: str,
+        command: str,
+        ticket_id: str = "",
+        workspace: Workspace | None = None,
     ) -> StepResult:
         """Run one of the project's own commands and record what it said.
+
+        `workspace` decides where it runs. A build's commands are written to be
+        run from inside it — `npm test` needs the directory holding its
+        `package.json`, `cargo test` the one holding its `Cargo.toml` — and
+        running them from the repository root either fails outright or, worse,
+        finds a different project's manifest and reports on that instead.
+
+        Its output is re-rooted before anything reads it, so a path the command
+        printed relative to its own directory is repo-relative by the time it
+        reaches `signatures`, `files_blamed`, the baseline comparison, the
+        stored step detail and the executor's prompt. Doing it here rather than
+        at each reader is what keeps the six of them agreeing; doing it at all
+        is what stops the `cwd` above from silently un-attributing every
+        failure in a subproject. See `failures.reroot`.
 
         `ticket_id` attributes the step to the ticket it was run *for*, and
         only the attempt's own verify steps pass it. Everything else here —
@@ -636,12 +681,13 @@ class Orchestrator:
         if not command.strip():
             return StepResult(ok=True, detail=f"no {name} command configured; skipped")
 
+        workspace = workspace or self.config.root_workspace
         step_id = self.store.start_step(run_id, ticket_id, name)
         try:
             result = subprocess.run(  # noqa: S602 - user-authored command from their own config
                 command,
                 shell=True,
-                cwd=self.config.root,
+                cwd=workspace.path(self.config.root),
                 capture_output=True,
                 text=True,
                 # A test suite that prints a non-ASCII character must not crash
@@ -657,7 +703,11 @@ class Orchestrator:
             self.store.end_step(step_id, "failed", f"{name} timed out after 1800s")
             return StepResult(ok=False, detail=f"{name} timed out")
 
-        output = f"{result.stdout}\n{result.stderr}".strip()
+        output = reroot(
+            f"{result.stdout}\n{result.stderr}".strip(),
+            workspace.prefix,
+            self.config.root,
+        )
         ok = result.returncode == 0
         self.store.end_step(step_id, "ok" if ok else "failed", output)
         return StepResult(ok=ok, detail=output)
@@ -730,53 +780,98 @@ class Orchestrator:
     # The verify steps, in the order a failure is cheapest to diagnose.
     _VERIFY_STEPS = ("lint", "typecheck", "test")
 
-    def _verify_plan(self) -> list[tuple[str, str]]:
-        """Every verify command to run, as `(step name, command)`.
+    def _verify_plan(self, ticket: Ticket | None = None) -> list[VerifyStep]:
+        """Every verify command to run, as `(step name, command, workspace)`.
 
-        One command per step assumed a repository is one language. With a map
-        there is one per language, and all of them run: verification stays
-        whole-project, which is what the baseline amnesty, the orphan sweep and
-        "you broke this, not the ticket before you" all rest on. A language
-        with no files in the tree is skipped — a JavaScript runner in a repo
-        that has no JavaScript yet has nothing to say, and running it would
-        fail on an empty match.
+        One command per step assumed a repository is one language, and then one
+        *build*. With a language map there is one command per language; with
+        workspaces there is one set per build, each run from its own root.
+
+        Within a workspace verification stays whole-workspace, which is what
+        the baseline amnesty, the orphan sweep and "you broke this, not the
+        ticket before you" all rest on. A language with no files under that
+        workspace is skipped — a JavaScript runner in a build that has no
+        JavaScript yet has nothing to say, and running it would fail on an
+        empty match.
+
+        `ticket` narrows the plan to the build its writable files belong to.
+        A ticket cannot break a build it cannot write to, and verifying it
+        against one is how a red Godot tree came to fail a TypeScript ticket
+        and vice versa. Cross-build breakage is still caught, by the sweeps
+        that pass no ticket: `_red_left_behind`, the run's opening check, and
+        `_finish`.
 
         Identical commands under two keys run once. A step with a single
-        command keeps its plain name, so a one-language project's step log and
-        dashboard read exactly as before; only a project that genuinely has two
-        gets `test[.js]`.
+        command keeps its plain name, so a one-language, one-build project's
+        step log and dashboard read exactly as before; only a project that
+        genuinely has two gets `test[.js]` or `test[path-forge]`.
         """
-        present = self._languages_present()
-        plan: list[tuple[str, str]] = []
-        for kind in self._VERIFY_STEPS:
-            commands = self.config.commands_for(kind)
-            wanted = {
-                suffix: command
-                for suffix, command in commands.items()
-                if suffix == ANY_LANGUAGE or suffix in present
-            }
-            seen: dict[str, str] = {}
-            for suffix, command in sorted(wanted.items()):
-                if command in seen.values():
-                    continue
-                seen[suffix] = command
-            for suffix, command in seen.items():
-                label = kind if len(seen) == 1 else f"{kind}[{suffix}]"
-                plan.append((label, command))
+        workspaces = self.config.workspaces
+        if ticket is not None:
+            workspaces = [self.config.workspace_for_ticket(ticket.allowed_files)]
+
+        plan: list[VerifyStep] = []
+        for workspace in workspaces:
+            present = self._languages_present(workspace)
+            for kind in self._VERIFY_STEPS:
+                commands = workspace.commands_for(kind)
+                wanted = {
+                    suffix: command
+                    for suffix, command in commands.items()
+                    if suffix == ANY_LANGUAGE or suffix in present
+                }
+                seen: dict[str, str] = {}
+                for suffix, command in sorted(wanted.items()):
+                    if command in seen.values():
+                        continue
+                    seen[suffix] = command
+                for suffix, command in seen.items():
+                    plan.append(
+                        VerifyStep(
+                            name=self._step_label(kind, suffix, len(seen), workspace),
+                            command=command,
+                            workspace=workspace,
+                        )
+                    )
         return plan
 
-    def _languages_present(self) -> set[str]:
-        """Extensions of the source files this project actually has.
+    def _step_label(
+        self, kind: str, suffix: str, languages: int, workspace: Workspace
+    ) -> str:
+        """`test`, `test[.js]`, `test[path-forge]`, `test[path-forge:.js]`.
+
+        Every qualifier is omitted when there is nothing to distinguish, so a
+        project with one build and one language logs the bare step name it
+        always logged. Step names are compared across a run — the baseline
+        keys by them — so they must be stable, not merely readable.
+        """
+        parts: list[str] = []
+        if len(self.config.workspaces) > 1 and not workspace.is_repo_root:
+            parts.append(workspace.name)
+        if languages > 1:
+            parts.append(suffix)
+        return f"{kind}[{':'.join(parts)}]" if parts else kind
+
+    def _languages_present(self, workspace: Workspace | None = None) -> set[str]:
+        """Extensions of the source files this build actually has.
 
         Read per call rather than cached: a ticket that writes the project's
         first `.js` file has just made the JavaScript runner relevant, and the
         verify step that follows it is the first place that matters.
+
+        Scoped to one workspace when given one. A build's runner is relevant
+        because of the files *it* owns; counting a sibling build's files is how
+        a language map ends up running a suite against an empty match.
         """
-        return {
-            suffix
-            for path in evidence.repo_files(self.config.root, limit=4000)
-            if (suffix := Path(path).suffix.lower())
-        }
+        present: set[str] = set()
+        for path in evidence.repo_files(self.config.root, limit=4000):
+            suffix = Path(path).suffix.lower()
+            if not suffix:
+                continue
+            if workspace is not None and self.config.workspace_for(path) != workspace:
+                continue
+            present.add(suffix)
+        return present
 
     @staticmethod
     def _fence_guidance(truncated: list[str], written: Sequence[str] = ()) -> str:
@@ -1157,11 +1252,21 @@ class Orchestrator:
         them.
         """
         known: dict[str, set[str]] = {}
-        for name, command in self._verify_plan():
-            result = self._shell(run_id, f"baseline-{name}", command)
+        self._baseline_counts = {}
+        for name, command, workspace in self._verify_plan(ticket):
+            result = self._shell(
+                run_id, f"baseline-{name}", command, workspace=workspace
+            )
             # Before anything is attributed. A command that cannot start is the
             # one failure the baseline must not treat as a fact about the code.
             self._note_toolchain(name, command, result)
+            # Captured before the amnesty logic and whether or not the step
+            # passed, because it is not about failures at all: it is how many
+            # tests this project had before the tester wrote one. See
+            # `_test_was_collected`.
+            counted = test_count(result.detail)
+            if counted is not None:
+                self._baseline_counts[name] = counted
             if result.ok:
                 continue
             found = signatures(result.detail)
@@ -1246,6 +1351,23 @@ class Orchestrator:
             return self._stop_for_toolchain(run_id)
         if red:
             return self._stop_for_red_baseline(run_id, red)
+
+        # After the tree is known green, so a red the canary did not cause is
+        # already gone. Before the first ticket, because what it measures — does
+        # this build's test command read this language, and can a failure in it
+        # be attributed — is true or false before any work is delegated, and
+        # every ticket in the backlog depends on the answer.
+        uncovered = self._canary(run_id)
+        if uncovered:
+            return self._stop_for_canary(run_id, uncovered)
+
+        # Said once, at the start, and never gated on. A language whose test
+        # command does not type-check it has a hole the size of every file no
+        # test imports, and the run should say so while there is still time to
+        # close it — but a project that has decided against a type checker has
+        # decided, and blocking would be arguing with it.
+        self._note_typecheck_gaps(run_id)
+        self._note_manifest_gaps(run_id)
 
         # Before the first ticket: a human may have requeued something already
         # green since the last run, and whatever was built on top of it was
@@ -1566,6 +1688,375 @@ class Orchestrator:
                 )
         return [name for name, report in checked.items() if report.startswith("FAIL")]
 
+    # What the canary contains. Invalid in every language this loop meets, so
+    # no per-language template has to be kept correct — `@@@` opens no
+    # construct in Python, Ruby, Rust, Go, Java, C#, JavaScript or TypeScript,
+    # and a runner that reads the file cannot report success about it.
+    #
+    # It says what it is because it can outlive the run that wrote it. The
+    # delete is in a `finally`, but a killed process, a full disk and a
+    # read-only tree all end with this on disk, and whoever finds it is owed an
+    # explanation rather than a mystery that breaks their build.
+    # Pure ASCII, and not a quote character anywhere in it. The first draft
+    # wrote ordinary prose, and CPython reported `unterminated string literal`
+    # at the apostrophe in "project's" — an error about line 3 rather than
+    # about the `@@@` on line 1, whose message said nothing about what the
+    # check is. The em-dash came back as U+FFFD through the subprocess decode
+    # on top of it. A file where every line is invalid keeps the diagnostic
+    # about the file.
+    _CANARY_BODY = (
+        "@@@ hybrid-forge preflight canary @@@\n"
+        "@@@ This file is deliberately unparseable. forge writes it, runs this\n"
+        "@@@ project test command over it, and deletes it, to check that the\n"
+        "@@@ command really reads this language instead of ignoring it.\n"
+        "@@@ If you are reading this, a run was interrupted before the delete.\n"
+        "@@@ Deleting it is safe and is the right thing to do.\n"
+        "@@@\n"
+    )
+
+    # The stem every canary is named with, in the two spellings `_test_stem`
+    # draws: a file whose name has to match a public type cannot use
+    # underscores, and javac rejects it before reading a line of the contents —
+    # which is a red naming the file, and would pass this check without the
+    # suite ever having run.
+    _CANARY_STEM = "forge_preflight_canary_test"
+    _CANARY_TYPE_STEM = "ForgePreflightCanaryTest"
+
+    def _canary(self, run_id: int) -> list[str]:
+        """Prove each build can check the languages this backlog will write.
+
+        Returns the reasons the run must not start, empty when every build
+        checks out.
+
+        Coverage was inferred from the *text* of a command — `_RUNNER_LANGUAGES`
+        in config, `_RUNNER_SUFFIXES` here — and those two tables disagree with
+        each other, know nothing of Godot, Bazel, Meson, `ctest`, `dune`, `mix`
+        or `zig build test`, and answer "covered" for anything they do not
+        recognise. A repository shipped fifteen green tickets over 4,000 lines
+        of TypeScript on the strength of that answer: the command was a gdUnit4
+        launcher, it globbed `tests/`, it ignored every `.ts` file in it, and it
+        exited 0 fifteen times.
+
+        A measurement needs to know none of that. Write a file that cannot
+        parse, run the command, read the exit code. A command that stays green
+        over a test that cannot pass does not run that language — a fact about
+        this machine and this configuration, not a guess about a string.
+
+        The second half is attribution, and it is the half that is easy to
+        forget: the failure must also *name* the file. Verification that goes
+        red without saying where is verification the amnesty cannot compare,
+        `_baseline_failures` excuses as unattributable, and every ticket then
+        passes a step that asserted nothing. Since `_shell` began re-rooting a
+        workspace's output that is a property of each build separately, and the
+        cheapest moment to find it wrong is before the first ticket.
+        """
+        if not self.config.loop.preflight_canary:
+            return []
+
+        problems: list[str] = []
+        for workspace, suffix in self._canary_languages(run_id):
+            problem = self._canary_one(run_id, workspace, suffix)
+            if problem:
+                problems.append(problem)
+        return problems
+
+    def _note_manifest_gaps(self, run_id: int) -> None:
+        """Warn when this backlog writes a language its build cannot build.
+
+        Said at ingest first, where fixing it costs one more ticket. Repeated
+        here because a run is often started long after the backlog was filed,
+        by somebody who never saw that output — and because a repository moves:
+        the ticket that was going to create the `package.json` may have been
+        dropped since.
+
+        Never gated, for the reason `toolchain.manifest_gaps` gives.
+        """
+        pending = [
+            ticket
+            for ticket in self.store.list_tickets(run_id)
+            if ticket.status not in self._GAVE_UP and ticket.status != TICKET_DONE
+        ]
+        for gap in toolchain.manifest_gaps(self.config, pending):
+            self.store.log(
+                run_id,
+                f"{gap} Add the build file as a ticket of its own, before the "
+                f"ones that need it.",
+                level="warn",
+                kind="verify",
+                data={"gap": gap},
+            )
+
+    def _note_typecheck_gaps(self, run_id: int) -> None:
+        """Warn when this backlog writes a language nothing type-checks.
+
+        `cargo test` and `go test` compile the project before running any of
+        it, so a Rust or Go backlog with no `typecheck` entry is missing
+        nothing. `npm test` and `pytest` load the modules their tests reach and
+        nothing else, so a file no test imports is parsed by nothing at all —
+        which is how a backlog of sixteen imports of modules that did not exist
+        passed every step it was put through. `tsc --noEmit` would have found
+        all of them in about two seconds.
+
+        Scoped to the backlog for the same reason the canary is: the languages
+        the tickets declare they will write are the ones whose verification has
+        to mean something, and a stray script in a language nobody is touching
+        is not worth a line of anyone's attention.
+        """
+        gaps: dict[tuple[str, str], tuple[str, ...]] = {}
+        for ticket in self.store.list_tickets(run_id):
+            if ticket.status in self._GAVE_UP or ticket.status == TICKET_DONE:
+                continue
+            for path in ticket.allowed_files:
+                if any(character in path for character in "*?["):
+                    continue
+                suffix = Path(path).suffix.lower()
+                workspace = self.config.workspace_for(path)
+                if workspace is None:
+                    continue
+                suggested = workspace.unchecked(suffix)
+                if suggested:
+                    gaps.setdefault((workspace.root, suffix), suggested)
+
+        for (root, suffix), suggested in sorted(gaps.items()):
+            where = "" if root == REPO_ROOT else f" in {root}"
+            self.store.log(
+                run_id,
+                f"Nothing type-checks {suffix}{where}. Its test command loads "
+                f"the modules its tests reach and nothing else, so a file no "
+                f"test imports is parsed by nothing here — which is how a "
+                f"backlog of imports naming modules that did not exist once "
+                f"passed every step it was put through. Set one up with "
+                f"`forge toolchain --kind typecheck --language {suffix}` "
+                f"(`{suggested[0]}`), or say it needs none with `--skip`.",
+                level="warn",
+                kind="verify",
+                data={"suffix": suffix, "workspace": root, "suggested": suggested[0]},
+            )
+
+    def _canary_languages(self, run_id: int) -> list[tuple[Workspace, str]]:
+        """Every `(build, language)` this backlog is about to write.
+
+        Read off the backlog, not off the tree, and the difference is the whole
+        usability of the gate. A Godot repository with one Python helper script
+        beside its `project.godot` has `.py` present, nothing that runs it, and
+        no ticket that cares — and a canary over the tree blocks the run on it.
+        That is the "stalling a backlog over build.sh" failure
+        `LANGUAGE-COVERAGE.md` names, with a louder stop.
+
+        What the tickets declare they will write is the set that matters: those
+        are the files whose verification has to mean something, and a language
+        nothing in this run touches cannot misreport anything about it.
+
+        Three kinds of pair are dropped, each for a reason that belongs
+        elsewhere. A file no workspace owns is phase 4's gate. A language with
+        no command at all is also phase 4's — there is nothing here to measure,
+        and reporting the same gap from the place with less to say about it
+        helps nobody. A language declared as needing no runner is a decision on
+        the record.
+        """
+        found: dict[tuple[str, str], tuple[Workspace, str]] = {}
+        for ticket in self.store.list_tickets(run_id):
+            if ticket.status in self._GAVE_UP or ticket.status == TICKET_DONE:
+                continue
+            for path in ticket.allowed_files:
+                if any(character in path for character in "*?["):
+                    continue
+                suffix = Path(path).suffix.lower()
+                if suffix not in self._CODE_SUFFIXES:
+                    continue
+                if suffix in self._UNTESTABLE_SUFFIXES:
+                    continue
+                workspace = self.config.workspace_for(path)
+                if workspace is None:
+                    continue
+                if not workspace.covers("test", suffix):
+                    continue
+                if workspace.exempt("test", suffix):
+                    continue
+                found.setdefault((workspace.root, suffix), (workspace, suffix))
+        return [found[key] for key in sorted(found)]
+
+    def _canary_path(self, workspace: Workspace, suffix: str) -> str:
+        """Where a canary of this language goes, repo-relative.
+
+        Beside an existing test of the same language when this build has one:
+        that directory is collected by definition, and a canary the runner
+        never looks at proves nothing about the runner. `_TEST_ROOTS` decides
+        otherwise, for the reason `_test_target` uses it — `tests/` is a fine
+        guess in most ecosystems and an invisible one in the JVM's, where a
+        file outside the compiled source set is not a failing test but an
+        absent one. Absent is exactly what is being measured, so guessing into
+        it would make every JVM build look uncovered.
+        """
+        directory = ""
+        example = self._example_test([], suffix, workspace=workspace)
+        if example:
+            directory = Path(example[0]).parent.as_posix()
+            if not workspace.is_repo_root:
+                directory = directory[len(workspace.root) + 1 :]
+        if not directory:
+            directory = self._TEST_ROOTS.get(suffix, "tests")
+
+        stem = (
+            self._CANARY_TYPE_STEM
+            if suffix in self._TYPE_NAMED_SUFFIXES
+            else self._CANARY_STEM
+        )
+        prefix = "" if directory in ("", ".") else f"{directory}/"
+        return f"{workspace.prefix}{prefix}{stem}{suffix}"
+
+    def _canary_one(self, run_id: int, workspace: Workspace, suffix: str) -> str:
+        """One build, one language. Returns why the run must not start, or "".
+
+        Three outcomes, and the third needs a second run to tell apart:
+
+        - **green** — the command read a file that cannot parse and reported
+          success. It does not run this language.
+        - **red, naming the canary** — it runs the language, and its failures
+          can be attributed. This is the pass.
+        - **red, not naming it** — either the command is red for its own
+          reasons, or it runs the language and cannot say where. Taking the
+          canary back out and running again separates them: still red is the
+          tree's state and `requireGreenBaseline`'s to gate, newly green is a
+          build whose failures no ticket can ever be blamed for.
+        """
+        path = self._canary_path(workspace, suffix)
+        command = workspace.command_for("test", path)
+        if not command:
+            return ""
+
+        absolute = self.config.root / path
+        if absolute.exists():
+            if not self._is_stale_canary(absolute):
+                # Never write over somebody's file to run a check about the
+                # build.
+                self.store.log(
+                    run_id,
+                    f"canary for {suffix} skipped: {path} already exists and is "
+                    f"not one of ours.",
+                    level="warn",
+                    kind="verify",
+                )
+                return ""
+            # A previous run was killed between writing and deleting. Clearing
+            # it is both the fix and the precondition for measuring anything.
+            self._remove_canary(run_id, absolute)
+
+        label = f"canary[{suffix}]"
+        if len(self.config.workspaces) > 1 and not workspace.is_repo_root:
+            label = f"canary[{workspace.name}:{suffix}]"
+
+        try:
+            absolute.parent.mkdir(parents=True, exist_ok=True)
+            absolute.write_text(self._CANARY_BODY, encoding="utf-8")
+        except OSError as exc:
+            self.store.log(
+                run_id,
+                f"canary for {suffix} skipped: cannot write {path} ({exc}).",
+                level="warn",
+                kind="verify",
+            )
+            return ""
+
+        try:
+            result = self._shell(run_id, label, command, workspace=workspace)
+        finally:
+            self._remove_canary(run_id, absolute)
+
+        if result.ok:
+            return (
+                f"`{command}` stayed green over {path}, a file that cannot "
+                f"parse. It does not run {suffix}. Every {suffix} ticket in "
+                f"this backlog would be checked by reading a diff against "
+                f"criteria a text search can satisfy, which is how a run "
+                f"finishes green having compiled nothing.\n"
+                f"  Give it a runner:   forge toolchain --language {suffix}\n"
+                f"  Or say it needs none: forge toolchain --language {suffix} --skip"
+            )
+
+        if self._names_the_canary(result.detail, path):
+            return ""
+
+        confirm = self._shell(run_id, f"{label}-control", command, workspace=workspace)
+        if not confirm.ok:
+            self.store.log(
+                run_id,
+                f"canary for {suffix} in {workspace.root} was inconclusive: "
+                f"`{command}` is red with the canary and red without it. That "
+                f"is the tree's state rather than an answer about {suffix}, and "
+                f"`requireGreenBaseline` is the gate for it.",
+                level="warn",
+                kind="verify",
+                data={"step": label, "suffix": suffix, "workspace": workspace.root},
+            )
+            return ""
+
+        return (
+            f"`{command}` failed over {path} without naming it. It reads "
+            f"{suffix}, but nothing in its output can be attributed to a file, "
+            f"so a failure in this build is excused as somebody else's and "
+            f"every ticket passes a step that asserted nothing about it.\n"
+            f"  What it said:\n{distill(result.detail, limit=800)}"
+        )
+
+    @staticmethod
+    def _names_the_canary(output: str, path: str) -> bool:
+        """Whether a failure said which file it was about.
+
+        A plain textual mention, not `errors_naming`. That reads locations out
+        of *diagnostic blocks*, which is the right question for a failing
+        assertion and the wrong one here: a file that will not parse is
+        reported by a syntax error, an import error or a collection error, and
+        those come in shapes no block parser was written for. `compileall`
+        prints `*** Error compiling 'tests\\x.py'...` and `File "tests\\x.py",
+        line 3`, and `errors_naming` found neither — so a runner that had
+        plainly named the file twice was reported as unable to attribute.
+
+        The claim being checked is only ever "the command told us which file",
+        so that is what is asked. Both separators, plus the bare filename for
+        runners that print no directory — the same fallback `errors_naming`
+        makes, and for the same reason.
+        """
+        if not path or not output:
+            return False
+        text = output.lower()
+        forward = path.replace("\\", "/").lower()
+        candidates = {forward, forward.replace("/", "\\"), forward.replace("/", "\\\\")}
+        if any(candidate in text for candidate in candidates):
+            return True
+        base = forward.rsplit("/", 1)[-1]
+        return bool(base) and base in text
+
+    @classmethod
+    def _is_stale_canary(cls, absolute: Path) -> bool:
+        """Whether this file is a canary a previous run failed to clean up."""
+        try:
+            return absolute.read_text(encoding="utf-8", errors="replace").startswith(
+                "@@@ hybrid-forge preflight canary @@@"
+            )
+        except OSError:
+            return False
+
+    def _remove_canary(self, run_id: int, absolute: Path) -> None:
+        """Take the canary back out, and say so loudly if it will not go.
+
+        A file that cannot parse, left in the tree, fails every verify step for
+        the rest of the run — and with `autoCommit` on it would be committed.
+        Nothing here raises: the run is about to be told whether it may start,
+        and losing that answer to a failed unlink is the wrong trade.
+        """
+        try:
+            absolute.unlink(missing_ok=True)
+        except OSError as exc:
+            self.store.log(
+                run_id,
+                f"Could not delete the preflight canary {absolute}: {exc}. "
+                f"Delete it by hand — it is deliberately unparseable and will "
+                f"fail every verify step while it is there.",
+                level="error",
+                kind="verify",
+            )
+
     def _owners_in_backlog(
         self, run_id: int, paths: Sequence[str]
     ) -> dict[str, str]:
@@ -1640,8 +2131,10 @@ class Orchestrator:
 
         failed: list[str] = []
         output: list[str] = []
-        for name, command in self._verify_plan():
-            result = self._shell(run_id, f"start-{name}", command)
+        for name, command, workspace in self._verify_plan():
+            result = self._shell(
+                run_id, f"start-{name}", command, workspace=workspace
+            )
             self._note_toolchain(name, command, result)
             if self._toolchain:
                 return ""
@@ -1727,6 +2220,33 @@ class Orchestrator:
         )
         return RUN_BLOCKED
 
+    def _stop_for_canary(self, run_id: int, problems: list[str]) -> str:
+        """End the run because a build cannot check the work it would be given.
+
+        `blocked`, not `failed`: nothing is wrong with the backlog or the
+        machine. A language this project writes has no runner that reads it, or
+        has one whose failures cannot be attributed, and either way the tickets
+        in it would be graded by reading a diff. That is a configuration
+        decision waiting to be made, and the run stops in front of it with
+        nothing spent.
+        """
+        self.store.set_run_status(
+            run_id, RUN_BLOCKED, f"{len(problems)} build(s) cannot verify their own language"
+        )
+        self.store.log(
+            run_id,
+            "Cannot start — verification here would prove nothing:\n\n"
+            + "\n\n".join(problems)
+            + "\n\nNothing has been delegated and nothing has been spent. "
+            "`forge doctor` shows what runs against each language. To start "
+            "anyway and accept that these languages are checked by reading, "
+            "set `loop.preflightCanary` to false.",
+            level="error",
+            kind="lifecycle",
+            data={"problems": problems},
+        )
+        return RUN_BLOCKED
+
     def _finish(self, run_id: int) -> str:
         # Order matters here. Parking first turns "pending forever" into a
         # reported skip, so the counts below describe the run a human has to
@@ -1758,8 +2278,10 @@ class Orchestrator:
         # that nobody owns a breakage nobody introduced, so the run has to
         # check for one itself rather than report a green backlog over a red
         # build.
-        for name, command in self._verify_plan():
-            result = self._shell(run_id, f"final-{name}", command)
+        for name, command, workspace in self._verify_plan():
+            result = self._shell(
+                run_id, f"final-{name}", command, workspace=workspace
+            )
             # The last place a broken toolchain can appear, and the one where
             # mislabelling it is most misleading: every ticket is green, so
             # "backlog complete but typecheck still fails" reads as work left
@@ -2151,6 +2673,21 @@ class Orchestrator:
         # Before anything is spent. A ticket in a language nothing runs cannot
         # be checked, and the loop's answer to that used to be to run it
         # anyway and report the skip as routine.
+        #
+        # Ownership first, because it is the wider question: a file no build
+        # owns has no command of any kind, and reporting it as a missing
+        # *runner* would send a person to `forge toolchain` for a problem no
+        # command can fix.
+        unowned = self._unowned_files(ticket)
+        if unowned:
+            self._park(run_id, ticket, self._no_workspace_note(ticket, unowned))
+            return
+
+        spanning = self._spanning_workspaces(ticket)
+        if len(spanning) > 1:
+            self._park(run_id, ticket, self._spanning_note(ticket, spanning))
+            return
+
         uncovered = self._uncovered_languages(ticket)
         if uncovered:
             self._park(run_id, ticket, self._no_runner_note(ticket, uncovered))
@@ -2963,13 +3500,72 @@ class Orchestrator:
                 continue
 
             if len(text) > self._SOURCE_LIMIT:
-                text = (
-                    text[: self._SOURCE_LIMIT]
-                    + f"\n[truncated at {self._SOURCE_LIMIT} characters — this "
-                    "file is reference only, do not return it]\n"
-                )
+                text = self._trim_reference(path, text)
             sources[path] = text
         return sources, oversized
+
+    # Extensions whose content is prose, where an excerpt with a marked gap in
+    # it is legible. Code is not on this list on purpose: a source file spliced
+    # from two ends reads as a whole file with functions that do not exist, and
+    # the executor is being asked to write against it.
+    _PROSE_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".txt", ".adoc"})
+
+    # Lines a specification cannot afford to lose: a table row, the heading
+    # above one, and the headings that say a section is binding. Everything a
+    # summary throws away first is on this list.
+    _NORMATIVE = re.compile(
+        r"\|.*\||^\s{0,3}#{1,6}\s|"
+        r"\b(normative|legend|alphabet|contract|grammar|must|exactly|verbatim)\b",
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    def _trim_reference(self, path: str, text: str) -> str:
+        """Cut an over-long reference down, keeping the part that cannot be lost.
+
+        Head truncation is right for code and wrong for a specification. The
+        binding part of a spec — the legend, the table of error strings, the
+        grammar — sits wherever its author put it, and a document whose
+        section 2 is normative survives a head cut only by luck. One did: the
+        run this exists for lost 16,000 characters off the end of a 40,000
+        character spec, and the eighteen-row table it needed happened to be at
+        character 2,888.
+
+        So a prose file keeps its head and then every table row, heading and
+        binding sentence from the remainder, with the gap marked. This is the
+        same shape `toolchain.excerpt` uses on a README, for the same reason,
+        against a different definition of the interesting line.
+
+        Anything that is not prose is head-truncated exactly as before.
+        """
+        limit = self._SOURCE_LIMIT
+        note = (
+            f"\n[truncated at {limit} characters — this file is reference "
+            f"only, do not return it]\n"
+        )
+        if Path(path).suffix.lower() not in self._PROSE_SUFFIXES:
+            return text[:limit] + note
+
+        head_size = max(limit // 2, 1)
+        head, rest = text[:head_size], text[head_size:]
+        kept: list[str] = []
+        budget = limit - head_size
+        for line in rest.splitlines():
+            if budget <= 0:
+                break
+            if not self._NORMATIVE.search(line):
+                continue
+            candidate = line[:budget]
+            kept.append(candidate)
+            budget -= len(candidate) + 1
+        if not kept:
+            return text[:limit] + note
+        return (
+            head
+            + "\n\n[… omitted; the tables, headings and binding lines from the "
+            "rest of this document follow, out of context …]\n\n"
+            + "\n".join(kept)
+            + note
+        )
 
     def _attempt(
         self,
@@ -3220,6 +3816,13 @@ class Orchestrator:
                 else ""
             )
 
+            # Before the truncation check, because a file cut short is a
+            # different complaint and this one is cheaper to act on: an import
+            # naming nothing is a fact about the tree, not about the reply.
+            dangling = self._dangling_imports(run_id, ticket, written)
+            if dangling:
+                return StepResult(ok=False, detail=dangling)
+
         # The clean files are on disk now, so the next attempt only has to send
         # the ones that were cut short. Stopping here rather than carrying on to
         # review: the response is known to be incomplete, and asking a reviewer
@@ -3231,6 +3834,7 @@ class Orchestrator:
             )
 
         # --- TESTS ---------------------------------------------------
+        authored_now = False
         # The criteria come from the ticket, never from the executor's own
         # suggestion. A model that writes both the code and the assertion it is
         # judged against will encode its bugs as passing tests.
@@ -3248,7 +3852,9 @@ class Orchestrator:
             suffix, example = "", None
         else:
             suffix = self._suite_suffix(written, exclude=written)
-            example = self._example_test(written, suffix)
+            example = self._example_test(
+                written, suffix, workspace=self._ticket_workspace(ticket)
+            )
             test_path, no_tests_because = self._test_target(
                 ticket, written, example, suffix
             )
@@ -3266,7 +3872,9 @@ class Orchestrator:
             # fixed path makes that the common case rather than the rare one.
             # Handing it back as "the convention this repo follows" would
             # launder the previous attempt's mistakes into a rule.
-            example = self._example_test(written + [test_path], suffix)
+            example = self._example_test(
+                written + [test_path], suffix, workspace=self._ticket_workspace(ticket)
+            )
         if repro is not None:
             # Counted as covered whatever its criteria say: a bug ticket has a
             # test that failed and then passed, which is the strongest coverage
@@ -3291,6 +3899,12 @@ class Orchestrator:
         if ticket.criteria and test_path and repro is None:
             step_id = self.store.start_step(run_id, ticket.ticket_id, "tests")
             existed = (self.config.root / test_path).exists()
+            # Whether the suite is *supposed* to have grown this attempt, which
+            # is the only condition under which an unchanged test count means
+            # anything. On a retry the previous attempt's file is already on
+            # disk and already in the baseline, so the count stays where it was
+            # and is entirely correct to.
+            authored_now = not existed
             try:
                 rejected_bindings: list[str] = []
                 for remaining in (1, 0):
@@ -3431,8 +4045,10 @@ class Orchestrator:
         proved: list[str] = []
         excused: list[str] = []
         excused_output = ""
-        for name, command in self._verify_plan():
-            result = self._shell(run_id, name, command, ticket.ticket_id)
+        for name, command, workspace in self._verify_plan(ticket):
+            result = self._shell(
+                run_id, name, command, ticket.ticket_id, workspace=workspace
+            )
             # Checked here too, not only at the baseline: `baselineVerify` can
             # be off, and a toolchain can break mid-run when a ticket edits the
             # file that configures it.
@@ -3460,6 +4076,11 @@ class Orchestrator:
             )
             if result.ok:
                 proved.append(name)
+                uncollected = self._test_was_collected(
+                    run_id, ticket, name, test_path, authored_now, result.detail
+                )
+                if uncollected:
+                    return StepResult(ok=False, detail=uncollected)
                 continue
 
             # Everything this step is complaining about was already broken when
@@ -3845,7 +4466,10 @@ class Orchestrator:
         return bool(cls._SNAKE_TEST.search(stem) or cls._CAMEL_TEST.search(stem))
 
     def _example_test(
-        self, exclude: list[str], suffix: str = ""
+        self,
+        exclude: list[str],
+        suffix: str = "",
+        workspace: Workspace | None = None,
     ) -> tuple[str, str] | None:
         """An existing test file for the tester to imitate, if the repo has one.
 
@@ -3861,6 +4485,13 @@ class Orchestrator:
         Files this ticket just wrote are excluded — handing back the tester's
         own previous attempt would launder a wrong guess into a convention. So
         are generated directories and non-source extensions.
+
+        `workspace` narrows it to one build. Framework is a hard constraint,
+        and it is a constraint *per build*: a subproject with its own
+        `package.json` has its own runner, its own layout and its own
+        conventions, and the repository root's suite is not an example of them.
+        Showing a ticket the wrong one produces a test file the build that owns
+        it never collects, which is not a failing test but an invisible one.
         """
         written = {p.replace("\\", "/") for p in exclude}
         for pattern in self._TEST_GLOBS:
@@ -3871,6 +4502,8 @@ class Orchestrator:
                     continue
                 relative = path.relative_to(self.config.root).as_posix()
                 if relative in written or not self._is_test_path(relative):
+                    continue
+                if workspace is not None and self.config.workspace_for(relative) != workspace:
                     continue
                 if self._IGNORED_DIRS.intersection(Path(relative).parts[:-1]):
                     continue
@@ -4128,9 +4761,211 @@ class Orchestrator:
             # outside it is not a failing test but an invisible one. That is how
             # a whole run's tester output came to be written, never compiled,
             # and never run, with every ticket passing the suite that excluded it.
-            directory = self._TEST_ROOTS.get(suffix, "tests")
+            #
+            # Prefixed with the ticket's own build for the same reason one step
+            # out: `tests/` at the repository root is not collected by a
+            # subproject's runner, and a test file the owning build never looks
+            # at is invisible in exactly the same way.
+            directory = (
+                f"{self._ticket_workspace(ticket).prefix}"
+                f"{self._TEST_ROOTS.get(suffix, 'tests')}"
+            )
         prefix = "" if directory in ("", ".") else f"{directory}/"
         return f"{prefix}{self._test_stem(ticket, suffix)}{suffix}", ""
+
+    def _ticket_workspace(self, ticket: Ticket) -> Workspace:
+        """The build a ticket's writable files belong to.
+
+        Spelled once because five places ask it, and a ticket answered
+        differently in two of them writes its test into a directory its own
+        verify step does not collect.
+        """
+        return self.config.workspace_for_ticket(ticket.allowed_files)
+
+    def _dangling_imports(
+        self, run_id: int, ticket: Ticket, written: Sequence[str]
+    ) -> str:
+        """What to tell an executor whose imports point at nothing, or "".
+
+        The cheapest check in the loop and the one that would have caught the
+        worst run: sixteen imports across eight invented module paths, every
+        one of them a shared module the ticket had been told to use and was not
+        allowed to create, and no ticket in the backlog owning any of them. The
+        apply step succeeded fifteen times, the reviewer read fifteen diffs
+        that looked right, and the backlog finished `done` over 4,000 lines
+        that had never been compiled.
+
+        A module another ticket will write is not a miss. That is a declared
+        future file, and failing an attempt over it would make a correct plan
+        unrunnable — a ticket writing the caller before the callee is ordinary,
+        and `needs` is what sequences them. It is worth *saying* when the
+        sequencing has not been declared, because a caller built against a
+        callee that has not been written yet is verified against nothing until
+        it is.
+
+        Returned as executor guidance rather than a park. The import may be a
+        typo the next attempt fixes, and where it is not, the executor has a
+        `BLOCKED:` protocol for asking for the file — which is the right
+        request and one a human can act on. Exhausting the attempts parks it
+        the ordinary way.
+        """
+        backlog = self.store.list_tickets(run_id)
+        owned: dict[str, str] = {}
+        for other in backlog:
+            for path in other.allowed_files:
+                if not any(character in path for character in "*?["):
+                    owned[normalize_path(path)] = other.ticket_id
+
+        misses = imports.unresolved(self.config.root, written, known=owned)
+        if not misses:
+            self._note_undeclared_dependencies(run_id, ticket, written, owned, backlog)
+            return ""
+
+        listing = "\n".join(f"  {path} imports {target!r}" for path, target in misses)
+        scope = ", ".join(ticket.allowed_files) or "(none)"
+        return (
+            f"These imports resolve to nothing. No file on disk matches them, "
+            f"and no ticket in this backlog is going to create one:\n"
+            f"{listing}\n\n"
+            f"Nothing here can load this code, so nothing can check it — a "
+            f"suite that cannot import a module reports no failures about it.\n\n"
+            f"Either point them at something that exists, or, if the module "
+            f"genuinely needs to be written and you may not write it, reply "
+            f"with BLOCKED: and name the file you need added. Your scope is: "
+            f"{scope}."
+        )
+
+    def _note_undeclared_dependencies(
+        self,
+        run_id: int,
+        ticket: Ticket,
+        written: Sequence[str],
+        owned: dict[str, str],
+        backlog: Sequence[Ticket],
+    ) -> None:
+        """Log imports satisfied only by a ticket this one does not wait for.
+
+        Not a failure. The file is coming and the plan may well be right — but
+        until it arrives this ticket is verified against a module that does not
+        exist, and `needs` is where that ordering was supposed to be written
+        down. A backlog of fifteen tickets with no edges between them was the
+        shape of the run this check comes from.
+        """
+        done = {
+            other.ticket_id
+            for other in backlog
+            if other.status == TICKET_DONE
+        }
+        pending: dict[str, str] = {}
+        for path in written:
+            relative = str(path).replace("\\", "/")
+            try:
+                text = (self.config.root / relative).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                continue
+            for target in imports.targets(relative, text):
+                for option in imports.candidates(relative, target):
+                    if not option or (self.config.root / option).exists():
+                        continue
+                    author = owned.get(normalize_path(option))
+                    if author and author != ticket.ticket_id and author not in done:
+                        pending.setdefault(option, author)
+
+        undeclared = {
+            path: author
+            for path, author in pending.items()
+            if author not in ticket.needs
+        }
+        if not undeclared:
+            return
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: imports {', '.join(sorted(undeclared))}, which "
+            f"{', '.join(sorted(set(undeclared.values())))} has yet to write and "
+            f"this ticket does not wait for. It is verified against a module "
+            f"that is not there until then.",
+            level="warn",
+            kind="scope",
+            data={"undeclared": undeclared},
+        )
+
+    def _test_was_collected(
+        self,
+        run_id: int,
+        ticket: Ticket,
+        step: str,
+        test_path: str,
+        authored_now: bool,
+        output: str,
+    ) -> str:
+        """Why this step's green says nothing about the test just written, or "".
+
+        A green from a command whose output never mentions the file is not
+        evidence about that file. One run recorded fifteen of them: the tester
+        wrote `node:test` suites into a directory a gdUnit4 launcher globbed
+        and ignored, the launcher exited 0 every time, and every ticket was
+        marked verified by a command that had read none of its tests.
+
+        The canary closed most of that at preflight — it proves the command
+        reads the language at the place `_test_target` puts files. What it
+        cannot prove is that *this* file was collected, because a planner may
+        designate a test path of its own that sits somewhere the runner never
+        looks. That is what this checks, and only that.
+
+        Three answers, and the third is the one that keeps it honest:
+
+        - **The output names the file.** Collected. Most runners print the file
+          they are running, and this is the ordinary case.
+        - **The suite did not grow.** The tester wrote a file that did not
+          exist, the runner reported a count before and after, and the number
+          is the same. Nothing else explains that: the file is not being
+          collected.
+        - **No count either way.** `go test` prints no number at all, and a
+          runner this does not recognise prints one it cannot read. "Cannot
+          tell" is a real answer and is reported as one — reading it as "fine"
+          is the failure being fixed, and reading it as "broken" would fail
+          every Go project in existence.
+        """
+        if not test_path or not authored_now:
+            return ""
+        if self._names_the_canary(output, test_path):
+            return ""
+
+        before = self._baseline_counts.get(step)
+        after = test_count(output)
+        if before is None or after is None:
+            # Said once per run, not once per ticket: it is a fact about the
+            # runner, and repeating it for every ticket would train a reader to
+            # skip it.
+            if not self._count_unavailable:
+                self._count_unavailable = True
+                self.store.log(
+                    run_id,
+                    f"{step} prints no test count this loop can read, and its "
+                    f"output does not name the files it runs. Whether a test "
+                    f"the tester writes is actually collected cannot be "
+                    f"confirmed from here — the preflight canary is what "
+                    f"establishes that this command reads the language at all.",
+                    level="warn",
+                    kind="verify",
+                    data={"step": step},
+                )
+            return ""
+
+        if after > before:
+            return ""
+
+        return (
+            f"`{step}` passed, and it ran the same {after} test(s) it ran "
+            f"before {test_path} was written. The file is not being collected "
+            f"by this project's test command, so its assertions have never "
+            f"executed and this green says nothing about them.\n\n"
+            f"Put the test where this suite looks. An existing test file in "
+            f"this project is the reliable guide to that — same directory, "
+            f"same naming convention, same framework."
+        )
 
     def _uncovered_languages(self, ticket: Ticket) -> list[str]:
         """Languages this ticket writes that nothing here can test.
@@ -4150,16 +4985,94 @@ class Orchestrator:
             if any(character in path for character in "*?["):
                 continue
             suffix = Path(path).suffix.lower()
-            if (
-                suffix in self._CODE_SUFFIXES
-                and suffix not in found
-                and not self.config.covers("test", suffix)
-                # A language the config declares as needing no runner is a
-                # decision on the record, not the oversight this gate is for.
-                and not self.config.exempt("test", suffix)
-            ):
-                found.append(suffix)
+            if suffix not in self._CODE_SUFFIXES or suffix in found:
+                continue
+            # Asked of the build that owns the file, not of the repository.
+            # Repository-wide, one workspace's runner answers for another's
+            # files — which is the absorption this whole feature exists to
+            # stop, surviving inside the gate meant to catch it. A file no
+            # build owns is `_unowned_files`, which runs first and says so in
+            # its own words.
+            workspace = self.config.workspace_for(path)
+            if workspace is None:
+                continue
+            if workspace.covers("test", suffix):
+                continue
+            # A language the config declares as needing no runner is a
+            # decision on the record, not the oversight this gate is for.
+            if workspace.exempt("test", suffix):
+                continue
+            found.append(suffix)
         return found
+
+    def _unowned_files(self, ticket: Ticket) -> list[str]:
+        """Writable files of this ticket that no declared build owns.
+
+        Only reachable in a repository that declares `workspaces` and leaves a
+        gap in them — the implicit root workspace claims everything, so a
+        project that never heard of the feature never sees this.
+
+        It is the fail-closed half of the design and the reason the key exists.
+        Absorption is the alternative: under one repository-wide command set, a
+        subproject's files are claimed by whatever catch-all is configured at
+        the root, and a claim reads as coverage everywhere downstream. One
+        gdUnit4 launcher reported itself as the test command for 4,000 lines of
+        TypeScript it could not see, and fifteen tickets finished green over
+        code that had never been compiled. Saying "nothing here owns this"
+        costs a person one line of config; guessing costs a backlog.
+        """
+        return [
+            path
+            for path in ticket.allowed_files
+            if not any(character in path for character in "*?[")
+            and Path(path).suffix
+            and self.config.workspace_for(path) is None
+        ]
+
+    def _no_workspace_note(self, ticket: Ticket, paths: list[str]) -> str:
+        """What to tell a human whose ticket lands outside every build."""
+        roots = ", ".join(workspace.root for workspace in self.config.workspaces)
+        return (
+            f"no workspace owns {', '.join(paths[:6])}, so no build in this "
+            f"repository would lint, type-check or test the work — it would "
+            f"pass on review alone, against criteria a text search can "
+            f"satisfy. The declared roots are: {roots}.\n\n"
+            f"Either widen a workspace to cover it, or declare the build it "
+            f"belongs to in .hybridforge/config.json:\n"
+            f'  "workspaces": [{{ "root": "{Path(paths[0]).parent.as_posix()}", '
+            f'"commands": {{ "test": "<command>" }} }}]\n\n'
+            f"Then: forge retry --ticket {ticket.ticket_id}"
+        )
+
+    def _spanning_workspaces(self, ticket: Ticket) -> list[str]:
+        """The roots of every build this ticket's writable files land in.
+
+        More than one is a scoping error rather than a configuration one: a
+        ticket is verified by its own build, and one straddling two is checked
+        by whichever happens to be picked. Splitting it is the fix, and it is
+        the right shape anyway — a unit of work spanning two builds is two
+        units of work.
+        """
+        found, _ = self.config.workspaces_for(ticket.allowed_files)
+        return sorted(workspace.root for workspace in found)
+
+    def _spanning_note(self, ticket: Ticket, roots: list[str]) -> str:
+        """What to tell a human whose ticket straddles two builds."""
+        listing = "\n".join(
+            f"  {path}  ->  {workspace.root}"
+            for path in ticket.allowed_files
+            if (workspace := self.config.workspace_for(path)) is not None
+        )
+        return (
+            f"this ticket writes into {len(roots)} builds — "
+            f"{', '.join(roots)} — and each has its own commands and its own "
+            f"working directory, so only one of them can verify it:\n"
+            f"{listing}\n\n"
+            f"Split it into one ticket per build. A unit of work spanning two "
+            f"builds is two units of work, and the split is what lets each "
+            f"half be checked by the toolchain that can actually run it.\n\n"
+            f"Then: forge retry --ticket {ticket.ticket_id}"
+        )
 
     def _no_runner_note(self, ticket: Ticket, languages: list[str]) -> str:
         """What to tell a human whose ticket has no way to be checked."""
@@ -4238,6 +5151,10 @@ class Orchestrator:
         # `_suite_suffix`, a JavaScript hypothesis in a Rust project resolves
         # to `.rs` — the project's runner — and the reproduction would then
         # assert something in a language the fault does not live in.
+        unowned = self._unowned_files(ticket)
+        if unowned:
+            return "", self._no_workspace_note(ticket, unowned)
+
         uncovered = self._uncovered_languages(ticket)
         if uncovered:
             return "", self._no_runner_note(ticket, uncovered)
@@ -4254,7 +5171,8 @@ class Orchestrator:
             # language nothing here runs, so a reproduction written in the
             # project's own suite would assert something that was never wrong.
             return "", self._no_runner_note(ticket, [suffix])
-        example = self._example_test([], suffix)
+        workspace = self._ticket_workspace(ticket)
+        example = self._example_test([], suffix, workspace=workspace)
         # `_TEST_ROOTS` for the same reason `_test_target` uses it: `tests/` is
         # a fine guess in most ecosystems and an invisible one in the JVM's,
         # where the build compiles a fixed source set and a file outside it is
@@ -4262,7 +5180,7 @@ class Orchestrator:
         directory = (
             Path(example[0]).parent.as_posix()
             if example
-            else self._TEST_ROOTS.get(suffix, "tests")
+            else f"{workspace.prefix}{self._TEST_ROOTS.get(suffix, 'tests')}"
         )
         prefix = "" if directory in ("", ".") else f"{directory}/"
         # `_test_stem`, not a bare slug plus `_test`. Building the name here
@@ -4278,9 +5196,15 @@ class Orchestrator:
     # Extensions that hold behavior a test suite could have covered. A ticket
     # that cannot reproduce a fault in one language is worth pointing at the
     # others; a ticket that cannot reproduce one in a stylesheet is not.
+    # `.gd` earns its place the way the rest did: a repository full of
+    # GDScript reported "(no source files)" in `forge doctor` and was asked
+    # nothing by any gate, because the tables had never heard of it. That is
+    # the same shape as the Godot launcher answering for TypeScript — a
+    # language nothing in the loop can see is a language nothing in the loop
+    # can check.
     _CODE_SUFFIXES = frozenset(
         """.rs .py .js .mjs .ts .tsx .jsx .go .rb .java .kt .swift .c .cc .cpp
-        .h .hpp .cs .php .sh .ps1 .lua .ex .exs .scala .dart""".split()
+        .h .hpp .cs .php .sh .ps1 .lua .ex .exs .scala .dart .gd""".split()
     )
 
     def _unreachable_layers(self, test_path: str) -> str:
@@ -4479,8 +5403,15 @@ class Orchestrator:
         this whole path exists to catch.
         """
         command = self.config.command_for("test", test_path)
+        # The reproduction's own build, not the repository's. A test file in a
+        # subproject is run by that subproject's command, from that
+        # subproject's root — and `command_for` already resolved through the
+        # same workspace, so the two cannot disagree about which build this is.
+        workspace = self.config.workspace_for(test_path) or self.config.root_workspace
         sources = self._sources_for(ticket)[0]
-        example = self._example_test([test_path], Path(test_path).suffix.lower())
+        example = self._example_test(
+            [test_path], Path(test_path).suffix.lower(), workspace=workspace
+        )
         own_file_errors: list[str] = []
         passed_instead = ""
 
@@ -4550,7 +5481,9 @@ class Orchestrator:
                 continue
 
             apply_edits(self.config.root, scoped.edits)
-            result = self._shell(run_id, "reproduce-test", command)
+            result = self._shell(
+                run_id, "reproduce-test", command, workspace=workspace
+            )
 
             if result.ok:
                 # Nothing was demonstrated. The file stays on disk for the
@@ -4763,8 +5696,13 @@ class Orchestrator:
 
         failed: list[str] = []
         output: list[str] = []
-        for name, command in self._verify_plan():
-            result = self._shell(run_id, f"after-{ticket.ticket_id}-{name}", command)
+        for name, command, workspace in self._verify_plan():
+            result = self._shell(
+                run_id,
+                f"after-{ticket.ticket_id}-{name}",
+                command,
+                workspace=workspace,
+            )
             self._note_toolchain(name, command, result)
             if self._toolchain:
                 return

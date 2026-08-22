@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -78,6 +79,194 @@ EVIDENCE_GLOBS: tuple[str, ...] = (
     "docs/DEVELOPMENT.md",
     "README.md",
 )
+
+# Files that mark a **build root** — a directory with its own dependency tree
+# and its own commands, which have to run from inside it. Narrower than
+# `EVIDENCE_GLOBS` on purpose: a README states commands and is not a build, and
+# proposing a workspace around every markdown file would bury the two that
+# matter.
+#
+# `Makefile` is deliberately absent. It marks a build often enough to tempt and
+# sits at the root of repositories with no subprojects at all, so it proposes
+# the workspace that already exists and nothing else.
+BUILD_MANIFESTS: tuple[str, ...] = (
+    "package.json",
+    "deno.json",
+    "Cargo.toml",
+    "pyproject.toml",
+    "setup.py",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "Gemfile",
+    "composer.json",
+    "Package.swift",
+    "project.godot",
+    "mix.exs",
+    "pubspec.yaml",
+    "CMakeLists.txt",
+)
+
+# What each language needs on disk before any of it can be built, and where a
+# build root would name it. Narrower than `BUILD_MANIFESTS`, which answers
+# "is there a build here" — this answers "can this language be built here at
+# all", and the two are different questions with different costs for being
+# wrong.
+#
+# Only the ecosystems where the answer is unambiguous. Python is the instructive
+# omission: a directory of standalone `.py` files with no `pyproject.toml` is
+# ordinary and runs perfectly, so listing it would report a hole in half the
+# repositories that exist. Same for Ruby, PHP, C and shell. A language belongs
+# here only when its code genuinely cannot be built without the file.
+LANGUAGE_MANIFESTS: dict[str, tuple[str, ...]] = {
+    ".ts": ("package.json", "deno.json"),
+    ".tsx": ("package.json", "deno.json"),
+    ".mts": ("package.json", "deno.json"),
+    ".cts": ("package.json", "deno.json"),
+    ".rs": ("Cargo.toml",),
+    ".go": ("go.mod",),
+    ".java": ("pom.xml", "build.gradle", "build.gradle.kts"),
+    ".kt": ("pom.xml", "build.gradle", "build.gradle.kts"),
+    ".swift": ("Package.swift",),
+    ".ex": ("mix.exs",),
+    ".exs": ("mix.exs",),
+    ".dart": ("pubspec.yaml",),
+    ".scala": ("build.sbt", "pom.xml", "build.gradle"),
+}
+
+
+def manifests_for(suffix: str) -> tuple[str, ...]:
+    """The build files this language cannot be built without, or `()`.
+
+    Empty is the common answer and means "no opinion" — not "no manifest
+    needed", but "this cannot tell, so it will not say".
+    """
+    return LANGUAGE_MANIFESTS.get(suffix.lower(), ())
+
+
+# Directories whose contents are generated, vendored, or private to a tool.
+# `node_modules` alone holds thousands of `package.json` files, every one of
+# which would otherwise be proposed as a build in this repository.
+_SKIP_DIRS = frozenset(
+    {
+        "node_modules", "target", "build", "dist", "out", "vendor", "bin", "obj",
+        ".git", ".hg", ".svn", ".hybridforge", ".venv", "venv", "__pycache__",
+        ".tox", ".mypy_cache", ".pytest_cache", ".next", ".gradle", ".idea",
+        "site-packages", "third_party", "Pods",
+    }
+)
+
+# How deep a build root can sit before it stops being one worth proposing. A
+# monorepo nests packages three or four deep and a person configuring one will
+# say so by hand; the case this exists for is `tools/path-forge` beside a game.
+MAX_WORKSPACE_DEPTH = 3
+
+
+def manifest_gaps(config: Any, tickets: Sequence[Any]) -> list[str]:
+    """Languages a backlog writes that its build cannot build yet.
+
+    A backlog creating a whole new language tree in a repository with nothing
+    to build it is the third root cause of the run this exists for: fifteen
+    tickets wrote 4,000 lines of TypeScript into a repository with no
+    `package.json`, no `tsconfig.json`, and no ticket owning either — so
+    nothing could compile, type-check or test a line of it, and every gate
+    downstream read the absence of complaints as the absence of a problem.
+
+    Reported, never refused, and the reason is that a refusal here has no
+    escape hatch. `commands` has an exemption spelling for a language nothing
+    runs; there is none for "this project builds its TypeScript with a Makefile
+    and no `package.json`", which is unusual and not wrong. The gates that do
+    refuse — an unowned file at ingest, a canary that stays green over a file
+    that cannot parse — catch the *consequences* of this on their own. What
+    this adds is the cause, named at the one moment fixing it is free.
+
+    A manifest some ticket in the backlog creates is not a gap: writing the
+    build file and the first module it builds is an ordinary way to start.
+    """
+    created = {
+        _normal(path)
+        for ticket in tickets
+        for path in ticket.allowed_files
+        if not any(character in path for character in "*?[")
+    }
+    # Keyed by the *manifest*, not the extension. `.ts` and `.tsx` are one
+    # ecosystem with one `package.json`, and reporting them separately says the
+    # same sentence twice about the same missing file.
+    found: dict[tuple[str, tuple[str, ...]], tuple[Any, set[str]]] = {}
+    for ticket in tickets:
+        for path in ticket.allowed_files:
+            if any(character in path for character in "*?["):
+                continue
+            suffix = Path(path).suffix.lower()
+            wanted = manifests_for(suffix)
+            if not wanted:
+                continue
+            workspace = config.workspace_for(path)
+            if workspace is None:
+                continue  # refused outright by the unowned-file gate
+            entry = found.setdefault((workspace.root, wanted), (workspace, set()))
+            entry[1].add(suffix)
+
+    gaps: list[str] = []
+    for (_root, wanted), (workspace, suffixes) in sorted(
+        found.items(), key=lambda item: item[0]
+    ):
+        if any(
+            (config.root / f"{workspace.prefix}{name}").is_file()
+            or _normal(f"{workspace.prefix}{name}") in created
+            for name in wanted
+        ):
+            continue
+        where = "" if workspace.is_repo_root else f" in {workspace.root}"
+        languages = ", ".join(sorted(suffixes))
+        gaps.append(
+            f"{languages}{where}: nothing here builds it. There is no "
+            f"{' or '.join(wanted)}{where or ' in this repository'}, and no "
+            f"ticket creates one, so nothing can compile, type-check or "
+            f"test the {languages} this backlog writes."
+        )
+    return gaps
+
+
+def _normal(path: str) -> str:
+    return str(path).replace("\\", "/").lstrip("./").lower()
+
+
+def discover_workspaces(root: Path, *, max_depth: int = MAX_WORKSPACE_DEPTH) -> list[str]:
+    """Directories in this repository that look like their own build.
+
+    Returned as repo-relative posix paths with `.` first when the root itself
+    holds a manifest, which is the order they should be proposed in.
+
+    This proposes; it never decides. A directory holding a `package.json` is
+    strong evidence of a build and no evidence at all about whether the person
+    wants it verified separately — a repository with one `package.json` at its
+    root is the ordinary single-build case and must keep behaving like one.
+    """
+    found: list[str] = []
+    root = Path(root)
+
+    def walk(directory: Path, depth: int) -> None:
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            return
+        if any(entry.name in BUILD_MANIFESTS and entry.is_file() for entry in entries):
+            relative = directory.relative_to(root).as_posix()
+            found.append(relative if relative != "." else ".")
+        if depth >= max_depth:
+            return
+        for entry in entries:
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            if entry.name in _SKIP_DIRS or entry.name.startswith("."):
+                continue
+            walk(entry, depth + 1)
+
+    walk(root, 0)
+    return found
+
 
 DETECT_SYSTEM = """You identify a repository's verify commands.
 

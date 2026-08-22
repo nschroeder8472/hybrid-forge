@@ -20,6 +20,7 @@ never cut inside a line.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 # Start of a diagnostic block. Deliberately broad — this runs over cargo, tsc,
 # pytest, eslint, go vet, and whatever a user configures, and a pattern that
@@ -300,6 +301,98 @@ _LOCATION = re.compile(
 # scheme that no repository path has. Dropped before matching so the location
 # underneath is an ordinary absolute path.
 _FILE_URI = re.compile(r"\bfile://", re.IGNORECASE)
+
+
+# How each runner says how many tests it ran. The largest number any of these
+# finds is taken, because several of them print more than one — pytest reports
+# `collected 5 items` and then `5 passed`, and a suite that grew shows the
+# growth in whichever number is biggest.
+#
+# A runner missing from this table yields no count, which is not a failure: the
+# caller treats "cannot tell" as its own answer and says so rather than
+# guessing. `go test` is the honest example — it prints `ok  pkg  0.01s` and no
+# count at all.
+_TEST_COUNTS = (
+    re.compile(r"\b(\d+)\s+passed\b", re.IGNORECASE),          # pytest, jest, vitest
+    re.compile(r"\bcollected\s+(\d+)\s+items?\b", re.IGNORECASE),  # pytest
+    re.compile(r"\bRan\s+(\d+)\s+tests?\b", re.IGNORECASE),   # unittest
+    re.compile(r"\b(\d+)\s+passing\b", re.IGNORECASE),         # mocha
+    re.compile(r"^#\s*pass\s+(\d+)\b", re.IGNORECASE | re.MULTILINE),  # node:test
+    re.compile(r"\bTests\s+run:\s*(\d+)", re.IGNORECASE),      # JUnit / maven
+    re.compile(r"\b(\d+)\s+tests?\s+completed\b", re.IGNORECASE),  # gradle
+    re.compile(r"\b(\d+)\s+examples?\b", re.IGNORECASE),       # rspec
+    re.compile(r"\b(\d+)\s+tests?,\s*\d+\s+assertions?\b", re.IGNORECASE),  # phpunit
+)
+
+
+def test_count(output: str) -> int | None:
+    """How many tests a runner said it ran, or `None` when it did not say.
+
+    `None` is a real answer and the caller must treat it as one. Reading "no
+    number printed" as "no tests ran" would fail every `go test` in existence,
+    and reading it as "fine" is what this exists to stop — so the only correct
+    handling is to say the question could not be answered.
+    """
+    found = [
+        int(match.group(1))
+        for pattern in _TEST_COUNTS
+        for match in pattern.finditer(output or "")
+    ]
+    return max(found) if found else None
+
+
+def reroot(output: str, prefix: str, root: Path) -> str:
+    """Rewrite a workspace's own paths so they are relative to the repository.
+
+    Every attribution in the loop matches **repo-relative** paths against the
+    text a command printed: `signatures` keys a diagnostic by its location,
+    `errors_naming` asks whether a failure names the tester's file,
+    `files_blamed` decides which ticket owns a red tree, and the executor is
+    handed the output and told to fix the files in it.
+
+    A command run with `cwd` set to a workspace prints paths relative to *that*
+    directory. `tsc` under `tools/path-forge` reports `src/parser/level.ts`
+    while the ticket owns `tools/path-forge/src/parser/level.ts`, and every one
+    of those questions then answers "no file here": the diagnostic attributes
+    to nothing, the baseline excuses it as unattributable, and the attempt goes
+    green over a build that does not compile. That is the exact failure
+    workspaces exist to remove, reintroduced by the fix for it — which is why
+    this lands in the same commit as the `cwd` change and not after it.
+
+    Conservative by construction. A path is rewritten only when
+    `root/prefix/path` is a file that exists, so a runner's internal module
+    names (`node:internal/modules/cjs/loader`), a URL, a version string, and a
+    path already relative to the repository are all left exactly as they were.
+    The cost of missing one is the behaviour we had; the cost of inventing one
+    is blaming a ticket for a file in another build.
+    """
+    if not prefix or not output:
+        return output
+    prefix = prefix.replace("\\", "/").rstrip("/")
+    if not prefix or prefix == ".":
+        return output
+
+    def rewrite(match: re.Match[str]) -> str:
+        whole = match.group(0)
+        path = match.group(1)
+        normalized = path.replace("\\", "/")
+        if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+            return whole  # already absolute
+        if normalized == prefix or normalized.startswith(f"{prefix}/"):
+            return whole  # already repo-relative
+        try:
+            if not (root / prefix / normalized).is_file():
+                return whole
+        except OSError:
+            return whole
+        # Keep the separator the tool used, so a Windows toolchain's output
+        # still reads as its own and a regex someone wrote against it still
+        # matches.
+        joiner = "\\" if "\\" in path and "/" not in path else "/"
+        replacement = prefix.replace("/", joiner) + joiner + path
+        return replacement + whole[len(path) :]
+
+    return _LOCATION.sub(rewrite, output)
 
 
 def locations(text: str) -> list[str]:

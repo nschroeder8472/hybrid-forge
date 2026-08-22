@@ -44,6 +44,7 @@ seems to do nothing, check its spelling against this page first.
   "models": {},
   "roles": {},
   "commands": {},
+  "workspaces": [],
   "neverDelegate": [],
   "memory": {},
   "loop": {},
@@ -52,6 +53,8 @@ seems to do nothing, check its spelling against this page first.
 ```
 
 Only `models` and `roles` are required. Everything else has working defaults.
+`commands` and `workspaces` are two spellings of the same thing — one build or
+several — and declaring both is refused.
 
 **`room`** (string, default `""`) — the project's name in whatever memory
 server you point at, used when `memory.room` is not set. Empty means memory
@@ -267,10 +270,109 @@ that way reports it as the ticket's fault. They are the loop's only source of gr
 whether the work is good — a run with all three empty is verified by review
 alone.
 
+A missing `typecheck` is reported, not gated — and only for the languages whose
+test command does not already compile them. `cargo test` and `go test` do, so
+nothing is said about Rust or Go. `npm test` and `pytest` load the modules their
+tests reach and nothing else, so for TypeScript and Python a missing entry is a
+hole the size of every file no test imports:
+
+```
+  no type check:
+    .ts  —  try `tsc --noEmit`
+```
+
+`forge doctor` prints that, and the run log says it once at the start. Close it
+with `forge toolchain --kind typecheck --language .ts`, or say it needs none
+with `--skip`.
+
 `test` does double duty: its text decides which language the tester writes in,
 so `cargo test` gets `.rs` files and `pytest` gets `.py` ones. A ticket writing
 files the test command cannot collect authors no tests and is checked at review
 instead, and the run says so at the end.
+
+---
+
+## `workspaces`
+
+Optional. A repository with one build never needs it — `commands` above is read
+as a single workspace at the repository root, and every run behaves exactly as
+it did before this key existed.
+
+Declare it when the repository contains a **second build**: a directory with its
+own manifest, its own dependency tree, and commands that only work when run from
+inside it.
+
+```json
+"workspaces": [
+  {
+    "root": ".",
+    "commands": { "test": "godot --headless --import && runtest.cmd -a tests/" },
+    "excludes": ["tools/**"]
+  },
+  {
+    "root": "tools/path-forge",
+    "commands": { "lint": "npm run lint", "typecheck": "tsc --noEmit", "test": "npm test" }
+  }
+]
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `root` | `"."` | Repo-relative directory this build owns. Must exist. |
+| `commands` | `{}` | Exactly the `commands` block documented above — string, language map, or `false` exemptions — scoped to this build. |
+| `excludes` | `[]` | Glob patterns this workspace does *not* own despite their sitting beneath it. A child workspace's root is excluded implicitly. |
+
+Three rules follow from it:
+
+1. **A file belongs to the workspace with the longest matching root.** `.`
+   contains a subproject's files too; ownership is the deepest claim, not the
+   first one.
+2. **Verify runs each build's commands with `cwd` set to that build's root** —
+   which is what `npm test` and `cargo test` need and what a repository-root
+   command cannot give them. A ticket is verified by the build its writable
+   files belong to; the sweeps between tickets and at the end of the run still
+   check every build, so cross-build breakage is caught.
+3. **A file no workspace owns is verified by nothing, and the loop says so
+   rather than guessing.** This is the reason the key exists. Without it, a
+   subproject's files are absorbed by whatever catch-all is configured at the
+   root, and absorption reads as coverage everywhere downstream: one repository
+   had its Godot test launcher report itself as the test command for 4,000 lines
+   of TypeScript it could not see, and fifteen tickets finished green over code
+   that had never been compiled.
+
+`commands` and `workspaces` are two spellings of the same thing, so declaring
+both is refused — the top-level block would be read by nothing while looking
+configured. Move it into the workspace whose root is `.`.
+
+A root that does not resolve is refused at load for the same reason. It owns no
+files, so every file falls through to whichever workspace does match, and the
+config looks entirely reasonable while a whole build goes unverified.
+
+Step names carry the build only when there is more than one: a single-workspace
+project logs `test`, and a two-workspace one logs `test` and
+`test[path-forge]`.
+
+`forge init` proposes the list. It walks the tree for the files that mark a
+build — `package.json`, `Cargo.toml`, `pyproject.toml`, `go.mod`,
+`project.godot`, and the rest — skipping generated directories, and asks only
+when it finds more than one. A repository with a single manifest at its root is
+the ordinary case and is never asked. Saying no keeps one set of commands for
+the whole repository, which is a real answer: some repositories genuinely carry
+a second manifest they do not verify separately.
+
+`forge toolchain` sets one build's command up:
+
+```bash
+forge toolchain --workspace tools/path-forge --language .ts --set "npm test"
+forge toolchain --workspace tools/path-forge --language .ts          # propose
+forge toolchain --workspace tools/path-forge --language .ts --accept # write it
+```
+
+`--workspace` is required once a repository declares more than one build, and
+refused if the root does not name one. Writing a command into the wrong build
+is worse than writing none: it reports as coverage for files that command
+cannot see, which is the failure this whole key exists to remove. Detection
+reads the build's own CI, manifest and docs, not the repository root's.
 
 ---
 
@@ -329,6 +431,7 @@ run some context, never the run.
 | `respecCriteria` | `false` | Let a respec rewrite the acceptance criteria too. Off: the party being judged does not write the standard it is judged against. Left on, one ticket's criteria drifted until they asserted the opposite of what its author wrote. |
 | `reopenStaleDependents` | `true` | Re-open a ticket that passed on top of a dependency a respec has since rewritten — its `done` was earned against a contract that no longer exists. Can re-open a lot of a backlog after one respec; turn it off to be warned instead. |
 | `preflight` | `true` | Probe every model before the first ticket, so a dead endpoint fails in seconds rather than one ticket at a time. |
+| `preflightCanary` | `true` | Prove, rather than infer, that each build's test command actually reads each language **this backlog is about to write**. Writes an unparseable file where that language's tests live, runs the command over it, and requires the command to go red **and** to name the file — then deletes it. Coverage used to be read off the *text* of a command against a table of known runners, and a runner the table has never heard of answers "covered" for everything: one gdUnit4 launcher reported itself as the test command for 4,000 lines of TypeScript and exited 0 fifteen times. A build that fails this blocks the run before anything is delegated. Scoped to the languages the tickets declare they will write, not to every language in the tree — a Godot repository with one Python helper script beside its `project.godot` has `.py` present, nothing that runs it, and no ticket that cares. Costs one command per language per build, once per run. Turn off for a suite slow enough that paying it at startup is worse than finding out later; `forge toolchain --language X --skip` is the narrower way to excuse one language, and says so on the record. |
 | `requireGreenBaseline` | `true` | Run the verify commands once before the first ticket and refuse to start on a tree that is already red. A failure that pre-dates the run is excused for *every* ticket in it, so the backlog would finish reporting green having compiled nothing — and `_unverifiable` cannot catch it, because red in files no ticket owns has no exhausted owner to point at. Only a failure naming files is gated on: `pytest` exiting 5 on a project with no tests yet is a greenfield run, not a broken one, and is reported instead. Turn it off, or pass `--allow-red-baseline`, for a repository whose red is what the backlog is there to fix. |
 | `quarantineFailed` | `true` | When a ticket gives up, restore the files it wrote to the state it inherited and keep a copy under `.hybridforge/abandoned/run-N/<ticket>/`. Verification is whole-project, so an abandoned file that does not compile is reported to every later ticket — and because it is outside their scope they are excused for it and pass having had nothing compiled. Quarantine keeps the salvage without the poison. Turn it off, or pass `--no-quarantine`, to have a failed ticket's work left in the tree. |
 | `pollSeconds` | `2.0` | Control-channel poll interval while waiting. |
@@ -477,6 +580,7 @@ it is a one-line edit in `roles`.
     "respecCriteria": false,
     "reopenStaleDependents": true,
     "preflight": true,
+    "preflightCanary": true,
     "requireGreenBaseline": true,
     "quarantineFailed": true,
     "pollSeconds": 2.0,

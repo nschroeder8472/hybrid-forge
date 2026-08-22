@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from forge import toolchain, wizard
+from forge.config import ROLES, Config, ConfigError, Workspace
 from forge.profile import Profile, profile_path, strip_secrets
 
 
@@ -449,3 +450,175 @@ class TestWizardFlow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSetupProposesTheBuildsItFinds(unittest.TestCase):
+    """A repository is not one build, and the person setting one up is the only
+    one who can say whether a subproject should be verified separately.
+    Discovery proposes; nothing is written without the answer."""
+
+    def _repo(self, *paths) -> Path:
+        root = Path(tempfile.mkdtemp()) / "repo"
+        root.mkdir(parents=True)
+        for name in paths:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}\n", encoding="utf-8")
+        return root
+
+    def _run(self, root: Path, answers: list[str]):
+        found = toolchain.Detection(
+            commands={"lint": "", "typecheck": "", "test": "detected-test"},
+            confidence="high",
+            evidence=[".github/workflows/ci.yml"],
+        )
+        with mock.patch.object(wizard, "probe_model", return_value=(True, "ok")), \
+             mock.patch.object(wizard, "probe_memory", return_value=(True, "ok")), \
+             mock.patch.object(wizard, "detect_commands", return_value=found):
+            return wizard.run(
+                root,
+                Profile(path=Path(tempfile.mkdtemp()) / "profile.json"),
+                wizard.Prompter(enabled=True, reader=scripted(answers)),
+            )
+
+    _MODELS = [
+        "http://gpu:11434/v1", "qwen3.6:35b-a3b", "",
+        "1", "opus",
+        "", "n",
+        "myroom",
+    ]
+
+    def test_one_build_is_never_asked_about(self):
+        # The ordinary case. A repository with one manifest at its root is not
+        # a monorepo, and asking would be a question with one answer.
+        root = self._repo("pyproject.toml")
+
+        config, _profile = self._run(
+            root, self._MODELS + ["y", "", "", "", "", "y"]
+        )
+
+        self.assertEqual([w.root for w in config.workspaces], ["."])
+        self.assertEqual(config.commands["test"], "detected-test")
+        self.assertFalse(config._explicit_workspaces)
+
+    def test_two_builds_are_proposed_and_configured_separately(self):
+        root = self._repo("project.godot", "tools/path-forge/package.json")
+
+        config, _profile = self._run(
+            root,
+            self._MODELS
+            + [
+                "y",                                    # configure separately
+                "y", "gdlint", "", "godot-test",        # the root build
+                "y", "npm run lint", "tsc --noEmit", "npm test",  # path-forge
+                "",                                     # neverDelegate
+                "y",                                    # write
+            ],
+        )
+
+        self.assertEqual(
+            [w.root for w in config.workspaces], [".", "tools/path-forge"]
+        )
+        self.assertEqual(
+            config.command_for("test", "tools/path-forge/src/a.ts"), "npm test"
+        )
+        self.assertEqual(config.command_for("test", "scripts/game.gd"), "godot-test")
+        # The two spellings are exclusive: a top-level block beside them would
+        # be read by nothing and would look configured.
+        self.assertEqual(config.commands, {})
+
+    def test_declining_keeps_one_set_of_commands(self):
+        # A real answer, not a formality. Some repositories genuinely have a
+        # second manifest they do not verify separately.
+        root = self._repo("project.godot", "tools/path-forge/package.json")
+
+        config, _profile = self._run(
+            root,
+            self._MODELS + ["n", "y", "", "", "", "", "y"],
+        )
+
+        self.assertEqual([w.root for w in config.workspaces], ["."])
+        self.assertFalse(config._explicit_workspaces)
+        self.assertEqual(config.commands["test"], "detected-test")
+
+    def test_each_build_is_read_from_its_own_directory(self):
+        # A subproject states its own commands in its own files, and the
+        # repository root's answer for them is the answer for another project.
+        root = self._repo("project.godot", "tools/path-forge/package.json")
+        seen = []
+
+        def detect(_root, _models, _roles, where=None):
+            seen.append(where)
+            return toolchain.Detection(commands={"test": "x"}, confidence="high")
+
+        with mock.patch.object(wizard, "probe_model", return_value=(True, "ok")), \
+             mock.patch.object(wizard, "probe_memory", return_value=(True, "ok")), \
+             mock.patch.object(wizard, "detect_commands", detect):
+            wizard.run(
+                root,
+                Profile(path=Path(tempfile.mkdtemp()) / "profile.json"),
+                wizard.Prompter(
+                    enabled=True,
+                    reader=scripted(
+                        self._MODELS
+                        + ["y", "y", "", "", "", "y", "", "", "", "", "y"]
+                    ),
+                ),
+            )
+
+        self.assertEqual(seen, [root, root / "tools" / "path-forge"])
+
+    def test_the_preview_shows_the_builds_it_will_write(self):
+        root = self._repo("project.godot", "tools/path-forge/package.json")
+
+        config, _profile = self._run(
+            root,
+            self._MODELS
+            + ["y", "y", "", "", "a", "y", "", "", "b", "", "y"],
+        )
+
+        preview = wizard._preview(config)
+        self.assertIn("workspaces", preview)
+        self.assertIn("tools/path-forge", preview)
+        self.assertNotIn('"commands": {}', preview)
+
+
+class TestDeclaringBuildsAfterTheFact(unittest.TestCase):
+    """`declare_workspaces` is how a caller that is not `load` says a
+    repository holds these builds — and it checks the same things `load` does,
+    because a root that resolves to nothing owns no files and a config written
+    with one looks entirely reasonable."""
+
+    def _config(self, root: Path) -> Config:
+        return Config(
+            root=root,
+            models={"m": {"kind": "openai", "model": "x"}},
+            roles={r: "m" for r in ROLES},
+        )
+
+    def test_a_root_that_does_not_exist_is_refused(self):
+        root = Path(tempfile.mkdtemp())
+        config = self._config(root)
+
+        with self.assertRaises(ConfigError):
+            config.declare_workspaces([Workspace(root="nope", commands={})])
+
+    def test_declaring_beside_a_top_level_block_is_refused(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "web").mkdir()
+        config = self._config(root)
+        config.commands = {"test": "pytest"}
+
+        with self.assertRaises(ConfigError):
+            config.declare_workspaces([Workspace(root="web", commands={})])
+
+    def test_declaring_none_puts_it_back_to_one_implicit_build(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "web").mkdir()
+        config = self._config(root)
+        config.declare_workspaces([Workspace(root="web", commands={"test": "npm test"})])
+
+        config.declare_workspaces([])
+
+        self.assertEqual([w.root for w in config.workspaces], ["."])
+        self.assertFalse(config._explicit_workspaces)

@@ -328,6 +328,29 @@ two is a guess, and the caller is better off told the path is wrong.
 `allowed_files` is exempt and must stay exempt — a ticket's writable scope is
 where its work is *going*, and most of it does not exist until the ticket runs.
 
+**The document a backlog was planned from is a reference for every ticket in
+it.** A planner reads a specification and writes a summary; the executor is
+handed the summary and never sees the source, so anything the summary dropped
+is gone. One run put a seven-hundred-line spec through that. Section 2 was
+labelled normative and held the complete legal alphabet as a table of eighteen
+characters, the seven exact error strings, and the order the checks run in.
+What reached the executor was "reject bad input with exact error strings",
+naming none of them, and every ticket in the backlog had `reference_files: []`.
+The implementation shipped four of the eighteen characters, treated the exit
+marker as a pushable block, and invented every message.
+
+`cmd_ingest` now puts the source document first in every ticket's
+`reference_files` when the backlog was **planned** from one — first because
+`reading_scope` takes `reference` in order and caps the rest at twelve. A
+backlog *parsed* from a ticket-shaped document gets nothing, because it already
+carries that document's words verbatim and attaching it would show every ticket
+every other ticket's spec.
+
+The planner is told the other half: **never paraphrase a table.** A legend, an
+alphabet, an error-message list or a status mapping goes into the ticket
+verbatim, every row. Summarising one is not compression, it is deletion — the
+executor cannot recover a row it was never shown.
+
 ---
 
 ## 11. Amnesty is measured, never asserted
@@ -511,6 +534,156 @@ the backlog is there to fix.
 
 ---
 
+## 15. Code that cannot be loaded is not code the loop can check
+
+Every gate downstream of the executor assumes the file can at least be read by
+the toolchain. A module that imports something which does not exist breaks that
+assumption before any of them run, and each one then reports the absence of
+evidence as the absence of a problem: the apply step succeeds because the file
+landed, verification is silent because a suite that cannot import a module
+reports no failures about it, and the reviewer reads a diff that looks entirely
+correct.
+
+One run went fifteen tickets that way. Sixteen relative imports across eight
+invented module paths — `../types`, `../geometry`, `../model/rect`,
+`../models/level_model` — each ticket reaching for a shared module it had been
+told to use and was not allowed to create, and no ticket in the backlog owning
+any of them. The run finished `done`, "all tickets complete", over 4,000 lines
+that had never been compiled.
+
+**Check that a relative import resolves, at apply, before anything expensive.**
+`imports.unresolved` reads the files the attempt just wrote, extracts every
+relative import, and asks whether any spelling of it is a file on disk or a
+path some ticket in this backlog is allowed to write. It is a regex and a
+`stat`: no toolchain, no model, and no ecosystem knowledge beyond one pattern
+per language family. It fails that run's first ticket on its first attempt.
+
+Three properties keep it from being noise:
+
+**Only relative imports.** A bare specifier is a package or resolves through
+configuration this cannot see — a `tsconfig` alias, a `PYTHONPATH`, an include
+directory. A false failure here costs an attempt and tells the executor to fix
+code that was never broken, so the check declines to have an opinion.
+
+**A module another ticket will write is not a miss.** It is a declared future
+file, and failing over it would make a correct plan unrunnable: writing the
+caller before the callee is ordinary, and `needs` is what sequences them. When
+the sequencing has *not* been declared the run log says so, because until the
+callee arrives the caller is verified against a module that is not there.
+
+**It is guidance, not a park.** The import may be a typo the next attempt
+fixes. Where it is not, the executor already has a `BLOCKED:` protocol for
+asking for the file — which is the right request, and one a human can act on.
+Exhausting the attempts parks it the ordinary way.
+
+Python is read with `ast` rather than a pattern, because the standard library
+parses it exactly and a regex finds `from .` inside a docstring. A file that
+does not parse yields nothing: it has a worse problem than an unresolved
+import, and the toolchain will say so.
+
+---
+
+## 16. A green from a command that read none of the tests is not a green
+
+Verification passing is taken as evidence about the ticket in front of it. That
+holds only while the command actually collected the ticket's tests, and nothing
+checked. One run recorded fifteen greens on a command that had read none of
+them: the tester wrote `node:test` suites into a directory a gdUnit4 launcher
+globbed and ignored, the launcher exited 0 every time, and each `05-verify-test`
+artifact says `"status": "ok"`.
+
+The preflight canary (§`WORKSPACES.md` phase 3) closes most of this before the
+first ticket — it proves the command reads the language at the place
+`_test_target` puts files. What it cannot prove is that *this* file was
+collected, because a planner may designate a test path of its own that sits
+somewhere the runner never looks. `_test_was_collected` asks that, once per
+passing test step, and only when the tester wrote a file that did not exist
+before.
+
+Three answers, and the third is what keeps it honest:
+
+- **The output names the file.** Collected. Most runners print what they run,
+  and this is the ordinary case — no counting required.
+- **The suite did not grow.** A file that did not exist was written, the runner
+  reported a count before and after, and the number is the same. Nothing else
+  explains that.
+- **No count either way.** `go test` prints `ok pkg 0.01s` and no number at
+  all, and a runner this does not recognise prints one it cannot read. *Cannot
+  tell* is a real answer and is reported as one, once per run. Reading it as
+  "fine" is the failure being fixed; reading it as "broken" would fail every Go
+  project in existence.
+
+**The retry is where this goes wrong, and the guard is `authored_now`.** On a
+second attempt the previous attempt's test file is already on disk and already
+counted in the baseline, so the suite does not grow and is entirely correct not
+to. The check applies only to a file that did not exist when the baseline was
+taken.
+
+`_baseline_counts` is captured in `_baseline_failures` whether or not the step
+passed — it is not about failures at all — and re-taken per ticket, because a
+count carried from the previous ticket is a count from a different suite.
+
+---
+
+## 17. A language the repository cannot build is a hole no gate downstream sees
+
+A backlog creating a whole new language tree in a repository with nothing to
+build it is a shape worth naming on its own. Fifteen tickets wrote 4,000 lines
+of TypeScript into a repository with no `package.json`, no `tsconfig.json`, and
+no ticket owning either. Nothing could compile, type-check or test a line of
+it, and every gate downstream read the absence of complaints as the absence of
+a problem.
+
+`toolchain.manifest_gaps` asks it at ingest and again at run start: for each
+language this backlog writes whose ecosystem cannot build without a manifest,
+does the owning workspace have one — on disk, or created by a ticket in the
+same backlog? Writing the build file and the first module it builds is an
+ordinary way to start, so a ticket that creates it closes the question.
+
+**The table is deliberately short.** `LANGUAGE_MANIFESTS` lists only the
+ecosystems where the answer is unambiguous — npm/deno, cargo, go, the JVM
+builds, SwiftPM, mix, pub, sbt. Python is the instructive omission: a directory
+of standalone `.py` files with no `pyproject.toml` is ordinary and runs
+perfectly, so listing it would report a hole in half the repositories that
+exist. Ruby, PHP, C and shell are out for the same reason.
+
+**It warns; it does not refuse.** Every other check of this family refuses, and
+this one cannot, because a refusal here has no escape hatch. `commands` has an
+exemption spelling for a language nothing runs — there is none for "this
+project builds its TypeScript with a Makefile and no `package.json`", which is
+unusual and not wrong. The gates that *do* refuse catch the consequences
+anyway: an unowned file is refused at ingest, and a canary that stays green
+over a file that cannot parse stops the run. What this adds is the **cause**,
+named at the one moment fixing it costs a single extra ticket.
+
+It is keyed by the manifest rather than the extension, because `.ts` and `.tsx`
+are one ecosystem with one `package.json` and reporting them separately says
+the same sentence twice about the same missing file.
+
+**A backlog where nothing is built on anything is the same hole, one level up.**
+`ingest.undeclared_order` reports a plan of four or more tickets, mostly
+creating files that do not exist, with no `needs` between any of them. That is
+either genuinely parallel work or a planner that decomposed by file instead of
+by unit of work — and the second is what shipped the defect. Nothing sequenced
+the shared type ahead of its consumers and no ticket owned it, so each module
+in turn reached for it, invented its own name for it, and imported a file
+nothing would ever write.
+
+Greenfield is the discriminator, and it has to be a majority of the files: a
+batch of independent fixes to code that already exists is genuinely parallel
+and stays quiet. `derive_needs` has already run by then, so a shared *writable*
+file has been ordered and is not what this is about; what is left is the
+dependency nobody could see from the paths alone.
+
+This is the one check in the family reasoning from the **absence** of
+something. The evidence is circumstantial — the tickets in that backlog did not
+name each other's files or ids anywhere in their prose, so the shape was all
+there was to go on — and it warns for that reason. Being told about a real
+parallel backlog costs a reader five seconds; not being told about the other
+kind cost fifteen tickets.
+
+---
+
 ## What is bug-loop-specific and what is not
 
 | Mechanism | Scope |
@@ -526,6 +699,13 @@ the backlog is there to fix.
 | `_unverifiable` / `StepResult.halt` | every ticket |
 | `_quarantine` / `_red_left_behind` | every ticket that gives up |
 | `_green_baseline` | once, before the first delegation |
+| `_canary` | once, before the first delegation, per build per language |
+| `imports.unresolved` / `_dangling_imports` | every attempt that writes a file |
+| `_source_reference` | every planned ingest |
+| `_trim_reference` | every reference file over the source limit |
+| `failures.test_count` / `_test_was_collected` | every passing test step on a ticket that authored one |
+| `toolchain.manifest_gaps` | every ingest, and once at run start |
+| `ingest.undeclared_order` | every ingest |
 | `environment_failure` / `_note_toolchain` | every verify step |
 | `resumable_runs` draining | every command that opens a run |
 | Reproduction, re-diagnosis, contradiction | bug tickets only |
