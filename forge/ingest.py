@@ -50,6 +50,14 @@ _FIELD = {
     "context": re.compile(r"^#{1,4}\s*Context.*$", re.MULTILINE | re.IGNORECASE),
 }
 
+# The section `write_tickets` emits for a ticket that has been through a
+# sign-off pass. Not a field — nothing reads it back — but it has to be a
+# boundary, or its bullets fall into whichever known section precedes them.
+# That is `## Context to pass through`, which every role is shown on every
+# attempt: re-ingesting a ratified ticket file would hand the executor the
+# argument about the ticket as though it were part of the ticket.
+_RATIFICATION = re.compile(r"^#{1,4}\s*Ratification.*$", re.MULTILINE | re.IGNORECASE)
+
 # "**Kind:** bug" — a ticket the loop must reproduce before it may fix it. Only
 # written when it is not the ordinary kind, so a plan a human wrote by hand
 # does not have to say "feature" on every section.
@@ -478,6 +486,9 @@ def parse_plan(text: str) -> list[Ticket]:
 
         found = {key: pattern.search(body) for key, pattern in _FIELD.items()}
         boundaries = [match.start() for match in found.values() if match]
+        closing = _RATIFICATION.search(body)
+        if closing:
+            boundaries.append(closing.start())
 
         route_match = _ROUTE.search(body)
         route = (route_match.group("route").lower() if route_match else "delegate")
@@ -669,6 +680,28 @@ def render_ticket(ticket: Ticket) -> str:
     lines += [f"- {c}" for c in ticket.criteria] or ["_(none listed)_"]
     if ticket.context.strip():
         lines += ["", "## Context to pass through", "", ticket.context.strip()]
+    # The argument that produced the ticket above, where there was one. On the
+    # file rather than only in the database because this file is what a human
+    # reads to decide whether the plan is right — and "three roles agreed, the
+    # reviewer did not and here is what it said" is the most useful sentence on
+    # the page for that decision.
+    if ticket.ratify_notes:
+        lines += [
+            "",
+            f"## Ratification — {ticket.ratify_status or 'unsettled'}"
+            f" after {ticket.ratify_passes} pass(es)",
+            "",
+        ]
+        for note in ticket.ratify_notes:
+            verdict = "signed off" if note.get("signed") else "did not sign off"
+            lines.append(f"- **Pass {note.get('pass', '?')}, {note.get('role', '?')}** "
+                         f"— {verdict}")
+            for point in note.get("blocking") or []:
+                lines.append(f"  - blocking: {point}")
+            for point in note.get("suggestions") or []:
+                lines.append(f"  - suggested: {point}")
+            if note.get("response"):
+                lines.append(f"  - planner: {note['response']}")
     return "\n".join(lines) + "\n"
 
 

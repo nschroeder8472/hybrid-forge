@@ -61,6 +61,12 @@ CREATE TABLE IF NOT EXISTS tickets (
     original_spec     TEXT NOT NULL DEFAULT '',
     original_criteria TEXT NOT NULL DEFAULT '[]',
     original_context  TEXT NOT NULL DEFAULT '',
+    ratify_status     TEXT NOT NULL DEFAULT '',
+    ratify_passes     INTEGER NOT NULL DEFAULT 0,
+    ratify_notes      TEXT NOT NULL DEFAULT '[]',
+    ratify_fingerprint TEXT NOT NULL DEFAULT '',
+    ratified_spec     TEXT NOT NULL DEFAULT '',
+    ratified_criteria TEXT NOT NULL DEFAULT '[]',
     updated_at    REAL NOT NULL,
     UNIQUE(run_id, ticket_id)
 );
@@ -221,6 +227,45 @@ class Ticket:
     # rationale scratchpad: five tickets lost the plan's bare-path-line rule to
     # a sentence about why the executor keeps omitting scaffold files.
     original_context: str = ""
+    # How the sign-off pass ended, and what was said in it. Empty status means
+    # the ticket has never been through one — either the feature is off, or it
+    # has not reached the front of the backlog yet.
+    #
+    # `ratify_notes` is a list of `{"pass", "role", "signed", "blocking",
+    # "suggestions", "response"}` records. It is the argument itself, kept
+    # because the roles downstream need it: an executor that asked for a wider
+    # scope should see whether it got one, and a reviewer that was overruled
+    # should read why here rather than raise the same objection again on the
+    # diff.
+    ratify_status: str = ""
+    ratify_passes: int = 0
+    ratify_notes: list[dict] = field(default_factory=list)
+    # The contract that was ratified, so a ticket a respec has since rewritten
+    # is put through ratification again rather than built to a version nobody
+    # signed off on.
+    ratify_fingerprint: str = ""
+    # The settled contract. Written when a ticket ratifies, and read by respec
+    # in preference to `original_*`: from that moment the ratified criteria are
+    # protected exactly as a human's are, because four roles agreed to them.
+    # `original_*` stays as ingested, so `drifted` keeps measuring against what
+    # a person actually wrote.
+    ratified_spec: str = ""
+    ratified_criteria: list[str] = field(default_factory=list)
+
+    @property
+    def contract_criteria(self) -> list[str]:
+        """The criteria a revision is not allowed to walk back.
+
+        The ratified ones where a sign-off pass settled them, the plan's
+        otherwise. Both are somebody's decision on the record; neither is the
+        loop's own invention, which is the distinction the ratchet turns on.
+        """
+        return self.ratified_criteria or self.original_criteria
+
+    @property
+    def contract_spec(self) -> str:
+        """The spec a revision is judged against, ratified version preferred."""
+        return self.ratified_spec or self.original_spec
 
     @property
     def drifted(self) -> bool:
@@ -280,6 +325,12 @@ class Ticket:
             "original_spec": self.original_spec,
             "original_criteria": json.dumps(self.original_criteria),
             "original_context": self.original_context,
+            "ratify_status": self.ratify_status,
+            "ratify_passes": self.ratify_passes,
+            "ratify_notes": json.dumps(self.ratify_notes),
+            "ratify_fingerprint": self.ratify_fingerprint,
+            "ratified_spec": self.ratified_spec,
+            "ratified_criteria": json.dumps(self.ratified_criteria),
         }
 
     @classmethod
@@ -306,6 +357,12 @@ class Ticket:
             original_spec=row["original_spec"],
             original_criteria=json.loads(row["original_criteria"]),
             original_context=row["original_context"],
+            ratify_status=row["ratify_status"],
+            ratify_passes=row["ratify_passes"],
+            ratify_notes=json.loads(row["ratify_notes"]),
+            ratify_fingerprint=row["ratify_fingerprint"],
+            ratified_spec=row["ratified_spec"],
+            ratified_criteria=json.loads(row["ratified_criteria"]),
         )
 
 
@@ -364,6 +421,12 @@ class Store:
         ("tickets", "dep_stamp", "TEXT NOT NULL DEFAULT '{}'"),
         ("tickets", "baseline_tree", "TEXT NOT NULL DEFAULT ''"),
         ("tickets", "charged_failures", "TEXT NOT NULL DEFAULT '[]'"),
+        ("tickets", "ratify_status", "TEXT NOT NULL DEFAULT ''"),
+        ("tickets", "ratify_passes", "INTEGER NOT NULL DEFAULT 0"),
+        ("tickets", "ratify_notes", "TEXT NOT NULL DEFAULT '[]'"),
+        ("tickets", "ratify_fingerprint", "TEXT NOT NULL DEFAULT ''"),
+        ("tickets", "ratified_spec", "TEXT NOT NULL DEFAULT ''"),
+        ("tickets", "ratified_criteria", "TEXT NOT NULL DEFAULT '[]'"),
     )
 
     def _migrate(self) -> None:
@@ -615,6 +678,29 @@ class Store:
                 "baseline_tree = :baseline_tree, "
                 "charged_failures = :charged_failures, context = :context, "
                 "blocked_note = :blocked_note, updated_at = :now "
+                "WHERE run_id = :run_id AND ticket_id = :ticket_id",
+                {**ticket.as_row(), "run_id": run_id, "now": time.time()},
+            )
+
+    def record_ratification(self, run_id: int, ticket: Ticket) -> None:
+        """Write what a sign-off pass settled, and what was said in it.
+
+        Separate from `update_ticket` for the same reason the originals are:
+        `ratified_spec` and `ratified_criteria` become the contract every later
+        revision is judged against, and an anchor any caller can move on the way
+        past is not an anchor. Only the ratify pass writes here.
+
+        The notes travel with them because they are the evidence for them — a
+        contract with no record of who agreed to it is indistinguishable from
+        one the loop wrote for itself.
+        """
+        with self._write() as connection:
+            connection.execute(
+                "UPDATE tickets SET ratify_status = :ratify_status, "
+                "ratify_passes = :ratify_passes, ratify_notes = :ratify_notes, "
+                "ratify_fingerprint = :ratify_fingerprint, "
+                "ratified_spec = :ratified_spec, "
+                "ratified_criteria = :ratified_criteria, updated_at = :now "
                 "WHERE run_id = :run_id AND ticket_id = :ticket_id",
                 {**ticket.as_row(), "run_id": run_id, "now": time.time()},
             )

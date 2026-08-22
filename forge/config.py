@@ -579,6 +579,21 @@ class LoopSettings:
     # reading, and disproof is evidence, not a dead end. 1 parks on the first
     # wrong guess, which is what this did before the re-diagnosis existed.
     bug_hypotheses: int = 3
+    # Sign-off passes over a ticket before its first attempt. Every role is
+    # shown the ticket and asked whether it can do its part as written; the
+    # planner turns the objections into a revision and the pass repeats. 0 is
+    # off — no calls, no steps, and a run that behaves exactly as it did.
+    #
+    # Off by default because it is not free: `roles × passes` calls per ticket
+    # before a line is written, one of them on the reviewer, which is most of
+    # the money on a hybrid run. What it buys is the disagreement that would
+    # otherwise surface as a rejected diff — a scope the executor cannot work
+    # in, a criterion the tester cannot assert, a bar the reviewer never agreed
+    # to — moved to the one moment when changing the ticket is free.
+    #
+    # See docs/RATIFY.md, including the rule it knowingly bends: a reviewer
+    # that helped write the contract is not independent of it.
+    ratify_passes: int = 0
 
 
 @dataclass
@@ -767,6 +782,7 @@ class Config:
             baseline_verify=bool(loop.get("baselineVerify", True)),
             executor_turns=int(loop.get("executorTurns", 0)),
             bug_hypotheses=int(loop.get("bugHypotheses", 3)),
+            ratify_passes=int(loop.get("ratifyPasses", 0)),
         )
 
         ui = data.get("ui", {}) or {}
@@ -805,6 +821,12 @@ class Config:
                 f"loop.executorTurns is {self.loop.executor_turns}; expected 0 "
                 f"(the single-message prompt) or the number of prior attempts "
                 f"to replay to the executor as conversation turns."
+            )
+        if self.loop.ratify_passes < 0:
+            raise ConfigError(
+                f"loop.ratifyPasses is {self.loop.ratify_passes}; expected 0 "
+                f"(no sign-off pass) or the number of passes the roles get to "
+                f"agree on a ticket before it is built."
             )
         for role in ROLES:
             name = self.roles.get(role)
@@ -1107,6 +1129,7 @@ class Config:
                 "baselineVerify": self.loop.baseline_verify,
                 "executorTurns": self.loop.executor_turns,
                 "bugHypotheses": self.loop.bug_hypotheses,
+                "ratifyPasses": self.loop.ratify_passes,
             },
             "ui": {"host": self.ui.host, "port": self.ui.port, "enabled": self.ui.enabled},
         }

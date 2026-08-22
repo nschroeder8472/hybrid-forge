@@ -84,7 +84,8 @@
     "maxRuntimeSeconds": 0,
     "baselineVerify": true,
     "bugHypotheses": 3,
-    "executorTurns": 0
+    "executorTurns": 0,
+    "ratifyPasses": 0
   },
   "ui": {
     "host": "127.0.0.1",

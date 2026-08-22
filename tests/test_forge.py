@@ -25,7 +25,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from types import SimpleNamespace
 
-from forge import cli, evidence, imports, modelfiles, replay, respec, toolchain
+from forge import cli, evidence, imports, modelfiles, ratify, replay, respec, toolchain
 from forge.artifacts import Artifacts
 from forge.budget import BudgetGate, ContextOverflow, RateLimitPolicy
 from forge.config import (
@@ -38,6 +38,7 @@ from forge.config import (
 )
 from forge.ingest import (
     derive_needs,
+    parse_plan,
     graph_problems,
     looks_like_plan,
     parse_plan,
@@ -90,8 +91,10 @@ from forge.prompts import (
     parse_locate,
     repro_prompt,
     build_prompt,
+    parse_ratify,
     parse_respec,
     parse_verdict,
+    ratification_message,
     respec_prompt,
     review_prompt,
     strip_prompt_echo,
@@ -104,6 +107,7 @@ from forge.providers.base import (
     Message,
     Provider,
     ProviderBadResponse,
+    ProviderError,
     ProviderUnreachable,
     Usage,
 )
@@ -14339,3 +14343,615 @@ class TestAProofIsWorthNothingWithoutItsFile(unittest.TestCase):
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
 
         self.assertNotIn("tester", seen)
+
+class TestReadingASignOff(unittest.TestCase):
+    """`parse_ratify` decides whether a role agreed, and it is fail-closed.
+
+    The direction matters. An unreadable reply costs a pass; a reply read as
+    agreement that was not builds the ticket on a contract nobody accepted, and
+    nothing downstream ever finds out.
+    """
+
+    def test_a_clean_sign_off(self):
+        signed, blocking, suggestions = parse_ratify(
+            "SIGNOFF: yes\nBLOCKING:\n- NONE\nSUGGEST:\n- name the module in the spec"
+        )
+        self.assertTrue(signed)
+        self.assertEqual(blocking, [])
+        self.assertEqual(suggestions, ["name the module in the spec"])
+
+    def test_a_refusal_carries_its_reason(self):
+        signed, blocking, _ = parse_ratify(
+            "SIGNOFF: no\nBLOCKING:\n- src/game.rs is not writable\nSUGGEST: NONE"
+        )
+        self.assertFalse(signed)
+        self.assertEqual(blocking, ["src/game.rs is not writable"])
+
+    def test_yes_with_a_blocking_objection_is_read_as_no(self):
+        # The role has named something it cannot work under. Taking the vote
+        # over the reason is how a sign-off pass becomes a formality.
+        signed, blocking, _ = parse_ratify(
+            "SIGNOFF: yes\nBLOCKING:\n- criterion 3 cannot be asserted\nSUGGEST:"
+        )
+        self.assertFalse(signed)
+        self.assertEqual(blocking, ["criterion 3 cannot be asserted"])
+
+    def test_a_bare_vote_is_absorbed(self):
+        # A small model that answers in one word has voted. Failing it over the
+        # missing label spends a pass on formatting.
+        self.assertTrue(parse_ratify("ACCEPT")[0])
+        self.assertTrue(parse_ratify("yes.")[0])
+
+    def test_an_unreadable_reply_is_not_agreement(self):
+        signed, blocking, _ = parse_ratify("I think the ticket looks reasonable.")
+        self.assertFalse(signed)
+        self.assertEqual(blocking, ["reply could not be read as a sign-off"])
+
+    def test_a_point_on_the_heading_line_is_kept(self):
+        _, blocking, suggestions = parse_ratify(
+            "SIGNOFF: no\nBLOCKING: the scope names no test file\nSUGGEST: none"
+        )
+        self.assertEqual(blocking, ["the scope names no test file"])
+        self.assertEqual(suggestions, [])
+
+    def test_bullets_and_placeholders_are_stripped(self):
+        _, blocking, suggestions = parse_ratify(
+            "SIGNOFF: no\nBLOCKING:\n* one\n- two\nSUGGEST:\n- (none)"
+        )
+        self.assertEqual(blocking, ["one", "two"])
+        self.assertEqual(suggestions, [])
+
+
+class TestWhoDecidesWhetherATicketShips(unittest.TestCase):
+    """The two rules in `resolve`, which answer different questions.
+
+    The planner's final say is over what the ticket *says*. A majority decides
+    whether it starts — including a majority the planner is not part of.
+    """
+
+    @staticmethod
+    def _votes(**signed):
+        return [ratify.Vote(role, value) for role, value in signed.items()]
+
+    def test_everybody_agreeing_is_unanimous(self):
+        outcome = ratify.resolve(
+            self._votes(planner=True, executor=True, tester=True, reviewer=True)
+        )
+        self.assertEqual(outcome, ratify.UNANIMOUS)
+
+    def test_three_of_four_ships_on_the_majority(self):
+        outcome = ratify.resolve(
+            self._votes(planner=True, executor=True, tester=True, reviewer=False)
+        )
+        self.assertEqual(outcome, ratify.MAJORITY)
+
+    def test_a_majority_the_planner_is_not_part_of_still_ships(self):
+        # Final say over the text is not a veto over the start. Three roles
+        # that can all do their part are not stopped by the one that wrote it.
+        outcome = ratify.resolve(
+            self._votes(planner=False, executor=True, tester=True, reviewer=True)
+        )
+        self.assertEqual(outcome, ratify.MAJORITY)
+
+    def test_the_planner_and_one_other_is_the_floor(self):
+        outcome = ratify.resolve(
+            self._votes(planner=True, executor=True, tester=False, reviewer=False)
+        )
+        self.assertEqual(outcome, ratify.SPLIT)
+
+    def test_two_without_the_planner_is_not_enough(self):
+        outcome = ratify.resolve(
+            self._votes(planner=False, executor=True, tester=True, reviewer=False)
+        )
+        self.assertEqual(outcome, ratify.BLOCKED)
+
+    def test_the_planner_alone_is_not_enough(self):
+        outcome = ratify.resolve(
+            self._votes(planner=True, executor=False, tester=False, reviewer=False)
+        )
+        self.assertEqual(outcome, ratify.BLOCKED)
+
+    def test_nobody_reachable_is_not_a_verdict(self):
+        # Parking a ticket for a disagreement that never happened is the kind
+        # of misreport that takes a human hours to see through.
+        votes = [ratify.Vote(role, False, error="connection refused") for role in ROLES]
+        self.assertEqual(ratify.resolve(votes), ratify.UNAVAILABLE)
+
+
+class TestTheSignOffPass(unittest.TestCase):
+    """The pass itself: votes, the planner's revision, and what it settles."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.store = Store(self.root / "run.db")
+        self.run_id = self.store.create_run("goal")
+        self.store.add_tickets(
+            self.run_id,
+            [
+                Ticket(
+                    "T-1",
+                    title="Parse the header",
+                    spec="Parse the header.",
+                    allowed_files=["src/a.rs"],
+                    criteria=["it parses"],
+                )
+            ],
+        )
+        self.ticket = self.store.list_tickets(self.run_id)[0]
+        self.calls: list[str] = []
+
+    def _caller(self, script):
+        """A caller that answers from `script`, keyed by role or by turn."""
+
+        def call(role, messages, budget):
+            self.calls.append(role)
+            replies = script[role]
+            reply = replies.pop(0) if isinstance(replies, list) else replies
+            return Completion(text=reply, usage=Usage(), finish_reason="stop")
+
+        return call
+
+    def _ratify(self, script, passes=2):
+        return ratify.ratify(
+            self.store,
+            self.run_id,
+            self.ticket,
+            call=self._caller(script),
+            budget_for=lambda role: 4096,
+            roles=ROLES,
+            passes=passes,
+            root=self.root,
+        )
+
+    def test_unanimous_agreement_settles_it_in_one_pass(self):
+        result = self._ratify({role: "SIGNOFF: yes" for role in ROLES})
+
+        self.assertEqual(result.status, ratify.UNANIMOUS)
+        self.assertEqual(result.passes, 1)
+        # Four votes and no revision: nothing was objected to, so there is
+        # nothing for the planner to rewrite.
+        self.assertEqual(len(self.calls), 4)
+
+    def test_what_was_agreed_becomes_the_contract(self):
+        self._ratify({role: "SIGNOFF: yes" for role in ROLES})
+        stored = self.store.list_tickets(self.run_id)[0]
+
+        self.assertEqual(stored.ratified_criteria, ["it parses"])
+        self.assertEqual(stored.ratified_spec, "Parse the header.")
+        self.assertEqual(stored.ratify_fingerprint, stored.fingerprint)
+        # The plan's own text is left where it was: drift is still measured
+        # against what a person wrote.
+        self.assertEqual(stored.original_spec, "Parse the header.")
+
+    def test_an_objection_is_answered_and_the_ticket_revised(self):
+        script = {
+            "planner": [
+                "SIGNOFF: yes",
+                json.dumps(
+                    {
+                        "spec": "Parse the header, rejecting a missing brace.",
+                        "criteria": ["returns Err(ParseError) for a missing brace"],
+                        "responses": ["made the criterion an assertion"],
+                    }
+                ),
+                "SIGNOFF: yes",
+            ],
+            "executor": ["SIGNOFF: yes", "SIGNOFF: yes"],
+            "tester": [
+                "SIGNOFF: no\nBLOCKING:\n- 'it parses' cannot be asserted",
+                "SIGNOFF: yes",
+            ],
+            "reviewer": ["SIGNOFF: yes", "SIGNOFF: yes"],
+        }
+        result = self._ratify(script)
+
+        self.assertEqual(result.status, ratify.UNANIMOUS)
+        self.assertEqual(result.passes, 2)
+        self.assertIn("criteria", result.changed)
+        stored = self.store.list_tickets(self.run_id)[0]
+        self.assertEqual(
+            stored.criteria, ["returns Err(ParseError) for a missing brace"]
+        )
+
+    def test_the_answer_is_attached_to_the_objection_it_answers(self):
+        # The record is what every role downstream reads. An answer filed
+        # against a role that signed off reports an argument that never
+        # happened.
+        script = {
+            "planner": [
+                "SIGNOFF: yes",
+                json.dumps({"spec": "Revised.", "responses": ["widened the scope"]}),
+                "SIGNOFF: yes",
+            ],
+            "executor": [
+                "SIGNOFF: no\nBLOCKING:\n- src/b.rs is not in scope",
+                "SIGNOFF: yes",
+            ],
+            "tester": ["SIGNOFF: yes", "SIGNOFF: yes"],
+            "reviewer": ["SIGNOFF: yes", "SIGNOFF: yes"],
+        }
+        self._ratify(script)
+        stored = self.store.list_tickets(self.run_id)[0]
+
+        objection = [n for n in stored.ratify_notes if n["role"] == "executor"][0]
+        self.assertEqual(objection["response"], "widened the scope")
+        signed_off = [n for n in stored.ratify_notes if n["role"] == "tester"][0]
+        self.assertEqual(signed_off["response"], "")
+
+    def test_no_revision_lands_after_the_final_vote(self):
+        # A ticket that shipped text nobody had voted on would carry the exact
+        # defect the pass exists to remove.
+        script = {
+            "planner": ["SIGNOFF: yes", json.dumps({"spec": "Revised once."}), "SIGNOFF: yes"],
+            "executor": ["SIGNOFF: no\nBLOCKING:\n- unclear", "SIGNOFF: no\nBLOCKING:\n- still unclear"],
+            "tester": ["SIGNOFF: yes", "SIGNOFF: yes"],
+            "reviewer": ["SIGNOFF: yes", "SIGNOFF: yes"],
+        }
+        self._ratify(script)
+
+        self.assertEqual(self.calls[-4:], list(ROLES))
+        self.assertEqual(self.calls.count("planner"), 3)
+
+    def test_a_ticket_nobody_will_agree_to_parks_with_the_objections(self):
+        script = {
+            "planner": [
+                "SIGNOFF: no\nBLOCKING:\n- the plan asks for two things",
+                json.dumps({"spec": "Still two things."}),
+                "SIGNOFF: no\nBLOCKING:\n- the plan asks for two things",
+            ],
+            "executor": ["SIGNOFF: no\nBLOCKING:\n- no scope for the second", "SIGNOFF: no\nBLOCKING:\n- no scope for the second"],
+            "tester": ["SIGNOFF: no\nBLOCKING:\n- untestable", "SIGNOFF: no\nBLOCKING:\n- untestable"],
+            "reviewer": ["SIGNOFF: yes", "SIGNOFF: yes"],
+        }
+        result = self._ratify(script)
+
+        self.assertEqual(result.status, ratify.BLOCKED)
+        self.assertIn("1 of 4 roles signed off", result.blocked_note)
+        self.assertIn("no scope for the second", result.blocked_note)
+
+    def test_a_blocked_ticket_records_no_contract(self):
+        script = {role: "SIGNOFF: no\nBLOCKING:\n- no" for role in ROLES}
+        self._ratify(script, passes=1)
+        stored = self.store.list_tickets(self.run_id)[0]
+
+        self.assertEqual(stored.ratify_status, ratify.BLOCKED)
+        self.assertEqual(stored.ratified_criteria, [])
+        self.assertEqual(stored.ratify_fingerprint, "")
+        # The argument survives even though the contract does not — it is what
+        # a human has to read to settle it.
+        self.assertTrue(stored.ratify_notes)
+
+    def test_an_unreachable_role_is_not_a_refusal(self):
+        def call(role, messages, budget):
+            raise ProviderError("connection refused")
+
+        result = ratify.ratify(
+            self.store,
+            self.run_id,
+            self.ticket,
+            call=call,
+            budget_for=lambda role: 4096,
+            roles=ROLES,
+            passes=2,
+        )
+
+        self.assertEqual(result.status, ratify.UNAVAILABLE)
+        self.assertTrue(result.proceeds)
+        stored = self.store.list_tickets(self.run_id)[0]
+        self.assertEqual(stored.ratified_spec, "")
+
+    def test_a_planner_that_cannot_revise_costs_a_pass_not_the_ticket(self):
+        script = {
+            "planner": ["SIGNOFF: yes", "I would rather not.", "SIGNOFF: yes"],
+            "executor": ["SIGNOFF: no\nBLOCKING:\n- unclear", "SIGNOFF: yes"],
+            "tester": ["SIGNOFF: yes", "SIGNOFF: yes"],
+            "reviewer": ["SIGNOFF: yes", "SIGNOFF: yes"],
+        }
+        result = self._ratify(script)
+
+        self.assertEqual(result.status, ratify.UNANIMOUS)
+        self.assertEqual(result.changed, [])
+
+    def test_a_revision_may_not_smuggle_in_a_path_outside_the_repository(self):
+        script = {
+            "planner": [
+                "SIGNOFF: yes",
+                json.dumps({"allowed_files": ["../../etc/passwd", "src/b.rs"]}),
+                "SIGNOFF: yes",
+            ],
+            "executor": ["SIGNOFF: no\nBLOCKING:\n- need another file", "SIGNOFF: yes"],
+            "tester": ["SIGNOFF: yes", "SIGNOFF: yes"],
+            "reviewer": ["SIGNOFF: yes", "SIGNOFF: yes"],
+        }
+        self._ratify(script)
+        stored = self.store.list_tickets(self.run_id)[0]
+
+        self.assertEqual(stored.allowed_files, ["src/b.rs"])
+
+    def test_what_earlier_tickets_settled_is_offered_to_the_next_one(self):
+        self.store.add_tickets(
+            self.run_id,
+            [self.ticket, Ticket("T-2", title="Next", spec="Next.", position=1)],
+        )
+        self._ratify(
+            {
+                "planner": [
+                    "SIGNOFF: yes",
+                    json.dumps({"spec": "Revised.", "responses": ["made it measurable"]}),
+                    "SIGNOFF: yes",
+                ],
+                "executor": ["SIGNOFF: yes", "SIGNOFF: yes"],
+                "tester": ["SIGNOFF: no\nBLOCKING:\n- 'it parses' is not measurable", "SIGNOFF: yes"],
+                "reviewer": ["SIGNOFF: yes", "SIGNOFF: yes"],
+            }
+        )
+
+        digest = ratify.learnings(self.store, self.run_id, exclude="T-2")
+        self.assertIn("T-1", digest)
+        self.assertIn("not measurable", digest)
+        self.assertIn("made it measurable", digest)
+        # And a ticket is never handed its own argument back as history.
+        self.assertNotIn("T-1", ratify.learnings(self.store, self.run_id, exclude="T-1"))
+
+
+class TestRatificationInTheLoop(unittest.TestCase):
+    """Where the pass sits, and what the rest of the loop does about it."""
+
+    def _orchestrator(self, passes=1, tickets=None, never_delegate=()):
+        root = Path(tempfile.mkdtemp())
+        (root / "src").mkdir()
+        (root / "src" / "a.rs").write_text("fn main() {}\n", encoding="utf-8")
+        config = Config(
+            root=root,
+            models={"m": {"kind": "openai", "model": "stub", "contextWindow": 8192,
+                          "maxOutputTokens": 1024}},
+            roles={role: "m" for role in ROLES},
+            commands={"lint": "", "typecheck": "", "test": "cargo test"},
+            never_delegate=list(never_delegate),
+            loop=LoopSettings(preflight=False, ratify_passes=passes),
+        )
+        store = Store(config.db_path)
+        run_id = store.create_run("goal")
+        store.add_tickets(
+            run_id,
+            tickets
+            or [
+                Ticket(
+                    "T-1",
+                    title="Parse",
+                    spec="Parse the header.",
+                    allowed_files=["src/a.rs"],
+                    criteria=["it parses"],
+                )
+            ],
+        )
+        orchestrator = Orchestrator(config, store)
+        orchestrator.artifacts = Artifacts(config.config_dir, run_id)
+        return orchestrator, store, run_id
+
+    @staticmethod
+    def _replies(orchestrator, script):
+        """Answer each role from `script`, recording who was asked."""
+        asked: list[str] = []
+
+        def call(run_id, role, messages, *, max_tokens, temperature=0.2):
+            asked.append(role)
+            reply = script[role]
+            text = reply.pop(0) if isinstance(reply, list) else reply
+            return Completion(text=text, usage=Usage(), finish_reason="stop")
+
+        orchestrator._call = call
+        return asked
+
+    def test_off_by_default_means_no_calls_at_all(self):
+        orchestrator, store, run_id = self._orchestrator(passes=0)
+        asked = self._replies(orchestrator, {})
+        ticket = store.list_tickets(run_id)[0]
+
+        self.assertTrue(orchestrator._ratify(run_id, ticket))
+        self.assertEqual(asked, [])
+        self.assertEqual(ticket.ratify_status, "")
+
+    def test_a_ticket_nobody_signs_off_is_parked_before_anything_is_built(self):
+        orchestrator, store, run_id = self._orchestrator(passes=1)
+        self._replies(orchestrator, {role: "SIGNOFF: no\nBLOCKING:\n- unclear" for role in ROLES})
+        ticket = store.list_tickets(run_id)[0]
+
+        self.assertFalse(orchestrator._ratify(run_id, ticket))
+        parked = store.list_tickets(run_id)[0]
+        self.assertEqual(parked.status, "blocked")
+        self.assertIn("ratification failed", parked.blocked_note)
+
+    def test_a_settled_ticket_is_not_put_to_the_roles_twice(self):
+        orchestrator, store, run_id = self._orchestrator(passes=1)
+        asked = self._replies(orchestrator, {role: "SIGNOFF: yes" for role in ROLES})
+        ticket = store.list_tickets(run_id)[0]
+
+        orchestrator._ratify(run_id, ticket)
+        self.assertEqual(len(asked), 4)
+        orchestrator._ratify(run_id, ticket)
+        self.assertEqual(len(asked), 4)
+
+    def test_a_ticket_a_respec_rewrote_is_put_to_them_again(self):
+        # Its `done` — and its sign-off — were earned against a contract that
+        # no longer exists.
+        orchestrator, store, run_id = self._orchestrator(passes=1)
+        asked = self._replies(orchestrator, {role: "SIGNOFF: yes" for role in ROLES})
+        ticket = store.list_tickets(run_id)[0]
+
+        orchestrator._ratify(run_id, ticket)
+        ticket.spec = "Parse the header, and the footer."
+        store.update_ticket(run_id, ticket)
+
+        orchestrator._ratify(run_id, ticket)
+        self.assertEqual(len(asked), 8)
+
+    def test_the_argument_reaches_the_roles_that_have_to_act_on_it(self):
+        ticket = Ticket(
+            "T-1",
+            title="Parse",
+            spec="Parse.",
+            allowed_files=["src/a.rs"],
+            criteria=["it parses"],
+            ratify_status="majority",
+            ratify_notes=[
+                {
+                    "pass": 1,
+                    "role": "reviewer",
+                    "signed": False,
+                    "blocking": ["criterion 1 is not checkable from a diff"],
+                    "suggestions": [],
+                    "response": "kept it; the tester asserts it",
+                }
+            ],
+        )
+        for messages in (
+            build_prompt(ticket),
+            tests_prompt(ticket, ["src/a.rs"], test_path="tests/t.rs"),
+            review_prompt(ticket, "diff --git a b"),
+        ):
+            joined = "\n".join(m.content for m in messages)
+            self.assertIn("not checkable from a diff", joined)
+            self.assertIn("kept it; the tester asserts it", joined)
+
+    def test_the_argument_is_droppable_when_the_prompt_will_not_fit(self):
+        # Worth having, never worth the ticket: the contract itself is stated
+        # in full a few lines further down whatever it costs.
+        message = ratification_message(
+            Ticket(
+                "T-1",
+                ratify_notes=[{"pass": 1, "role": "tester", "signed": True,
+                               "blocking": [], "suggestions": [], "response": ""}],
+            )
+        )
+        self.assertTrue(_droppable(message))
+
+    def test_memory_is_not_asked_twice_for_the_same_contract(self):
+        # The sign-off pass wants the project's prior decisions and so does the
+        # ticket run. Memory does not change in between, and a second query is
+        # a second round trip for the same answer — but a revision changes what
+        # is being asked, so the contract is part of the key.
+        orchestrator, store, run_id = self._orchestrator(passes=1)
+        queries: list[str] = []
+
+        class _Memory:
+            def search(self, query):
+                queries.append(query)
+                return "prior decision"
+
+        orchestrator.memory = _Memory()
+        ticket = store.list_tickets(run_id)[0]
+
+        self.assertEqual(orchestrator._retrieve_context(run_id, ticket), "prior decision")
+        orchestrator._retrieve_context(run_id, ticket)
+        self.assertEqual(len(queries), 1)
+
+        ticket.spec = "Parse the header, and the footer."
+        orchestrator._retrieve_context(run_id, ticket)
+        self.assertEqual(len(queries), 2)
+
+    def test_a_pass_that_widens_scope_into_neverdelegate_still_parks(self):
+        # A scope four roles agreed on is exactly the kind nobody looks at
+        # again, so the gates are asked a second time rather than trusted.
+        orchestrator, store, run_id = self._orchestrator(
+            passes=2, never_delegate=["src/secrets.rs"]
+        )
+        self._replies(
+            orchestrator,
+            {
+                "planner": [
+                    "SIGNOFF: yes",
+                    json.dumps({"allowed_files": ["src/a.rs", "src/secrets.rs"]}),
+                    "SIGNOFF: yes",
+                ],
+                "executor": ["SIGNOFF: no\nBLOCKING:\n- need the secrets file", "SIGNOFF: yes"],
+                "tester": ["SIGNOFF: yes", "SIGNOFF: yes"],
+                "reviewer": ["SIGNOFF: yes", "SIGNOFF: yes"],
+            },
+        )
+        ticket = store.list_tickets(run_id)[0]
+
+        orchestrator._ratify(run_id, ticket)
+        self.assertIn("src/secrets.rs", ticket.allowed_files)
+        self.assertFalse(orchestrator._scope_gate(run_id, ticket))
+        self.assertEqual(store.list_tickets(run_id)[0].status, "blocked")
+
+
+class TestTheRatifiedContractIsTheAnchor(unittest.TestCase):
+    """After a sign-off pass, respec's ratchet protects what was agreed.
+
+    Before it, only the plan's criteria are a human's contract. After it, four
+    roles have settled one — and a revision after a failure is no more entitled
+    to walk that back than it was to walk back the plan's.
+    """
+
+    def _ticket(self):
+        return Ticket(
+            "T-1",
+            spec="Revised at ratification.",
+            criteria=["returns Err(ParseError) for a missing brace"],
+            original_criteria=["it parses"],
+            original_spec="Parse the header.",
+            ratified_spec="Revised at ratification.",
+            ratified_criteria=["returns Err(ParseError) for a missing brace"],
+        )
+
+    def test_a_respec_cannot_drop_what_ratification_settled(self):
+        criteria, refused, _minted = _merge_criteria(self._ticket(), ["something easier"])
+
+        self.assertEqual(criteria, ["returns Err(ParseError) for a missing brace"])
+        self.assertEqual(refused, ["returns Err(ParseError) for a missing brace"])
+
+    def test_an_unratified_ticket_still_anchors_on_the_plan(self):
+        ticket = Ticket(
+            "T-1",
+            criteria=["it parses"],
+            original_criteria=["it parses"],
+            original_spec="Parse the header.",
+        )
+        _criteria, refused, _minted = _merge_criteria(ticket, ["something easier"])
+        self.assertEqual(refused, ["it parses"])
+
+
+class TestTheTicketFileRecordsTheArgument(unittest.TestCase):
+    """The ticket file is what a human reads to decide whether the plan is
+    right, and "three roles agreed, the reviewer did not, here is why" is the
+    most useful sentence on the page for that."""
+
+    def _ticket(self):
+        return Ticket(
+            "T-1",
+            title="Parse",
+            spec="Parse the header.",
+            allowed_files=["src/a.rs"],
+            criteria=["it parses"],
+            context="Keep the paths bare.",
+            ratify_status="majority",
+            ratify_passes=2,
+            ratify_notes=[
+                {
+                    "pass": 1,
+                    "role": "tester",
+                    "signed": False,
+                    "blocking": ["'it parses' cannot be asserted"],
+                    "suggestions": [],
+                    "response": "reworded it",
+                }
+            ],
+        )
+
+    def test_it_names_who_objected_and_what_was_done(self):
+        rendered = render_ticket(self._ticket())
+
+        self.assertIn("## Ratification — majority after 2 pass(es)", rendered)
+        self.assertIn("'it parses' cannot be asserted", rendered)
+        self.assertIn("planner: reworded it", rendered)
+
+    def test_re_reading_the_file_does_not_fold_it_into_the_context(self):
+        # The context is shown to every role on every attempt. Absorbing the
+        # argument about the ticket into it would hand the executor the
+        # argument as though it were part of the work.
+        back = parse_plan(render_ticket(self._ticket()))[0]
+
+        self.assertEqual(back.context, "Keep the paths bare.")
+        self.assertEqual(back.criteria, ["it parses"])

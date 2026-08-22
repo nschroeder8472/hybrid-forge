@@ -33,6 +33,11 @@ PRIOR_VERDICTS_HEADING = "## You have already rejected this ticket"
 # the newest. Marked so the gate can drop an old exchange whole.
 PRIOR_ATTEMPT_HEADING = "## That attempt failed"
 
+# What the roles settled before the ticket was built, carried into every prompt
+# that acts on it. Droppable: it is the reason behind a contract, and the
+# contract itself is stated in full a few lines further down whatever it costs.
+RATIFICATION_HEADING = "## Settled before any code was written"
+
 # The path root every format example in this module uses. A small model shown a
 # worked example will sometimes return the example along with its answer, and
 # those edits are then rejected for being out of scope — which reads, to
@@ -333,11 +338,15 @@ def _criteria_provenance_block(ticket: Ticket) -> str:
     reported as trying to gut the contract and raise the bar at once. A heading
     is not part of any line, so there is nothing to carry.
     """
-    original = set(ticket.original_criteria)
+    # The ratified criteria where a sign-off pass settled them, the plan's
+    # otherwise. Both are somebody's decision on the record, which is what the
+    # protection is about — and after ratification the ingested text is a draft
+    # four roles have already superseded.
+    original = set(ticket.contract_criteria)
     # No anchor recorded — a run ingested before originals were kept. Everything
     # is treated as the plan's, which errs toward leaving a human's contract
     # alone.
-    if not ticket.original_criteria:
+    if not ticket.contract_criteria:
         plan_stated, revision_added = list(ticket.criteria), []
     else:
         plan_stated = [c for c in ticket.criteria if c in original]
@@ -430,6 +439,10 @@ def build_prompt(
     context = _context_message(ticket, retrieved)
     if context is not None:
         messages.append(context)
+
+    settled = ratification_message(ticket)
+    if settled is not None:
+        messages.append(settled)
 
     # Its own message, ahead of the ticket, because the gate drops whole
     # messages and this is one the executor can lose and still do the work.
@@ -705,10 +718,16 @@ module and call it directly. These tests run on the host, where an exported
 function is an ordinary function of its own language.
 """
 
-    return [
-        Message(role="system", content=TESTER_SYSTEM),
-        Message(role="user", content=body),
-    ]
+    messages = [Message(role="system", content=TESTER_SYSTEM)]
+    # What the roles settled before any code existed. The tester is the role
+    # most likely to have asked for a criterion to be made measurable, and it
+    # should see whether it got it rather than rediscovering the same problem
+    # while writing the assertion.
+    settled = ratification_message(ticket)
+    if settled is not None:
+        messages.append(settled)
+    messages.append(Message(role="user", content=body))
+    return messages
 
 
 def bug_prompt(
@@ -1131,6 +1150,14 @@ def review_prompt(
     context = _context_message(ticket, retrieved)
     if context is not None:
         messages.append(context)
+
+    # The reviewer signed off on this contract before anything was built, and
+    # is shown what it agreed to. A reviewer that was overruled reads the
+    # reason here instead of raising the objection again on the diff — which is
+    # the failure the sign-off pass exists to move earlier, not to duplicate.
+    settled = ratification_message(ticket)
+    if settled is not None:
+        messages.append(settled)
 
     verdicts = _prior_verdicts_message(prior_verdicts)
     if verdicts is not None:
@@ -1728,18 +1755,29 @@ say so in `rationale` and leave the ticket as written.
         # ingested text in front of it the planner cannot tell its own
         # accumulated drift from what a human actually asked for — and it will
         # keep revising away from the plan, one plausible step at a time.
+        # Which fixed point this is depends on whether the ticket was
+        # ratified. Saying "human-authored" over text four roles negotiated
+        # would be telling the planner something untrue about who it is
+        # overruling.
+        settled = (
+            "This is what every role signed off on before any code was "
+            "written, and where it and the current text disagree, the "
+            "ratified version is the intent."
+            if ticket.ratified_spec
+            else "This is the human-authored original, and where the two "
+            "disagree, the original is the intent."
+        )
         body += f"""
-## What this ticket said when the plan was ingested
-This is the human-authored original. The "current" text above is what earlier
-revisions have made of it. Where the two disagree, the original is the intent;
+## What this ticket said before any attempt was made
+{settled} The "current" text above is what earlier revisions have made of it;
 treat any difference you cannot justify from the failures below as drift you
 should undo rather than build on.
 
 ### Original spec
-{ticket.original_spec}
+{ticket.contract_spec or ticket.original_spec}
 
 ### Original acceptance criteria
-{_criteria_block(ticket, ticket.original_criteria)}
+{_criteria_block(ticket, ticket.contract_criteria)}
 """
         if ticket.original_context.strip():
             body += f"""
@@ -1869,12 +1907,13 @@ nothing in the failures says which."}}
     ]
 
 
-def parse_respec(text: str) -> dict[str, Any]:
-    """Parse a respec reply into the ticket fields it changes.
+def _json_object(text: str, *, who: str = "model") -> dict[str, Any]:
+    """The JSON object in a reply, however the model wrapped it.
 
-    Returns only the keys the planner actually supplied, so a reply that omits
-    a field leaves the existing value alone rather than blanking it — a
-    dropped `allowed_files` would silently narrow scope to nothing.
+    Fenced, bare, or with prose either side of it — all three arrive, and a
+    parser that accepts only the first spends attempts on presentation. Shared
+    by every prompt in this module that asks for JSON, so a model that learns
+    to satisfy one satisfies the rest.
     """
     candidate = (text or "").strip()
     fence = re.search(r"```(?:json)?\s*\n(.*?)\n```", candidate, re.DOTALL)
@@ -1888,9 +1927,22 @@ def parse_respec(text: str) -> dict[str, Any]:
     try:
         data = json.loads(candidate)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"planner did not return usable JSON: {(text or '')[:400]}") from exc
+        raise ValueError(
+            f"{who} did not return usable JSON: {(text or '')[:400]}"
+        ) from exc
     if not isinstance(data, dict):
-        raise ValueError("planner reply was not a JSON object")
+        raise ValueError(f"{who} reply was not a JSON object")
+    return data
+
+
+def parse_respec(text: str) -> dict[str, Any]:
+    """Parse a respec reply into the ticket fields it changes.
+
+    Returns only the keys the planner actually supplied, so a reply that omits
+    a field leaves the existing value alone rather than blanking it — a
+    dropped `allowed_files` would silently narrow scope to nothing.
+    """
+    data = _json_object(text, who="planner")
 
     revision: dict[str, Any] = {}
     for key in ("spec", "context", "rationale", "impossible"):
@@ -1912,3 +1964,386 @@ def parse_respec(text: str) -> dict[str, Any]:
     if not revision.get("spec") and not revision.get("impossible"):
         raise ValueError("planner reply carried no revised spec")
     return revision
+
+
+# ----------------------------------------------------------------------
+# Ratification — the sign-off pass before a ticket is built
+# ----------------------------------------------------------------------
+
+RATIFY_SYSTEM = """You are the {role} in a plan-and-execute pipeline, and a \
+ticket has been put to you before any code exists.
+
+Nothing has been built yet. Nothing will be until this ticket is agreed. You
+are not reviewing work — you are being asked one question about the contract
+you will have to work under:
+
+**{question}**
+
+Answer it honestly and narrowly. This is the only moment where changing the
+ticket is free. After this, the same objection costs a rejected diff, a wasted
+attempt, or a criterion nobody can check.
+
+Two things are worth separating, and the format keeps them apart:
+
+- **Blocking** — you cannot do your part as written. A scope missing a file you
+  must edit, a criterion that cannot be turned into an assertion, a spec that
+  contradicts itself. Say what would have to change for it to stop blocking.
+- **Suggestion** — you can do your part, and the ticket would still be better
+  with this. Sign off anyway.
+
+Do not object to a ticket for being small, for lacking detail you do not need,
+or for stylistic reasons. Do not restate the ticket back. Do not propose work
+the ticket does not ask for — a ticket that does less than you would like is
+not a defect, and scope you add here is scope somebody has to verify.
+
+Reply in exactly this format and nothing else:
+
+SIGNOFF: yes
+BLOCKING:
+- (one line each, or NONE)
+SUGGEST:
+- (one line each, or NONE)
+
+`SIGNOFF: yes` with a blocking objection listed is read as no. You have named
+something you cannot work under, and the loop takes your reason over your vote.
+"""
+
+# What each role is actually being asked. The question is the whole difference
+# between four sign-offs and four opinions: a role asked "is this ticket good?"
+# answers about somebody else's job, and a planner reading four such answers
+# cannot tell which of them it has to act on.
+RATIFY_QUESTIONS = {
+    "planner": (
+        "Is this still one testable unit of the work the plan asked for, with "
+        "the right dependencies, and does its scope match what it describes?"
+    ),
+    "executor": (
+        "Could you produce this implementation from the spec, the scope, and "
+        "the reference files listed — without opening a file you have not been "
+        "given, and without writing outside the allowed scope?"
+    ),
+    "tester": (
+        "Could you turn every acceptance criterion into a test that fails "
+        "before the change and passes after it? Name any criterion you could "
+        "not express as an assertion."
+    ),
+    "reviewer": (
+        "Could you rule on this ticket from a diff and these criteria alone? "
+        "Name any criterion you could not check by reading the change."
+    ),
+}
+
+
+def _ratify_notes_block(notes: Sequence[dict], limit: int = 12) -> str:
+    """The argument so far, oldest first.
+
+    Rendered from the stored records rather than re-summarised, so the role
+    that raised a point sees its own words and the answer it was given. A role
+    shown a paraphrase of its own objection raises the objection again.
+    """
+    lines = []
+    for note in list(notes)[-limit:]:
+        verdict = "signed off" if note.get("signed") else "did not sign off"
+        lines.append(f"Pass {note.get('pass', '?')} — {note.get('role', '?')}: {verdict}")
+        for point in note.get("blocking") or []:
+            lines.append(f"  blocking: {point}")
+        for point in note.get("suggestions") or []:
+            lines.append(f"  suggested: {point}")
+        if note.get("response"):
+            lines.append(f"  planner: {note['response']}")
+    return "\n".join(lines)
+
+
+def ratify_prompt(
+    ticket: Ticket,
+    role: str,
+    *,
+    sources: dict[str, str] | None = None,
+    retrieved: str = "",
+    notes: Sequence[dict] = (),
+    learnings: str = "",
+) -> list[Message]:
+    """Ask one role to sign off on a ticket, before anything is built."""
+    question = RATIFY_QUESTIONS.get(
+        role, "Could you do your part of this ticket as written?"
+    )
+    messages = [
+        Message(role="system", content=RATIFY_SYSTEM.format(role=role, question=question))
+    ]
+
+    context = _context_message(ticket, retrieved)
+    if context is not None:
+        messages.append(context)
+
+    # Earlier tickets in this run, so the second ticket does not re-open what
+    # the first settled. Behind the context heading, which makes it droppable:
+    # worth having, never worth the ticket.
+    if learnings.strip():
+        messages.append(
+            Message(
+                role="user",
+                content=f"{CONTEXT_HEADING}\n"
+                f"### Already settled on earlier tickets in this run\n"
+                f"{learnings.strip()}",
+            )
+        )
+
+    body = f"""Ticket: {ticket.ticket_id} — {ticket.title}
+
+## Spec
+{ticket.spec}
+
+## Allowed scope (the only files this ticket may write)
+{_files_block(ticket)}
+
+## Reference files (readable, not writable)
+{_reference_block(ticket)}
+
+## Acceptance criteria
+{_criteria_block(ticket)}
+"""
+
+    if sources:
+        body += f"""
+## The files as they exist now
+{_sources_block(sources)}
+"""
+
+    if notes:
+        body += f"""
+{RATIFICATION_HEADING}
+{_ratify_notes_block(notes)}
+
+The ticket above already reflects what the planner changed. Do not re-raise a
+point that has been answered unless the answer is wrong, and say why if it is.
+"""
+
+    messages.append(
+        Message(role="user", content=body + "\nAnswer now, in the format given.")
+    )
+    return messages
+
+
+_SIGNOFF_LINE = re.compile(
+    r"^\s*signoff\s*[:\-]\s*\**\s*(yes|no|y|n|accept|reject|agree|object)",
+    re.IGNORECASE,
+)
+_RATIFY_SECTION = re.compile(
+    r"^\s*\**\s*(blocking|suggest(?:ion|ions|ed)?)\s*\**\s*[:\-]\s*(.*)$", re.IGNORECASE
+)
+_RATIFY_NONE = re.compile(r"^\(?\s*(none|n/?a|nothing)\b", re.IGNORECASE)
+_BARE_VOTE = ("yes", "accept", "agree", "ok", "signoff: yes", "signoff yes")
+
+
+def _ratify_points(raw: Sequence[str]) -> list[str]:
+    """Clean one section's lines: strip bullets, drop the NONE placeholder."""
+    points = []
+    for line in raw:
+        text = line.strip().lstrip("-*• \t").strip()
+        if not text or _RATIFY_NONE.match(text):
+            continue
+        points.append(text)
+    return points
+
+
+def parse_ratify(text: str) -> tuple[bool, list[str], list[str]]:
+    """Read one role's sign-off. Returns `(signed, blocking, suggestions)`.
+
+    Fail-closed, for the reason `parse_verdict` is: a reply nobody can read is
+    not agreement. The cost of that is bounded — an unreadable answer costs a
+    pass, and the resolution rule does not require every role to sign off —
+    while the other direction builds a ticket on a contract a role never
+    accepted.
+
+    A `yes` alongside a blocking objection is read as no. The role has named
+    something it cannot work under, and taking the vote over the reason is how
+    a sign-off pass becomes a formality that changes nothing.
+    """
+    signed = False
+    saw_vote = False
+    section = ""
+    blocking: list[str] = []
+    suggestions: list[str] = []
+
+    for line in (text or "").splitlines():
+        vote = _SIGNOFF_LINE.match(line)
+        if vote:
+            saw_vote = True
+            signed = vote.group(1).lower() in ("yes", "y", "accept", "agree")
+            section = ""
+            continue
+        heading = _RATIFY_SECTION.match(line)
+        if heading:
+            section = "blocking" if heading.group(1).lower() == "blocking" else "suggest"
+            trailing = heading.group(2).strip()
+            if trailing:
+                (blocking if section == "blocking" else suggestions).append(trailing)
+            continue
+        if section == "blocking":
+            blocking.append(line)
+        elif section == "suggest":
+            suggestions.append(line)
+
+    blocking = _ratify_points(blocking)
+    suggestions = _ratify_points(suggestions)
+
+    if not saw_vote:
+        # Absorbed rather than refused where the answer is plainly one word: a
+        # small model that writes "ACCEPT" and nothing else has voted, and
+        # failing it over the missing label spends a pass on formatting. The
+        # same absorption is not extended to a refusal buried in prose — that
+        # is already a no, and reading it as one costs nothing.
+        if (text or "").strip().lower().rstrip(".!") in _BARE_VOTE:
+            return True, [], []
+        return False, ["reply could not be read as a sign-off"], suggestions
+
+    return (signed and not blocking), blocking, suggestions
+
+
+RATIFY_REVISE_SYSTEM = """You are the planner. Every role has been asked \
+whether it can do its part of one ticket, and at least one said it could not. \
+Nothing has been built yet.
+
+Rewrite the ticket so the blocking objections stop being true, and answer each
+one. You decide what the ticket says — the other roles propose, you dispose —
+but an objection you decline is one you have to give a reason for, and the role
+that raised it will read that reason.
+
+You may change the spec, the context, the allowed scope, the reference files,
+and — unlike a revision after a failure — the acceptance criteria. This is the
+moment the contract is settled: a criterion that cannot be tested should be
+made testable now, and a missing one should be added now.
+
+What you must not do:
+
+- Do not weaken a criterion to make an objection go away. A criterion nobody
+  checks is worse than one somebody objected to.
+- Do not widen the scope past the files the work actually needs.
+- Do not turn this into a different ticket. The plan asked for something; a
+  revision that does more than was asked is a new ticket, not this one.
+- Do not drop something the plan stated because a role found it inconvenient.
+
+Reply with a JSON object and nothing else:
+
+```json
+{
+  "spec": "the revised spec",
+  "criteria": ["every criterion, in full, including the unchanged ones"],
+  "allowed_files": ["path/one"],
+  "reference_files": ["path/two"],
+  "context": "anything the roles must carry, or omit this key",
+  "responses": ["one line per objection: what you changed, or why you did not"]
+}
+```
+
+Every key is optional, except that the reply has to change something. Omit a
+key to leave that field exactly as it is. `criteria` and the file lists are
+replacements rather than additions, so send them in full or not at all.
+"""
+
+
+def ratify_revision_prompt(
+    ticket: Ticket,
+    notes: Sequence[dict],
+    *,
+    sources: dict[str, str] | None = None,
+    learnings: str = "",
+) -> list[Message]:
+    """Ask the planner to rewrite a ticket the roles could not all sign off."""
+    messages = [Message(role="system", content=RATIFY_REVISE_SYSTEM)]
+
+    if learnings.strip():
+        messages.append(
+            Message(
+                role="user",
+                content=f"{CONTEXT_HEADING}\n"
+                f"### Already settled on earlier tickets in this run\n"
+                f"{learnings.strip()}",
+            )
+        )
+
+    body = f"""Ticket: {ticket.ticket_id} — {ticket.title}
+
+## Spec
+{ticket.spec}
+
+## Allowed scope
+{_files_block(ticket)}
+
+## Reference files
+{_reference_block(ticket)}
+
+## Acceptance criteria
+{_criteria_block(ticket)}
+
+## What the plan originally asked for
+{ticket.original_spec or ticket.spec}
+
+{RATIFICATION_HEADING}
+{_ratify_notes_block(notes)}
+"""
+
+    if sources:
+        body += f"""
+## The files as they exist now
+{_sources_block(sources)}
+"""
+
+    messages.append(
+        Message(role="user", content=body + "\nReturn the revised ticket as JSON now.")
+    )
+    return messages
+
+
+def parse_ratify_revision(text: str) -> dict[str, Any]:
+    """Parse a ratify revision. Respec's grammar, one rule relaxed.
+
+    Respec demands a revised spec, because a revision with nothing in it is a
+    planner that gave up on a ticket it was asked to rescue. Here a revision
+    that only widens a scope, or only rewords one criterion, is a complete
+    answer: the objection was narrow and so is the fix. What is still refused
+    is a reply that changes nothing at all, which spends a pass and leaves the
+    next vote reading the identical ticket.
+    """
+    data = _json_object(text, who="planner")
+
+    revision: dict[str, Any] = {}
+    for key in ("spec", "context", "rationale"):
+        if isinstance(data.get(key), str) and data[key].strip():
+            revision[key] = data[key].strip()
+    for key in ("criteria", "allowed_files", "reference_files", "responses"):
+        value = data.get(key)
+        if isinstance(value, list):
+            items = [str(v).strip() for v in value if str(v).strip()]
+            # An empty list is a truncated reply far more often than it is a
+            # deliberate "this ticket needs no criteria" — the same reading
+            # `parse_respec` takes, and for the same reason.
+            if items:
+                revision[key] = items
+
+    if not set(revision) - {"rationale", "responses"}:
+        raise ValueError("planner reply revised nothing")
+    return revision
+
+
+def ratification_message(ticket: Ticket) -> Message | None:
+    """What the roles agreed, for the prompts that act on the ticket afterwards.
+
+    Carried into build, tests and review so the role that asked for something
+    can see whether it got it, and the role that was overruled reads the reason
+    here rather than raising the same objection again on the diff.
+    """
+    if not ticket.ratify_notes:
+        return None
+    status = ticket.ratify_status or "unsettled"
+    return Message(
+        role="user",
+        content=f"""{RATIFICATION_HEADING}
+Every role was asked whether it could do its part of this ticket before any
+code existed. The ticket above is the result, agreed {status}.
+
+{_ratify_notes_block(ticket.ratify_notes)}
+
+This is settled. Do not re-open it — work to the ticket as it now stands.
+""",
+    )
