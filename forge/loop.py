@@ -40,11 +40,12 @@ from typing import Any, Callable, NamedTuple, Sequence
 
 from . import imports
 from . import toolchain
+from . import ratify as ratification
 from . import respec
 from . import evidence
 from .artifacts import ABANDONED_DIR, Artifacts, safe_name
 from .budget import BudgetGate, Wait
-from .config import ANY_LANGUAGE, REPO_ROOT, Config, ConfigError, Workspace
+from .config import ANY_LANGUAGE, REPO_ROOT, ROLES, Config, ConfigError, Workspace
 from .failures import (
     blocks_naming,
     distill,
@@ -87,7 +88,9 @@ from .prompts import (
     PRIOR_ATTEMPT_HEADING,
     PRIOR_FAILURES_HEADING,
     PRIOR_VERDICTS_HEADING,
+    RATIFICATION_HEADING,
     build_prompt,
+    ratification_message,
     parse_record,
     parse_verdict,
     parse_bug,
@@ -130,6 +133,7 @@ _DROPPABLE_HEADINGS = (
     PRIOR_FAILURES_HEADING,
     PRIOR_VERDICTS_HEADING,
     PRIOR_ATTEMPT_HEADING,
+    RATIFICATION_HEADING,
 )
 
 
@@ -303,6 +307,9 @@ class Orchestrator:
         # for a twenty-ticket run logs once rather than twenty times.
         self._memory_warned = False
         self._memory_failures = 0
+        # The last ticket contract memory was queried for, and what came back.
+        self._retrieved_for: tuple[str, str] | None = None
+        self._retrieved_text = ""
         # Tickets that got a test file, and tickets that were told they should
         # not have one. Individually a skip is routine; every ticket in a run
         # skipping is a misconfiguration, and it presents as a quiet `info`
@@ -360,9 +367,19 @@ class Orchestrator:
         unrecognized tool surface degrades the run to "no context" — it never
         ends it, because losing an overnight run over a memory outage would be
         a far worse failure than building without project history.
+
+        Cached for as long as the ticket's contract holds. The sign-off pass
+        asks for it before the ticket runs and `_work_ticket` asks again once
+        it does, and memory does not change in between — but a respec or a
+        ratify revision does change the query, so the fingerprint is part of
+        the key rather than the ticket id alone.
         """
         if self.memory is None:
             return ""
+
+        key = (ticket.ticket_id, ticket.fingerprint)
+        if self._retrieved_for == key:
+            return self._retrieved_text
 
         query = ticket_query(ticket.title, ticket.spec, ticket.allowed_files)
         try:
@@ -392,6 +409,7 @@ class Orchestrator:
             return ""
 
         self._memory_failures = 0
+        self._retrieved_for, self._retrieved_text = key, retrieved
         if retrieved:
             self.store.log(
                 run_id,
@@ -2641,6 +2659,156 @@ class Orchestrator:
             )
         return revised, True, parked
 
+    def _scope_gate(self, run_id: int, ticket: Ticket) -> bool:
+        """Everything about a ticket's scope that can be judged before spending.
+
+        Returns False when the ticket was parked. Asked once before the ticket
+        runs and again after a ratify pass, because a pass may widen the scope
+        into any of these — and a scope four roles agreed on is exactly the
+        kind nobody looks at twice.
+
+        Ownership before runners: a file no build owns has no command of any
+        kind, and reporting it as a missing *runner* would send a person to
+        `forge toolchain` for a problem no command can fix.
+        """
+        offending = [
+            p for p in ticket.allowed_files if matches_any(p, self.config.never_delegate)
+        ]
+        if offending:
+            ticket.status = TICKET_BLOCKED
+            ticket.blocked_note = (
+                f"allowed files match neverDelegate: {', '.join(offending)}"
+            )
+            self.store.update_ticket(run_id, ticket)
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: blocked — {ticket.blocked_note}",
+                level="warn",
+                kind="ticket",
+            )
+            return False
+
+        unowned = self._unowned_files(ticket)
+        if unowned:
+            self._park(run_id, ticket, self._no_workspace_note(ticket, unowned))
+            return False
+
+        spanning = self._spanning_workspaces(ticket)
+        if len(spanning) > 1:
+            self._park(run_id, ticket, self._spanning_note(ticket, spanning))
+            return False
+
+        uncovered = self._uncovered_languages(ticket)
+        if uncovered:
+            self._park(run_id, ticket, self._no_runner_note(ticket, uncovered))
+            return False
+        return True
+
+    def _ratify(self, run_id: int, ticket: Ticket) -> bool:
+        """Put the ticket to every role before anything is built.
+
+        Returns False when the ticket was parked for want of agreement.
+
+        Off by default, and off means *nothing*: no calls, no steps, no ticket
+        fields written. What it costs when on is `roles × passes` calls per
+        ticket before a line of code exists, one of them on the reviewer, so it
+        is a decision an operator makes rather than one the loop makes for
+        them.
+
+        Re-run when the contract moves. A ticket a respec has rewritten carries
+        a fingerprint that no longer matches what was signed off, and building
+        it would be building a version nobody agreed to — which is the failure
+        this whole pass exists to remove, arriving by another door.
+        """
+        passes = self.config.loop.ratify_passes
+        if passes <= 0:
+            return True
+        if ticket.ratify_status and ticket.ratify_fingerprint == ticket.fingerprint:
+            return True
+
+        # What earlier tickets in this run settled, so this one does not
+        # re-open it. Read from the database rather than held here: a daemon
+        # restarted mid-backlog has to know what it agreed to yesterday.
+        digest = ratification.learnings(self.store, run_id, exclude=ticket.ticket_id)
+        sources, _missing = self._sources_for(ticket)
+        retrieved = self._retrieve_context(run_id, ticket)
+
+        step_id = self.store.start_step(run_id, ticket.ticket_id, "ratify")
+
+        def call(role: str, messages: list[Message], budget: int) -> Completion:
+            completion = self._call(
+                run_id, role, messages, max_tokens=budget, temperature=0.0
+            )
+            self._record_call(
+                ticket, f"ratify-{role}", role, completion, extra={"pass": "sign-off"}
+            )
+            return completion
+
+        result = ratification.ratify(
+            self.store,
+            run_id,
+            ticket,
+            call=call,
+            budget_for=self._output_budget,
+            roles=ROLES,
+            passes=passes,
+            sources=sources,
+            retrieved=retrieved,
+            digest=digest,
+            root=self.config.root,
+        )
+
+        self._record_step(
+            ticket,
+            "ratify",
+            "ok" if result.proceeds else "failed",
+            {
+                "status": result.status,
+                "passes": result.passes,
+                "changed": result.changed,
+                "notes": result.notes,
+            },
+        )
+
+        if result.status == ratification.UNAVAILABLE:
+            # Not a verdict, and not held against the ticket. Parking work
+            # because a model was unreachable would report a disagreement that
+            # never happened — the hardest kind of misreport to see through.
+            self.store.end_step(step_id, "failed", "no role could be reached")
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: no role could be reached for sign-off; "
+                f"continuing without ratification.",
+                level="warn",
+                kind="ticket",
+            )
+            return True
+
+        # The ticket file a human reads has to say what the roles agreed, or
+        # the record of the argument lives only in the database.
+        write_tickets(self.config.tickets_dir, [ticket])
+
+        if not result.proceeds:
+            self.store.end_step(step_id, "failed", result.blocked_note)
+            self._park(run_id, ticket, result.blocked_note)
+            return False
+
+        self.store.end_step(
+            step_id,
+            "ok",
+            f"{result.status} after {result.passes} pass(es)"
+            + (f"; revised {', '.join(result.changed)}" if result.changed else ""),
+        )
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: ratified {result.status} after "
+            f"{result.passes} pass(es)."
+            + (f" Revised {', '.join(result.changed)}." if result.changed else ""),
+            kind="ticket",
+            data={"status": result.status, "passes": result.passes},
+        )
+        return True
+
     def _work_ticket(self, run_id: int, ticket: Ticket) -> None:
         # Triage is a hard gate, not a preference. A claude-only ticket is one
         # the plan judged unsafe to hand to the executor, and the loop is not
@@ -2657,40 +2825,20 @@ class Orchestrator:
             )
             return
 
-        offending = [p for p in ticket.allowed_files if matches_any(p, self.config.never_delegate)]
-        if offending:
-            ticket.status = TICKET_BLOCKED
-            ticket.blocked_note = f"allowed files match neverDelegate: {', '.join(offending)}"
-            self.store.update_ticket(run_id, ticket)
-            self.store.log(
-                run_id,
-                f"{ticket.ticket_id}: blocked — {ticket.blocked_note}",
-                level="warn",
-                kind="ticket",
-            )
+        if not self._scope_gate(run_id, ticket):
             return
 
-        # Before anything is spent. A ticket in a language nothing runs cannot
-        # be checked, and the loop's answer to that used to be to run it
-        # anyway and report the skip as routine.
-        #
-        # Ownership first, because it is the wider question: a file no build
-        # owns has no command of any kind, and reporting it as a missing
-        # *runner* would send a person to `forge toolchain` for a problem no
-        # command can fix.
-        unowned = self._unowned_files(ticket)
-        if unowned:
-            self._park(run_id, ticket, self._no_workspace_note(ticket, unowned))
+        # Before the baseline, the snapshot, and any code: every role is asked
+        # whether it can do its part of this ticket as written. Off unless
+        # `loop.ratifyPasses` says otherwise — see `_ratify`.
+        if not self._ratify(run_id, ticket):
             return
 
-        spanning = self._spanning_workspaces(ticket)
-        if len(spanning) > 1:
-            self._park(run_id, ticket, self._spanning_note(ticket, spanning))
-            return
-
-        uncovered = self._uncovered_languages(ticket)
-        if uncovered:
-            self._park(run_id, ticket, self._no_runner_note(ticket, uncovered))
+        # A ratify pass may have widened the scope into a file no build owns, a
+        # second workspace, or a language nothing runs. The gates are cheap and
+        # the answer may have changed, so they are asked again rather than
+        # trusted from before the revision.
+        if ticket.ratify_status and not self._scope_gate(run_id, ticket):
             return
 
         ticket.status = TICKET_RUNNING

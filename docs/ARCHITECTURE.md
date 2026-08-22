@@ -12,6 +12,7 @@ changes between those two cases is only what gets fed into it.
 
 ```mermaid
 flowchart LR
+    RATIFY["0 · RATIFY<br/>every role signs off — off by default"]
     BUILD["1 · BUILD<br/>writes the code"]
     APPLY["2 · APPLY<br/>scope-checked"]
     TESTS["3 · TESTS<br/>encodes ticket criteria"]
@@ -22,18 +23,25 @@ flowchart LR
     DONE(["ticket done"])
     PARK(["parked for a human"])
 
-    BUILD --> APPLY --> TESTS --> VERIFY --> REVIEW --> RECORD --> COMMIT --> DONE
+    RATIFY --> BUILD --> APPLY --> TESTS --> VERIFY --> REVIEW --> RECORD --> COMMIT --> DONE
+
+    RATIFY -->|"no majority"| PARK
 
     VERIFY -->|"check failed"| BUILD
     REVIEW -->|"REJECT"| BUILD
     BUILD -->|"BLOCKED:"| PARK
 
     classDef model fill:#1F6B52,stroke:#14483A,color:#FFFFFF;
-    class BUILD,TESTS,REVIEW,RECORD model;
+    class RATIFY,BUILD,TESTS,REVIEW,RECORD model;
 ```
 
-The four green steps are model calls, each wrapped by the budget gate. The rest
-are your own shell commands and `git`, and cost nothing.
+The green steps are model calls, each wrapped by the budget gate. The rest are
+your own shell commands and `git`, and cost nothing.
+
+RATIFY is the one that is off unless asked for: `loop.ratifyPasses` puts the
+ticket to every role before it is built, so a scope the executor cannot work
+in, a criterion the tester cannot assert, or a bar the reviewer will not accept
+surfaces while changing the ticket is still free. See [RATIFY.md](RATIFY.md).
 
 Verification runs **before** any model reviews, so the reviewer judges a diff
 that already compiles and passes — it is never asked to guess whether it would.

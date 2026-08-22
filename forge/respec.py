@@ -398,10 +398,15 @@ def _anchor(ticket: Ticket, ruled_out: Sequence[tuple[str, str]] = ()) -> str:
     A bug ticket's fixed point was never the first hypothesis anyway — it is
     the report, which no revision rewrites. Where one exists, the current spec
     is the live hypothesis and drift from a dead one is the point.
+
+    A ticket that has been through a sign-off pass has a nearer fixed point
+    than the plan: `ratified_spec`, which four roles agreed to before anything
+    was built. It is preferred where it exists, because the ingested text is
+    then a draft that has already been superseded on the record.
     """
     if ruled_out:
         return ticket.spec
-    return ticket.original_spec or ticket.spec
+    return ticket.contract_spec or ticket.spec
 
 
 # How much of a ruled-out spec a revision must restate before it counts as
@@ -558,7 +563,7 @@ def _drop_whole_file_claims(
     respec itself broke would be the wrong way round. Only what this revision
     is adding is filtered.
     """
-    plan_stated = {_key(c) for c in (ticket.original_criteria or ticket.criteria)}
+    plan_stated = {_key(c) for c in (ticket.contract_criteria or ticket.criteria)}
     backlog = [t for t in store.list_tickets(run_id) if t.ticket_id != ticket.ticket_id]
     candidate = Ticket(
         ticket_id=ticket.ticket_id,
@@ -654,7 +659,7 @@ def _merge_criteria(
     plan stating thirteen: every one of them present twice, in two spellings,
     for the executor to read as two separate demands.
     """
-    original = {_key(c) for c in (ticket.original_criteria or ticket.criteria)}
+    original = {_key(c) for c in (ticket.contract_criteria or ticket.criteria)}
     known = {_key(criterion) for criterion in ticket.criteria}
     wanted = {_key(criterion) for criterion in proposed}
 

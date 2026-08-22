@@ -77,6 +77,18 @@ pass otherwise" is true of every contradiction and settles none of them. The
 argument goes to the run log verbatim either way: what a person wants later is
 not that scope changed but why somebody thought the old assertion was wrong.
 
+**Where this is knowingly bent, and why.** `loop.ratifyPasses` asks every role,
+the reviewer included, to sign off on a ticket before it is built — so the
+reviewer helps settle the contract it will later judge work against. That is a
+weaker version of this rule, taken deliberately: the failure it removes (review
+rejecting a diff over a bar the reviewer never agreed to, on a ticket that did
+what it was told) has been observed, and the failure it risks (a reviewer
+anchored on a contract it helped write) has not. The mitigations are that it is
+off by default, that the criteria may only move *before* any attempt exists —
+after that respec's ratchet protects the ratified contract exactly as it
+protects a human's — and that the whole argument is recorded on the ticket
+where a person can read it. See [RATIFY.md](RATIFY.md).
+
 ---
 
 ## 4. "Mentions the path" is not "is blamed for the path"
@@ -708,4 +720,5 @@ kind cost fifteen tickets.
 | `ingest.undeclared_order` | every ingest |
 | `environment_failure` / `_note_toolchain` | every verify step |
 | `resumable_runs` draining | every command that opens a run |
+| `ratify.resolve` / `_scope_gate` re-run | every ticket, when `ratifyPasses` is on |
 | Reproduction, re-diagnosis, contradiction | bug tickets only |

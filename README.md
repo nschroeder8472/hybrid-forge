@@ -22,6 +22,7 @@ were holding the plan.
 ```
 forged (daemon)
  ├─ state: .hybridforge/run.db
+ ├─ RATIFY   every role signs off on the ticket first (off by default)
  ├─ BUILD    executor writes the implementation against the spec
  ├─ APPLY    edits land on disk; anything outside scope is rejected
  ├─ TESTS    tester encodes the ticket's criteria — never its own
