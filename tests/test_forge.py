@@ -74,6 +74,8 @@ from forge.patch import (
     repo_relative,
 )
 from forge.failures import (
+    _blocks,
+    _file_of,
     blocks_naming,
     classify,
     distill,
@@ -13085,6 +13087,128 @@ class TestLocationsReadsEveryDialect(unittest.TestCase):
         # accepting bare words would let prose read as a filename.
         self.assertEqual(locations("build/Makefile:12: *** missing separator"), ["build/Makefile"])
         self.assertEqual(locations("Makefile:12: *** missing separator"), [])
+
+    def test_godots_res_scheme_is_a_repository_relative_path(self):
+        # Godot spells every project file `res://…`, relative to the project
+        # root — which is repository-relative already. The scheme's `//` was
+        # kept, so every GDScript location parsed to `//tests/x.gd`: a path
+        # matching nothing on disk and nothing in a ticket's scope, for the
+        # whole Godot half of a project.
+        self.assertEqual(
+            locations('  at res://tests/theme/test_decor_fixtures.gd:11'),
+            ["tests/theme/test_decor_fixtures.gd"],
+        )
+
+    def test_the_user_scheme_is_left_alone(self):
+        # `user://` is the engine's user-data directory, outside the
+        # repository. Stripping it would invent a repository file.
+        self.assertNotIn("saves/game.cfg", locations("at user://saves/game.cfg:3"))
+
+    def test_an_address_is_not_a_file(self):
+        # `'127.0.0.1:0'` read as the file `127.0.0.1` at line 0. Godot prints
+        # it whenever it cannot reach its debugger, which is every headless
+        # run, and it was one of the top failure classes of a ticket that spent
+        # 45 attempts — 37 times over.
+        self.assertEqual(
+            locations("ERROR: Remote Debugger: Unable to connect to host '127.0.0.1:0'."),
+            [],
+        )
+
+    def test_a_numeric_version_in_a_path_still_parses(self):
+        self.assertEqual(
+            locations("/usr/lib/python3.11/site-packages/x.py:4: error"),
+            ["/usr/lib/python3.11/site-packages/x.py"],
+        )
+
+
+class TestTheRuntimeIsNotTheProject(unittest.TestCase):
+    """Godot prints its own C++ source in a frame under every engine error, and
+    prints those errors on every run — a debugger port it was not given, a
+    D3D12 swapchain resize, pages still allocated at exit. Parsed as
+    diagnostics they were the top four failure classes of a ticket that spent
+    45 attempts: `core/io/stream_peer_tcp.cpp`,
+    `drivers/d3d12/rendering_device_driver_d3d12.cpp`,
+    `./core/templates/paged_allocator.h` and `127.0.0.1`, each 37 times. The
+    four real GDScript parse errors ranked below them, and convergence was
+    being measured against the engine's startup."""
+
+    NOISE = (
+        "ERROR: The remote port number must be between 1 and 65535 (inclusive).\n"
+        "   at: connect_to_host (core/io/stream_peer_tcp.cpp:69)\n"
+    )
+    REAL = (
+        'SCRIPT ERROR: Parse Error: Cannot infer the type of "x" variable.\n'
+        "   at: GDScript::reload (res://tools/dump_decor_fixtures.gd:11)\n"
+    )
+
+    def test_an_engine_error_about_engine_source_is_not_a_diagnostic(self):
+        self.assertEqual(classify("test", self.NOISE + self.REAL), {
+            "test script error: parse error: cannot infer the type of @ variab "
+            "in tools/dump_decor_fixtures.gd"
+        })
+
+    def test_the_project_file_is_still_blamed(self):
+        self.assertEqual(
+            list(files_blamed(self.NOISE + self.REAL)),
+            ["tools/dump_decor_fixtures.gd"],
+        )
+
+    def test_noise_is_only_noise_when_there_is_signal(self):
+        # A run whose sole evidence is an engine error has nothing to gain from
+        # being told nothing failed.
+        self.assertTrue(classify("test", self.NOISE))
+
+    def test_the_frame_goes_but_the_error_above_it_stays(self):
+        # One Godot error is both: the head names the project file that failed
+        # and the frame names where Godot's loader gave up. Dropping the whole
+        # block would lose the only statement of what is wrong; keeping the
+        # frame blamed the engine, twenty times on one ticket.
+        output = (
+            'ERROR: Failed to load script "res://tests/theme/x.gd" with error '
+            '"Parse error".\n'
+            "   at: load (modules/gdscript/gdscript_resource_format.cpp:46)\n"
+            "   GDScript backtrace (most recent call first):\n"
+            "       [0] scan (res://addons/gdUnit4/src/core/Scanner.gd:214)\n"
+        )
+
+        self.assertEqual(
+            classify("test", output),
+            {"test test failed in tests/theme/x.gd"},
+        )
+
+    def test_a_stack_frame_naming_a_project_file_is_kept(self):
+        # gdUnit4's own scanner is in `addons/`, which is a real repository
+        # path and a real thing to report. Only the subject is decided
+        # elsewhere.
+        blamed = files_blamed(
+            'ERROR: Failed to load script "res://tests/theme/x.gd" with error '
+            '"Parse error".\n'
+            "       [0] scan (res://addons/gdUnit4/src/core/Scanner.gd:214)\n"
+        )
+
+        self.assertIn("addons/gdUnit4/src/core/Scanner.gd", blamed)
+
+    def test_a_head_naming_its_file_beats_a_line_below_naming_another(self):
+        # A tool states its subject first and explains how it got there after.
+        # Reading the location below the head first blamed gdUnit4's scanner,
+        # which is in `addons/` and which no ticket may touch.
+        blocks, _ = _blocks(
+            (
+                'ERROR: Failed to load script "res://tests/theme/x.gd" with '
+                'error "Parse error".\n'
+                "       [0] scan (res://addons/gdUnit4/src/core/Scanner.gd:214)\n"
+            ).splitlines()
+        )
+
+        self.assertEqual(_file_of(blocks[0]), "tests/theme/x.gd")
+
+    def test_a_runner_that_puts_the_file_below_the_head_still_works(self):
+        # pytest's head carries the exception and no path at all.
+        blocks, _ = _blocks(
+            "E   AssertionError: assert 1 == 2\ntests/test_a.py:4: in <module>\n".splitlines()
+        )
+
+        self.assertEqual(_file_of(blocks[0]), "tests/test_a.py")
 
 
 class TestPytestSignaturesStayDistinctPerFile(unittest.TestCase):
