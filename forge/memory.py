@@ -932,6 +932,35 @@ def ticket_query(title: str, spec: str, allowed_files: list[str]) -> str:
 # ----------------------------------------------------------------------
 
 
+def _entry_param(tool: dict[str, Any]) -> str | None:
+    """Which parameter takes the memory text: a name, `""`, or `None`.
+
+    `""` means the tool declares no schema at all, so `content` is as good a
+    guess as any. `None` means the entry has nowhere to go and this tool cannot
+    be written to — sending a memory into the wrong field would silently create
+    a malformed record that later reads back as authoritative.
+
+    One function because two callers need the same answer and drifting apart is
+    what a mis-pick looks like: the chooser saw a name it liked, the builder
+    saw a schema it could not fill, and the write was refused every time
+    instead of the next candidate being tried.
+    """
+    properties = _schema_properties(tool)
+    if not properties:
+        return ""
+    for name in _ENTRY_PARAMS:
+        if name in properties:
+            return name
+    # A single required string is unambiguous: there is one place the text can
+    # go and no other candidate to confuse it with.
+    required = [
+        name
+        for name in (tool.get("inputSchema") or {}).get("required", [])
+        if properties.get(name, {}).get("type") == "string"
+    ]
+    return required[0] if len(required) == 1 else None
+
+
 def _pick_write_tool(
     tools: list[dict[str, Any]], preferred: str = ""
 ) -> dict[str, Any] | None:
@@ -940,6 +969,16 @@ def _pick_write_tool(
     An explicit `preferred` name still cannot select a forbidden tool. Naming
     `delete_memories` in config is far more likely to be a typo than an
     intention, and the loop calls this unattended at 3am.
+
+    A tool the entry text cannot be put into is not a candidate. That is a fact
+    about the schema rather than the name, and leaving it out of the choice is
+    what let a name match end the search on a tool nothing could be written to:
+    MemPalace declares `mempalace_kg_add` — subject, predicate, object — before
+    `mempalace_add_drawer`, both match the `add` hint, and the first one won.
+    Every write for an entire run was refused, forty recorder calls were spent
+    producing text that was thrown away, and nothing was learned across
+    tickets. `preferred` is exempt: an operator naming a tool has said which
+    one, and the builder will report what it cannot fill.
     """
     by_name = {str(tool.get("name", "")): tool for tool in tools}
 
@@ -957,6 +996,7 @@ def _pick_write_tool(
         if not any(
             bad in str(tool.get("name", "")).lower() for bad in _WRITE_HINTS_FORBIDDEN
         )
+        and _entry_param(tool) is not None
     ]
     # Two passes rather than one, so a side-channel name never beats a primary
     # store just by matching an earlier hint.
@@ -999,33 +1039,25 @@ def _build_write_arguments(
         _apply_extra_arguments(arguments, extra or {}, properties, protected="content")
         return arguments
 
-    entry_param = ""
-    for name in _ENTRY_PARAMS:
-        if name in properties:
-            arguments[name] = entry
-            entry_param = name
-            break
-    else:
-        required = [
-            name
-            for name in (tool.get("inputSchema") or {}).get("required", [])
-            if properties.get(name, {}).get("type") == "string"
-        ]
-        if len(required) == 1:
-            arguments[required[0]] = entry
-            entry_param = required[0]
-        else:
-            raise MemoryRefused(
-                f"cannot tell which parameter of {tool.get('name')!r} takes the "
-                f"entry text (it declares: {', '.join(properties) or 'nothing'}). "
-                "Nothing was sent; set memory.writeTool or disable memory.write."
-            )
+    entry_param = _entry_param(tool)
+    if entry_param is None:
+        raise MemoryRefused(
+            f"cannot tell which parameter of {tool.get('name')!r} takes the "
+            f"entry text (it declares: {', '.join(properties) or 'nothing'}). "
+            "Nothing was sent; set memory.writeTool or disable memory.write."
+        )
+    arguments[entry_param] = entry
 
     if title:
-        for name in _TITLE_PARAMS:
-            if name in properties:
-                arguments[name] = title
-                break
+        titled = next((name for name in _TITLE_PARAMS if name in properties), "")
+        if titled:
+            arguments[titled] = title
+        else:
+            # Kept rather than dropped. A store with one text field is an
+            # ordinary shape — MemPalace's `add_drawer` is content, wing, room
+            # and nothing else — and the title is what a future ticket reads
+            # first to decide whether the entry is about it.
+            arguments[entry_param] = f"{title}\n\n{entry}"
     if room:
         for name in _ROOM_PARAMS:
             if name in properties:
