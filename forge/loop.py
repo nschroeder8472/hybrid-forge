@@ -374,6 +374,9 @@ class Orchestrator:
         # feed the rung below them and neither survives the process: they are
         # this run's working notes, and the durable record is the step log.
         self._stuck_opinion: dict[str, tuple[str, str]] = {}
+        # Provider notes already reported. A model that reasons past its budget
+        # does it on every call, and the remedy is one configuration change.
+        self._recovered: set[str] = set()
         self._impossible_claims: dict[str, str] = {}
         # Why the run gave up on verifying anything, once it has. Set when a
         # ticket's every verify step was excused, which means the project no
@@ -720,6 +723,20 @@ class Orchestrator:
                 continue
 
             self.gate.record(model_name, completion.usage)
+            if completion.recovered and completion.recovered not in self._recovered:
+                # Once per distinct message. It is a fact about the model's
+                # configuration rather than about this call, so repeating it
+                # every call would bury the run's own log — and saying it
+                # nowhere would leave a run being quietly answered by a model
+                # the operator did not configure.
+                self._recovered.add(completion.recovered)
+                self.store.log(
+                    run_id,
+                    completion.recovered,
+                    level="warn",
+                    kind="usage",
+                    data={"model": model_name, "role": role},
+                )
             if completion.truncated:
                 self.store.log(
                     run_id,

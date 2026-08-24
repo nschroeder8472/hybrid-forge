@@ -14837,6 +14837,82 @@ class TestThinkingModelsThatNeverAnswer(unittest.TestCase):
         provider = self._provider(self._payload('{"ok":1}', "stop", reasoning=self.THOUGHT))
         self.assertEqual(self._complete(provider).text, '{"ok":1}')
 
+    def _twice(self, second: dict, **config) -> tuple[OpenAICompatProvider, list[dict]]:
+        """A provider whose first reply is all reasoning and whose second is `second`."""
+        sent: list[dict] = []
+        replies = [self._payload("", "length", reasoning=self.THOUGHT), second]
+        provider = OpenAICompatProvider(
+            "local",
+            {
+                "baseUrl": "http://x:11434/v1",
+                "model": "thinker",
+                "contextWindow": 32768,
+                "maxOutputTokens": 4096,
+                **config,
+            },
+        )
+        mod = sys.modules["forge.providers.openai_compat"]
+
+        def post(_url, payload, **_kwargs):
+            sent.append(payload)
+            return replies[min(len(sent), len(replies)) - 1]
+
+        self.enterContext(unittest.mock.patch.object(mod, "post_json", post))
+        return provider, sent
+
+    def test_it_asks_again_without_thinking_rather_than_losing_the_call(self):
+        # Raising the budget does not fix this: a model that reasons until it
+        # is cut off will do that at any ceiling. The only thing that changes
+        # the outcome is asking it not to, which this used to print and leave
+        # to a person. It cost one run five calls.
+        provider, sent = self._twice(self._payload('{"ok":1}', "stop"))
+
+        completion = self._complete(provider)
+
+        self.assertEqual(completion.text, '{"ok":1}')
+        self.assertEqual(len(sent), 2)
+        self.assertNotIn("reasoning_effort", sent[0])
+        self.assertEqual(sent[1]["reasoning_effort"], "none")
+
+    def test_it_says_what_it_had_to_do(self):
+        # An answer produced by a model the operator did not configure is still
+        # worth knowing about.
+        provider, _sent = self._twice(self._payload('{"ok":1}', "stop"))
+
+        recovered = self._complete(provider).recovered
+
+        self.assertIn("reasoning_effort", recovered)
+        self.assertIn("thinker", recovered)
+
+    def test_an_operators_own_setting_is_never_overruled(self):
+        # Someone who has written `reasoning_effort` into `extraBody` has
+        # chosen how this model thinks, and quietly overruling it would make
+        # the configuration a suggestion.
+        provider, sent = self._twice(
+            self._payload('{"ok":1}', "stop"),
+            extraBody={"reasoning_effort": "high"},
+        )
+
+        with self.assertRaises(ProviderBadResponse) as caught:
+            self._complete(provider)
+
+        self.assertEqual(len(sent), 1)
+        self.assertIn("already sets how it reasons", str(caught.exception))
+
+    def test_a_second_helping_of_nothing_is_still_an_error(self):
+        provider, sent = self._twice(self._payload("", "stop"))
+
+        with self.assertRaises(ProviderBadResponse) as caught:
+            self._complete(provider)
+
+        self.assertEqual(len(sent), 2)
+        self.assertIn("asked again without thinking", str(caught.exception))
+
+    def test_a_reply_that_never_needed_this_reports_nothing(self):
+        provider = self._provider(self._payload('{"ok":1}', "stop"))
+
+        self.assertEqual(self._complete(provider).recovered, "")
+
 
 class TestRecorderOutputBudget(unittest.TestCase):
     """The recorder's answer is tiny, but the budget is the configured one.

@@ -78,6 +78,11 @@ class Completion:
     finish_reason: str = "stop"
     model: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
+    # What a provider had to do to get an answer at all. Empty on the ordinary
+    # path. Recorded and logged by the caller rather than raised, because the
+    # answer arrived — but a run whose planner is being silently downgraded is
+    # a run whose operator needs to know.
+    recovered: str = ""
 
     @property
     def truncated(self) -> bool:

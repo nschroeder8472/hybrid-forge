@@ -21,7 +21,15 @@ import os
 from typing import Any
 
 from ._http import get_json, post_json
-from .base import Capabilities, Completion, Message, Provider, ProviderBadResponse, Usage
+from .base import (
+    Capabilities,
+    Completion,
+    Message,
+    Provider,
+    ProviderBadResponse,
+    ProviderError,
+    Usage,
+)
 
 
 def _tagged(name: str) -> str:
@@ -121,6 +129,7 @@ class OpenAICompatProvider(Provider):
         except (KeyError, IndexError, TypeError) as exc:
             raise ProviderBadResponse(f"unexpected response shape: {str(data)[:400]}") from exc
 
+        recovered = ""
         finish_reason = choice.get("finish_reason") or "stop"
         if not text.strip():
             # Thinking models served over this shape put their chain of thought
@@ -130,12 +139,13 @@ class OpenAICompatProvider(Provider):
             # malformed output — naming the real cause here saves that hunt.
             reasoning = _reasoning_text(message)
             if reasoning and finish_reason in ("length", "max_tokens"):
-                raise ProviderBadResponse(
-                    f"{self.model} spent its entire {max_tokens:,}-token output budget "
-                    "on hidden reasoning and never began its answer. Raise "
-                    "`maxOutputTokens` for this model, or turn thinking off with "
-                    '`"extraBody": {"reasoning_effort": "none"}`.'
+                data, recovered = self._without_thinking(
+                    payload, max_tokens, timeout
                 )
+                choice = data["choices"][0]
+                message = choice.get("message") or {}
+                text = message.get("content") or ""
+                finish_reason = choice.get("finish_reason") or "stop"
 
         raw_usage = data.get("usage") or {}
         usage = Usage(
@@ -153,6 +163,75 @@ class OpenAICompatProvider(Provider):
             finish_reason=finish_reason,
             model=data.get("model", self.model),
             raw=data,
+            recovered=recovered,
+        )
+
+    def _without_thinking(
+        self, payload: dict[str, Any], max_tokens: int, timeout: int
+    ) -> tuple[dict[str, Any], str]:
+        """One more attempt with thinking turned off. Raises if that is not on.
+
+        The budget is not the problem and raising it does not fix this: a model
+        that reasons until it is cut off will reason until it is cut off at any
+        ceiling. The only thing that changes the outcome is asking it not to,
+        which is the remedy this used to print and leave to a person.
+
+        Worth doing automatically because the alternative is losing the call
+        outright. On one run this cost five calls — three of them the memory
+        step, whose whole answer is `NOTHING` or three sentences, and two of
+        them a tester that then had to be retried from scratch.
+
+        Never against an operator's own setting. Someone who has written
+        `reasoning_effort` into `extraBody` has chosen how this model thinks,
+        and quietly overruling it would make the configuration a suggestion.
+        Reported rather than done in silence for the same reason: an answer
+        produced by a model the operator did not configure is still worth
+        knowing about.
+        """
+        chosen = {key.lower() for key in self.extra_body}
+        if "reasoning_effort" in chosen or "reasoning" in chosen:
+            raise ProviderBadResponse(
+                f"{self.model} spent its entire {max_tokens:,}-token output budget "
+                "on hidden reasoning and never began its answer, and `extraBody` "
+                "already sets how it reasons, so this was not overruled. Raise "
+                "`maxOutputTokens` for this model, or turn thinking off with "
+                '`"extraBody": {"reasoning_effort": "none"}`.'
+            )
+
+        retry = {**payload, "reasoning_effort": "none"}
+        try:
+            data = post_json(
+                f"{self.base_url}/chat/completions",
+                retry,
+                headers=self._headers(),
+                timeout=timeout,
+            )
+            text = ((data["choices"][0].get("message") or {}).get("content")) or ""
+        except (ProviderError, KeyError, IndexError, TypeError) as exc:
+            raise ProviderBadResponse(
+                f"{self.model} spent its entire {max_tokens:,}-token output budget "
+                f"on hidden reasoning and never began its answer, and asking it "
+                f"again with `reasoning_effort: none` did not help ({exc}). Raise "
+                "`maxOutputTokens` for this model, or turn thinking off with "
+                '`"extraBody": {"reasoning_effort": "none"}` — on Ollama, in the '
+                "Modelfile."
+            ) from exc
+
+        if not text.strip():
+            raise ProviderBadResponse(
+                f"{self.model} spent its entire {max_tokens:,}-token output budget "
+                "on hidden reasoning and never began its answer, and answered "
+                "with nothing when asked again without thinking. Raise "
+                "`maxOutputTokens` for this model, or turn thinking off with "
+                '`"extraBody": {"reasoning_effort": "none"}` — on Ollama, in the '
+                "Modelfile."
+            )
+        return data, (
+            f"{self.model} spent its entire {max_tokens:,}-token output budget on "
+            f"hidden reasoning and never began its answer; asked again with "
+            f"`reasoning_effort: none`, which worked. Set that in `extraBody` for "
+            f"this model, or raise `maxOutputTokens`, so the run is not paying "
+            f"for a wasted call each time."
         )
 
     def capabilities(self) -> Capabilities:
