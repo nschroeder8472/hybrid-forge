@@ -335,6 +335,27 @@ class Ticket:
     # Consecutive cycles that produced exactly the classes the one before them
     # did. Reset by any cycle that changes the set in either direction.
     flat_cycles: int = 0
+    # Distinctive constants this ticket's spec has stated and then dropped, in
+    # the order it dropped them.
+    #
+    # Respec may not touch a criterion the plan wrote, so when a spec's stated
+    # algorithm and a criterion's expected value disagree, the only lever it
+    # has is the spec — and it will use it. Each cycle it sees the current spec
+    # and the failures, never the fact that it has already rewritten this same
+    # constant twice, so it changes the number again with confidence and the
+    # ticket spends another attempt budget proving it wrong.
+    #
+    # One ticket's seeding increment went `(seed << 1) | 1` -> `3n` ->
+    # `29739081755268826799n` -> `1442695040888963407n` across four cycles,
+    # each revision correcting the previous revision's invention. The system
+    # prompt already says "do not rewrite the spec to chase it"; what it had no
+    # way to know is that it was doing it.
+    #
+    # Evidence, not a bar. Nothing refuses a value for being here — the walk
+    # never repeated itself, so a guard against repeats would have caught none
+    # of it — and a planner that means to return to an earlier constant may.
+    # Written only by `Store.abandon`, for the reason `learned` is.
+    abandoned_values: list[str] = field(default_factory=list)
 
     @property
     def contract_criteria(self) -> list[str]:
@@ -451,6 +472,7 @@ class Ticket:
             cycle_classes=json.loads(row["cycle_classes"] or "[]"),
             cycle_mark=row["cycle_mark"] or 0,
             tests_fingerprint=row["tests_fingerprint"] or "",
+            abandoned_values=json.loads(row["abandoned_values"] or "[]"),
             flat_cycles=row["flat_cycles"] or 0,
         )
 
@@ -533,6 +555,7 @@ class Store:
         ("tickets", "cycle_mark", "INTEGER NOT NULL DEFAULT 0"),
         ("tickets", "flat_cycles", "INTEGER NOT NULL DEFAULT 0"),
         ("tickets", "tests_fingerprint", "TEXT NOT NULL DEFAULT ''"),
+        ("tickets", "abandoned_values", "TEXT NOT NULL DEFAULT '[]'"),
     )
 
     def _migrate(self) -> None:
@@ -1264,6 +1287,40 @@ class Store:
             (run_id, ticket_id),
         ).fetchone()
         return int(row["newest"] or 0)
+
+    def abandon(self, run_id: int, ticket: Ticket, values: Sequence[str]) -> list[str]:
+        """Note constants this ticket's spec stated and then dropped.
+
+        Append-only and deduplicated, and merged here rather than by the
+        caller, for the reason `learn` is: a field any caller can shorten is
+        not append-only, and `update_ticket` does not name the column.
+
+        `ticket.abandoned_values` is updated in place so the caller's object
+        matches disk. Returns the ones that were genuinely new.
+        """
+        kept = list(ticket.abandoned_values)
+        added: list[str] = []
+        for raw in values:
+            value = str(raw or "").strip()[:80]
+            if value and value not in kept:
+                kept.append(value)
+                added.append(value)
+        if not added:
+            return []
+
+        ticket.abandoned_values = kept
+        with self._write() as connection:
+            connection.execute(
+                "UPDATE tickets SET abandoned_values = :values, updated_at = :now "
+                "WHERE run_id = :run_id AND ticket_id = :ticket_id",
+                {
+                    "values": json.dumps(kept),
+                    "run_id": run_id,
+                    "ticket_id": ticket.ticket_id,
+                    "now": time.time(),
+                },
+            )
+        return added
 
     def record_tests_fingerprint(self, run_id: int, ticket: Ticket) -> None:
         """Note the inputs the test file on disk was written from."""

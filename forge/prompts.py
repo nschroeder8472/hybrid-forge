@@ -2287,6 +2287,28 @@ reproduction. Both leave the disagreement in place and hide it.
 {evidence}
 """
 
+    if ticket.abandoned_values:
+        # The planner sees the current spec and the failures, never the fact
+        # that it has already rewritten this same constant twice. One ticket's
+        # seeding increment went `(seed << 1) | 1` -> `3n` ->
+        # `29739081755268826799n` -> `1442695040888963407n` across four cycles,
+        # each revision confidently correcting the last one's invention, and
+        # the rule below was in this prompt the whole time.
+        listed = "\n".join(f"- `{value}`" for value in ticket.abandoned_values[:12])
+        body += f"""
+## Constants this ticket's spec has already stated and dropped
+{listed}
+
+Each was written into the spec by a revision of this ticket, and each was taken
+back out by a later one. They were tried; the attempts failed; the number was
+changed again.
+
+If the value you are about to write is another guess at the same quantity, that
+is the pattern above continuing, and the next cycle will read exactly like this
+one. A spec whose stated algorithm cannot produce the value a criterion demands
+is not a wording problem — say so instead.
+"""
+
     if criteria_locked:
         # Scoped by provenance rather than frozen outright. A blanket freeze
         # made a machine-invented criterion as immutable as a human-authored

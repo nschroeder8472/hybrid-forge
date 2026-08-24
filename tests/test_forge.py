@@ -51,7 +51,7 @@ from forge.ingest import (
     undeclared_order,
 )
 from forge.ingest import ingest as ingest_document
-from forge.respec import _merge_criteria, _refuse_protocol_edits
+from forge.respec import _constants, _merge_criteria, _refuse_protocol_edits
 from forge.loop import (
     _ASSERTED,
     _DROPPABLE_HEADINGS,
@@ -10655,6 +10655,126 @@ class TestATicketKeepsWhatItsAttemptsEstablished(unittest.TestCase):
         message = Message(role="user", content=f"{LEARNED_HEADING}\\nx")
 
         self.assertTrue(_droppable(message))
+
+
+class TestRespecCannotQuietlyWalkAConstant(unittest.TestCase):
+    """Respec may not touch a criterion the plan wrote, so when a spec's stated
+    algorithm and a criterion's expected value disagree, the only lever it has
+    is the spec — and it uses it. Each cycle it sees the current spec and the
+    failures, never the fact that it has already rewritten this same constant
+    twice, so it changes the number again with confidence and the ticket spends
+    another attempt budget proving it wrong.
+
+    One ticket's PCG32 seeding increment went `(seed << 1) | 1` -> `3n` ->
+    `29739081755268826799n` -> `1442695040888963407n` across four cycles, each
+    revision correcting the previous revision's invention. `do not rewrite the
+    spec to chase it` was in the system prompt the whole time; what the planner
+    had no way to know is that it was doing it."""
+
+    # The clause that actually changed, cycle by cycle.
+    SPECS = (
+        "Set #inc from the seed as (seed << 1) | 1, state 0x14057b7ef767814f.",
+        "Set #inc to 3n, state 0x14057b7ef767814f.",
+        "Set #inc to 29739081755268826799n, state 0x14057b7ef767814f.",
+        "Set #inc to 1442695040888963407n, state 0x14057b7ef767814f.",
+    )
+
+    def _walked(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        ticket = Ticket("PF-005", spec=self.SPECS[0], criteria=["state is 9335332574048425045n"])
+        store.add_tickets(run_id, [ticket])
+        for revised in self.SPECS[1:]:
+            surrendered = sorted(_constants(ticket.spec) - _constants(revised))
+            ticket.spec = revised
+            store.update_ticket(run_id, ticket)
+            store.abandon(run_id, ticket, surrendered)
+        return store, run_id
+
+    def test_only_a_constant_distinctive_enough_to_mean_something_is_tracked(self):
+        # A short decimal is a count, an index or a line limit, and following
+        # those would report a change every time a sentence was reworded.
+        found = _constants(
+            "counts [3, 3, 4], line length 125, #inc 3n, "
+            "state 0x14057b7ef767814f, seed 3130775471"
+        )
+
+        self.assertEqual(
+            found, {"3n", "0x14057b7ef767814f", "3130775471"}
+        )
+
+    def test_the_values_it_dropped_are_kept_in_the_order_it_dropped_them(self):
+        store, run_id = self._walked()
+
+        self.assertEqual(
+            store.list_tickets(run_id)[0].abandoned_values,
+            ["3n", "29739081755268826799n"],
+        )
+
+    def test_a_constant_the_spec_kept_is_not_one_it_abandoned(self):
+        store, run_id = self._walked()
+
+        self.assertNotIn(
+            "0x14057b7ef767814f", store.list_tickets(run_id)[0].abandoned_values
+        )
+
+    def test_the_next_revision_is_shown_them(self):
+        store, run_id = self._walked()
+
+        shown = _joined(
+            respec_prompt(
+                store.list_tickets(run_id)[0], [{"name": "test", "detail": "AssertionError"}]
+            )
+        )
+
+        self.assertIn("already stated and dropped", shown)
+        self.assertIn("`3n`", shown)
+        self.assertIn("`29739081755268826799n`", shown)
+        self.assertIn("is not a wording problem", shown)
+
+    def test_a_ticket_that_never_walked_one_is_told_nothing(self):
+        shown = _joined(
+            respec_prompt(Ticket("T-1", spec="s"), [{"name": "lint", "detail": "d"}])
+        )
+
+        self.assertNotIn("already stated and dropped", shown)
+
+    def test_the_list_is_append_only_and_deduplicated(self):
+        # `learn`'s invariant, for the same reason: a field any caller can
+        # shorten is not append-only.
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        ticket = Ticket("T-1")
+        store.add_tickets(run_id, [ticket])
+
+        self.assertEqual(store.abandon(run_id, ticket, ["3n", "40n"]), ["3n", "40n"])
+        self.assertEqual(store.abandon(run_id, ticket, ["3n"]), [])
+        self.assertEqual(
+            store.list_tickets(run_id)[0].abandoned_values, ["3n", "40n"]
+        )
+
+    def test_nothing_refuses_a_value_for_being_on_the_list(self):
+        # Evidence, not a bar. The walk never repeated itself, so a guard
+        # against repeats would have caught none of it, and a planner that
+        # means to return to an earlier constant may.
+        store, run_id = self._walked()
+        ticket = store.list_tickets(run_id)[0]
+        # Respec declines a ticket that has never run, and this one has to
+        # have failed to be here at all.
+        ticket.attempts = 3
+        store.update_ticket(run_id, ticket)
+        step = store.start_step(run_id, "PF-005", "test")
+        store.end_step(step, "failed", "AssertionError: expected 1 to be 2")
+
+        def call(_messages, _budget):
+            return Completion(
+                text=json.dumps({"spec": "Set #inc to 3n, state 0x14057b7ef767814f."}),
+                usage=Usage(),
+            )
+
+        respec.revise(store, run_id, ticket, call=call, budget=1024)
+
+        self.assertIn("3n", store.list_tickets(run_id)[0].spec)
 
 
 class TestRespecCanWriteDownWhatItWorkedOut(unittest.TestCase):

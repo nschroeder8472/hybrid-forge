@@ -34,6 +34,18 @@ Caller = Callable[[list[Message], int], Completion]
 # the guard in `_apply`.
 WorkspaceOf = Callable[[str], str]
 
+# A constant distinctive enough that a spec stating it means it. Long decimals,
+# hex literals, and anything carrying JavaScript's BigInt `n` suffix — which is
+# what makes `3n` worth tracking where a bare `3` is not. A short decimal is a
+# count, an index or a line limit, and following those would report a change
+# every time a sentence was reworded.
+_CONSTANT = re.compile(r"\b0[xX][0-9a-fA-F]{4,}n?\b|\b\d{6,}n?\b|\b\d+n\b")
+
+
+def _constants(text: str) -> set[str]:
+    """The distinctive constants a spec states."""
+    return set(_CONSTANT.findall(text or ""))
+
 
 @dataclass
 class Revision:
@@ -1184,6 +1196,16 @@ def revise(
             pending_scope=pending_scope,
         )
 
+    # Computed before the revision lands, because it is a comparison against
+    # the spec being replaced. See `Ticket.abandoned_values`: respec may not
+    # touch a criterion the plan wrote, so a spec whose stated algorithm
+    # disagrees with an expected value is the only thing it can change — and
+    # it does, with a different number every cycle, having no way to see that
+    # it has already done so twice.
+    surrendered = sorted(
+        _constants(ticket.spec) - _constants(revision.get("spec", ticket.spec))
+    )
+
     for field_name, value in revision.items():
         setattr(ticket, field_name, value)
 
@@ -1204,6 +1226,19 @@ def revise(
             changed.append("needs")
 
     store.update_ticket(run_id, ticket)
+    dropped_values = store.abandon(run_id, ticket, surrendered)
+    if dropped_values:
+        store.log(
+            run_id,
+            f"{ticket.ticket_id}: this revision dropped "
+            f"{len(dropped_values)} constant(s) the spec had stated. The next "
+            f"revision is shown every one this ticket has abandoned, because a "
+            f"planner that cannot see it has already changed the same number "
+            f"twice will change it again:\n"
+            + "\n".join(f"  - {value}" for value in dropped_values[:8]),
+            kind="ticket",
+            data={"ticket": ticket.ticket_id, "abandoned": dropped_values},
+        )
     store.log(
         run_id,
         f"{ticket.ticket_id}: respec revised {', '.join(changed)}. {rationale}".strip(),
