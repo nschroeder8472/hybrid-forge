@@ -8800,6 +8800,97 @@ class TestFindingImportsThatPointAtNothing(unittest.TestCase):
 
         self.assertEqual(imports.unresolved(root, ["src/a.ts"]), [])
 
+    def test_a_typescript_dot_js_import_resolves_to_the_dot_ts_file(self):
+        # The one case where a target that *names* an extension still has to be
+        # tried under another. Under `moduleResolution: node16`/`nodenext` a
+        # specifier names the emitted file, so `./types.js` is how a `.ts` file
+        # imports `types.ts` — and `./types.ts` is TS5097.
+        #
+        # This is the exact tree that parked a ticket. The check called the
+        # import a miss, the executor rewrote it to `./types.ts`, `tsc`
+        # rejected that, the executor rewrote it back, and the two verdicts
+        # traded the ticket back and forth for fifty-five attempts.
+        root = self._tree(
+            {
+                "src/level/parse.ts": 'import { Tile } from "./types.js";\n',
+                "src/level/types.ts": "export type Tile = number;\n",
+            }
+        )
+
+        self.assertEqual(imports.unresolved(root, ["src/level/parse.ts"]), [])
+
+    def test_the_rewrite_covers_the_module_specific_spellings(self):
+        root = self._tree(
+            {
+                "src/a.mts": "import { x } from './b.mjs';\n",
+                "src/b.mts": "export const x = 1;\n",
+                "src/c.cts": "import { y } from './d.cjs';\n",
+                "src/d.cts": "export const y = 1;\n",
+                "src/e.tsx": "import { z } from './f.jsx';\n",
+                "src/f.tsx": "export const z = 1;\n",
+            }
+        )
+
+        self.assertEqual(
+            imports.unresolved(root, ["src/a.mts", "src/c.cts", "src/e.tsx"]), []
+        )
+
+    def test_a_declaration_file_satisfies_the_rewrite(self):
+        root = self._tree(
+            {
+                "src/a.ts": "import { x } from './vendor.js';\n",
+                "src/vendor.d.ts": "export declare const x: number;\n",
+            }
+        )
+
+        self.assertEqual(imports.unresolved(root, ["src/a.ts"]), [])
+
+    def test_a_dotted_stem_keeps_its_dots_through_the_rewrite(self):
+        # `with_suffix` would turn `level.gen.js` into `level.ts`, which is a
+        # different module and probably somebody else's.
+        root = self._tree(
+            {
+                "src/a.ts": "import { x } from './level.gen.js';\n",
+                "src/level.gen.ts": "export const x = 1;\n",
+            }
+        )
+
+        self.assertEqual(imports.unresolved(root, ["src/a.ts"]), [])
+
+    def test_javascript_importing_dot_js_is_not_rewritten(self):
+        # The rule is TypeScript's, and applying it here would excuse an import
+        # of a module nobody wrote: `./b.js` from a `.js` file means that file.
+        root = self._tree(
+            {
+                "src/a.js": "import { x } from './b.js';\n",
+                "src/b.ts": "export const x = 1;\n",
+            }
+        )
+
+        self.assertEqual(
+            imports.unresolved(root, ["src/a.js"]), [("src/a.js", "./b.js")]
+        )
+
+    def test_a_dot_js_import_of_nothing_at_all_is_still_a_miss(self):
+        root = self._tree(
+            {"src/a.ts": "import { x } from './nowhere.js';\n"}
+        )
+
+        self.assertEqual(
+            imports.unresolved(root, ["src/a.ts"]), [("src/a.ts", "./nowhere.js")]
+        )
+
+    def test_the_rewritten_spelling_counts_as_a_declared_future_file(self):
+        # `known` is what stops a correct plan being unrunnable, and it is
+        # written in `.ts` because that is the file the next ticket creates.
+        # Matching only the literal `.js` target would fail the caller for
+        # importing the callee it was sequenced against.
+        root = self._tree({"src/a.ts": "import { x } from './b.js';\n"})
+
+        self.assertEqual(
+            imports.unresolved(root, ["src/a.ts"], known={"src/b.ts"}), []
+        )
+
     def test_a_commented_out_import_names_nothing(self):
         # The whole value of the check is that a failure it produces is worth
         # acting on.
