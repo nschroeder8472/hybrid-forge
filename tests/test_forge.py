@@ -74,8 +74,11 @@ from forge.patch import (
     repo_relative,
 )
 from forge.failures import (
+    _blocks,
+    _file_of,
     blocks_naming,
     classify,
+    clip,
     distill,
     environment_failure,
     errors_naming,
@@ -4550,6 +4553,155 @@ class TestRespecMayWidenScopeButNotTheGraph(unittest.TestCase):
         self.assertTrue(result.revised)
 
 
+class TestRespecMayNotWidenIntoASecondBuild(unittest.TestCase):
+    """`_scope_gate` refuses a ticket writing into two builds, correctly and
+    permanently: each has its own commands and its own working directory, so
+    only one can verify it. What the gate cannot do is tell a scoping error the
+    plan made from one respec invented on attempt 46, and it parks either way.
+
+    A ticket writing two `.gd` files spent nine cycles on real GDScript
+    failures. Respec then added `tools/path_forge/fixtures/` to its scope and
+    the gate blocked it at the start of the next cycle — the repair step ending
+    the ticket it was called in to repair, and taking nine cycles of
+    accumulated context with it."""
+
+    # `.` owns everything the second does not, which is how the loop's own
+    # `workspace_for` answers.
+    WORKSPACE = staticmethod(
+        lambda path: "tools/path_forge" if path.startswith("tools/path_forge/") else "."
+    )
+
+    def _store(self, allowed=("tools/dump.gd", "tests/theme/test_decor.gd")):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(
+            run_id,
+            [Ticket("PF-009", status="failed", attempts=5, allowed_files=list(allowed), spec="one")],
+        )
+        step = store.start_step(run_id, "PF-009", "test")
+        store.end_step(step, "failed", "Parse Error: nope")
+        return store, run_id
+
+    def _revise(self, store, run_id, workspace_of=None, **payload):
+        def call(_messages, _budget):
+            return Completion(text=json.dumps(payload), usage=Usage())
+
+        ticket = store.list_tickets(run_id)[0]
+        return respec.revise(
+            store, run_id, ticket, call=call, budget=1024,
+            workspace_of=self.WORKSPACE if workspace_of is None else workspace_of,
+        )
+
+    def test_the_straying_path_is_dropped(self):
+        store, run_id = self._store()
+
+        self._revise(
+            store, run_id,
+            spec="revised",
+            allowed_files=["tools/dump.gd", "tests/theme/test_decor.gd",
+                           "tools/path_forge/fixtures/"],
+        )
+
+        self.assertEqual(
+            store.list_tickets(run_id)[0].allowed_files,
+            ["tools/dump.gd", "tests/theme/test_decor.gd"],
+        )
+
+    def test_the_rest_of_the_revision_stands(self):
+        # Dropped rather than refused whole, the way the other scope guards
+        # here work: the rest may still be right.
+        store, run_id = self._store()
+
+        self._revise(
+            store, run_id,
+            spec="revised spec", allowed_files=["tools/dump.gd", "tools/path_forge/x.ts"],
+        )
+
+        self.assertEqual(store.list_tickets(run_id)[0].spec, "revised spec")
+
+    def test_it_says_what_it_refused_and_why(self):
+        store, run_id = self._store()
+
+        self._revise(
+            store, run_id,
+            spec="revised", allowed_files=["tools/dump.gd", "tools/path_forge/fixtures/"],
+        )
+
+        messages = " ".join(e["message"] for e in store.events_after(0))
+        self.assertIn("tools/path_forge/fixtures/", messages)
+        self.assertIn("second build", messages)
+
+    def test_a_scope_left_empty_is_absent_rather_than_blank(self):
+        # An empty `allowed_files` would silently narrow the ticket to nothing,
+        # which is why `parse_respec` treats an empty list as absent.
+        store, run_id = self._store()
+
+        self._revise(
+            store, run_id, spec="revised", allowed_files=["tools/path_forge/x.ts"],
+        )
+
+        self.assertEqual(
+            store.list_tickets(run_id)[0].allowed_files,
+            ["tools/dump.gd", "tests/theme/test_decor.gd"],
+        )
+
+    def test_staying_in_the_same_build_is_untouched(self):
+        store, run_id = self._store()
+
+        self._revise(
+            store, run_id,
+            spec="revised", allowed_files=["tools/dump.gd", "tests/theme/other.gd"],
+        )
+
+        self.assertEqual(
+            store.list_tickets(run_id)[0].allowed_files,
+            ["tools/dump.gd", "tests/theme/other.gd"],
+        )
+
+    def test_a_ticket_that_already_straddles_is_not_respec_s_fault(self):
+        # The plan's error and the gate's to report. Blaming respec for it
+        # would also stop it proposing the narrowing that fixes it.
+        store, run_id = self._store(
+            allowed=("tools/dump.gd", "tools/path_forge/fixtures/")
+        )
+
+        self._revise(
+            store, run_id,
+            spec="revised", allowed_files=["tools/dump.gd", "tools/path_forge/x.ts"],
+        )
+
+        self.assertEqual(
+            store.list_tickets(run_id)[0].allowed_files,
+            ["tools/dump.gd", "tools/path_forge/x.ts"],
+        )
+
+    def test_a_file_no_build_owns_is_a_different_fault_and_passes_through(self):
+        # `_unowned_files` reports it, with a message about declaring the build
+        # rather than about splitting the ticket.
+        store, run_id = self._store()
+
+        self._revise(
+            store, run_id,
+            spec="revised", allowed_files=["tools/dump.gd", "outside/x.rs"],
+            workspace_of=lambda path: "" if path.startswith("outside/") else ".",
+        )
+
+        self.assertIn("outside/x.rs", store.list_tickets(run_id)[0].allowed_files)
+
+    def test_a_caller_that_names_no_builds_changes_nothing(self):
+        store, run_id = self._store()
+
+        self._revise(
+            store, run_id, spec="revised",
+            allowed_files=["tools/dump.gd", "tools/path_forge/fixtures/"],
+            workspace_of=False,
+        )
+
+        self.assertIn(
+            "tools/path_forge/fixtures/", store.list_tickets(run_id)[0].allowed_files
+        )
+
+
 class TestRespecMayNotRaiseTheBar(unittest.TestCase):
     """Respec runs on a ticket that has just exhausted its attempts, and its
     job is to produce one the next attempt can satisfy. Adding criteria there
@@ -8800,6 +8952,97 @@ class TestFindingImportsThatPointAtNothing(unittest.TestCase):
 
         self.assertEqual(imports.unresolved(root, ["src/a.ts"]), [])
 
+    def test_a_typescript_dot_js_import_resolves_to_the_dot_ts_file(self):
+        # The one case where a target that *names* an extension still has to be
+        # tried under another. Under `moduleResolution: node16`/`nodenext` a
+        # specifier names the emitted file, so `./types.js` is how a `.ts` file
+        # imports `types.ts` — and `./types.ts` is TS5097.
+        #
+        # This is the exact tree that parked a ticket. The check called the
+        # import a miss, the executor rewrote it to `./types.ts`, `tsc`
+        # rejected that, the executor rewrote it back, and the two verdicts
+        # traded the ticket back and forth for fifty-five attempts.
+        root = self._tree(
+            {
+                "src/level/parse.ts": 'import { Tile } from "./types.js";\n',
+                "src/level/types.ts": "export type Tile = number;\n",
+            }
+        )
+
+        self.assertEqual(imports.unresolved(root, ["src/level/parse.ts"]), [])
+
+    def test_the_rewrite_covers_the_module_specific_spellings(self):
+        root = self._tree(
+            {
+                "src/a.mts": "import { x } from './b.mjs';\n",
+                "src/b.mts": "export const x = 1;\n",
+                "src/c.cts": "import { y } from './d.cjs';\n",
+                "src/d.cts": "export const y = 1;\n",
+                "src/e.tsx": "import { z } from './f.jsx';\n",
+                "src/f.tsx": "export const z = 1;\n",
+            }
+        )
+
+        self.assertEqual(
+            imports.unresolved(root, ["src/a.mts", "src/c.cts", "src/e.tsx"]), []
+        )
+
+    def test_a_declaration_file_satisfies_the_rewrite(self):
+        root = self._tree(
+            {
+                "src/a.ts": "import { x } from './vendor.js';\n",
+                "src/vendor.d.ts": "export declare const x: number;\n",
+            }
+        )
+
+        self.assertEqual(imports.unresolved(root, ["src/a.ts"]), [])
+
+    def test_a_dotted_stem_keeps_its_dots_through_the_rewrite(self):
+        # `with_suffix` would turn `level.gen.js` into `level.ts`, which is a
+        # different module and probably somebody else's.
+        root = self._tree(
+            {
+                "src/a.ts": "import { x } from './level.gen.js';\n",
+                "src/level.gen.ts": "export const x = 1;\n",
+            }
+        )
+
+        self.assertEqual(imports.unresolved(root, ["src/a.ts"]), [])
+
+    def test_javascript_importing_dot_js_is_not_rewritten(self):
+        # The rule is TypeScript's, and applying it here would excuse an import
+        # of a module nobody wrote: `./b.js` from a `.js` file means that file.
+        root = self._tree(
+            {
+                "src/a.js": "import { x } from './b.js';\n",
+                "src/b.ts": "export const x = 1;\n",
+            }
+        )
+
+        self.assertEqual(
+            imports.unresolved(root, ["src/a.js"]), [("src/a.js", "./b.js")]
+        )
+
+    def test_a_dot_js_import_of_nothing_at_all_is_still_a_miss(self):
+        root = self._tree(
+            {"src/a.ts": "import { x } from './nowhere.js';\n"}
+        )
+
+        self.assertEqual(
+            imports.unresolved(root, ["src/a.ts"]), [("src/a.ts", "./nowhere.js")]
+        )
+
+    def test_the_rewritten_spelling_counts_as_a_declared_future_file(self):
+        # `known` is what stops a correct plan being unrunnable, and it is
+        # written in `.ts` because that is the file the next ticket creates.
+        # Matching only the literal `.js` target would fail the caller for
+        # importing the callee it was sequenced against.
+        root = self._tree({"src/a.ts": "import { x } from './b.js';\n"})
+
+        self.assertEqual(
+            imports.unresolved(root, ["src/a.ts"], known={"src/b.ts"}), []
+        )
+
     def test_a_commented_out_import_names_nothing(self):
         # The whole value of the check is that a failure it produces is worth
         # acting on.
@@ -12994,6 +13237,196 @@ class TestLocationsReadsEveryDialect(unittest.TestCase):
         # accepting bare words would let prose read as a filename.
         self.assertEqual(locations("build/Makefile:12: *** missing separator"), ["build/Makefile"])
         self.assertEqual(locations("Makefile:12: *** missing separator"), [])
+
+    def test_godots_res_scheme_is_a_repository_relative_path(self):
+        # Godot spells every project file `res://…`, relative to the project
+        # root — which is repository-relative already. The scheme's `//` was
+        # kept, so every GDScript location parsed to `//tests/x.gd`: a path
+        # matching nothing on disk and nothing in a ticket's scope, for the
+        # whole Godot half of a project.
+        self.assertEqual(
+            locations('  at res://tests/theme/test_decor_fixtures.gd:11'),
+            ["tests/theme/test_decor_fixtures.gd"],
+        )
+
+    def test_the_user_scheme_is_left_alone(self):
+        # `user://` is the engine's user-data directory, outside the
+        # repository. Stripping it would invent a repository file.
+        self.assertNotIn("saves/game.cfg", locations("at user://saves/game.cfg:3"))
+
+    def test_an_address_is_not_a_file(self):
+        # `'127.0.0.1:0'` read as the file `127.0.0.1` at line 0. Godot prints
+        # it whenever it cannot reach its debugger, which is every headless
+        # run, and it was one of the top failure classes of a ticket that spent
+        # 45 attempts — 37 times over.
+        self.assertEqual(
+            locations("ERROR: Remote Debugger: Unable to connect to host '127.0.0.1:0'."),
+            [],
+        )
+
+    def test_a_numeric_version_in_a_path_still_parses(self):
+        self.assertEqual(
+            locations("/usr/lib/python3.11/site-packages/x.py:4: error"),
+            ["/usr/lib/python3.11/site-packages/x.py"],
+        )
+
+
+class TestWhatIsKeptOfAnOverlongStep(unittest.TestCase):
+    """A step's stored output was the first 20,000 characters of it. Which end
+    carries the verdict depends on the tool, and taking a side is wrong for
+    half of them: a compiler leads with its diagnostics, a test runner logs a
+    line per case and states what failed at the bottom.
+
+    On the run this comes from, 17 of one ticket's 37 recorded test failures
+    stored not one line of failure text. All 17 were exactly at the cap, and
+    every one of them was a run where discovery had succeeded — so there was
+    nothing at the head either. What was kept was the engine banner and several
+    hundred passing tests, filed as the evidence for a red step."""
+
+    def test_output_that_fits_is_untouched(self):
+        self.assertEqual(clip("a\nb\nc", 20_000), "a\nb\nc")
+
+    def test_both_ends_survive(self):
+        text = "\n".join(f"line {n}" for n in range(5_000))
+
+        kept = clip(text, 2_000)
+
+        self.assertLessEqual(len(kept), 2_000)
+        self.assertIn("line 0", kept)
+        self.assertIn("line 4999", kept)
+        self.assertIn("not stored", kept)
+
+    def test_it_never_cuts_a_line_in_half(self):
+        text = "\n".join(f"line {n} " + "x" * 60 for n in range(5_000))
+
+        for line in clip(text, 2_000).splitlines():
+            with self.subTest(line=line):
+                self.assertTrue(line.startswith("line ") or line.startswith("[…"))
+
+    def test_a_line_repeated_thousands_of_times_is_counted_not_kept(self):
+        # Position is the wrong thing to select on when most of the output is
+        # one sentence. A green gdUnit4 run of a 400-test suite is 738,000
+        # characters, 87% of which is two lines Godot writes while shutting
+        # down its renderer — *after* the run's verdict. The summary sits 29%
+        # of the way in with half a megabyte of that couplet behind it, so a
+        # head cut misses it and so does a tail cut.
+        noise = "ERROR: Condition is true. Returning: ERR_CANT_CREATE\n   at: swap_chain_resize (drivers/d3d12/rd.cpp:2837)\n"
+        text = "GdUnit4 Comandline Tool\n" + "filler\n" * 200 + (
+            "Overall Summary: 403 test cases | 2 failures\n"
+        ) + noise * 3_000
+
+        kept = clip(text, 20_000)
+
+        self.assertIn("GdUnit4 Comandline Tool", kept)
+        self.assertIn("Overall Summary: 403 test cases | 2 failures", kept)
+        self.assertIn("identical to", kept)
+        self.assertLessEqual(len(kept), 20_000)
+
+    def test_the_count_of_a_repeat_is_kept(self):
+        # "This happened 3,475 times" is itself a fact about the run.
+        kept = clip("head\n" + "same\n" * 4_000 + "tail\n", 1_000)
+
+        self.assertIn("3998 further line(s) identical to 1 shown above", kept)
+
+    def test_repeats_are_only_capped_when_the_output_is_too_long(self):
+        text = "same\n" * 5
+
+        self.assertEqual(clip(text, 20_000), text)
+
+    def test_a_diagnostic_repeated_twice_still_reads_as_repeated(self):
+        text = "error: boom\n" * 3 + "x\n" * 20_000
+
+        self.assertEqual(clip(text, 2_000).count("error: boom"), 2)
+
+
+class TestTheRuntimeIsNotTheProject(unittest.TestCase):
+    """Godot prints its own C++ source in a frame under every engine error, and
+    prints those errors on every run — a debugger port it was not given, a
+    D3D12 swapchain resize, pages still allocated at exit. Parsed as
+    diagnostics they were the top four failure classes of a ticket that spent
+    45 attempts: `core/io/stream_peer_tcp.cpp`,
+    `drivers/d3d12/rendering_device_driver_d3d12.cpp`,
+    `./core/templates/paged_allocator.h` and `127.0.0.1`, each 37 times. The
+    four real GDScript parse errors ranked below them, and convergence was
+    being measured against the engine's startup."""
+
+    NOISE = (
+        "ERROR: The remote port number must be between 1 and 65535 (inclusive).\n"
+        "   at: connect_to_host (core/io/stream_peer_tcp.cpp:69)\n"
+    )
+    REAL = (
+        'SCRIPT ERROR: Parse Error: Cannot infer the type of "x" variable.\n'
+        "   at: GDScript::reload (res://tools/dump_decor_fixtures.gd:11)\n"
+    )
+
+    def test_an_engine_error_about_engine_source_is_not_a_diagnostic(self):
+        self.assertEqual(classify("test", self.NOISE + self.REAL), {
+            "test script error: parse error: cannot infer the type of @ variab "
+            "in tools/dump_decor_fixtures.gd"
+        })
+
+    def test_the_project_file_is_still_blamed(self):
+        self.assertEqual(
+            list(files_blamed(self.NOISE + self.REAL)),
+            ["tools/dump_decor_fixtures.gd"],
+        )
+
+    def test_noise_is_only_noise_when_there_is_signal(self):
+        # A run whose sole evidence is an engine error has nothing to gain from
+        # being told nothing failed.
+        self.assertTrue(classify("test", self.NOISE))
+
+    def test_the_frame_goes_but_the_error_above_it_stays(self):
+        # One Godot error is both: the head names the project file that failed
+        # and the frame names where Godot's loader gave up. Dropping the whole
+        # block would lose the only statement of what is wrong; keeping the
+        # frame blamed the engine, twenty times on one ticket.
+        output = (
+            'ERROR: Failed to load script "res://tests/theme/x.gd" with error '
+            '"Parse error".\n'
+            "   at: load (modules/gdscript/gdscript_resource_format.cpp:46)\n"
+            "   GDScript backtrace (most recent call first):\n"
+            "       [0] scan (res://addons/gdUnit4/src/core/Scanner.gd:214)\n"
+        )
+
+        self.assertEqual(
+            classify("test", output),
+            {"test test failed in tests/theme/x.gd"},
+        )
+
+    def test_a_stack_frame_naming_a_project_file_is_kept(self):
+        # gdUnit4's own scanner is in `addons/`, which is a real repository
+        # path and a real thing to report. Only the subject is decided
+        # elsewhere.
+        blamed = files_blamed(
+            'ERROR: Failed to load script "res://tests/theme/x.gd" with error '
+            '"Parse error".\n'
+            "       [0] scan (res://addons/gdUnit4/src/core/Scanner.gd:214)\n"
+        )
+
+        self.assertIn("addons/gdUnit4/src/core/Scanner.gd", blamed)
+
+    def test_a_head_naming_its_file_beats_a_line_below_naming_another(self):
+        # A tool states its subject first and explains how it got there after.
+        # Reading the location below the head first blamed gdUnit4's scanner,
+        # which is in `addons/` and which no ticket may touch.
+        blocks, _ = _blocks(
+            (
+                'ERROR: Failed to load script "res://tests/theme/x.gd" with '
+                'error "Parse error".\n'
+                "       [0] scan (res://addons/gdUnit4/src/core/Scanner.gd:214)\n"
+            ).splitlines()
+        )
+
+        self.assertEqual(_file_of(blocks[0]), "tests/theme/x.gd")
+
+    def test_a_runner_that_puts_the_file_below_the_head_still_works(self):
+        # pytest's head carries the exception and no path at all.
+        blocks, _ = _blocks(
+            "E   AssertionError: assert 1 == 2\ntests/test_a.py:4: in <module>\n".splitlines()
+        )
+
+        self.assertEqual(_file_of(blocks[0]), "tests/test_a.py")
 
 
 class TestPytestSignaturesStayDistinctPerFile(unittest.TestCase):

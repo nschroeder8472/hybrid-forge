@@ -50,6 +50,7 @@ from .config import ANY_LANGUAGE, REPO_ROOT, ROLES, Config, ConfigError, Workspa
 from .failures import (
     blocks_naming,
     classify,
+    clip,
     distill,
     environment_failure,
     errors_naming,
@@ -115,6 +116,7 @@ from .prompts import (
     tests_prompt,
 )
 from .state import (
+    DETAIL_CHARS,
     RUN_BLOCKED,
     RUN_DONE,
     RUN_FAILED,
@@ -3005,6 +3007,11 @@ class Orchestrator:
                 # So a revised read scope is checked against the tree rather
                 # than taken on the planner's word for where a file lives.
                 root=self.config.root,
+                # So a revised *write* scope stays in the build that can verify
+                # it. See the guard this feeds.
+                workspace_of=lambda path: getattr(
+                    self.config.workspace_for(path), "root", ""
+                ),
                 # Set only for a ticket that has stopped moving, and it
                 # inverts the question: not *revise this so the next attempt
                 # succeeds*, which has an answer whether or not one exists, but
@@ -4496,7 +4503,7 @@ class Orchestrator:
                     "restated context — or reply BLOCKED: if the ticket cannot "
                     "be implemented within that budget."
                 )
-                self.store.end_step(step_id, "failed", completion.text[:20000])
+                self.store.end_step(step_id, "failed", clip(completion.text, DETAIL_CHARS))
                 return StepResult(ok=False, detail=detail)
 
             parsed = parse_output(completion.text)
@@ -4512,7 +4519,7 @@ class Orchestrator:
                 data={"complaint": malformed[:400]},
             )
 
-        self.store.end_step(step_id, "ok", completion.text[:20000])
+        self.store.end_step(step_id, "ok", clip(completion.text, DETAIL_CHARS))
 
         if parsed.is_blocked:
             return StepResult(ok=False, blocked=True, detail=parsed.blocked_reason)
@@ -5120,7 +5127,7 @@ class Orchestrator:
         # stops mid-sentence passes the ticket by default. Truncation must not
         # be the cheapest route to approval.
         if completion.truncated:
-            self.store.end_step(step_id, "failed", completion.text[:20000])
+            self.store.end_step(step_id, "failed", clip(completion.text, DETAIL_CHARS))
             return StepResult(
                 ok=False,
                 detail="reviewer hit its output limit; the verdict was incomplete "
@@ -5128,7 +5135,7 @@ class Orchestrator:
             )
 
         approved, verdict = parse_verdict(completion.text)
-        self.store.end_step(step_id, "ok" if approved else "failed", verdict[:20000])
+        self.store.end_step(step_id, "ok" if approved else "failed", clip(verdict, DETAIL_CHARS))
         self._record_call(
             ticket,
             "review",
@@ -6386,7 +6393,7 @@ class Orchestrator:
 
             self._record_call(ticket, "reproduce", "tester", completion)
             if completion.truncated:
-                self.store.end_step(step_id, "failed", completion.text[:20000])
+                self.store.end_step(step_id, "failed", clip(completion.text, DETAIL_CHARS))
                 return StepResult(
                     ok=False,
                     blocked=True,

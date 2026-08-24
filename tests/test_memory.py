@@ -410,6 +410,96 @@ class TestWriteToolSelection(unittest.TestCase):
             "mempalace_diary_write",
         )
 
+    def test_a_tool_the_entry_cannot_go_into_is_not_a_candidate(self):
+        from forge.memory import _pick_write_tool
+
+        # The real one, and the one this comes from. MemPalace declares
+        # `mempalace_kg_add` — subject, predicate, object — ahead of
+        # `mempalace_add_drawer`; both match the `add` hint, and the first one
+        # won. Every write for an entire run was refused, forty recorder calls
+        # were spent producing text that was thrown away, and nothing was
+        # learned across tickets. The disqualifier is the schema, not the name,
+        # so it has to be part of the choice rather than a complaint after it.
+        tools = [
+            {
+                "name": "mempalace_kg_add",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "subject": {"type": "string"},
+                        "predicate": {"type": "string"},
+                        "object": {"type": "string"},
+                    },
+                    "required": ["subject", "predicate", "object"],
+                },
+            },
+            {
+                "name": "mempalace_add_drawer",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "wing": {"type": "string"},
+                        "room": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["content"],
+                },
+            },
+        ]
+
+        self.assertEqual(_pick_write_tool(tools)["name"], "mempalace_add_drawer")
+
+    def test_a_lone_required_string_is_still_somewhere_to_put_it(self):
+        from forge.memory import _pick_write_tool
+
+        tools = [
+            {
+                "name": "palace_remember",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"note": {"type": "string"}, "at": {"type": "integer"}},
+                    "required": ["note"],
+                },
+            }
+        ]
+
+        self.assertEqual(_pick_write_tool(tools)["name"], "palace_remember")
+
+    def test_an_operator_who_names_a_tool_gets_it(self):
+        from forge.memory import _build_write_arguments, MemoryRefused, _pick_write_tool
+
+        # `preferred` is exempt from the schema check: naming a tool is saying
+        # which one, and what cannot be filled is reported when it is filled.
+        tool = {
+            "name": "mempalace_kg_add",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"subject": {"type": "string"}, "object": {"type": "string"}},
+                "required": ["subject", "object"],
+            },
+        }
+
+        self.assertIs(_pick_write_tool([tool], preferred="mempalace_kg_add"), tool)
+        with self.assertRaises(MemoryRefused):
+            _build_write_arguments(tool, entry="x", room="", title="")
+
+    def test_the_title_is_kept_when_there_is_nowhere_to_declare_it(self):
+        from forge.memory import _build_write_arguments
+
+        tool = {
+            "name": "mempalace_add_drawer",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"content": {"type": "string"}, "wing": {"type": "string"}},
+                "required": ["content"],
+            },
+        }
+
+        self.assertEqual(
+            _build_write_arguments(tool, entry="Chose tiny-skia.", room="", title="Renderer"),
+            {"content": "Renderer\n\nChose tiny-skia."},
+        )
+
 
 class TestWriteGuards(unittest.TestCase):
     def _client(self, **kwargs):
@@ -453,7 +543,12 @@ class TestWriteEndToEnd(unittest.TestCase):
             # under test is schema-driven argument mapping, not the tool name.
             result = client.remember("Chose tiny-skia.", title="Renderer")
             self.assertIn("recorded", result)
-            self.assertEqual(handler.calls[-1]["arguments"]["q"], "Chose tiny-skia.")
+            # The title goes into the one text field the schema has, because
+            # this one declares nowhere else to put it and dropping it loses
+            # what a future ticket reads first.
+            self.assertEqual(
+                handler.calls[-1]["arguments"]["q"], "Renderer\n\nChose tiny-skia."
+            )
         finally:
             server.shutdown()
 

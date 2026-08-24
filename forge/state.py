@@ -24,7 +24,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-from .failures import classify, distill
+from .failures import classify, clip, distill
+
+# How much of a step's output is kept. Enough for any compiler's diagnostics
+# and for a runner's summary, and not so much that a backlog of gdUnit runs —
+# 780 KB apiece — becomes the largest thing in the database. `clip` decides
+# which part of an over-long output that buys; see its docstring.
+DETAIL_CHARS = 20_000
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -1195,6 +1201,10 @@ class Store:
         can leave 780 KB of output behind, so classifying on read would mean
         re-parsing megabytes on every prompt; classifying on write costs one
         pass over output that has just been produced anyway.
+
+        They are computed from the whole of it, before the stored copy is cut
+        down. What is kept on disk is what a person and a later prompt read;
+        what a class is derived from is everything the tool said.
         """
         classes: list[str] = []
         if status == "failed" and detail.strip():
@@ -1207,7 +1217,7 @@ class Store:
             connection.execute(
                 "UPDATE steps SET status = ?, ended_at = ?, detail = ?, classes = ? "
                 "WHERE id = ?",
-                (status, time.time(), detail[:20000], json.dumps(classes), step_id),
+                (status, time.time(), clip(detail, DETAIL_CHARS), json.dumps(classes), step_id),
             )
 
     def last_step_id(self, run_id: int, ticket_id: str) -> int:

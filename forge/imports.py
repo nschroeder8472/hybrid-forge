@@ -47,6 +47,31 @@ _CANDIDATE_SUFFIXES: dict[str, tuple[str, ...]] = {
     ".cjs": (".cjs", ".js", ".ts", ".cts"),
 }
 
+# TypeScript's emit-extension rule, and the one case where a target that names
+# an extension still has to be tried under a different one. Under
+# `moduleResolution: node16` or `nodenext` a relative specifier names the file
+# the *compiler emits*, so `./types.js` is how a `.ts` file imports `types.ts`
+# — mandatory unless `allowImportingTsExtensions` is set, and writing
+# `./types.ts` instead is TS5097.
+#
+# Missing it cost a run four tickets. The check reported `./types.js` as
+# resolving to nothing, the executor rewrote it to `./types.ts`, `tsc` rejected
+# that with TS5097, the executor rewrote it back, and the ticket oscillated
+# between the two for fifty-five attempts before parking on this check — with
+# `types.ts` sitting on disk in its own allowed files the whole time, and its
+# own learned notes recording the rule correctly five times over. Three
+# tickets downstream were skipped for a dependency that was never wrong.
+_TS_REWRITES: dict[str, tuple[str, ...]] = {
+    ".js": (".ts", ".tsx", ".d.ts"),
+    ".jsx": (".tsx", ".d.ts"),
+    ".mjs": (".mts", ".d.mts"),
+    ".cjs": (".cts", ".d.cts"),
+}
+# Only from a TypeScript source. A `.js` file importing `./x.js` means that
+# file literally, and rewriting it there would excuse an import of a module
+# nobody wrote.
+_TS_SOURCES = frozenset({".ts", ".tsx", ".mts", ".cts"})
+
 # Where a directory import lands. `index` for the JavaScript family, and the
 # reason a bare directory target is not automatically a miss.
 _INDEX_STEMS = ("index",)
@@ -179,8 +204,15 @@ def candidates(path: str, target: str) -> list[str]:
     if suffix in _JS_FAMILY:
         base = _normalize(directory / target)
         found = [_posix(base)]
-        if not Path(target).suffix:
+        named = Path(target).suffix.lower()
+        if not named:
             found += [f"{_posix(base)}{ext}" for ext in _CANDIDATE_SUFFIXES[suffix]]
+        elif suffix in _TS_SOURCES and named in _TS_REWRITES:
+            # Sliced off the rendered path rather than `with_suffix`, which
+            # cannot spell `.d.ts` and would eat a dot in a stem like
+            # `level.gen.js`.
+            stem = _posix(base)[: -len(named)]
+            found += [f"{stem}{ext}" for ext in _TS_REWRITES[named]]
         found += [
             f"{_posix(base)}/{stem}{ext}"
             for stem in _INDEX_STEMS

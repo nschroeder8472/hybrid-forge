@@ -20,6 +20,7 @@ never cut inside a line.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from pathlib import Path
 
 # Start of a diagnostic block. Deliberately broad — this runs over cargo, tsc,
@@ -68,6 +69,13 @@ _ERROR = re.compile(
 
 _WARNING = re.compile(r"^\s*warning\s*[:\[]", re.IGNORECASE)
 
+# A file extension, for every pattern here that needs to recognise one. The
+# lookahead requires a letter in it: an all-digit suffix is not an extension,
+# and without that `'127.0.0.1:0'` is the file `127.0.0.1` at line 0. Godot
+# prints that when it cannot reach its debugger — on every run — and it was
+# recorded as one of the top failure classes of a ticket, 37 times over.
+_EXTENSION = r"\.(?=[A-Za-z0-9]{0,4}[A-Za-z])[A-Za-z0-9]{1,5}"
+
 # Continuation of a diagnostic that is not indented. rustc renders source
 # snippets with the line number in column zero (`77 |     .board`), and tsc and
 # pytest use a leading marker, so an "unindented means new block" rule alone
@@ -82,7 +90,7 @@ _CONTINUATION = re.compile(
     # block" rule threw away along with the only mention of the file. A new
     # diagnostic is still checked for first, so an eslint `path.js: error: …`
     # opens its own block rather than being swallowed here.
-    r"|^\s*[\w./\\+-]+\.[A-Za-z0-9]{1,5}:\d+",
+    r"|^\s*[\w./\\+-]+" + _EXTENSION + r":\d+",
     re.IGNORECASE,
 )
 
@@ -119,6 +127,28 @@ _SUMMARY = re.compile(
 # banner as the failure it was being asked to fix, on the ticket that went on
 # to spend 430 attempts. See docs/CONVERGENCE.md.
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+# Godot's own error format. `_err_print_error` prints the message and then one
+# frame naming the file it was raised from:
+#
+#   ERROR: The remote port number must be between 1 and 65535 (inclusive).
+#      at: connect_to_host (core/io/stream_peer_tcp.cpp:69)
+#
+# Which is the *engine's* C++ source, not the project's. Godot spells every
+# project file with the `res://` scheme, so a frame carrying no scheme is the
+# runtime talking about itself, and no toolchain this loop has met prints a
+# symbol before a parenthesised location in any other context.
+#
+# It matters because the engine says these things on every run, green ones
+# included: a debugger port it was not given, a D3D12 swapchain resize, pages
+# still allocated at exit. On the run this comes from they were the top four
+# failure classes of a ticket that spent 45 attempts —
+# `core/io/stream_peer_tcp.cpp`, `drivers/d3d12/rendering_device_driver_d3d12
+# .cpp`, `./core/templates/paged_allocator.h` and `127.0.0.1`, each 37 times —
+# so convergence was measured against Godot's startup and the four real
+# GDScript parse errors were ranked below it.
+_ENGINE_FRAME = re.compile(r"^\s*at:\s+\S.*\([^()]+:\d+\)\s*$")
+_PROJECT_SCHEME = re.compile(r"\bres://", re.IGNORECASE)
 
 
 def strip_ansi(text: str) -> str:
@@ -171,7 +201,46 @@ def _blocks(lines: list[str]) -> tuple[list[list[str]], int]:
 
     if keeping and current:
         errors.append(current)
-    return errors, warnings
+
+    # Done here rather than at each reader, for the reason `_blocks` is shared
+    # at all: `signatures`, `classify`, `files_blamed` and `distill` must not
+    # disagree about what counts as a diagnostic.
+    #
+    # Only when something else survives. Noise is only noise when there is
+    # signal, and a run whose *sole* evidence is an engine error has nothing to
+    # gain from being told nothing failed.
+    kept = [trimmed for block in errors if (trimmed := _trim_engine(block))]
+    return (kept or errors), warnings
+
+
+def _is_engine_frame(line: str) -> bool:
+    """Whether this line is the runtime naming its own source. See `_ENGINE_FRAME`."""
+    return bool(_ENGINE_FRAME.match(line)) and not _PROJECT_SCHEME.search(line)
+
+
+def _trim_engine(block: list[str]) -> list[str]:
+    """The block without the runtime's own frames, or [] if that is all it was.
+
+    Removed line by line rather than block by block, because one Godot error
+    is both: `ERROR: Failed to load script "res://tests/theme/x.gd"` names the
+    project file that actually failed, and the frame under it names
+    `modules/gdscript/gdscript_resource_format.cpp`, which is where Godot's
+    loader gave up. Keeping the block and dropping the frame is the only
+    reading that attributes it to the right file — with the frame in place the
+    engine source was picked as the subject twenty times on one ticket.
+    """
+    trimmed = [line for line in block if not _is_engine_frame(line)]
+    if len(trimmed) == len(block):
+        return block
+    # What is left of an engine error once its frame is gone: a message about
+    # a debugger port, a swapchain, or pages still allocated at exit. Nothing
+    # naming project code, on a line the engine prints every run including the
+    # green ones.
+    if any(_PROJECT_SCHEME.search(line) for line in trimmed) or any(
+        _LOCATION.search(line) for line in trimmed
+    ):
+        return trimmed
+    return []
 
 
 # Fragments that differ between two runs of the *same* failing build: cargo's
@@ -272,7 +341,9 @@ _VERDICT = re.compile(r"^\s*(?:(?:FAIL|FAILED|ERROR)\b|[✗×])", re.IGNORECASE)
 # A path with no line number after it, which `_LOCATION` deliberately does not
 # match. Required to contain a separator: without that, `Object.is` and
 # `assert.ok` are paths, and every assertion message names a file.
-_BARE_PATH = re.compile(r"(?<![\w])((?:[A-Za-z]:)?[\w.+-]*[/\\][\w./\\+-]*\.[A-Za-z0-9]{1,5})\b")
+_BARE_PATH = re.compile(
+    r"(?<![\w])((?:[A-Za-z]:)?[\w.+-]*[/\\][\w./\\+-]*" + _EXTENSION + r")\b"
+)
 
 # Every number that is not part of an error code. Line numbers, column numbers,
 # counts, and the literal values an assertion compared — all of which change
@@ -388,19 +459,27 @@ def _file_of(block: list[str]) -> str:
     """The file this diagnostic is about, or "".
 
     Three places, in the order a tool is likely to put it: on the head with a
-    line number, on a later line with one, and — for a runner's verdict — on
-    the head with no line number at all, which `_LOCATION` does not match by
-    design and which is the only path a vitest failure prints.
+    line number, on the head with none — which `_LOCATION` does not match by
+    design, and which is the only path a vitest failure prints — and only then
+    on a later line.
+
+    The head is asked both ways before anything below it is asked at all,
+    because a tool states its subject first and then explains how it got
+    there. Godot's is the case that settles the order: `ERROR: Failed to load
+    script "res://tests/theme/x.gd" with error "Parse error"` names the file on
+    the head without a line number and follows it with a ten-frame backtrace
+    through gdUnit4's scanner. Reading a location below the head first blamed
+    the scanner, which is in `addons/` and which no ticket may touch.
     """
-    head = block[0].strip()
+    head = _URI_SCHEME.sub("", block[0].strip())
     where = locations(head)
     if where:
         return where[0]
-    below = next((locations(line) for line in block[1:] if locations(line)), [])
-    if below:
-        return below[0]
     bare = _BARE_PATH.search(head)
-    return bare.group(1).replace("\\", "/") if bare else ""
+    if bare:
+        return bare.group(1).replace("\\", "/")
+    below = next((locations(line) for line in block[1:] if locations(line)), [])
+    return below[0] if below else ""
 
 
 def distill(output: str, *, limit: int = 6000) -> str:
@@ -463,6 +542,104 @@ def _clip_lines(lines: list[str], limit: int, *, note: str) -> str:
     return "\n".join(kept)
 
 
+# Room reserved for `clip`'s marker, which cannot be measured until the size of
+# what it is reporting is known. Generous: the message is fixed and the number
+# in it cannot exceed a step's output.
+_CLIP_MARKER = 120
+
+
+def clip(text: str, limit: int) -> str:
+    """`text` cut to `limit` characters, keeping both ends.
+
+    Which end carries the verdict depends on the tool, and taking a side is
+    wrong for half of them. A compiler leads with its diagnostics — tsc prints
+    nothing else, and Godot reports a parse error nine lines in, right under
+    its banner. A test runner ends with them: it logs a line per case as it
+    goes and states what failed at the bottom.
+
+    Head-only truncation lost the second kind completely. A gdUnit4 suite
+    prints `STARTED` and `PASSED` for every case, so a project with a few
+    hundred tests overruns any sane cap long before the summary — and on the
+    run this comes from, 17 of one ticket's 37 recorded test failures stored
+    not one line of failure text. All 17 were exactly at the cap, and every one
+    of them was a run where discovery had *succeeded*, so there was nothing at
+    the head either: what was kept was the engine banner and several hundred
+    passing tests, filed as the evidence for a red step.
+
+    The tail gets the larger share. A tool that leads with its diagnostics has
+    said what it has to say within a few KB; one that ends with them has its
+    per-case log running right up to the summary.
+    """
+    text = text or ""
+    if len(text) <= limit:
+        return text
+
+    text = _cap_repeats(text)
+    if len(text) <= limit:
+        return text
+
+    room = max(limit - _CLIP_MARKER, 0)
+    head, tail = room * 2 // 5, room - room * 2 // 5
+    # Whole lines, for the reason `_clip_lines` does it: a diagnostic cut in
+    # half reads as a claim about a symbol that is not in the source.
+    front = text[:head].rpartition("\n")[0] or text[:head]
+    back = text[len(text) - tail :].partition("\n")[2] or text[len(text) - tail :]
+    dropped = len(text) - len(front) - len(back)
+    return f"{front}\n[… {dropped} characters not stored …]\n{back}"
+
+
+# How many times one line may appear before the rest are counted instead of
+# kept. Two rather than one, so a genuinely repeated diagnostic still reads as
+# repeated.
+_REPEAT_LIMIT = 2
+
+
+def _cap_repeats(text: str) -> str:
+    """The same line over and over, replaced by a count of how often.
+
+    Position is the wrong thing to select on when most of the output is one
+    sentence. A green gdUnit4 run of a 400-test suite is 738,000 characters, of
+    which 633,000 — 87% — is two lines alternating 3,475 times apiece:
+
+        ERROR: Condition "!((HRESULT)(res) >= 0)" is true. Returning: …
+           at: swap_chain_resize (drivers/d3d12/rendering_device_driver_d3d12…)
+
+    Godot writes them while shutting down its renderer, *after* the run's
+    verdict. So the summary sits 29% of the way in, with half a megabyte of
+    that couplet behind it: a head cut misses it and so does a tail cut. With
+    the repeats counted the same run is 84,000 characters, the verdict is near
+    the end of it where a tail cut finds it, and exactly two distinct lines
+    were affected.
+
+    Only reached when the output is already over the limit, so nothing that
+    fits is ever altered — and the count is kept, because "this happened 3,475
+    times" is itself a fact about the run.
+    """
+    seen: Counter[str] = Counter()
+    dropped: Counter[str] = Counter()
+    kept: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            # Runs of blank lines are what removing thousands of lines leaves
+            # behind, and they cost the room this is trying to save.
+            if kept and kept[-1].strip():
+                kept.append(line)
+            continue
+        seen[stripped] += 1
+        if seen[stripped] <= _REPEAT_LIMIT:
+            kept.append(line)
+        else:
+            dropped[stripped] += 1
+
+    if not dropped:
+        return text
+    return "\n".join(kept) + (
+        f"\n[{sum(dropped.values())} further line(s) identical to "
+        f"{len(dropped)} shown above, not stored]"
+    )
+
+
 # A file location inside a diagnostic. Deliberately loose about the path shape,
 # because this runs over every toolchain a user can configure; the caller checks
 # the path against the repository before trusting it.
@@ -487,14 +664,25 @@ def _clip_lines(lines: list[str], limit: int, *, note: str) -> str:
 # ending `file` is read as a drive, yielding `e:///repo/src/Main.kt` — a path
 # matching nothing, which silently excuses every Kotlin error.
 _LOCATION = re.compile(
-    r"((?<![\w])(?:[A-Za-z]:)?[\w./\\+-]*(?:\.[A-Za-z0-9]{1,5}|[/\\][\w+-]+))"
+    r"((?<![\w])(?:[A-Za-z]:)?[\w./\\+-]*(?:" + _EXTENSION + r"|[/\\][\w+-]+))"
     r"(?::(\d+)(?::\d+)?|\((\d+)(?:,\d+)?\))"
 )
 
-# `file:///repo/src/Main.kt` (kotlinc, and any tool reporting URIs) carries a
-# scheme that no repository path has. Dropped before matching so the location
-# underneath is an ordinary absolute path.
-_FILE_URI = re.compile(r"\bfile://", re.IGNORECASE)
+# A scheme no repository path has, dropped before matching so the location
+# underneath is an ordinary one. `file:///repo/src/Main.kt` is kotlinc and any
+# tool reporting URIs; `res://tests/x.gd` is Godot naming a file relative to
+# the project root, which is repository-relative already.
+#
+# Without the second, every GDScript location parsed to `//tests/x.gd` — a path
+# with a leading double slash that matches nothing on disk and nothing in a
+# ticket's scope. For the whole Godot half of a project, attribution, baseline
+# amnesty and contradiction detection were answering about a file that does not
+# exist.
+#
+# `user://` is deliberately absent. It names the engine's user-data directory,
+# which is outside the repository, and rewriting it to a bare relative path
+# would invent a repository file that was never there.
+_URI_SCHEME = re.compile(r"\b(?:file|res)://", re.IGNORECASE)
 
 
 # How each runner says how many tests it ran. The largest number any of these
@@ -610,7 +798,7 @@ def locations(text: str) -> list[str]:
     diagnostic -- the one compilers put the error at -- is checked first.
     """
     found: list[str] = []
-    for match in _LOCATION.finditer(_FILE_URI.sub("", strip_ansi(text))):
+    for match in _LOCATION.finditer(_URI_SCHEME.sub("", strip_ansi(text))):
         path = match.group(1).replace("\\", "/")
         if path and path not in found:
             found.append(path)
@@ -643,8 +831,11 @@ def files_blamed(output: str, exclude: set[str] | None = None) -> dict[str, list
         if exclude and _block_key(block) in exclude:
             continue
         for line in block:
-            for match in _LOCATION.finditer(line):
-                path = match.group(1).replace("\\", "/")
+            # Through `locations` rather than `_LOCATION` directly: it is this
+            # module's one answer to "which file is this about", and a second
+            # copy of the pattern here is how this came to be the only reader
+            # that never stripped a URI scheme.
+            for path in locations(line):
                 entry = line.strip()
                 lines = blamed.setdefault(path, [])
                 if entry not in lines:
