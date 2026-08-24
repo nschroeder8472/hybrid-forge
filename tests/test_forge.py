@@ -75,6 +75,7 @@ from forge.patch import (
 )
 from forge.failures import (
     blocks_naming,
+    classify,
     distill,
     environment_failure,
     errors_naming,
@@ -85,6 +86,13 @@ from forge.failures import (
     test_count,
 )
 from forge.prompts import (
+    FAILURE_CLASSES_HEADING,
+    LEARNED_HEADING,
+    convention_prompt,
+    parse_stuck_review,
+    record_prompt,
+    stuck_review_prompt,
+    TOOLCHAIN_HEADING,
     bug_prompt,
     locate_prompt,
     parse_bug,
@@ -1727,8 +1735,24 @@ class TestRetryCycleConfig(unittest.TestCase):
         self.assertEqual(config.loop.retry_cycles, 0)
         self.assertTrue(config.loop.respec_on_retry)
 
-    def test_the_conversational_executor_is_off_by_default(self):
-        self.assertEqual(self._load({}).loop.executor_turns, 0)
+    def test_the_sign_off_pass_is_on_by_default(self):
+        # Turned on after the Puzzle-Path run of 2026-08-22/23 sent two tickets
+        # no implementation could satisfy to the executor, because nothing had
+        # asked whether they were buildable. 650 attempts between them.
+        self.assertEqual(self._load({}).loop.ratify_passes, 2)
+
+    def test_the_sign_off_pass_can_be_turned_off(self):
+        self.assertEqual(self._load({"ratifyPasses": 0}).loop.ratify_passes, 0)
+
+    def test_the_conversational_executor_is_on_by_default(self):
+        # Off until the Puzzle-Path run of 2026-08-22/23 measured what the flat
+        # shape costs on a long backlog: 430 attempts on one ticket, each one
+        # meeting its own previous answer as a stranger's. See
+        # docs/CONVERGENCE.md. 4 covers a full attempt budget.
+        self.assertEqual(self._load({}).loop.executor_turns, 4)
+
+    def test_the_conversational_executor_can_be_turned_off(self):
+        self.assertEqual(self._load({"executorTurns": 0}).loop.executor_turns, 0)
 
     def test_the_turn_count_is_read_and_survives_a_write(self):
         config = self._load({"executorTurns": 2})
@@ -6503,7 +6527,16 @@ class TestPlanningFromABugReport(unittest.TestCase):
 
 
 def _stub_orchestrator(commands: dict[str, str] | None = None):
-    """An Orchestrator over a temp repo with every shell command disabled."""
+    """An Orchestrator over a temp repo with every shell command disabled.
+
+    `ratify_passes` and `executor_turns` are pinned off for the same reason
+    the commands are blank: they are on by default in a real run and neither
+    is what the callers of this fixture are testing. Both spend model calls —
+    ratify before the first build, turns by reshaping the prompt — and every
+    caller here scripts an exact reply sequence through `_replies`, so leaving
+    the shipped defaults in makes an unrelated feature eat the first answers.
+    The tests that do cover them set them explicitly.
+    """
     root = Path(tempfile.mkdtemp())
     config = Config(
         root=root,
@@ -6518,6 +6551,7 @@ def _stub_orchestrator(commands: dict[str, str] | None = None):
         },
         roles={role: "m" for role in ("planner", "executor", "tester", "reviewer")},
         commands=commands or {"lint": "", "typecheck": "", "test": ""},
+        loop=LoopSettings(ratify_passes=0, executor_turns=0),
     )
     store = Store(root / "t.db")
     return Orchestrator(config, store), root, store.create_run("goal")
@@ -6641,7 +6675,12 @@ class TestHistoryIsTrimmedRatherThanBlocking(unittest.TestCase):
             ],
         )
 
-        kept = _joined(self._fit(messages, window=4096))
+        # The stub counts one token per character, so the window here is
+        # roughly 1.5k real tokens rather than 6k. Sized above the system
+        # prompt plus the ticket so the assertion is about the gate dropping
+        # history, which is what this tests, and not about how long the
+        # executor's rules happen to be this month.
+        kept = _joined(self._fit(messages, window=6144))
 
         self.assertIn("the spec that must survive", kept)
         self.assertNotIn("Earlier attempts on this ticket", kept)
@@ -6686,13 +6725,14 @@ class TestHistoryIsTrimmedRatherThanBlocking(unittest.TestCase):
 
 
 class TestTheExecutorCanSeeItsOwnAnswers(unittest.TestCase):
-    """The executor has never seen its own output. It is handed the spec, the
+    """The executor used not to see its own output. It was handed the spec, the
     files as they exist on disk and the failures — with nothing anywhere saying
     that it wrote those files. That is the state behind "Looking at the files
     provided, I can see they already implement the spec correctly": a model
-    reading its own work as somebody else's. Behind `loop.executorTurns`,
-    because a model shown its own wrong answer as an assistant turn also
-    defends it more readily, and which effect wins is a measurement."""
+    reading its own work as somebody else's. Behind `loop.executorTurns`, which
+    is now 4 by default: a model shown its own wrong answer as an assistant
+    turn does defend it more readily, and the measurement that settled which
+    effect wins is in docs/CONVERGENCE.md."""
 
     TURNS = [
         ("src/a.py\n```python\nx = 1\n```", "lint failed: x is unused"),
@@ -6806,8 +6846,11 @@ class TestTurnsAreRebuiltFromTheStepLog(unittest.TestCase):
         self.assertEqual(store.ticket_turns(run_id, "T-1"), [])
 
 
-class TestConversationalExecutorIsOffUntilAskedFor(unittest.TestCase):
-    """A flag, and an experiment. The flat prompt stays the default."""
+class TestTheConversationalExecutorCanBeTurnedOff(unittest.TestCase):
+    """`loop.executorTurns` is 4 by default and 0 restores the flat prompt.
+    Both shapes stay supported: the flat one is what a provider with no
+    conversation semantics gets, and it is the fallback if a model turns out
+    to defend its own wrong answers more than it learns from them."""
 
     def _run(self, turns: int):
         orch, _root, run_id = _stub_orchestrator()
@@ -6831,7 +6874,7 @@ class TestConversationalExecutorIsOffUntilAskedFor(unittest.TestCase):
         orch._work_ticket(run_id, Ticket("T-1", allowed_files=["src/a.py"]))
         return seen
 
-    def test_off_by_default_nothing_is_replayed(self):
+    def test_at_zero_nothing_is_replayed(self):
         seen = self._run(turns=0)
 
         self.assertEqual(len(seen), 2, "the ticket should have had two attempts")
@@ -9152,6 +9195,1944 @@ class TestALanguageNothingTypeChecks(unittest.TestCase):
             cli._report_coverage(Config.load(root))
 
         self.assertNotIn("no type check", captured.getvalue())
+
+
+class TestTheTestsStopMovingUnderTheExecutor(unittest.TestCase):
+    """The tester was the most expensive role in the loop and almost none of
+    what it spent was new work: 916 calls and 18,253 seconds on one run, more
+    wall clock than the executor's 16,726. One ticket regenerated a
+    functionally identical file 430 times, several byte-identical in groups of
+    fifteen. The worse cost is not the seconds — an executor judged against
+    assertions rewritten under it every attempt is aiming at a moving target.
+    See docs/CONVERGENCE.md."""
+
+    REPLY = "src/a.py\n```python\nx = 1\n```"
+    TESTS = "tests/t_1_test.py\n```python\ndef test_a(): assert True\n```"
+
+    def _orchestrator(self):
+        orch, root, run_id = _stub_orchestrator()
+        (root / "src").mkdir()
+        return orch, root, run_id
+
+    def _ticket(self):
+        return Ticket("T-1", allowed_files=["src/a.py"], criteria=["x is 1"])
+
+    def _run(self, orch, run_id, ticket, attempts=2):
+        called: list[str] = []
+
+        def call(_run_id, role, _messages, **_kwargs):
+            called.append(role)
+            return Completion(
+                text={"executor": self.REPLY, "tester": self.TESTS}.get(
+                    role, "ACCEPT\nfine"
+                ),
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        orch._call = call
+        for _ in range(attempts):
+            orch._attempt(run_id, ticket, "")
+        return called
+
+    def test_the_first_attempt_writes_them(self):
+        orch, root, run_id = self._orchestrator()
+        ticket = self._ticket()
+
+        called = self._run(orch, run_id, ticket, attempts=1)
+
+        self.assertIn("tester", called)
+        self.assertTrue((root / "tests" / "t_1_test.py").is_file())
+        self.assertTrue(ticket.tests_fingerprint)
+
+    def test_a_second_attempt_over_unchanged_criteria_writes_nothing(self):
+        orch, _root, run_id = self._orchestrator()
+
+        called = self._run(orch, run_id, self._ticket(), attempts=3)
+
+        self.assertEqual(
+            called.count("tester"), 1, "the tester should have run once, not three times"
+        )
+
+    def test_changed_criteria_rewrite_them(self):
+        orch, _root, run_id = self._orchestrator()
+        ticket = self._ticket()
+        self._run(orch, run_id, ticket, attempts=1)
+
+        ticket.criteria = ["x is 1", "y is 2"]
+        called = self._run(orch, run_id, ticket, attempts=1)
+
+        self.assertIn("tester", called)
+
+    def test_a_changed_spec_rewrites_them(self):
+        # A revision can change what a criterion means without changing its
+        # words, and the tester is shown the spec.
+        orch, _root, run_id = self._orchestrator()
+        ticket = self._ticket()
+        self._run(orch, run_id, ticket, attempts=1)
+
+        ticket.spec = "Now it returns a Level."
+        called = self._run(orch, run_id, ticket, attempts=1)
+
+        self.assertIn("tester", called)
+
+    def test_a_missing_file_rewrites_them(self):
+        # Reclaimed by `_discard_tests`, taken out by `_quarantine`, or never
+        # landed. Whatever the reason, there is nothing to keep.
+        orch, root, run_id = self._orchestrator()
+        ticket = self._ticket()
+        self._run(orch, run_id, ticket, attempts=1)
+        (root / "tests" / "t_1_test.py").unlink()
+
+        called = self._run(orch, run_id, ticket, attempts=1)
+
+        self.assertIn("tester", called)
+
+    def test_a_failure_in_the_test_file_rewrites_them(self):
+        # The one failure that is the tester's own: the file is outside every
+        # other role's scope, so nobody else can fix it.
+        orch, _root, run_id = self._orchestrator()
+        ticket = self._ticket()
+        self._run(orch, run_id, ticket, attempts=1)
+
+        self.assertEqual(
+            orch._tests_are_current(
+                ticket,
+                "tests/t_1_test.py",
+                orch._tests_fingerprint(ticket, "tests/t_1_test.py"),
+                "error: unused variable\n  --> tests/t_1_test.py:4:9",
+            ),
+            "the last failure was in the test file itself",
+        )
+
+    def test_a_failure_in_the_implementation_does_not(self):
+        # The whole point. The executor's failure is the executor's to fix, and
+        # rewriting the assertions under it is what made the target move.
+        orch, _root, run_id = self._orchestrator()
+        ticket = self._ticket()
+        self._run(orch, run_id, ticket, attempts=1)
+
+        self.assertEqual(
+            orch._tests_are_current(
+                ticket,
+                "tests/t_1_test.py",
+                orch._tests_fingerprint(ticket, "tests/t_1_test.py"),
+                "src/a.py:4: AssertionError: x is 2, expected 1",
+            ),
+            "",
+        )
+
+    def test_the_fingerprint_ignores_the_implementation(self):
+        # Not an oversight: the tests encode the criteria, which is why the
+        # tester is a separate role and why its file is outside the executor's
+        # scope. A fingerprint that moved with the code would regenerate every
+        # attempt, which is the behaviour this replaces.
+        orch, root, _run_id = self._orchestrator()
+        ticket = self._ticket()
+        before = orch._tests_fingerprint(ticket, "tests/t_1_test.py")
+        (root / "src" / "a.py").write_text("x = 99\n", encoding="utf-8")
+
+        self.assertEqual(orch._tests_fingerprint(ticket, "tests/t_1_test.py"), before)
+
+    def test_turning_it_off_rewrites_them_every_attempt(self):
+        orch, _root, run_id = self._orchestrator()
+        orch.config.loop.freeze_tests = False
+
+        called = self._run(orch, run_id, self._ticket(), attempts=3)
+
+        self.assertEqual(called.count("tester"), 3)
+
+    def test_keeping_them_is_recorded_as_a_step(self):
+        orch, _root, run_id = self._orchestrator()
+        self._run(orch, run_id, self._ticket(), attempts=2)
+
+        said = " ".join(row["message"] for row in orch.store.events_after(0))
+        self.assertIn("kept the tests already written", said)
+
+    def test_a_bug_tickets_reproduction_is_untouched_by_any_of_this(self):
+        # A bug ticket authors no tests at all: its contract was written before
+        # the fix and the party being judged does not get to add to it.
+        orch, root, run_id = self._orchestrator()
+        (root / "tests").mkdir()
+        (root / "tests" / "bug_1_test.py").write_text(
+            "def test_bug(): assert False\n", encoding="utf-8"
+        )
+        called: list[str] = []
+
+        def call(_run_id, role, _messages, **_kwargs):
+            called.append(role)
+            return Completion(
+                text=self.REPLY if role == "executor" else "ACCEPT\nfine",
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        orch._call = call
+        orch._attempt(
+            run_id,
+            Ticket("T-1", allowed_files=["src/a.py"], kind=TICKET_BUG),
+            "",
+            repro=("tests/bug_1_test.py", "AssertionError"),
+        )
+
+        self.assertNotIn("tester", called)
+        self.assertEqual(
+            (root / "tests" / "bug_1_test.py").read_text(encoding="utf-8"),
+            "def test_bug(): assert False\n",
+        )
+
+
+class TestAStuckTicketReachesTheReviewer(unittest.TestCase):
+    """Review sits behind verification, so a ticket failing the same way for
+    cycles never reaches the one role positioned to say the contract is wrong.
+    1,350 executor calls produced 17 reviews on the run this comes from, and
+    the ticket that spent 6.7M tokens against an unsatisfiable contract gave
+    the reviewer 43k of them. See docs/CONVERGENCE.md."""
+
+    def _orchestrator(self, **loop_settings):
+        return TestAutomaticRetryCycles._orchestrator(
+            self,
+            tickets=[Ticket("T-1", status="failed", attempts=3)],
+            retry_cycles=-1,
+            **loop_settings,
+        )
+
+    def _fail(self, store, run_id, detail, ticket_id="T-1"):
+        step = store.start_step(run_id, ticket_id, "typecheck")
+        store.end_step(step, "failed", detail)
+
+    def test_the_question_is_whether_the_ticket_can_be_met_not_whether_it_was(self):
+        ticket = Ticket(
+            "T-1",
+            spec="Port the hash.",
+            criteria=["hash(0) returns 1", "hash(0) returns 2"],
+        )
+
+        shown = _joined(
+            stuck_review_prompt(
+                ticket,
+                "diff --git a/x b/x",
+                [{"name": "test failed in tests/a.test.ts", "count": 40}],
+                "AssertionError: expected 1 to be 2",
+            )
+        )
+
+        self.assertIn("Can\nthis ticket be satisfied as written?", shown)
+        self.assertIn("hash(0) returns 2", shown)
+        self.assertIn("40 times", shown)
+
+    def test_the_system_prompt_offers_unclear_as_a_real_answer(self):
+        # A wrong `unwinnable` parks work that would have landed, and a wrong
+        # `winnable` spends another dozen cycles.
+        system = stuck_review_prompt(Ticket("T-1"), "", [], "")[0].content
+
+        self.assertIn("VERDICT: unclear", system)
+        self.assertIn("better than a confident guess", system)
+
+    def test_an_unreadable_verdict_is_unclear_rather_than_an_error(self):
+        # A step whose whole purpose is advice must not be able to end a
+        # ticket.
+        self.assertEqual(parse_stuck_review("I could not say.")[0], "unclear")
+        self.assertEqual(parse_stuck_review("")[0], "unclear")
+
+    def test_it_runs_on_the_flat_cycle_it_is_configured_for(self):
+        orchestrator, store, run_id = self._orchestrator(review_when_stuck=2)
+        asked: list[str] = []
+
+        def call(_run_id, role, messages, **_kwargs):
+            if role == "reviewer" and any("satisfied as written" in m.content for m in messages):
+                asked.append(role)
+                return Completion(
+                    text="VERDICT: unwinnable\nCriteria 1 and 2 disagree.",
+                    usage=Usage(),
+                    finish_reason="stop",
+                )
+            return Completion(text="{}", usage=Usage(), finish_reason="stop")
+
+        orchestrator._call = call
+        for _ in range(3):
+            self._fail(store, run_id, "src/a.ts(4,1): error TS2532: x")
+            orchestrator._retry_cycle(run_id, "blocked")
+            ticket = store.list_tickets(run_id)[0]
+            if ticket.status == "pending":
+                ticket.status = "failed"
+                store.update_ticket(run_id, ticket)
+
+        self.assertEqual(len(asked), 1, "the rung should fire once, not every cycle")
+        self.assertEqual(orchestrator._stuck_opinion["T-1"][0], "unwinnable")
+
+    def test_it_never_runs_on_a_ticket_that_is_still_moving(self):
+        orchestrator, store, run_id = self._orchestrator(review_when_stuck=2)
+        asked: list[str] = []
+
+        def call(_run_id, role, messages, **_kwargs):
+            if role == "reviewer" and any("satisfied as written" in m.content for m in messages):
+                asked.append(role)
+            return Completion(text="{}", usage=Usage(), finish_reason="stop")
+
+        orchestrator._call = call
+        for count in (4, 3, 2, 1):
+            for n in range(count):
+                self._fail(store, run_id, f"src/f{n}.ts(1,1): error TS2532: x")
+            orchestrator._retry_cycle(run_id, "blocked")
+            ticket = store.list_tickets(run_id)[0]
+            if ticket.status == "pending":
+                ticket.status = "failed"
+                store.update_ticket(run_id, ticket)
+
+        self.assertEqual(asked, [])
+
+    def test_turning_the_ladder_off_never_escalates(self):
+        orchestrator, store, run_id = self._orchestrator(review_when_stuck=0)
+        orchestrator._stuck_review = unittest.mock.Mock()
+
+        for _ in range(5):
+            self._fail(store, run_id, "src/a.ts(4,1): error TS2532: x")
+            orchestrator._retry_cycle(run_id, "blocked")
+            ticket = store.list_tickets(run_id)[0]
+            if ticket.status == "pending":
+                ticket.status = "failed"
+                store.update_ticket(run_id, ticket)
+
+        orchestrator._stuck_review.assert_not_called()
+
+    def test_an_unreachable_reviewer_leaves_the_ticket_where_it_was(self):
+        orchestrator, store, run_id = self._orchestrator(review_when_stuck=1)
+
+        def call(*_args, **_kwargs):
+            raise ProviderError("no route to host")
+
+        orchestrator._call = call
+        ticket = store.list_tickets(run_id)[0]
+
+        self.assertEqual(orchestrator._stuck_review(run_id, ticket)[0], "unclear")
+        self.assertNotEqual(store.list_tickets(run_id)[0].status, "blocked")
+
+
+class TestThePlannerIsAskedWhetherTheTicketIsPossible(unittest.TestCase):
+    """`impossible` has been available on every respec call since the field
+    existed, and in 86 consecutive cycles on one ticket the planner never
+    reached for it — because it was asked, every time, to revise the ticket so
+    the next attempt could succeed, and that question has an answer whether or
+    not one exists."""
+
+    def test_the_ordinary_question_is_unchanged(self):
+        shown = _joined(
+            respec_prompt(Ticket("T-1", spec="s"), [{"name": "lint", "detail": "d"}])
+        )
+
+        self.assertIn("Revise the ticket so the next attempt can succeed.", shown)
+        self.assertNotIn("This ticket has stopped moving", shown)
+
+    def test_the_inverted_question_asks_for_one_of_two_answers(self):
+        shown = _joined(
+            respec_prompt(
+                Ticket("T-1", spec="s"),
+                [{"name": "lint", "detail": "d"}],
+                stuck={
+                    "flat_cycles": 3,
+                    "classes": ["typecheck TS2532 in src/a.ts"],
+                    "verdict": "unwinnable",
+                    "review": "Criteria 1 and 11 disagree about hash(0).",
+                },
+            )
+        )
+
+        self.assertIn("This ticket has stopped moving", shown)
+        self.assertIn("cannot be satisfied as written", shown)
+        self.assertIn("Criteria 1 and 11 disagree", shown)
+        self.assertNotIn(
+            "Revise the ticket so the next attempt can succeed.", shown
+        )
+
+    def test_the_reviewers_opinion_is_offered_as_an_opinion(self):
+        shown = _joined(
+            respec_prompt(
+                Ticket("T-1", spec="s"),
+                [{"name": "lint", "detail": "d"}],
+                stuck={
+                    "flat_cycles": 3,
+                    "classes": [],
+                    "verdict": "unwinnable",
+                    "review": "The criteria disagree.",
+                },
+            )
+        )
+
+        self.assertIn("It is an opinion, not a finding", shown)
+
+    def test_the_executors_claim_travels_with_it_and_is_marked_as_a_claim(self):
+        shown = _joined(
+            respec_prompt(
+                Ticket("T-1", spec="s"),
+                [{"name": "lint", "detail": "d"}],
+                stuck={
+                    "flat_cycles": 2,
+                    "classes": [],
+                    "executor_claim": "criteria 1 and 11 want different values",
+                },
+            )
+        )
+
+        self.assertIn("criteria 1 and 11 want different values", shown)
+        self.assertIn("every reason to conclude nobody can", shown)
+
+
+class TestTheExecutorCanSayTheTicketIsImpossible(unittest.TestCase):
+    """One executor wrote "there's a contradiction in the acceptance criteria"
+    into an otherwise ordinary reply on attempt 58 of 430. It was right — two
+    criteria demanded different values from the same call — the edits parsed,
+    and the sentence was read by nothing."""
+
+    def test_a_bare_claim_is_read(self):
+        parsed = parse_output("IMPOSSIBLE: criteria 1 and 11 disagree about hash(0).")
+
+        self.assertTrue(parsed.is_impossible)
+        self.assertIn("criteria 1 and 11", parsed.impossible_reason)
+
+    def test_a_claim_alongside_an_implementation_is_read_too(self):
+        # The shape it actually arrives in: an executor implements its best
+        # guess and says so at the same time.
+        parsed = parse_output(
+            "src/a.ts\n```ts\nexport const x = 1;\n```\nIMPOSSIBLE: the criteria disagree."
+        )
+
+        self.assertEqual(len(parsed.edits), 1)
+        self.assertTrue(parsed.is_impossible)
+
+    def test_an_ordinary_reply_claims_nothing(self):
+        parsed = parse_output("src/a.ts\n```ts\nexport const x = 1;\n```")
+
+        self.assertFalse(parsed.is_impossible)
+
+    def test_it_is_a_different_claim_from_blocked(self):
+        self.assertFalse(parse_output("BLOCKED: I need wider scope.").is_impossible)
+        self.assertFalse(
+            parse_output("IMPOSSIBLE: the criteria disagree.").is_blocked
+        )
+
+    def test_the_attempt_continues_and_the_claim_is_held(self):
+        # Never acted on where it is made: it is a claim about the ticket from
+        # the party least able to judge it.
+        orch, root, run_id = _stub_orchestrator()
+        (root / "src").mkdir()
+        orch._call = lambda *_a, **_k: Completion(
+            text="src/a.ts\n```ts\nexport const x = 1;\n```\nIMPOSSIBLE: criteria disagree.",
+            usage=Usage(),
+            finish_reason="stop",
+        )
+
+        outcome = orch._attempt(run_id, Ticket("T-1", allowed_files=["src/a.ts"]), "")
+
+        self.assertFalse(outcome.blocked)
+        self.assertEqual((root / "src" / "a.ts").read_text(encoding="utf-8"), "export const x = 1;\n")
+        self.assertIn("criteria disagree", orch._impossible_claims["T-1"])
+
+    def test_the_claim_is_reported_once_not_every_attempt(self):
+        orch, root, run_id = _stub_orchestrator()
+        (root / "src").mkdir()
+        orch._call = lambda *_a, **_k: Completion(
+            text="src/a.ts\n```ts\nexport const x = 1;\n```\nIMPOSSIBLE: criteria disagree.",
+            usage=Usage(),
+            finish_reason="stop",
+        )
+        for _ in range(3):
+            orch._attempt(run_id, Ticket("T-1", allowed_files=["src/a.ts"]), "")
+
+        said = [
+            row["message"]
+            for row in orch.store.events_after(0)
+            if "cannot be satisfied as written" in row["message"]
+        ]
+        self.assertEqual(len(said), 1)
+
+
+class TestARunKnowsWhetherItIsGettingCloser(unittest.TestCase):
+    """A run that spends 18 hours descending has earned them; one that spends
+    18 hours resampling reads identically from the outside — same log lines,
+    same attempt counts, same "re-delegating" every five minutes. Nothing in
+    the loop measured the difference. The backlog-wide brake could not: it asks
+    whether *every* unfinished ticket reproduced the last cycle, so a ticket
+    going nowhere stays invisible while any other still moves. One spent the
+    full 18 hours in exactly that position. See docs/CONVERGENCE.md."""
+
+    def _orchestrator(self, **loop_settings):
+        return TestAutomaticRetryCycles._orchestrator(
+            self,
+            tickets=[Ticket("T-1", status="failed", attempts=3)],
+            retry_cycles=-1,
+            **loop_settings,
+        )
+
+    def _cycle(self, store, run_id, *details, ticket_id="T-1"):
+        """One cycle's worth of failures against the ticket."""
+        for detail in details:
+            step = store.start_step(run_id, ticket_id, "typecheck")
+            store.end_step(step, "failed", detail)
+
+    def _measure(self, orchestrator, store, run_id, ticket_id="T-1"):
+        ticket = next(
+            t for t in store.list_tickets(run_id) if t.ticket_id == ticket_id
+        )
+        return orchestrator._measure_cycle(run_id, ticket)
+
+    def test_the_first_cycle_has_nothing_to_compare_against(self):
+        orchestrator, store, run_id = self._orchestrator()
+        self._cycle(store, run_id, "src/a.ts(4,1): error TS2532: x")
+
+        self.assertEqual(self._measure(orchestrator, store, run_id), Orchestrator.FIRST)
+
+    def test_fewer_kinds_of_failure_is_descending(self):
+        orchestrator, store, run_id = self._orchestrator()
+        self._cycle(
+            store,
+            run_id,
+            "src/a.ts(4,1): error TS2532: x",
+            "src/b.ts(9,1): error TS2538: y",
+        )
+        self._measure(orchestrator, store, run_id)
+
+        self._cycle(store, run_id, "src/a.ts(4,1): error TS2532: x")
+
+        self.assertEqual(
+            self._measure(orchestrator, store, run_id), Orchestrator.DESCENDING
+        )
+
+    def test_trading_one_failure_for_another_is_churning(self):
+        # Separated from flat rather than folded into "not descending": they
+        # ask for different things. Churning is the executor trading one
+        # failure for another, which more attempts can genuinely resolve.
+        orchestrator, store, run_id = self._orchestrator()
+        self._cycle(store, run_id, "src/a.ts(4,1): error TS2532: x")
+        self._measure(orchestrator, store, run_id)
+
+        self._cycle(store, run_id, "src/b.ts(9,1): error TS2538: y")
+
+        self.assertEqual(
+            self._measure(orchestrator, store, run_id), Orchestrator.CHURNING
+        )
+
+    def test_the_same_set_again_is_flat(self):
+        orchestrator, store, run_id = self._orchestrator()
+        self._cycle(store, run_id, "src/a.ts(4,1): error TS2532: x")
+        self._measure(orchestrator, store, run_id)
+
+        # Different line, same mistake — which is what 86 cycles looked like.
+        self._cycle(store, run_id, "src/a.ts(51,8): error TS2532: x")
+
+        self.assertEqual(self._measure(orchestrator, store, run_id), Orchestrator.FLAT)
+
+    def test_a_cycle_that_failed_at_nothing_is_neither(self):
+        orchestrator, store, run_id = self._orchestrator()
+        self._cycle(store, run_id, "src/a.ts(4,1): error TS2532: x")
+        self._measure(orchestrator, store, run_id)
+
+        self.assertEqual(
+            self._measure(orchestrator, store, run_id), Orchestrator.CLEARED
+        )
+
+    def test_progress_is_said_out_loud(self):
+        orchestrator, store, run_id = self._orchestrator()
+        self._cycle(
+            store,
+            run_id,
+            "src/a.ts(4,1): error TS2532: x",
+            "src/b.ts(9,1): error TS2538: y",
+        )
+        self._measure(orchestrator, store, run_id)
+        self._cycle(store, run_id, "src/a.ts(4,1): error TS2532: x")
+        self._measure(orchestrator, store, run_id)
+
+        said = " ".join(row["message"] for row in store.events_after(0))
+        self.assertIn("converging", said)
+        self.assertIn("down from 2", said)
+
+    def test_a_flat_cycle_says_which_one_it_is(self):
+        orchestrator, store, run_id = self._orchestrator()
+        for _ in range(3):
+            self._cycle(store, run_id, "src/a.ts(4,1): error TS2532: x")
+            self._measure(orchestrator, store, run_id)
+
+        said = " ".join(row["message"] for row in store.events_after(0))
+        self.assertIn("second cycle running", said)
+
+    def test_the_count_resets_when_anything_changes(self):
+        orchestrator, store, run_id = self._orchestrator()
+        for _ in range(3):
+            self._cycle(store, run_id, "src/a.ts(4,1): error TS2532: x")
+            self._measure(orchestrator, store, run_id)
+        self._cycle(store, run_id, "src/b.ts(9,1): error TS2538: y")
+        self._measure(orchestrator, store, run_id)
+
+        ticket = store.list_tickets(run_id)[0]
+        self.assertEqual(ticket.flat_cycles, 0)
+
+    def test_a_stalled_ticket_is_parked_and_the_backlog_carries_on(self):
+        # The behaviour change. One ticket failing identically forever used to
+        # take a fresh attempt budget every cycle for as long as any other
+        # ticket kept the run alive.
+        orchestrator, store, run_id = self._orchestrator(flat_cycles=2)
+        store.add_tickets(run_id, [Ticket("T-2", status="failed", attempts=3)])
+        for round_number in range(3):
+            self._cycle(store, run_id, "src/a.ts(4,1): error TS2532: x")
+            # T-2 fails in a new way every cycle, so the run is still going
+            # somewhere and the backlog-wide brake stays quiet throughout.
+            self._cycle(
+                store,
+                run_id,
+                f"src/b.ts({round_number},1): error TS253{round_number}: y",
+                ticket_id="T-2",
+            )
+            orchestrator._retry_cycle(run_id, "blocked")
+            for ticket in store.list_tickets(run_id):
+                if ticket.status == "pending":
+                    ticket.status = "failed"
+                    store.update_ticket(run_id, ticket)
+
+        by_id = {t.ticket_id: t for t in store.list_tickets(run_id)}
+        self.assertEqual(by_id["T-1"].status, "blocked")
+        self.assertIn("stalled", by_id["T-1"].blocked_note)
+        self.assertNotEqual(by_id["T-2"].status, "blocked")
+
+    def test_the_parked_note_names_what_it_kept_failing_on(self):
+        orchestrator, store, run_id = self._orchestrator(flat_cycles=2)
+        for _ in range(3):
+            self._cycle(store, run_id, "src/a.ts(4,1): error TS2532: x")
+            orchestrator._retry_cycle(run_id, "blocked")
+            ticket = store.list_tickets(run_id)[0]
+            if ticket.status == "pending":
+                ticket.status = "failed"
+                store.update_ticket(run_id, ticket)
+
+        note = store.list_tickets(run_id)[0].blocked_note
+        self.assertIn("TS2532", note)
+        self.assertIn("src/a.ts", note)
+
+    def test_the_brake_is_off_by_default(self):
+        # Measured, and there is no safe threshold: replayed against the run
+        # this comes from, the ticket that went on to pass sat still for four
+        # consecutive cycles while the genuinely unsatisfiable one managed
+        # three. Parking on that signal alone trades a stalled ticket for a
+        # killed one. See docs/CONVERGENCE.md.
+        self.assertEqual(LoopSettings().flat_cycles, 0)
+
+    def test_the_measurement_runs_whether_or_not_the_brake_does(self):
+        orchestrator, store, run_id = self._orchestrator(flat_cycles=0)
+        self._cycle(store, run_id, "src/a.ts(4,1): error TS2532: x")
+        self._measure(orchestrator, store, run_id)
+        self._cycle(store, run_id, "src/a.ts(51,8): error TS2532: x")
+
+        self.assertEqual(self._measure(orchestrator, store, run_id), Orchestrator.FLAT)
+        self.assertIn(
+            "flat", " ".join(row["message"] for row in store.events_after(0))
+        )
+
+    def test_turning_the_brake_off_never_parks_a_ticket(self):
+        orchestrator, store, run_id = self._orchestrator(flat_cycles=0)
+        for _ in range(6):
+            self._cycle(store, run_id, "src/a.ts(4,1): error TS2532: x")
+            orchestrator._retry_cycle(run_id, "blocked")
+            ticket = store.list_tickets(run_id)[0]
+            if ticket.status == "pending":
+                ticket.status = "failed"
+                store.update_ticket(run_id, ticket)
+
+        self.assertNotEqual(store.list_tickets(run_id)[0].status, "blocked")
+
+    def test_a_ticket_still_descending_is_never_parked(self):
+        orchestrator, store, run_id = self._orchestrator(flat_cycles=2)
+        for count in (4, 3, 2, 1):
+            self._cycle(
+                store,
+                run_id,
+                *[f"src/f{n}.ts(1,1): error TS2532: x" for n in range(count)],
+            )
+            orchestrator._retry_cycle(run_id, "blocked")
+            ticket = store.list_tickets(run_id)[0]
+            if ticket.status == "pending":
+                ticket.status = "failed"
+                store.update_ticket(run_id, ticket)
+
+        self.assertNotEqual(store.list_tickets(run_id)[0].status, "blocked")
+
+
+class TestWhatAFailedTicketLearnedOutlivesIt(unittest.TestCase):
+    """Project memory was read 262 times in one 18-hour run and written zero
+    times, and the two tickets that spent 650 attempts between them both ended
+    parked — so everything their failures had demonstrated about the project
+    went into the artifact directory and nowhere else. The next run started
+    knowing none of it. See docs/CONVERGENCE.md."""
+
+    def _orchestrator(self, *, write=True):
+        orch, root, run_id = _stub_orchestrator()
+        orch.memory = unittest.mock.Mock()
+        orch.memory.settings = unittest.mock.Mock(write=write)
+        orch.memory.remember = unittest.mock.Mock(return_value="recorded")
+        orch.memory.retrieve = unittest.mock.Mock(return_value="")
+        # `_retrieve_context` measures what came back, so the stub has to
+        # return text rather than a Mock.
+        orch._retrieve_context = lambda *_a, **_k: ""
+        return orch, root, run_id
+
+    def _ticket(self, learned=True):
+        return Ticket(
+            "T-1",
+            allowed_files=["src/a.ts"],
+            learned=(
+                [{"text": "The type checker runs with noUncheckedIndexedAccess.", "count": 4}]
+                if learned
+                else []
+            ),
+        )
+
+    def test_a_failed_ticket_offers_what_it_established(self):
+        orch, _root, run_id = self._orchestrator()
+        seen: list[list[Message]] = []
+
+        def call(_run_id, _role, messages, **_kwargs):
+            seen.append(messages)
+            return Completion(
+                text="TITLE: strict index access\nEvery index needs a guard here.",
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        orch._call = call
+        orch._record_conventions(run_id, self._ticket())
+
+        self.assertIn("noUncheckedIndexedAccess", _joined(seen[0]))
+        orch.memory.remember.assert_called_once()
+
+    def test_a_ticket_that_learned_nothing_costs_no_call(self):
+        orch, _root, run_id = self._orchestrator()
+        orch._call = unittest.mock.Mock()
+
+        orch._record_conventions(run_id, self._ticket(learned=False))
+
+        orch._call.assert_not_called()
+        orch.memory.remember.assert_not_called()
+
+    def test_write_back_off_means_nothing_is_written(self):
+        orch, _root, run_id = self._orchestrator(write=False)
+        orch._call = unittest.mock.Mock()
+
+        orch._record_conventions(run_id, self._ticket())
+
+        orch._call.assert_not_called()
+
+    def test_nothing_worth_keeping_is_a_real_answer(self):
+        orch, _root, run_id = self._orchestrator()
+        orch._call = lambda *_a, **_k: Completion(
+            text="NOTHING", usage=Usage(), finish_reason="stop"
+        )
+
+        orch._record_conventions(run_id, self._ticket())
+
+        orch.memory.remember.assert_not_called()
+
+    def test_the_recorder_is_never_shown_the_failed_code(self):
+        # The rule `_record_outcome` enforces is right and this does not bend
+        # it: a conclusion drawn from unverified work is a rumour. What reaches
+        # this prompt is only `learned`, which came from what the project's own
+        # tools printed.
+        ticket = self._ticket()
+        ticket.spec = "Port the hash function."
+
+        shown = _joined(convention_prompt(ticket))
+
+        self.assertIn("noUncheckedIndexedAccess", shown)
+        self.assertNotIn("Port the hash function.", shown)
+        self.assertIn("did not pass", shown)
+
+    def test_the_system_prompt_refuses_conclusions_about_the_work(self):
+        system = convention_prompt(self._ticket())[0].content
+
+        self.assertIn("nothing about the work itself may be recorded", system)
+        self.assertIn("applies only to the files this one ticket owned", system)
+
+    def test_an_unreachable_recorder_does_not_change_how_the_ticket_ends(self):
+        orch, _root, run_id = self._orchestrator()
+
+        def call(*_args, **_kwargs):
+            raise ProviderError("no route to host")
+
+        orch._call = call
+        orch._record_conventions(run_id, self._ticket())
+
+        said = " ".join(row["message"] for row in orch.store.events_after(0))
+        self.assertIn("could not evaluate conventions", said)
+
+    def test_a_ticket_that_gives_up_reaches_it(self):
+        # The wiring, at the moment 430 attempts of learning used to evaporate.
+        orch, root, run_id = self._orchestrator()
+        orch.config.loop.max_attempts = 1
+        (root / "src").mkdir()
+        recorded: list[str] = []
+
+        def call(_run_id, role, messages, **_kwargs):
+            if role == orch.config.record_role and any(
+                "did not pass" in m.content for m in messages
+            ):
+                recorded.append(_joined(messages))
+                return Completion(text="NOTHING", usage=Usage(), finish_reason="stop")
+            return Completion(
+                text=(
+                    "src/a.ts\n```ts\nexport const x = 1;\n```"
+                    if role == "executor"
+                    else "REJECT\nnot what the spec asked for"
+                ),
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        orch._call = call
+        orch.store.add_tickets(run_id, [Ticket("T-1", allowed_files=["src/a.ts"])])
+        stored = orch.store.list_tickets(run_id)[0]
+        # Through the real path: `learned` is written by `Store.learn` alone,
+        # which is what makes it append-only.
+        orch.store.learn(
+            run_id, stored, ["The type checker runs with noUncheckedIndexedAccess."]
+        )
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertTrue(recorded, "a ticket that gave up should offer what it learned")
+
+    def test_a_passing_ticket_shows_the_recorder_what_it_established(self):
+        # The other half: `record_prompt` never had this material either.
+        ticket = self._ticket()
+
+        shown = _joined(
+            record_prompt(ticket, diff="d", review="ACCEPT", attempts=3)
+        )
+
+        self.assertIn("established about the project", shown)
+        self.assertIn("noUncheckedIndexedAccess", shown)
+        self.assertIn("established 4 separate times", shown)
+
+
+class TestATicketKeepsWhatItsAttemptsEstablished(unittest.TestCase):
+    """Everything else a cycle produces is rebuilt from the plan each time it
+    runs, which is the right rule for a contract and left the loop nowhere to
+    put a fact. Eighty-six respec cycles on one ticket ended with its `context`
+    holding the plan's paragraph, verbatim, twice — and the same three
+    conventions were rediscovered eleven times across two tickets that never
+    exchanged a word. See docs/CONVERGENCE.md."""
+
+    def _store(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(run_id, [Ticket("T-1")])
+        return store, run_id, store.list_tickets(run_id)[0]
+
+    def test_a_learning_survives_the_write(self):
+        store, run_id, ticket = self._store()
+
+        store.learn(run_id, ticket, ["The type checker runs with noUncheckedIndexedAccess."])
+
+        reloaded = store.list_tickets(run_id)[0]
+        self.assertEqual(
+            [entry["text"] for entry in reloaded.learned],
+            ["The type checker runs with noUncheckedIndexedAccess."],
+        )
+
+    def test_a_later_cycle_adds_without_removing(self):
+        # The property the whole field exists for: cycle 41 must not lose what
+        # cycle 40 worked out.
+        store, run_id, ticket = self._store()
+        store.learn(run_id, ticket, ["Imports resolve with a .js extension."])
+
+        store.learn(run_id, ticket, ["Indexing needs a guard."])
+
+        self.assertEqual(len(store.list_tickets(run_id)[0].learned), 2)
+
+    def test_the_same_fact_twice_is_counted_not_duplicated(self):
+        store, run_id, ticket = self._store()
+        store.learn(run_id, ticket, ["Imports resolve with a `.js` extension."])
+
+        store.learn(run_id, ticket, ["imports resolve with a .js extension"])
+
+        learned = store.list_tickets(run_id)[0].learned
+        self.assertEqual(len(learned), 1)
+        self.assertEqual(learned[0]["count"], 2)
+
+    def test_the_most_rediscovered_comes_first(self):
+        # The ordering is the signal: a conclusion reached on four separate
+        # cycles is one the plan should have stated.
+        store, run_id, ticket = self._store()
+        store.learn(run_id, ticket, ["Rarely seen."])
+        for _ in range(3):
+            store.learn(run_id, ticket, ["Seen every cycle."])
+
+        self.assertEqual(
+            store.list_tickets(run_id)[0].learned[0]["text"], "Seen every cycle."
+        )
+
+    def test_learn_reports_only_what_was_new(self):
+        store, run_id, ticket = self._store()
+        store.learn(run_id, ticket, ["Already known."])
+
+        added = store.learn(run_id, ticket, ["Already known.", "Brand new."])
+
+        self.assertEqual(added, ["Brand new."])
+
+    def test_an_ordinary_update_cannot_shorten_it(self):
+        # `update_ticket` does not name the column, for the same reason it does
+        # not name `original_spec`: a field any caller can shorten is not
+        # append-only.
+        store, run_id, ticket = self._store()
+        store.learn(run_id, ticket, ["Established."])
+
+        ticket.learned = []
+        store.update_ticket(run_id, ticket)
+
+        self.assertEqual(len(store.list_tickets(run_id)[0].learned), 1)
+
+    def test_blank_entries_are_not_recorded(self):
+        store, run_id, ticket = self._store()
+
+        self.assertEqual(store.learn(run_id, ticket, ["", "   ", "\t \t"]), [])
+        self.assertEqual(store.list_tickets(run_id)[0].learned, [])
+
+    def test_the_executor_is_shown_them_as_facts_not_requirements(self):
+        ticket = Ticket(
+            "T-1",
+            learned=[{"text": "Indexing needs a guard.", "count": 3}],
+        )
+
+        shown = _joined(build_prompt(ticket))
+
+        self.assertIn(LEARNED_HEADING, shown)
+        self.assertIn("Indexing needs a guard.", shown)
+        self.assertIn("established 3 separate times", shown)
+        self.assertIn("not requirements you are judged against", shown)
+
+    def test_the_tester_is_shown_them_too(self):
+        ticket = Ticket(
+            "T-1", learned=[{"text": "The linter forbids trailing whitespace.", "count": 1}]
+        )
+
+        shown = _joined(tests_prompt(ticket, ["src/a.gd"], test_path="tests/t.gd"))
+
+        self.assertIn("forbids trailing whitespace", shown)
+
+    def test_the_reviewer_is_not(self):
+        # It is not a bar. Nothing downstream enforces a line of it, which is
+        # what keeps it out of the criteria ratchet's jurisdiction.
+        ticket = Ticket(
+            "T-1", criteria=["go() returns 1"], learned=[{"text": "A fact.", "count": 1}]
+        )
+
+        shown = _joined(review_prompt(ticket, "diff"))
+
+        self.assertNotIn("A fact.", shown)
+
+    def test_the_limit_caps_what_reaches_a_prompt(self):
+        ticket = Ticket(
+            "T-1",
+            learned=[{"text": f"Fact {n}.", "count": 1} for n in range(20)],
+        )
+
+        shown = _joined(build_prompt(ticket, learned_limit=3))
+
+        self.assertIn("Fact 0.", shown)
+        self.assertNotIn("Fact 9.", shown)
+
+    def test_a_limit_of_zero_renders_none(self):
+        ticket = Ticket("T-1", learned=[{"text": "A fact.", "count": 1}])
+
+        self.assertNotIn(LEARNED_HEADING, _joined(build_prompt(ticket, learned_limit=0)))
+
+    def test_a_ticket_with_nothing_learned_says_nothing(self):
+        self.assertNotIn(LEARNED_HEADING, _joined(build_prompt(Ticket("T-1"))))
+
+    def test_it_is_droppable(self):
+        message = Message(role="user", content=f"{LEARNED_HEADING}\\nx")
+
+        self.assertTrue(_droppable(message))
+
+
+class TestRespecCanWriteDownWhatItWorkedOut(unittest.TestCase):
+    """`learned_add` is respec's channel for a fact about the repository, as
+    opposed to a demand on the executor. Screened on the way in, because the
+    field is read by every later attempt and never revised away."""
+
+    def _revised(self, reply: dict, ticket: Ticket | None = None):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(run_id, [ticket or Ticket("T-1", spec="Write a parser.")])
+        step = store.start_step(run_id, "T-1", "typecheck")
+        store.end_step(step, "failed", "src/a.ts(4,1): error TS2532: x")
+
+        respec.revise(
+            store,
+            run_id,
+            store.list_tickets(run_id)[0],
+            call=lambda _messages, _budget: Completion(
+                text=json.dumps(reply), usage=Usage()
+            ),
+            budget=1024,
+        )
+        return store, run_id
+
+    def test_a_plain_fact_is_recorded(self):
+        store, run_id = self._revised(
+            {
+                "spec": "Write a parser.",
+                "learned_add": ["The type checker runs with noUncheckedIndexedAccess."],
+            }
+        )
+
+        self.assertEqual(
+            [entry["text"] for entry in store.list_tickets(run_id)[0].learned],
+            ["The type checker runs with noUncheckedIndexedAccess."],
+        )
+
+    def test_a_waiver_is_never_recorded_as_a_learning(self):
+        # `learned` is read by every later attempt and never revised away, so a
+        # sentence saying a failing check does not count is the durable form of
+        # the failure `_refuse_verification_waivers` exists for.
+        store, run_id = self._revised(
+            {
+                "spec": "Write a parser.",
+                "learned_add": [
+                    "Ignore the pre-existing compilation error during verification.",
+                    "The parser is invoked from src/main.ts.",
+                ],
+            }
+        )
+
+        self.assertEqual(
+            [entry["text"] for entry in store.list_tickets(run_id)[0].learned],
+            ["The parser is invoked from src/main.ts."],
+        )
+
+    def test_a_refused_criterion_is_not_quietly_turned_into_a_fact(self):
+        # Tried, and rejected on the evidence. Across a whole 18-hour run no
+        # minted criterion was ever proposed twice in the same words, so a
+        # recurrence gate would promote nothing — and without one, two of a
+        # single ticket's eleven refusals contradicted each other outright
+        # (`use the non-null assertion operator` against `without non-null
+        # assertions`). Recording both as established fact would feed the
+        # oscillation the field exists to break. See docs/CONVERGENCE.md.
+        store, run_id = self._revised(
+            {
+                "spec": "Write a parser.",
+                "criteria": [
+                    "parse() returns a Level",
+                    "All imports must use `.js` extensions.",
+                ],
+            },
+            ticket=Ticket(
+                "T-1", spec="Write a parser.", criteria=["parse() returns a Level"]
+            ),
+        )
+
+        self.assertEqual(store.list_tickets(run_id)[0].learned, [])
+
+
+class TestAFailureIsClassifiedByKindNotByText(unittest.TestCase):
+    """`signatures` answers "is this the error the baseline already had", and
+    keeps the line to answer it. This answers "have I failed this way before",
+    and the line is exactly what has to go: `TS2532` at line 40 and at line 51
+    are one misunderstanding of one compiler flag. Keyed by text, one ticket
+    produced 512 instances of that flag as 512 distinct facts, of which the
+    executor was shown the newest two. See docs/CONVERGENCE.md."""
+
+    def test_the_same_code_in_one_file_is_one_class(self):
+        output = (
+            "src/a.ts(40,12): error TS2532: Object is possibly 'undefined'.\n"
+            "src/a.ts(51,8): error TS2532: Object is possibly 'undefined'.\n"
+        )
+
+        self.assertEqual(
+            classify("typecheck", output), {"typecheck TS2532 in src/a.ts"}
+        )
+
+    def test_the_same_code_in_two_files_is_two_classes(self):
+        # One rule broken in two places is two pieces of work; the same rule
+        # broken twice in one file is one thing to learn.
+        output = (
+            "src/a.ts(40,12): error TS2532: Object is possibly 'undefined'.\n"
+            "src/b.ts(4,1): error TS2532: Object is possibly 'undefined'.\n"
+        )
+
+        self.assertEqual(len(classify("typecheck", output)), 2)
+
+    def test_the_step_is_part_of_the_class(self):
+        output = "src/a.ts(40,12): error TS2532: Object is possibly 'undefined'."
+
+        self.assertNotEqual(
+            classify("typecheck", output), classify("test[.ts]", output)
+        )
+
+    def test_a_linter_rule_is_named_the_way_the_linter_names_it(self):
+        output = (
+            "tests/a.gd:15: Error: Trailing whitespace(s) (trailing-whitespace)\n"
+            "tests/a.gd:17: Error: Trailing whitespace(s) (trailing-whitespace)\n"
+        )
+
+        self.assertEqual(
+            classify("lint", output), {"lint trailing-whitespace in tests/a.gd"}
+        )
+
+    def test_values_that_differ_every_attempt_do_not_make_a_new_class(self):
+        # The failure that defeated the retry brake for 86 consecutive cycles:
+        # an assertion quoting a hash that is different every run.
+        first = classify(
+            "test", "AssertionError: expected 937260802 to be 1691721052"
+        )
+        second = classify(
+            "test", "AssertionError: expected 2424842523 to be 3103417317"
+        )
+
+        self.assertEqual(first, second)
+        self.assertTrue(first)
+
+    def test_a_rust_error_code_is_the_class(self):
+        output = "error[E0603]: module `game` is private\n --> src/main.rs:4:12\n"
+
+        self.assertEqual(classify("lint", output), {"lint E0603 in src/main.rs"})
+
+    def test_colour_codes_do_not_hide_a_failure(self):
+        # vitest colours everything it prints, and every pattern here is
+        # anchored at the start of a line. Across an 18-hour run not one of its
+        # failures parsed.
+        plain = " FAIL  tests/a.test.ts > suite > case\nAssertionError: expected 1 to be 2\n"
+        coloured = (
+            "\x1b[31m FAIL \x1b[39m tests/a.test.ts > suite > case\n"
+            "\x1b[1mAssertionError\x1b[22m: expected 1 to be 2\n"
+        )
+
+        self.assertTrue(classify("test", plain))
+        self.assertEqual(classify("test", plain), classify("test", coloured))
+
+    def test_a_runner_verdict_is_classed_by_its_file_not_its_test_name(self):
+        # The verdict line's message is the test's own name, so treating it as
+        # a message mints a class per case — the opposite of the point.
+        output = (
+            " FAIL  tests/a.test.ts > hash > returns 1691721052\n"
+            "\n"
+            " FAIL  tests/a.test.ts > hash > returns 293696066\n"
+        )
+
+        self.assertEqual(
+            classify("test", output), {"test test failed in tests/a.test.ts"}
+        )
+
+    def test_a_reviewers_rejection_still_has_an_identity(self):
+        # No toolchain, no diagnostic, and the brake still has to be able to
+        # tell one cycle's rejection from the next.
+        first = classify("review", "REJECT: the implementation is missing")
+        second = classify("review", "REJECT: the RNG seed handling is wrong")
+
+        self.assertTrue(first)
+        self.assertNotEqual(first, second)
+
+    def test_output_with_nothing_in_it_has_no_class(self):
+        self.assertEqual(classify("lint", ""), set())
+        self.assertEqual(classify("lint", "   \n\n"), set())
+
+    def test_signatures_still_keeps_the_line(self):
+        # The two must not collapse into one function: attribution needs the
+        # line and convergence needs it gone.
+        output = (
+            "src/a.ts(40,12): error TS2532: Object is possibly 'undefined'.\n"
+            "src/a.ts(51,8): error TS2532: Object is possibly 'undefined'.\n"
+        )
+
+        self.assertEqual(len(signatures(output)), 2)
+        self.assertEqual(len(classify("typecheck", output)), 1)
+
+
+class TestTheLoopCountsWhatKeepsFailing(unittest.TestCase):
+    """The prompt has carried "if the newest failure is one you have already
+    seen, the two changes are undoing each other" all along, and could never
+    fire: two entries deduplicated by text were reliably two instances of one
+    mistake. Counting is what makes the paragraph true."""
+
+    def _store(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        return store, store.create_run("goal")
+
+    def _fail(self, store, run_id, name, detail, ticket="T-1"):
+        step = store.start_step(run_id, ticket, name)
+        store.end_step(step, "failed", detail)
+
+    def test_classes_are_recorded_when_the_step_closes(self):
+        store, run_id = self._store()
+
+        self._fail(store, run_id, "typecheck", "src/a.ts(4,1): error TS2532: x")
+
+        self.assertEqual(
+            [entry["name"] for entry in store.ticket_classes(run_id, "T-1")],
+            ["typecheck TS2532 in src/a.ts"],
+        )
+
+    def test_a_passing_step_records_none(self):
+        store, run_id = self._store()
+        step = store.start_step(run_id, "T-1", "typecheck")
+        store.end_step(step, "ok", "all good")
+
+        self.assertEqual(store.ticket_classes(run_id, "T-1"), [])
+
+    def test_the_count_is_how_many_attempts_produced_it(self):
+        store, run_id = self._store()
+        for line in (4, 51, 92):
+            self._fail(
+                store, run_id, "typecheck", f"src/a.ts({line},1): error TS2532: x"
+            )
+
+        entry = store.ticket_classes(run_id, "T-1")[0]
+
+        self.assertEqual(entry["count"], 3)
+        self.assertEqual(entry["first_attempt"], 1)
+        self.assertEqual(entry["last_attempt"], 3)
+
+    def test_the_commonest_class_comes_first(self):
+        store, run_id = self._store()
+        self._fail(store, run_id, "lint", "src/b.ts:1: Error: bad (no-shadow)")
+        for line in (4, 51):
+            self._fail(
+                store, run_id, "typecheck", f"src/a.ts({line},1): error TS2532: x"
+            )
+
+        names = [entry["name"] for entry in store.ticket_classes(run_id, "T-1")]
+
+        self.assertEqual(names[0], "typecheck TS2532 in src/a.ts")
+
+    def test_the_prompt_says_how_many_times(self):
+        classes = [
+            {
+                "name": "typecheck TS2532 in src/a.ts",
+                "count": 40,
+                "first_attempt": 3,
+                "last_attempt": 61,
+            }
+        ]
+
+        shown = _joined(build_prompt(Ticket("T-1"), failure_classes=classes))
+
+        self.assertIn(FAILURE_CLASSES_HEADING, shown)
+        self.assertIn("40 times", shown)
+        self.assertIn("attempt 3", shown)
+        self.assertIn("attempt 61", shown)
+
+    def test_a_mistake_made_once_is_not_a_pattern(self):
+        classes = [
+            {
+                "name": "typecheck TS2532 in src/a.ts",
+                "count": 1,
+                "first_attempt": 1,
+                "last_attempt": 1,
+            }
+        ]
+
+        shown = _joined(build_prompt(Ticket("T-1"), failure_classes=classes))
+
+        self.assertNotIn(FAILURE_CLASSES_HEADING, shown)
+
+    def test_the_tally_is_droppable(self):
+        # Worth having and not worth a ticket, like every other history block.
+        message = Message(role="user", content=f"{FAILURE_CLASSES_HEADING}\nx")
+
+        self.assertTrue(_droppable(message))
+
+    def test_prior_failures_deduplicate_by_class(self):
+        # The window used to hold one mistake twice. Two instances of `TS2532`
+        # at different lines are two strings and one fact.
+        store, run_id = self._store()
+        for line in (4, 51, 92):
+            self._fail(
+                store, run_id, "typecheck", f"src/a.ts({line},1): error TS2532: x"
+            )
+        self._fail(store, run_id, "lint", "src/b.ts:1: Error: bad (no-shadow)")
+
+        failures = store.ticket_failures(run_id, "T-1", limit=6)
+
+        self.assertEqual(len(failures), 2)
+
+    def test_the_window_is_configurable(self):
+        orch, _root, _run_id = _stub_orchestrator()
+        orch.config.loop.prior_failures = 5
+
+        self.assertEqual(orch._prior_failures, 5)
+
+
+class TestTheRetryBrakeComparesClasses(unittest.TestCase):
+    """The brake never fired once in 86 consecutive cycles on one ticket. The
+    assertions it was failing quoted a hash that differed every attempt, so
+    every cycle's evidence hashed to something new and "this reproduced the
+    previous cycle's failures exactly" was never true of any two of them. The
+    same seven classes were failing throughout."""
+
+    def _orchestrator(self, retry_cycles=-1):
+        # The same fixture `TestAutomaticRetryCycles` uses: respec off, because
+        # it is a model call and what is under test here is the comparison the
+        # cycle makes before it gets there.
+        return TestAutomaticRetryCycles._orchestrator(
+            self,
+            tickets=[Ticket("T-1", status="failed", attempts=3)],
+            retry_cycles=retry_cycles,
+        )
+
+    def _fail_again(self, store, run_id, detail):
+        ticket = store.list_tickets(run_id)[0]
+        ticket.status = "failed"
+        store.update_ticket(run_id, ticket)
+        step = store.start_step(run_id, "T-1", "test")
+        store.end_step(step, "failed", detail)
+
+    def test_a_cycle_whose_values_changed_but_whose_mistake_did_not_stops(self):
+        orchestrator, store, run_id = self._orchestrator()
+        self._fail_again(
+            store, run_id, "AssertionError: expected 937260802 to be 1691721052"
+        )
+        self.assertIs(orchestrator._retry_cycle(run_id, "blocked"), True)
+
+        # Same mistake, different numbers — which is what 86 cycles looked like.
+        self._fail_again(
+            store, run_id, "AssertionError: expected 2424842523 to be 3103417317"
+        )
+
+        self.assertIs(orchestrator._retry_cycle(run_id, "blocked"), False)
+
+    def test_a_cycle_that_fails_in_a_genuinely_new_way_keeps_going(self):
+        orchestrator, store, run_id = self._orchestrator()
+        self._fail_again(
+            store, run_id, "AssertionError: expected 937260802 to be 1691721052"
+        )
+        self.assertIs(orchestrator._retry_cycle(run_id, "blocked"), True)
+
+        self._fail_again(store, run_id, "src/a.ts(4,1): error TS2532: x")
+
+        self.assertIs(orchestrator._retry_cycle(run_id, "blocked"), True)
+
+
+class TestTheFormatterRunsBeforeAnythingJudges(unittest.TestCase):
+    """117 of one ticket's 160 lint failures had trailing whitespace as their
+    only problem, in a file the tester had just written. Each cost an executor
+    call, a tester call, an 8-second suite run and a share of a respec cycle,
+    against a `gdlintrc` nobody had shown it. A formatter clears all of them in
+    milliseconds, and lowers no bar doing it — the linter's thresholds are the
+    project's and are untouched. See docs/CONVERGENCE.md."""
+
+    def setUp(self):
+        # A real formatter, as a real shell command: it strips trailing
+        # whitespace from every file named on its command line and touches
+        # nothing else. Written to disk rather than inlined so the test
+        # exercises the argument-appending contract the config documents.
+        self.tool = Path(tempfile.mkdtemp()) / "strip_trailing.py"
+        self.tool.write_text(
+            "import pathlib, sys\n"
+            "for argument in sys.argv[1:]:\n"
+            "    target = pathlib.Path(argument)\n"
+            "    text = target.read_text(encoding='utf-8')\n"
+            "    stripped = [line.rstrip() for line in text.split('\\n')]\n"
+            "    target.write_text('\\n'.join(stripped), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        self.formatter = f'"{sys.executable}" "{self.tool}"'
+
+    def _orch(self, command=None):
+        return _stub_orchestrator({
+            "lint": "",
+            "typecheck": "",
+            "test": "",
+            "format": self.formatter if command is None else command,
+        })
+
+    def _logged(self, orch, run_id) -> str:
+        return " ".join(row["message"] for row in orch.store.events_after(0))
+
+    def test_it_rewrites_what_the_attempt_wrote(self):
+        orch, root, run_id = self._orch()
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("x = 1   \ny = 2\t\n", encoding="utf-8")
+
+        changed = orch._format_pass(
+            run_id, Ticket("T-1", allowed_files=["src/a.py"]), ["src/a.py"]
+        )
+
+        self.assertEqual(changed, ["src/a.py"])
+        self.assertEqual(
+            (root / "src" / "a.py").read_text(encoding="utf-8"), "x = 1\ny = 2\n"
+        )
+
+    def test_a_file_it_did_not_change_is_not_reported(self):
+        orch, root, run_id = self._orch()
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+        changed = orch._format_pass(
+            run_id, Ticket("T-1", allowed_files=["src/a.py"]), ["src/a.py"]
+        )
+
+        self.assertEqual(changed, [])
+
+    def test_only_the_files_this_attempt_landed(self):
+        # A ticket scoped `src/*.py` has not touched most of `src/`, and
+        # reformatting a file it never wrote is an out-of-scope edit dressed as
+        # a tidy-up.
+        orch, root, run_id = self._orch()
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("x = 1   \n", encoding="utf-8")
+        (root / "src" / "untouched.py").write_text("y = 2   \n", encoding="utf-8")
+
+        orch._format_pass(
+            run_id, Ticket("T-1", allowed_files=["src/*.py"]), ["src/a.py"]
+        )
+
+        self.assertEqual(
+            (root / "src" / "untouched.py").read_text(encoding="utf-8"), "y = 2   \n"
+        )
+
+    def test_no_format_command_costs_nothing(self):
+        orch, root, run_id = _stub_orchestrator()
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("x = 1   \n", encoding="utf-8")
+
+        self.assertEqual(orch._format_pass(run_id, Ticket("T-1"), ["src/a.py"]), [])
+        self.assertEqual(
+            (root / "src" / "a.py").read_text(encoding="utf-8"), "x = 1   \n"
+        )
+
+    def test_a_formatter_that_cannot_run_never_parks_the_ticket(self):
+        # A missing binary is a configuration fault. Parking a correct
+        # implementation over one would be a worse bug than the one this fixes.
+        orch, root, run_id = self._orch("this-command-does-not-exist-anywhere")
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("x = 1   \n", encoding="utf-8")
+
+        changed = orch._format_pass(
+            run_id, Ticket("T-1", allowed_files=["src/a.py"]), ["src/a.py"]
+        )
+
+        self.assertEqual(changed, [])
+        self.assertEqual(
+            (root / "src" / "a.py").read_text(encoding="utf-8"), "x = 1   \n"
+        )
+        self.assertIn("format command failed", self._logged(orch, run_id))
+
+    def test_a_rewrite_is_reported(self):
+        # Model output being rewritten by something other than the model. Small
+        # and mechanical so far, and the moment it stops being that is the
+        # moment somebody needs to see it in the log.
+        orch, root, run_id = self._orch()
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("x = 1   \n", encoding="utf-8")
+
+        orch._format_pass(
+            run_id, Ticket("T-1", allowed_files=["src/a.py"]), ["src/a.py"]
+        )
+
+        said = self._logged(orch, run_id)
+        self.assertIn("formatter rewrote", said)
+        self.assertIn("src/a.py", said)
+
+    def test_a_language_with_no_formatter_is_skipped(self):
+        orch, root, run_id = self._orch({".py": self.formatter})
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("x = 1   \n", encoding="utf-8")
+        (root / "src" / "a.md").write_text("text   \n", encoding="utf-8")
+
+        changed = orch._format_pass(
+            run_id,
+            Ticket("T-1", allowed_files=["src/a.py", "src/a.md"]),
+            ["src/a.py", "src/a.md"],
+        )
+
+        self.assertEqual(changed, ["src/a.py"])
+        self.assertEqual(
+            (root / "src" / "a.md").read_text(encoding="utf-8"), "text   \n"
+        )
+
+    def test_a_missing_file_is_not_passed_to_the_formatter(self):
+        orch, _root, run_id = self._orch()
+
+        self.assertEqual(orch._format_pass(run_id, Ticket("T-1"), ["src/gone.py"]), [])
+
+    def test_a_scope_glob_is_not_a_file(self):
+        orch, root, run_id = self._orch()
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("x = 1   \n", encoding="utf-8")
+
+        self.assertEqual(orch._format_pass(run_id, Ticket("T-1"), ["src/*.py"]), [])
+
+    def test_an_attempt_runs_it_over_the_executors_file_and_the_testers(self):
+        # The wiring. The tester's file matters as much as the executor's: it
+        # is the one that carried the 117 failures.
+        orch, root, run_id = self._orch()
+        (root / "src").mkdir()
+
+        def call(_run_id, role, _messages, **_kwargs):
+            return Completion(
+                text={
+                    "executor": "src/a.py\n```python\nx = 1   \n```",
+                    "tester": "tests/t_1_test.py\n```python\ndef test_a(): pass   \n```",
+                }.get(role, "ACCEPT\nfine"),
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        orch._call = call
+        orch._attempt(
+            run_id,
+            Ticket("T-1", allowed_files=["src/a.py"], criteria=["x is 1"]),
+            "",
+        )
+
+        self.assertEqual((root / "src" / "a.py").read_text(encoding="utf-8"), "x = 1\n")
+        self.assertEqual(
+            (root / "tests" / "t_1_test.py").read_text(encoding="utf-8"),
+            "def test_a(): pass\n",
+        )
+
+    def test_a_bug_tickets_reproduction_is_never_rewritten(self):
+        # It is the standard the fix is measured against — the one file in the
+        # pipeline nothing may touch, for the same reason the executor cannot
+        # edit it and `_discard_tests` does not reclaim it. "It only changes
+        # whitespace" is a claim about a third-party binary.
+        orch, root, run_id = self._orch()
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "tests" / "bug_1_test.py").write_text(
+            "def test_bug(): assert False   \n", encoding="utf-8"
+        )
+
+        def call(_run_id, role, _messages, **_kwargs):
+            return Completion(
+                text=(
+                    "src/a.py\n```python\nx = 1   \n```"
+                    if role == "executor"
+                    else "ACCEPT\nfine"
+                ),
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        orch._call = call
+        orch._attempt(
+            run_id,
+            Ticket("T-1", allowed_files=["src/a.py"], kind=TICKET_BUG),
+            "",
+            repro=("tests/bug_1_test.py", "AssertionError"),
+        )
+
+        self.assertEqual(
+            (root / "tests" / "bug_1_test.py").read_text(encoding="utf-8"),
+            "def test_bug(): assert False   \n",
+        )
+        self.assertEqual((root / "src" / "a.py").read_text(encoding="utf-8"), "x = 1\n")
+
+
+class TestTheRulesTheCodeIsGradedByReachTheRoles(unittest.TestCase):
+    """The executor and tester are judged by `commands.lint` and
+    `commands.typecheck` and were never shown what those enforce. One run set
+    `noUncheckedIndexedAccess` in a `tsconfig.json` no prompt contained, and the
+    executor spent 512 failures inferring it from `TS2532` two at a time; the
+    tester wrote 117 lint failures of trailing whitespace against a `gdlintrc`
+    it had never opened. Both files were on disk the whole time.
+    See docs/CONVERGENCE.md."""
+
+    def _repo(self, files: dict[str, str], workspaces=None):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        payload = {
+            "models": {"m": {"kind": "openai", "model": "x"}},
+            "roles": {r: "m" for r in ROLES},
+        }
+        if workspaces is not None:
+            payload["workspaces"] = workspaces
+        for name, text in files.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+        return Config.load(root)
+
+    def test_the_compiler_flags_that_grade_a_file_are_found(self):
+        config = self._repo({
+            "tsconfig.json": '{"compilerOptions": {"noUncheckedIndexedAccess": true}}',
+            "src/a.ts": "x\n",
+        })
+
+        found = toolchain.toolchain_context(config, ["src/a.ts"])
+
+        self.assertIn("tsconfig.json", found)
+        self.assertIn("noUncheckedIndexedAccess", found["tsconfig.json"])
+
+    def test_only_the_languages_the_ticket_writes(self):
+        # A TypeScript ticket has no use for the GDScript linter's thresholds,
+        # and sending both is how a small prompt stops being one.
+        config = self._repo({
+            "tsconfig.json": "{}",
+            "gdlintrc": "max-line-length: 125\n",
+            "src/a.ts": "x\n",
+        })
+
+        found = toolchain.toolchain_context(config, ["src/a.ts"])
+
+        self.assertIn("tsconfig.json", found)
+        self.assertNotIn("gdlintrc", found)
+
+    def test_the_nearer_config_wins_over_the_repository_root(self):
+        # The whole reason a nested build has its own: the parent project's
+        # compiler flags are not the rules this code is graded by.
+        config = self._repo(
+            {
+                "tsconfig.json": '{"compilerOptions": {"strict": false}}',
+                "tools/pf/tsconfig.json": '{"compilerOptions": {"strict": true}}',
+                "tools/pf/src/a.ts": "x\n",
+            },
+            workspaces=[
+                {"root": ".", "commands": {"test": "pytest -q"}},
+                {"root": "tools/pf", "commands": {"test": "npm test"}},
+            ],
+        )
+
+        found = toolchain.toolchain_context(config, ["tools/pf/src/a.ts"])
+
+        self.assertIn("tools/pf/tsconfig.json", found)
+        self.assertNotIn("tsconfig.json", found)
+
+    def test_the_walk_stops_at_the_workspace_root(self):
+        # Walking past it hands the executor the parent project's settings for
+        # files the parent cannot see.
+        config = self._repo(
+            {
+                "tsconfig.json": '{"compilerOptions": {"strict": false}}',
+                "tools/pf/package.json": '{"name": "pf"}',
+                "tools/pf/src/a.ts": "x\n",
+            },
+            workspaces=[
+                {"root": ".", "commands": {"test": "pytest -q"}},
+                {"root": "tools/pf", "commands": {"test": "npm test"}},
+            ],
+        )
+
+        found = toolchain.toolchain_context(config, ["tools/pf/src/a.ts"])
+
+        self.assertNotIn("tsconfig.json", found)
+        self.assertIn("tools/pf/package.json", found)
+
+    def test_a_manifest_contributes_its_scripts_not_its_dependencies(self):
+        # 200 dependencies say nothing about how the code is graded. `type` and
+        # `scripts` say everything: this run's import-extension failures came
+        # straight from that pair.
+        config = self._repo({
+            "package.json": json.dumps({
+                "name": "pf",
+                "type": "module",
+                "scripts": {"test": "vitest run"},
+                "dependencies": {f"dep{n}": "1.0.0" for n in range(50)},
+            }),
+            "src/a.ts": "x\n",
+        })
+
+        found = toolchain.toolchain_context(config, ["src/a.ts"])["package.json"]
+
+        self.assertIn('"type": "module"', found)
+        self.assertIn("vitest run", found)
+        self.assertNotIn("dep17", found)
+
+    def test_what_the_manifest_dropped_is_named(self):
+        # A role shown a `package.json` with no `dependencies` key may conclude
+        # the project has none.
+        config = self._repo({
+            "package.json": json.dumps({"name": "pf", "dependencies": {"a": "1"}}),
+            "src/a.ts": "x\n",
+        })
+
+        found = toolchain.toolchain_context(config, ["src/a.ts"])["package.json"]
+
+        self.assertIn("omitted", found)
+        self.assertIn("dependencies", found)
+
+    def test_a_manifest_that_does_not_parse_is_sent_whole(self):
+        # Better read than dropped, and guessing at its structure is what the
+        # distiller exists to avoid.
+        config = self._repo({
+            "package.json": '{"name": "pf",}',
+            "src/a.ts": "x\n",
+        })
+
+        found = toolchain.toolchain_context(config, ["src/a.ts"])
+
+        self.assertEqual(found["package.json"], '{"name": "pf",}')
+
+    def test_an_oversized_config_is_clipped_not_dropped(self):
+        config = self._repo({
+            "gdlintrc": "# " + "x" * (toolchain.MAX_TOOLCHAIN_FILE_CHARS * 2) + "\n",
+            "scripts/a.gd": "x\n",
+        })
+
+        found = toolchain.toolchain_context(config, ["scripts/a.gd"])["gdlintrc"]
+
+        self.assertLess(len(found), toolchain.MAX_TOOLCHAIN_FILE_CHARS + 100)
+        self.assertIn("truncated", found)
+
+    def test_the_total_is_capped_by_dropping_whole_files(self):
+        # Half a `tsconfig.json` states compiler flags the other half turns
+        # off, so the cap takes files, not characters.
+        big = "x" * (toolchain.MAX_TOOLCHAIN_FILE_CHARS - 10)
+        config = self._repo({
+            "tsconfig.json": big,
+            "eslint.config.js": big,
+            ".eslintrc.json": big,
+            "vitest.config.ts": big,
+            "package.json": big,
+            "src/a.ts": "x\n",
+        })
+
+        found = toolchain.toolchain_context(config, ["src/a.ts"])
+
+        self.assertLessEqual(
+            sum(len(v) for v in found.values()),
+            toolchain.MAX_TOOLCHAIN_TOTAL_CHARS,
+        )
+        # Most authoritative first, so what survives is the compiler's own.
+        self.assertIn("tsconfig.json", found)
+
+    def test_a_scope_glob_is_not_a_file(self):
+        config = self._repo({"tsconfig.json": "{}", "src/a.ts": "x\n"})
+
+        self.assertEqual(toolchain.toolchain_context(config, ["src/*.ts"]), {})
+
+    def test_a_repository_with_no_config_gets_nothing(self):
+        # Ordinary, and the state every role was in before this existed.
+        config = self._repo({"src/a.ts": "x\n"})
+
+        self.assertEqual(toolchain.toolchain_context(config, ["src/a.ts"]), {})
+
+    def test_project_godot_is_not_treated_as_a_grading_file(self):
+        # 4 KB of input maps and rendering settings that say nothing about how
+        # GDScript is judged, riding on every prompt of the run.
+        config = self._repo({
+            "project.godot": "[input]\n" + "x" * 4000,
+            "scripts/a.gd": "x\n",
+        })
+
+        self.assertEqual(toolchain.toolchain_context(config, ["scripts/a.gd"]), {})
+
+
+# One valid executor reply, kept off the class so the fence characters are
+# never re-escaped by an edit.
+_TS_REPLY = """src/a.ts
+```ts
+export const x = 1;
+```"""
+
+
+class TestTheToolchainReachesThePrompt(unittest.TestCase):
+    """Carried as its own message with a droppable heading. A repository with a
+    large linter config must not be able to stop a ticket fitting, and the
+    ticket is the thing worth the window."""
+
+    RULES = {"tsconfig.json": '{"compilerOptions": {"noUncheckedIndexedAccess": true}}'}
+
+    def test_the_executor_is_shown_it_before_the_ticket(self):
+        messages = build_prompt(
+            Ticket("T-1", allowed_files=["src/a.ts"]), toolchain=self.RULES
+        )
+
+        shown = _joined(messages)
+        self.assertIn("noUncheckedIndexedAccess", shown)
+        self.assertIn(TOOLCHAIN_HEADING, shown)
+        headings = [m.content for m in messages if m.content.startswith(TOOLCHAIN_HEADING)]
+        self.assertEqual(len(headings), 1)
+
+    def test_it_is_stated_as_a_constraint_not_as_reference(self):
+        # A role that reads the flag writes the guard on the first attempt; one
+        # shown the same file as ordinary reference reads it as somebody
+        # else's problem.
+        block = [
+            m.content
+            for m in build_prompt(Ticket("T-1"), toolchain=self.RULES)
+            if m.content.startswith(TOOLCHAIN_HEADING)
+        ][0]
+
+        self.assertIn("fails before anyone reads it", block)
+        self.assertIn("not in your scope", block)
+
+    def test_the_tester_is_shown_it_too(self):
+        messages = tests_prompt(
+            Ticket("T-1"), ["src/a.ts"], test_path="tests/t.ts", toolchain=self.RULES
+        )
+
+        self.assertIn("noUncheckedIndexedAccess", _joined(messages))
+
+    def test_nothing_is_added_when_there_is_no_config(self):
+        messages = build_prompt(Ticket("T-1", allowed_files=["src/a.ts"]))
+
+        self.assertNotIn(TOOLCHAIN_HEADING, _joined(messages))
+
+    def test_the_loop_resolves_it_from_the_ticket_and_passes_it_on(self):
+        # The wiring, not the resolver: a real attempt over a real repo.
+        orch, root, run_id = _stub_orchestrator()
+        (root / "tsconfig.json").write_text(
+            '{"compilerOptions": {"noUncheckedIndexedAccess": true}}', encoding="utf-8"
+        )
+        seen: list[list[Message]] = []
+
+        def call(_run_id, role, messages, **_kwargs):
+            if role == "executor":
+                seen.append(messages)
+            return Completion(
+                text=_TS_REPLY,
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        orch._call = call
+        orch._attempt(run_id, Ticket("T-1", allowed_files=["src/a.ts"]), "")
+
+        self.assertIn("noUncheckedIndexedAccess", _joined(seen[0]))
+
+    def test_turning_it_off_sends_nothing(self):
+        orch, root, run_id = _stub_orchestrator()
+        orch.config.loop.toolchain_context = False
+        (root / "tsconfig.json").write_text(
+            '{"compilerOptions": {"noUncheckedIndexedAccess": true}}', encoding="utf-8"
+        )
+        seen: list[list[Message]] = []
+
+        def call(_run_id, role, messages, **_kwargs):
+            if role == "executor":
+                seen.append(messages)
+            return Completion(
+                text=_TS_REPLY,
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        orch._call = call
+        orch._attempt(run_id, Ticket("T-1", allowed_files=["src/a.ts"]), "")
+
+        self.assertNotIn(TOOLCHAIN_HEADING, _joined(seen[0]))
+
+    def test_an_unreadable_config_never_costs_an_attempt(self):
+        # Context is never worth the work it is context for.
+        orch, _root, _run_id = _stub_orchestrator()
+        broken = unittest.mock.patch.object(
+            toolchain, "toolchain_context", side_effect=OSError("disk")
+        )
+        with broken:
+            self.assertEqual(orch._toolchain_for(Ticket("T-1", allowed_files=["a.ts"])), {})
+
+    def test_the_budget_gate_may_drop_it(self):
+        # It must be droppable, and it should go before the ticket does: losing
+        # it costs a rule the role can still infer from a failure, while losing
+        # the ticket costs the attempt outright.
+        message = Message(role="user", content=f"{TOOLCHAIN_HEADING}\nrules")
+
+        self.assertTrue(_droppable(message))
+
+
+class TestDoctorNamesTheSilentMisconfigurations(unittest.TestCase):
+    """Three settings that cost a run and fail without saying anything: a
+    nested build nobody declared, and a test command that re-runs the type
+    check the step before it just ran. Neither is wrong enough to refuse at
+    load, both were live on the Puzzle-Path run of 2026-08-22/23, and the whole
+    point is that a config can look entirely reasonable while doing this.
+    See docs/CONVERGENCE.md."""
+
+    def _doctor(self, config) -> str:
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            cli._report_coverage(config)
+        return captured.getvalue()
+
+    def test_a_nested_manifest_nobody_declared_is_named(self):
+        # The cost of leaving it out is not visible from the config: every `*`
+        # command runs on every ticket, so a TypeScript ticket under
+        # `tools/path_forge` pays for the repository's Godot suite on every
+        # attempt. 908 runs of it in one run, none of which could fail.
+        root = _workspace_repo(None, files=("src/a.py",), commands={"test": "pytest -q"})
+        (root / "tools" / "path_forge").mkdir(parents=True)
+        (root / "tools" / "path_forge" / "package.json").write_text("{}", encoding="utf-8")
+
+        printed = self._doctor(Config.load(root))
+
+        self.assertIn("undeclared builds", printed)
+        self.assertIn("tools/path_forge", printed)
+
+    def test_a_declared_build_is_not_named(self):
+        root = _workspace_repo(
+            [
+                {"root": ".", "commands": {"test": "pytest -q"}},
+                {"root": "tools/path_forge", "commands": {"test": "npm test"}},
+            ],
+            files=("src/a.py", "tools/path_forge/src/a.ts"),
+        )
+        (root / "tools" / "path_forge" / "package.json").write_text("{}", encoding="utf-8")
+
+        self.assertNotIn("undeclared builds", self._doctor(Config.load(root)))
+
+    def test_a_repository_with_one_manifest_is_not_named(self):
+        # The ordinary single-build case, which must keep reading as it did.
+        root = _workspace_repo(None, files=("src/a.py",), commands={"test": "pytest -q"})
+
+        self.assertNotIn("undeclared builds", self._doctor(Config.load(root)))
+
+    def test_a_test_command_that_re_runs_the_typecheck_is_named(self):
+        root = _workspace_repo(
+            None,
+            files=("src/a.ts",),
+            commands={
+                "typecheck": {".ts": "tsc --noEmit"},
+                "test": {".ts": "tsc --noEmit && npm test"},
+            },
+        )
+
+        printed = self._doctor(Config.load(root))
+
+        self.assertIn("re-runs the typecheck command", printed)
+        self.assertIn("tsc --noEmit && npm test", printed)
+
+    def test_one_finding_covers_every_extension_sharing_the_pair(self):
+        # Four extensions of one language normally carry the same pair, and
+        # printing it four times buries the checks around it.
+        root = _workspace_repo(
+            None,
+            files=("src/a.ts", "src/b.tsx"),
+            commands={
+                "typecheck": {".ts": "tsc --noEmit", ".tsx": "tsc --noEmit"},
+                "test": {".ts": "tsc --noEmit && npm test", ".tsx": "tsc --noEmit && npm test"},
+            },
+        )
+
+        printed = self._doctor(Config.load(root))
+
+        self.assertEqual(printed.count("re-runs the typecheck command"), 1)
+        self.assertIn(".ts, .tsx", printed)
+
+    def test_a_test_command_that_is_not_the_typecheck_is_left_alone(self):
+        root = _workspace_repo(
+            None,
+            files=("src/a.ts",),
+            commands={
+                "typecheck": {".ts": "tsc --noEmit"},
+                "test": {".ts": "make test"},
+            },
+        )
+
+        self.assertNotIn("re-runs the typecheck", self._doctor(Config.load(root)))
+
+    def test_a_test_command_that_is_the_typecheck_is_left_alone(self):
+        # Identical, not prefixed: a project whose type check *is* its test
+        # command has said so, and there is nothing to drop.
+        root = _workspace_repo(
+            None,
+            files=("src/a.ts",),
+            commands={
+                "typecheck": {".ts": "tsc --noEmit"},
+                "test": {".ts": "tsc --noEmit"},
+            },
+        )
+
+        self.assertNotIn("re-runs the typecheck", self._doctor(Config.load(root)))
 
 
 class TestTheSpecificationReachesTheExecutor(unittest.TestCase):

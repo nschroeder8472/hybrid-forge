@@ -216,12 +216,36 @@ run. That is the trade being made deliberately.
 "commands": {
   "lint": "cargo clippy --all-targets -- -D warnings",
   "typecheck": "cargo check --all-targets",
-  "test": "cargo test"
+  "test": "cargo test",
+  "format": "rustfmt"
 }
 ```
 
-Shell commands run from the project root after each attempt. An empty string
-skips that check.
+`lint`, `typecheck` and `test` are shell commands run from the project root
+after each attempt. An empty string skips that check.
+
+`format` is different in three ways, and each of them matters:
+
+- **It runs before verification, not after** — between the tester writing its
+  file and anything judging either file.
+- **It rewrites files instead of reporting on them**, and the loop appends the
+  paths to rewrite. Give the command *without* a target: `gdformat`,
+  `prettier --write`, `ruff format`, `rustfmt`, `gofmt -w`, `black`. A command
+  that ignores its arguments and reformats the whole tree is an out-of-scope
+  edit on every attempt.
+- **Its own failure is never the ticket's.** A missing binary is logged and
+  skipped, and the attempt is judged exactly as it would have been with no
+  formatter configured.
+
+It runs only over the files that attempt landed — the executor's and the
+tester's — never the ticket's whole glob, and never a bug ticket's
+reproduction, which is the standard the fix is measured against.
+
+This lowers no bar. The linter is the project's and its thresholds are
+untouched; what changes is that the code is made to meet them before it is
+judged. One run spent 117 of a ticket's 160 lint failures on trailing
+whitespace in a file the tester had just written, each costing a full attempt.
+See [CONVERGENCE](CONVERGENCE.md).
 
 **Each one may also be a map from language to command**, because a repository is
 rarely one language and a single command silently means "everything is Rust":
@@ -438,8 +462,14 @@ run some context, never the run.
 | `maxRuntimeSeconds` | `0` (off) | Cap on unattended wall-clock time. Covers the whole `forge go`, not each run in its queue — one `go` can drain several runs, and a fresh clock per run would quietly multiply the cap. |
 | `baselineVerify` | `true` | Run the verify commands once before each ticket, so breakage that was already there is not blamed on whichever ticket ran next. Turn off only when a full suite is slow enough that paying it per ticket costs more than the attempts it saves. |
 | `bugHypotheses` | `3` | How many explanations a `forge bug` ticket may go through before it parks. The first is the planner's reading of the report; each one after it is a re-diagnosis, asked for when the reproduction could not be written — a test that passes against the named code has *disproved* that reading, and disproof is evidence rather than a dead end. `1` parks on the first wrong guess. See [BUG-LOOP.md](BUG-LOOP.md). |
-| `executorTurns` | `0` (off) | Replay this many prior attempts to the executor as real conversation turns — its own reply as an `assistant` message, the failure that followed as the next `user` one. Experimental — a model shown its own wrong answer defends it more readily, and the flat prompt already anchors that way through disk state. See [SETUP](SETUP.md#thinking-models-answer-last) for the whole trade. |
-| `ratifyPasses` | `0` (off) | Sign-off passes over a ticket before its first attempt. Every role is asked whether it can do its part as written, the planner rewrites the ticket from what they say, and the pass repeats. A ticket ships when everyone signs off, when a majority does, or when the planner and one other do; below that it parks with the objections recorded. Costs `roles × passes` calls per ticket before any code exists, one of them on the reviewer. See [RATIFY.md](RATIFY.md). |
+| `executorTurns` | `4` | Replay this many prior attempts to the executor as real conversation turns — its own reply as an `assistant` message, the failure that followed as the next `user` one. `0` restores the flat single-message prompt, in which the executor reads its own previous work as somebody else's. See [SETUP](SETUP.md#thinking-models-answer-last) for the trade and [CONVERGENCE](CONVERGENCE.md) for what the flat shape cost on a long backlog. |
+| `toolchainContext` | `true` | Show the executor and tester the linter, compiler and test-runner settings that grade what they write — the real files at their real paths, resolved per language from the ticket's own scope and clipped. They are measured by `commands.lint` and `commands.typecheck` and were otherwise never shown what those enforce, so they inferred it from failures. Costs a few hundred characters a call, and the budget gate drops it first. See [CONVERGENCE](CONVERGENCE.md). |
+| `priorFailures` | `8` | Earlier failures carried into the executor's prompt alongside the newest one, deduplicated by failure *class* — `(step, error code, file)`, line numbers and quoted values masked — rather than by raw text. Keyed by text this window held one mistake repeated, not several distinct ones. See [CONVERGENCE](CONVERGENCE.md). |
+| `learnedLimit` | `12` | How many of a ticket's accumulated learnings reach a prompt, commonest first. A learning is a fact about *this repository* that an earlier attempt established — a compiler flag, an import convention — recorded by respec so the loop stops rediscovering it. It is not a bar: the reviewer is not shown it and no criterion is made from it. `0` renders none. See [CONVERGENCE](CONVERGENCE.md). |
+| `flatCycles` | `0` (off) | Consecutive cycles a ticket may fail on exactly the same set of failure *classes* before it is parked and the rest of the backlog carries on. Per ticket, unlike the backlog-wide brake beside it, which cannot see a ticket going nowhere while any other ticket still moves. Off because the threshold was measured and none is safe: on the run this comes from, a ticket that went on to pass sat still for four consecutive cycles while the genuinely unsatisfiable one managed three. The measurement runs either way and logs what it found — `descending`, `churning`, `flat` — which is what the escalation rungs will read. See [CONVERGENCE](CONVERGENCE.md). |
+| `reviewWhenStuck` | `2` | Consecutive flat cycles before the loop escalates. Two rungs, one per cycle after it: at `n` the reviewer is asked against the red tree whether the ticket is winnable at all — normally unreachable for a ticket that never verifies — and at `n + 1` the planner is asked the inverted question and may reply `impossible`, which parks the ticket for a reason rather than for a count. `0` never escalates. See [CONVERGENCE](CONVERGENCE.md). |
+| `freezeTests` | `true` | Keep a ticket's tests while the criteria they encode are unchanged, instead of re-deriving them on every attempt. The tests are a function of the criteria, so an unchanged fingerprint — criteria, spec, scope, test command — produces the same file at the price of the loop's most expensive role, and gives the executor a target that stops moving under it. Rewritten when any of those changes, when the file is not on disk, or when the last failure was in the test file itself. See [CONVERGENCE](CONVERGENCE.md). |
+| `ratifyPasses` | `2` | Sign-off passes over a ticket before its first attempt. Every role is asked whether it can do its part as written, the planner rewrites the ticket from what they say, and the pass repeats. A ticket ships when everyone signs off, when a majority does, or when the planner and one other do; below that it parks with the objections recorded. Costs `roles × passes` calls per ticket before any code exists, one of them on the reviewer. See [RATIFY.md](RATIFY.md). |
 
 ---
 
@@ -587,8 +617,12 @@ it is a one-line edit in `roles`.
     "pollSeconds": 2.0,
     "maxRuntimeSeconds": 0,
     "baselineVerify": true,
-    "executorTurns": 0,
-    "ratifyPasses": 0
+    "executorTurns": 4,
+    "toolchainContext": true,
+    "priorFailures": 8,
+    "learnedLimit": 12,
+    "flatCycles": 3,
+    "ratifyPasses": 2
   },
   "ui": {
     "host": "127.0.0.1",

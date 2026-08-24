@@ -27,6 +27,15 @@ CONTEXT_HEADING = "## Established project context"
 # verdicts may raise a fresh objection — a ticket that will not fit does none
 # of the work at all.
 PRIOR_FAILURES_HEADING = "## Earlier attempts on this ticket, oldest first"
+
+# The tally that says a mistake is being repeated rather than merely made. Its
+# own message, and droppable, for the same reason the raw history is.
+FAILURE_CLASSES_HEADING = "## What this ticket keeps failing on"
+
+# What earlier attempts established about the repository, as opposed to what
+# they failed on. Droppable like the rest of the history: it is worth having
+# and it is not worth the ticket.
+LEARNED_HEADING = "## What earlier attempts on this ticket established"
 PRIOR_VERDICTS_HEADING = "## You have already rejected this ticket"
 
 # The feedback turn in a conversational executor prompt, for every attempt but
@@ -37,6 +46,14 @@ PRIOR_ATTEMPT_HEADING = "## That attempt failed"
 # that acts on it. Droppable: it is the reason behind a contract, and the
 # contract itself is stated in full a few lines further down whatever it costs.
 RATIFICATION_HEADING = "## Settled before any code was written"
+
+# The linter, compiler and runner configuration this repository grades code
+# with. Droppable, and it is the first thing that should go: losing it costs
+# the role a rule it can still infer from a failure, while losing the ticket
+# costs the attempt outright. Carried at all because inferring those rules from
+# failures is exactly what one run spent 512 attempts doing — see
+# docs/CONVERGENCE.md.
+TOOLCHAIN_HEADING = "## How this project checks the code you write"
 
 # The path root every format example in this module uses. A small model shown a
 # worked example will sometimes return the example along with its answer, and
@@ -65,6 +82,13 @@ Rules:
 - If the spec is ambiguous or you believe it is wrong, DO NOT GUESS. Reply with
   a line starting `BLOCKED:` explaining precisely what is unclear, and nothing
   else. A blocked ticket is a useful outcome; a plausible guess is not.
+- If you believe NO implementation could satisfy this ticket as written — two
+  criteria demanding different results from the same call, a criterion asserting
+  a value the spec's own algorithm cannot produce — add a line starting
+  `IMPOSSIBLE:` naming the criteria and the contradiction. Send your best
+  implementation with it; both are read. `BLOCKED:` means you need something;
+  `IMPOSSIBLE:` means the ticket is wrong, and the planner is asked to confirm
+  or refute it rather than taking your word.
 - Output the COMPLETE contents of every file you change. For each one, put the
   file path on its own line, then a fenced code block containing the whole
   file. No partial files, no diffs, no ellipses. One block per file, and never
@@ -316,6 +340,91 @@ someone who will read it months from now with no memory of this ticket.>
 """
 
 
+STUCK_REVIEWER_SYSTEM = """You are asked a different question from the usual
+review. This ticket's last few cycles failed on exactly the same things, so
+whether its current diff meets the bar is already known — it does not. The
+question is whether the ticket can be met at all as written.
+
+You are the only role positioned to ask it. The executor is trying to satisfy
+the ticket and reads every failure as its own; the planner rewrites the ticket
+from those failures and will keep finding a plausible rewrite. You are being
+shown the contract and the evidence side by side and asked whether they agree.
+
+Three answers, and the middle one is the common case:
+
+VERDICT: unwinnable
+  No implementation of this spec satisfies these criteria. Two criteria demand
+  different results from the same call; a criterion asserts a value the spec's
+  own algorithm cannot produce; the scope excludes the file that would have to
+  change. Name the specific clause and the specific contradiction, in terms a
+  person can check against the text above without rerunning anything.
+
+VERDICT: winnable
+  The ticket is satisfiable and the attempts have been going about it wrongly.
+  Say what the attempts keep doing and what they would have to do instead. Be
+  concrete: "every attempt indexes the lookup table directly; the type checker
+  requires a guard first" is useful, "try a different approach" is not.
+
+VERDICT: unclear
+  You cannot tell from what you were shown. This is a real answer and it is
+  better than a confident guess in either direction — a wrong `unwinnable`
+  parks work that would have landed, and a wrong `winnable` spends another
+  dozen cycles.
+
+Never:
+- Judge the implementation's quality. It failed; that is established.
+- Propose a revised spec or new criteria. That is the planner's, and you are
+  being asked about the contract, not writing one.
+- Repeat the failure text back. It is above; say what it means.
+
+Reply with the verdict line, then two to five sentences and nothing else."""
+
+
+CONVENTION_RECORDER_SYSTEM = """You decide whether a ticket that never passed
+established anything about this project worth writing to long-term memory.
+
+This ticket failed. Its implementation was never verified and is being taken
+back out of the tree, so **nothing about the work itself may be recorded** — not
+what the approach was, not why it might have been right, not what the next
+attempt should try. A conclusion drawn from unverified code is a rumour that
+every future ticket will read as fact.
+
+What can be recorded is narrower and comes from one place: the list below of
+things earlier attempts established about the repository. Those were derived
+from what the project's own linters, compilers and test runners actually said,
+which is evidence about the *project* rather than about this ticket's code. A
+compiler flag is true whether or not the ticket that discovered it passed.
+
+Record ONLY a convention or constraint of the project that a future ticket in
+any part of this repository would need to know:
+- "The type checker runs with noUncheckedIndexedAccess, so every index access
+  needs a guard."
+- "Imports in this package resolve with an explicit .js extension."
+
+Never record:
+- Anything about this ticket's implementation, approach, or what went wrong
+  with it. It failed, and why it failed is in the run log where it belongs.
+- A convention that applies only to the files this one ticket owned.
+- A restatement of the spec, the criteria, or the failure text.
+- Transient state: attempt counts, error messages, what the tests printed.
+- Credentials, tokens, keys, or connection strings, in any form.
+
+If the list below holds nothing that generalizes past this ticket — which is
+the common case — say NOTHING.
+
+Reply with exactly one of:
+
+NOTHING
+  (on its own line)
+
+or
+
+TITLE: <one short line naming the convention>
+<one to three sentences stating it as a fact about this project, for someone
+reading it months from now who has never heard of this ticket.>
+"""
+
+
 def _criteria_block(ticket: Ticket, criteria: Sequence[str] | None = None) -> str:
     items = ticket.criteria if criteria is None else criteria
     return "\n".join(f"- {c}" for c in items) or "- (none stated)"
@@ -410,12 +519,124 @@ def _sources_block(sources: dict[str, str]) -> str:
     return "\n\n".join(parts)
 
 
+def _toolchain_message(toolchain: dict[str, str] | None) -> Message | None:
+    """The configuration the verify commands enforce, as its own message.
+
+    Its own message rather than a section of the ticket body, for the same
+    reason retrieved context is: the budget gate drops whole messages, and a
+    repository with a large linter config must not be able to stop a ticket
+    fitting. Ahead of the ticket, because it is background the role should read
+    before the work rather than a demand made of it.
+
+    Stated as *what will reject this code*, not as *reference*. The reference
+    block says take the signatures from here; this says the check has already
+    been configured and you are being measured against it. A role that reads
+    `noUncheckedIndexedAccess: true` writes the guard on the first attempt; one
+    shown the same file as ordinary reference reads it as somebody else's.
+    """
+    if not toolchain:
+        return None
+    return Message(
+        role="user",
+        content=f"""{TOOLCHAIN_HEADING}
+These are this repository's real linter, compiler and test-runner settings, at
+the paths shown. The verify commands enforce them, so code that breaks one of
+these fails before anyone reads it, and the failure will look like a mistake in
+your implementation rather than a rule you were not told about.
+
+Read them as constraints on what you write. You are not asked to change them
+and they are not in your scope.
+
+{_sources_block(toolchain)}
+""",
+    )
+
+
+def _classes_message(classes: Sequence[dict]) -> Message | None:
+    """The kinds of failure this ticket has produced, counted.
+
+    The raw history says what went wrong last time and the time before. It
+    cannot say *this is the fortieth time*, because two instances of one
+    mistake are two different strings — `TS2532` at line 40 and at line 51, an
+    assertion quoting a hash that differs every run. So the anti-oscillation
+    paragraph below it, which has been in this prompt all along, could never
+    fire: the executor was shown two failures and asked to notice a cycle 400
+    attempts long.
+
+    Counted, it is one line. See docs/CONVERGENCE.md.
+    """
+    repeated = [entry for entry in classes if entry.get("count", 0) > 1]
+    if not repeated:
+        return None
+    lines = []
+    for entry in repeated:
+        span = (
+            f" — first seen on attempt {entry['first_attempt']}, "
+            f"last on attempt {entry['last_attempt']}"
+            if entry["last_attempt"] > entry["first_attempt"]
+            else ""
+        )
+        lines.append(f"- {entry['name']} — {entry['count']} times{span}")
+    return Message(
+        role="user",
+        content=f"""{FAILURE_CLASSES_HEADING}
+Each line is one kind of mistake, counted across every attempt this ticket has
+had, including earlier retry cycles. The exact line numbers and values differ
+between them; the mistake does not.
+
+{chr(10).join(lines)}
+
+A count in double figures is not a hard problem being worked on, it is the
+same fix being tried repeatedly. Read the rule it breaks — the compiler and
+linter settings are above — and change the approach rather than the line.
+""",
+    )
+
+
+def learned_message(ticket: Ticket, limit: int = 12) -> Message | None:
+    """What earlier attempts worked out about this repository.
+
+    Facts, not demands. Nothing downstream enforces a line of this: the
+    reviewer is not shown it, no criterion is minted from it, and a role that
+    ignores one is not failing anything — which is what keeps it out of the
+    criteria ratchet's jurisdiction. The ratchet stops the loop raising its own
+    bar; this stops the loop forgetting.
+
+    Ordered by how often the loop has had to rediscover each one, because that
+    ordering is itself the signal: a conclusion reached on four separate cycles
+    is one the plan should have stated, and it should be the first thing the
+    next attempt reads.
+    """
+    entries = [entry for entry in (ticket.learned or []) if entry.get("text")][:limit]
+    if not entries:
+        return None
+    lines = []
+    for entry in entries:
+        count = int(entry.get("count", 1))
+        again = f"  (established {count} separate times)" if count > 1 else ""
+        lines.append(f"- {entry['text']}{again}")
+    return Message(
+        role="user",
+        content=f"""{LEARNED_HEADING}
+These are conclusions earlier attempts reached about this repository, kept so
+you do not have to reach them again. They are established facts about how this
+project works, not requirements you are judged against — the acceptance
+criteria below are the bar, and nothing here adds to it.
+
+{chr(10).join(lines)}
+""",
+    )
+
+
 def build_prompt(
     ticket: Ticket,
     failure_context: str = "",
     retrieved: str = "",
     sources: dict[str, str] | None = None,
     *,
+    toolchain: dict[str, str] | None = None,
+    learned_limit: int = 12,
+    failure_classes: Sequence[dict] = (),
     prior_failures: Sequence[str] = (),
     malformed: str = "",
     prior_turns: Sequence[tuple[str, str]] = (),
@@ -440,6 +661,16 @@ def build_prompt(
     if context is not None:
         messages.append(context)
 
+    rules = _toolchain_message(toolchain)
+    if rules is not None:
+        messages.append(rules)
+
+    # After the toolchain settings and before the ticket: these are usually
+    # conclusions *about* those settings, and they read as a gloss on them.
+    established = learned_message(ticket, learned_limit)
+    if established is not None:
+        messages.append(established)
+
     settled = ratification_message(ticket)
     if settled is not None:
         messages.append(settled)
@@ -452,6 +683,12 @@ def build_prompt(
     #
     # Superseded by the turns themselves when there are any: the same failures,
     # each one attached to the answer that caused it.
+    # Ahead of the raw history: the count is the fact that changes what the
+    # next attempt should do, and the history is the detail it works from.
+    counted = _classes_message(failure_classes)
+    if counted is not None:
+        messages.append(counted)
+
     if prior_failures and not prior_turns:
         earlier = "\n\n".join(distill(entry, limit=800) for entry in prior_failures)
         messages.append(
@@ -573,6 +810,8 @@ def tests_prompt(
     example_test: tuple[str, str] | None = None,
     failure_context: str = "",
     sources: dict[str, str] | None = None,
+    toolchain: dict[str, str] | None = None,
+    learned_limit: int = 12,
     rejected_bindings: list[str] | None = None,
     own_file_errors: list[str] | None = None,
 ) -> list[Message]:
@@ -719,6 +958,18 @@ function is an ordinary function of its own language.
 """
 
     messages = [Message(role="system", content=TESTER_SYSTEM)]
+    # The tester is graded by the same lint and type checks as the executor,
+    # and on one run it was the tester's file that carried 117 of the 160 lint
+    # failures — every one of them trailing whitespace, against a config it had
+    # never been shown.
+    rules = _toolchain_message(toolchain)
+    if rules is not None:
+        messages.append(rules)
+    # The tester rediscovers a convention as readily as the executor does, and
+    # on one run it was the tester's file that kept breaking the linter.
+    established = learned_message(ticket, learned_limit)
+    if established is not None:
+        messages.append(established)
     # What the roles settled before any code existed. The tester is the role
     # most likely to have asked for a criterion to be made measurable, and it
     # should see whether it got it rather than rediscovering the same problem
@@ -1495,6 +1746,16 @@ def parse_verdict(text: str) -> tuple[bool, str]:
 NOTHING_SENTINEL = "NOTHING"
 
 
+def _learned_block(ticket: Ticket) -> str:
+    """A ticket's accumulated learnings, for a prompt that judges them."""
+    return "\n".join(
+        f"- {entry['text']}"
+        + (f"  (established {entry['count']} separate times)" if entry.get("count", 1) > 1 else "")
+        for entry in (ticket.learned or [])
+        if entry.get("text")
+    )
+
+
 def record_prompt(
     ticket: Ticket,
     diff: str,
@@ -1532,6 +1793,21 @@ def record_prompt(
 {corrections}
 """
 
+    established = _learned_block(ticket)
+    if established:
+        # The raw material this step never had. These are facts about the
+        # repository that the ticket's own attempts worked out — which is
+        # exactly the shape of thing worth outliving the run, and until now it
+        # was thrown away with the ticket.
+        body += f"""
+## What this ticket's attempts established about the project
+Each of these was written down because an attempt had to work it out. A count
+above one means the loop had to work it out more than once, which is the
+strongest signal here that it belongs in memory rather than in a ticket.
+
+{established}
+"""
+
     body += f"""
 ## Reviewer's verdict
 {review}
@@ -1546,6 +1822,146 @@ context above already covers it, answer {NOTHING_SENTINEL}."""
 
     messages.append(Message(role="user", content=body))
     return messages
+
+
+def convention_prompt(ticket: Ticket, retrieved: str = "") -> list[Message]:
+    """Ask what a *failed* ticket established about the project, if anything.
+
+    The sibling of `record_prompt`, against the case it refuses to touch. The
+    rule that step enforces — never record a conclusion drawn from unverified
+    work — is right, and the reason it is right does not reach a toolchain
+    fact: `noUncheckedIndexedAccess` is set or it is not, and the compiler said
+    so. That the ticket which discovered it went on to fail says nothing about
+    whether the flag is set.
+
+    Worth having because the tickets that learn most are the ones that fail
+    most. On the run this comes from, the two tickets that spent 650 attempts
+    between them ended blocked, and everything their failures had demonstrated
+    about the project went into the artifact directory and nowhere else.
+
+    So the system prompt is narrower than the recorder's on every axis except
+    that one: no decisions, no approaches, no corrections, nothing about the
+    implementation at all — only a constraint of the project that a ticket in
+    another part of the repository would need to know.
+    """
+    messages = [Message(role="system", content=CONVENTION_RECORDER_SYSTEM)]
+
+    context = _context_message(ticket, retrieved)
+    if context is not None:
+        messages.append(context)
+
+    messages.append(
+        Message(
+            role="user",
+            content=f"""Ticket: {ticket.ticket_id} — {ticket.title}
+This ticket did not pass. Its code is being taken back out of the tree.
+
+## What its attempts established about the project
+{_learned_block(ticket) or "(nothing was recorded)"}
+
+Does any of that generalize past this ticket, to a constraint a future ticket
+anywhere in this repository would need to know? If the project context above
+already covers it, or if it is only about the files this ticket owned, answer
+{NOTHING_SENTINEL}.""",
+        )
+    )
+    return messages
+
+
+# What a stuck review can conclude. `unclear` is listed because it is the
+# honest answer often enough to need somewhere to go: a verdict parser that
+# only understands the two confident answers turns "I cannot tell" into
+# whichever one it resembles.
+STUCK_WINNABLE = "winnable"
+STUCK_UNWINNABLE = "unwinnable"
+STUCK_UNCLEAR = "unclear"
+
+_STUCK_VERDICT = re.compile(
+    r"^\s*VERDICT\s*:\s*(winnable|unwinnable|unclear)\b", re.IGNORECASE | re.MULTILINE
+)
+
+
+def stuck_review_prompt(
+    ticket: Ticket,
+    diff: str,
+    classes: Sequence[dict],
+    failure: str,
+    retrieved: str = "",
+) -> list[Message]:
+    """Ask the reviewer whether a stuck ticket can be met at all.
+
+    Run against a red tree, which every other review refuses to do, and the
+    refusal is why this exists. Review sits behind verification, so a ticket
+    stuck on the same failure for cycles never reaches the only role positioned
+    to say the contract is wrong. On the run this comes from, 1,350 executor
+    calls produced 17 reviews, and the ticket that spent 6.7M tokens on an
+    unsatisfiable contract gave the reviewer 43k of them.
+
+    Advisory. It cannot pass a red tree and it does not change the ticket's
+    status; what it produces is an opinion for the planner to work from and a
+    line in the log for a person.
+    """
+    messages = [Message(role="system", content=STUCK_REVIEWER_SYSTEM)]
+
+    context = _context_message(ticket, retrieved)
+    if context is not None:
+        messages.append(context)
+
+    settled = ratification_message(ticket)
+    if settled is not None:
+        messages.append(settled)
+
+    repeated = "\n".join(
+        f"- {entry['name']} — {entry['count']} times" for entry in classes
+    ) or "- (none recorded)"
+
+    body = f"""Ticket: {ticket.ticket_id} — {ticket.title}
+
+## Spec
+{ticket.spec}
+
+## Acceptance criteria
+{_criteria_block(ticket)}
+
+## Scope this ticket may write
+{_files_block(ticket)}
+
+## What it keeps failing on
+The same kinds of failure, cycle after cycle. Counts are across every attempt.
+
+{repeated}
+
+## The newest failure in full
+{distill(failure, limit=3000) or "(nothing recorded)"}
+
+## The code as it stands
+```diff
+{diff or "(empty diff)"}
+```
+
+Read the criteria against the spec, and both against what keeps failing. Can
+this ticket be satisfied as written?"""
+
+    messages.append(Message(role="user", content=body))
+    return messages
+
+
+def parse_stuck_review(text: str) -> tuple[str, str]:
+    """Split a stuck review into `(verdict, reasoning)`.
+
+    An unparseable reply is `unclear` rather than an error. The caller acts on
+    a confident verdict and this one is advisory, so a reply nobody can read
+    should leave the ticket exactly where it was.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return STUCK_UNCLEAR, ""
+    found = _STUCK_VERDICT.search(stripped)
+    if not found:
+        return STUCK_UNCLEAR, stripped[:2000]
+    verdict = found.group(1).lower()
+    reasoning = stripped[found.end() :].strip()
+    return verdict, (reasoning or stripped)[:2000]
 
 
 def parse_record(text: str) -> tuple[str, str]:
@@ -1648,6 +2064,20 @@ Rules:
   no ambiguity, nothing the spec could have prevented — say so by returning
   the ticket essentially unchanged with a rationale explaining why.
 
+- `learned_add` is where a fact about *this repository* goes: something the
+  failures have demonstrated about how the project is built, checked or wired,
+  which the next attempt would otherwise have to work out again. "The type
+  checker runs with `noUncheckedIndexedAccess`, so every index needs a guard."
+  "Imports in this package resolve with a `.js` extension." One short sentence
+  each, stated as fact.
+  It is not a requirement and nothing enforces it: the reviewer is not shown
+  it and no criterion is made from it. That is the point — write down what is
+  true here, not a new bar for the executor to clear. If the thing you want to
+  say is a demand, it belongs in `criteria` or nowhere.
+  Entries accumulate across cycles and are never removed, so a fact you state
+  twice is counted rather than duplicated. Say nothing rather than restating
+  the spec.
+
 Reply with JSON and nothing else:
 
 {
@@ -1656,7 +2086,8 @@ Reply with JSON and nothing else:
   "criteria": ["revised acceptance criteria"],
   "allowed_files": ["revised scope"],
   "reference_files": ["files the executor must be shown to get this right"],
-  "context": "what the next attempt should already know"
+  "context": "what the next attempt should already know",
+  "learned_add": ["facts about this repository the next attempt should not have to rediscover"]
 }
 
 `context` is read by the executor as established fact. Put conclusions there,
@@ -1677,6 +2108,7 @@ def respec_prompt(
     report: str = "",
     contradiction: dict[str, list[str]] | None = None,
     reproduction: Sequence[str] = (),
+    stuck: dict | None = None,
 ) -> list[Message]:
     """Ask the planner to fix a ticket that its own executor could not satisfy.
 
@@ -1899,7 +2331,68 @@ seed 1 yields [2, ...]. Either the constant or the criterion is wrong, and \
 nothing in the failures says which."}}
 """
 
-    body += "\nRevise the ticket so the next attempt can succeed."
+    if stuck:
+        # The question inverted. `impossible` has been available on every
+        # respec call since the field existed, and in 86 consecutive cycles on
+        # one ticket the planner never reached for it once — because it was
+        # asked, every time, to revise the ticket so the next attempt could
+        # succeed, and that question has an answer whether or not one exists.
+        # Asking the other question is the whole feature. See
+        # docs/CONVERGENCE.md.
+        cycles = stuck.get("flat_cycles", 0)
+        repeated = "\n".join(f"- {name}" for name in stuck.get("classes", ())) or "- (none)"
+        body += f"""
+## This ticket has stopped moving
+Its last {cycles} cycles failed on exactly these, and on nothing else:
+
+{repeated}
+
+The line numbers and the values differ between them; the mistakes do not. That
+is not a hard problem being worked on — it is the same ticket producing the
+same result from a fresh attempt budget, {cycles} times over.
+"""
+        opinion = (stuck.get("review") or "").strip()
+        if opinion:
+            body += f"""
+### What the reviewer said when it was shown this
+It was asked one question — can this ticket be satisfied as written — against
+the criteria and the failures together. Its answer is **{stuck.get('verdict', 'unclear')}**:
+
+{opinion[:1500]}
+
+It is an opinion, not a finding. Weigh it; you have the text in front of you
+and it did too.
+"""
+        if stuck.get("executor_claim"):
+            body += f"""
+### What the executor said
+It replied `IMPOSSIBLE:` rather than only implementing:
+
+{str(stuck['executor_claim'])[:1000]}
+
+An executor that cannot pass a ticket has every reason to conclude nobody can,
+so this is a claim to check against the criteria above, not a finding either.
+"""
+        body += """
+Answer one of two things, and do not split the difference.
+
+- **The ticket cannot be satisfied as written.** Reply with `impossible`,
+  naming the criterion and the contradiction in plain terms a person can check.
+  That parks it for someone to settle and costs nothing further. It is the
+  right answer here more often than anywhere else in this loop, because a
+  ticket that has produced identical results from repeated fresh attempts has
+  already demonstrated that the variable is not the sampling.
+
+- **It can, and the attempts have been going about it wrongly.** Then say what
+  they keep doing and what the revision makes them do instead, and revise for
+  that specifically. A rewrite that restates the same requirement in different
+  words spends another cycle proving it again — if you cannot name the thing
+  that will now happen differently, the honest answer is the one above.
+
+Do not return the ticket essentially unchanged. Unchanged is the one reply that
+guarantees another identical cycle."""
+    else:
+        body += "\nRevise the ticket so the next attempt can succeed."
 
     return [
         Message(role="system", content=RESPEC_SYSTEM),
@@ -1948,7 +2441,7 @@ def parse_respec(text: str) -> dict[str, Any]:
     for key in ("spec", "context", "rationale", "impossible"):
         if isinstance(data.get(key), str) and data[key].strip():
             revision[key] = data[key].strip()
-    for key in ("criteria", "allowed_files", "reference_files"):
+    for key in ("criteria", "allowed_files", "reference_files", "learned_add"):
         value = data.get(key)
         if isinstance(value, list):
             items = [str(v).strip() for v in value if str(v).strip()]

@@ -55,7 +55,13 @@ _ERROR = re.compile(
     # makes — baseline amnesty, contradiction detection, scope blame — was
     # blind on the language for as long as it has supported it.
     r"|.*\s(?:FAILED|ERROR)\s*$"
-    r"|FAIL\b|✗|×"                               # assorted test runners
+    # `\s*` because a runner indents its verdict line. vitest prints
+    # ` FAIL  tests/a.test.ts > suite > case` above the assertion, and that
+    # header is the only place the failing *file* appears — the
+    # `AssertionError:` block below it carries the message and no path at all.
+    # Without it every vitest failure parsed to a diagnostic nothing could
+    # attribute, on top of being invisible behind its own colour codes.
+    r"|\s*(?:FAIL\b|✗|×)"                        # assorted test runners
     r")",
     re.IGNORECASE,
 )
@@ -98,6 +104,31 @@ _SUMMARY = re.compile(
     r"|^\s*\d+ tests? completed\b",
     re.IGNORECASE,
 )
+
+
+# What a tool writes when it thinks it is talking to a terminal: colour, bold,
+# cursor moves. Every pattern in this module is anchored at `^` or matches on
+# word boundaries, and an escape sequence sits in front of the first character
+# of the line — so a runner that colours its output was invisible to all of it.
+#
+# That is not hypothetical. `vitest` colours every failure, and across an
+# 18-hour run not one of its failures parsed: `signatures` returned the empty
+# set, so the baseline amnesty compared nothing to nothing; `files_blamed`
+# named no file, so nothing could be attributed; and `distill` fell through to
+# the head of the output, which is the run banner. The executor was shown the
+# banner as the failure it was being asked to fix, on the ticket that went on
+# to spend 430 attempts. See docs/CONVERGENCE.md.
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def strip_ansi(text: str) -> str:
+    """Terminal control sequences removed, so the text is what it says.
+
+    Applied where output is captured — see `Orchestrator._shell` — and again at
+    the entry to every parser here, because a caller may hand over a detail
+    string recorded before this existed.
+    """
+    return _ANSI.sub("", text or "")
 
 
 def _blocks(lines: list[str]) -> tuple[list[list[str]], int]:
@@ -171,7 +202,7 @@ def signatures(output: str) -> set[str]:
     against an unparseable failure would silently forgive it.
     """
     found: set[str] = set()
-    blocks, _ = _blocks((output or "").splitlines())
+    blocks, _ = _blocks(strip_ansi(output).splitlines())
     for block in blocks:
         key = _block_key(block)
         if key:
@@ -209,6 +240,169 @@ def _block_key(block: list[str]) -> str:
     return re.sub(r"\s+", " ", _VOLATILE.sub("#", f"{head} {where}")).strip().lower()
 
 
+# The identifier a toolchain gives its own diagnostics, most specific first.
+# Extracted so a *class* can be named the way its tool names it — `TS2532`,
+# `trailing-whitespace`, `E0603` — rather than by a paraphrase of the message,
+# which changes with every symbol it happens to mention.
+#
+# Nothing here is required to match. A tool with no error codes falls back to
+# its message with the numbers masked, which is less precise and still stable
+# across the line numbers that make raw text useless for this.
+_CODES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\berror\[([A-Z]?\d+)\]"),                    # rustc / cargo
+    re.compile(r"\berror\s+(TS\d+)\b", re.IGNORECASE),        # tsc
+    re.compile(r"\b(clippy::[a-z_][a-z0-9_:]*)"),             # clippy lints
+    re.compile(r"\(([a-z][a-z0-9]*(?:-[a-z0-9]+)+)\)\s*$"),   # gdlint, eslint
+    re.compile(r"\b([EWFCNDIS]\d{3})\b"),                     # flake8, ruff, pycodestyle
+    re.compile(r"\b([A-Z]\w*(?:Error|Exception))\b"),         # Python exceptions
+    re.compile(r"\b(CS\d+|SA\d+|error\s+C\d+)\b"),            # C#, C++
+)
+
+# A test runner's verdict line: the framework saying which case failed. It
+# carries no error code and its message is the *test's own name*, so treating
+# it as a message mints a class per test case and the dedupe this exists for
+# never fires. What it does carry, and what nothing else in a vitest failure
+# does, is the file.
+# `\b` only after the words: it needs a word character beside it, and a verdict
+# written as a symbol has a space there. Without the split, every `× suite >
+# case` line fell through to `_message_of` and minted a class per test case —
+# the opposite of what this exists for.
+_VERDICT = re.compile(r"^\s*(?:(?:FAIL|FAILED|ERROR)\b|[✗×])", re.IGNORECASE)
+
+# A path with no line number after it, which `_LOCATION` deliberately does not
+# match. Required to contain a separator: without that, `Object.is` and
+# `assert.ok` are paths, and every assertion message names a file.
+_BARE_PATH = re.compile(r"(?<![\w])((?:[A-Za-z]:)?[\w.+-]*[/\\][\w./\\+-]*\.[A-Za-z0-9]{1,5})\b")
+
+# Every number that is not part of an error code. Line numbers, column numbers,
+# counts, and the literal values an assertion compared — all of which change
+# between two instances of the same mistake, and all of which made the raw text
+# useless as an identity.
+_NUMBERS = re.compile(r"(?<![A-Za-z])\d+(?:\.\d+)?")
+
+# How much of a message survives into a class when there is no code to name it
+# by. Long enough to distinguish two complaints, short enough that a compiler
+# quoting a whole type signature does not make every instance unique.
+_MESSAGE_CHARS = 60
+
+
+def _code_of(head: str) -> str:
+    """The tool's own name for this diagnostic, or "" if it does not give one."""
+    for pattern in _CODES:
+        found = pattern.search(head)
+        if found:
+            return found.group(1).strip()
+    # After the codes, not before: a verdict line that also carries a code —
+    # `FAILED ... error[E0603]` — should be classed by the code.
+    if _VERDICT.match(head):
+        return "test failed"
+    return ""
+
+
+def _message_of(head: str) -> str:
+    """A head line reduced to the complaint, with everything variable removed.
+
+    The fallback identity for a tool that does not number its diagnostics. Both
+    the location and every number go: `a.py:14: undefined name 'x'` and
+    `a.py:98: undefined name 'y'` are one mistake made twice, and a key that
+    keeps the line number says they are two.
+    """
+    text = head
+    for path in locations(head):
+        text = text.replace(path, " ")
+    text = _LOCATION.sub(" ", text)
+    text = _VOLATILE.sub(" ", text)
+    text = _NUMBERS.sub("#", text)
+    # Quoted symbols are the other thing that varies between two instances of
+    # one mistake: `'foo' is possibly undefined` and `'bar' is possibly
+    # undefined` are the same misunderstanding about the same rule.
+    text = re.sub(r"[`'\"][^`'\"]{1,80}[`'\"]", "@", text)
+    text = re.sub(r"[^\w@#:\-. ]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip().lower()[:_MESSAGE_CHARS]
+
+
+def classify(step: str, output: str) -> set[str]:
+    """The distinct *kinds* of failure in one step's output.
+
+    `signatures` answers "is this the same error as the one the baseline had",
+    and to answer it keeps the location — line and column included — because
+    attribution needs to know which line broke. This answers a different
+    question: "have I failed this way before". `TS2532` at line 40 and `TS2532`
+    at line 51 are one misunderstanding about one compiler flag, and a key that
+    separates them is why an executor could fail the same way 512 times without
+    anything noticing.
+
+    A class is `(step, code, file)`. The code is the tool's own — `TS2532`,
+    `trailing-whitespace`, `E0603` — falling back to the message with its
+    numbers, paths and quoted symbols masked. The file is kept because the same
+    rule broken in two files is two pieces of work; the line is not, because
+    the same rule broken twice in one file is one thing to learn.
+
+    Shares `_blocks` and the head/location parsing with `signatures`, so the
+    two never disagree about what counts as one diagnostic. They must not be
+    collapsed into one function: attribution needs the line and convergence
+    needs it gone.
+
+    Returns readable strings on purpose. These are counted into the executor's
+    prompt, and a class it cannot read is a fact it cannot use.
+    """
+    found: set[str] = set()
+    # The same class seen *with* a file somewhere in this output.
+    named: set[str] = set()
+    blocks, _ = _blocks(strip_ansi(output).splitlines())
+    for block in blocks:
+        head = block[0].strip()
+        name = _code_of(head) or _message_of(head)
+        if not name:
+            continue
+        target = _file_of(block)
+        found.add(f"{step} {name} in {target}" if target else f"{step} {name}")
+        if target:
+            named.add(f"{step} {name}")
+    # A runner prints the same verdict twice — once with the file, once as a
+    # bare case line — and the fileless copy says nothing the located one does
+    # not. Dropped here rather than at the caller, so the count the executor is
+    # shown is a count of distinct mistakes.
+    found -= named
+    if found:
+        return found
+
+    # Nothing parsed as a diagnostic, and the step still failed. Two kinds of
+    # step reach here and both need an identity: a reviewer's `REJECT:`, which
+    # is the loop's own protocol rather than a toolchain's, and any tool whose
+    # output none of the patterns above recognise.
+    #
+    # Returning nothing instead is what a caller cannot survive. The retry
+    # brake compares one cycle's classes to the last, and a ticket that
+    # produces none is a ticket whose evidence is always new — which is exactly
+    # the state that let one run repeat itself 86 times.
+    first = next(
+        (line.strip() for line in strip_ansi(output).splitlines() if line.strip()),
+        "",
+    )
+    message = _message_of(first)
+    return {f"{step} {message}"} if message else set()
+
+
+def _file_of(block: list[str]) -> str:
+    """The file this diagnostic is about, or "".
+
+    Three places, in the order a tool is likely to put it: on the head with a
+    line number, on a later line with one, and — for a runner's verdict — on
+    the head with no line number at all, which `_LOCATION` does not match by
+    design and which is the only path a vitest failure prints.
+    """
+    head = block[0].strip()
+    where = locations(head)
+    if where:
+        return where[0]
+    below = next((locations(line) for line in block[1:] if locations(line)), [])
+    if below:
+        return below[0]
+    bare = _BARE_PATH.search(head)
+    return bare.group(1).replace("\\", "/") if bare else ""
+
+
 def distill(output: str, *, limit: int = 6000) -> str:
     """Reduce toolchain output to its diagnostics, newest information first.
 
@@ -216,7 +410,7 @@ def distill(output: str, *, limit: int = 6000) -> str:
     diagnostic: an unrecognized tool still tends to lead with its complaint,
     and the tail is where the noise lives.
     """
-    text = (output or "").strip()
+    text = strip_ansi(output).strip()
     if not text:
         return ""
     if len(text) <= limit:
@@ -416,7 +610,7 @@ def locations(text: str) -> list[str]:
     diagnostic -- the one compilers put the error at -- is checked first.
     """
     found: list[str] = []
-    for match in _LOCATION.finditer(_FILE_URI.sub("", text or "")):
+    for match in _LOCATION.finditer(_FILE_URI.sub("", strip_ansi(text))):
         path = match.group(1).replace("\\", "/")
         if path and path not in found:
             found.append(path)

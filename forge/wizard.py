@@ -502,12 +502,15 @@ def _ask_memory(answers: Answers, profile: Profile, prompter: Prompter) -> None:
             say("Continuing — memory failures never end a run, they only remove context.")
             break
 
-    # Write-back stays off. It mutates a store every future session reads with
-    # no undo, and that is not a decision to make inside a setup flow the user
-    # is trying to get through.
+    # Write-back mutates a store every future session reads, with no undo, so
+    # it is asked rather than assumed. The default is yes because the answer it
+    # enables is dry-run: nothing is written, and the log shows what would have
+    # been. Defaulting to no produced a run with 262 memory retrievals and zero
+    # writes, which rediscovered the same three project conventions eleven
+    # times across two tickets that never exchanged a word.
     if prompter.confirm(
         "\nLet the loop write durable decisions back to memory (starts in dry-run)",
-        default=False,
+        default=True,
     ):
         answers.memory["write"] = True
         answers.memory["dryRun"] = True
@@ -583,16 +586,28 @@ def _ask_builds(root: Path, prompter: Prompter) -> list[str]:
 def _ask_commands(
     answers: Answers, root: Path, prompter: Prompter, build: str
 ) -> dict[str, str]:
-    """One build's three commands, detected from inside it and confirmed."""
+    """One build's commands, detected from inside it and confirmed."""
     where = root if build == REPO_ROOT else root / build
     if build != REPO_ROOT:
         say(f"\n\033[1m{build}\033[0m")
     suggested = _detect_or_ask(answers, root, prompter, where=where)
-    return {
+    commands = {
         "lint": prompter.ask("\nlint", suggested.get("lint", "")),
         "typecheck": prompter.ask("typecheck", suggested.get("typecheck", "")),
         "test": prompter.ask("test", suggested.get("test", "")),
     }
+    # Asked last and explained, because it is the one command here that is not
+    # a whole invocation: the loop appends the files it just wrote. It runs
+    # before verification and its own failure never parks a ticket, so a ticket
+    # whose only defect is whitespace costs nothing instead of an attempt. One
+    # run spent 117 of a ticket's 160 lint failures on exactly that. Blank is a
+    # supported answer and the safe one.
+    say("\nA formatter is optional, and pays for itself the first time a lint")
+    say("failure is only whitespace. The loop appends the files it wrote, so")
+    say("give the command *without* a target:  gdformat  /  prettier --write")
+    say("/  ruff format  /  rustfmt  /  gofmt -w.  Blank for none.")
+    commands["format"] = prompter.ask("format", suggested.get("format", ""))
+    return commands
 
 
 def _detect_or_ask(

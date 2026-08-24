@@ -53,6 +53,25 @@ _BLOCK = re.compile(
 
 BLOCKED_PREFIX = "BLOCKED:"
 
+# The executor's other refusal, and a different claim. `BLOCKED:` says *I need
+# something before I can do this* — a wider scope, a decision only a person can
+# make — and the loop answers it by widening the scope or parking the ticket for
+# a human. `IMPOSSIBLE:` says *no implementation satisfies this as written*,
+# which is a claim about the ticket rather than a request.
+#
+# It exists because the executor made that claim in prose and nothing read it.
+# On attempt 58 of 430, an executor wrote "there's a contradiction in the
+# acceptance criteria" into the middle of an otherwise ordinary reply, and it
+# was right — two criteria demanded different values from the same call. The
+# reply parsed as an ordinary implementation, the loop applied it, and 372
+# further attempts followed. See docs/CONVERGENCE.md.
+#
+# Never believed on sight. It routes to respec as a forced impossibility check,
+# where the planner is shown the criteria and asked to confirm or refute it —
+# an executor that cannot pass a ticket has every reason to conclude nobody
+# can.
+IMPOSSIBLE_PREFIX = "IMPOSSIBLE:"
+
 # A fence line on its own — an opener with an optional language, or a closer.
 _FENCE_LINE = re.compile(r"^[ \t]*```[^\n]*$")
 
@@ -144,6 +163,9 @@ class FileEdit:
 class ParsedOutput:
     edits: list[FileEdit] = field(default_factory=list)
     blocked_reason: str = ""
+    # The executor's claim that the ticket cannot be satisfied as written. A
+    # claim to be checked, never an outcome — see `IMPOSSIBLE_PREFIX`.
+    impossible_reason: str = ""
     # Paths the model tried to write that its ticket did not allow.
     rejected: list[str] = field(default_factory=list)
     # Paths whose fenced block was closed by a fence inside the file itself, so
@@ -157,21 +179,42 @@ class ParsedOutput:
         return bool(self.blocked_reason)
 
     @property
+    def is_impossible(self) -> bool:
+        return bool(self.impossible_reason)
+
+    @property
     def is_empty(self) -> bool:
-        return not self.edits and not self.blocked_reason
+        return not self.edits and not self.blocked_reason and not self.impossible_reason
 
 
 def parse_output(text: str) -> ParsedOutput:
-    """Extract file edits, or the executor's refusal to guess."""
+    """Extract file edits, or one of the executor's two refusals."""
     stripped = text.strip()
     if stripped.startswith(BLOCKED_PREFIX):
         return ParsedOutput(blocked_reason=stripped[len(BLOCKED_PREFIX) :].strip())
+    if stripped.startswith(IMPOSSIBLE_PREFIX):
+        return ParsedOutput(
+            impossible_reason=stripped[len(IMPOSSIBLE_PREFIX) :].strip()
+        )
 
     # A BLOCKED marker anywhere in the response counts, since models often lead
     # with a sentence of preamble before the marker.
     marker = re.search(rf"^{BLOCKED_PREFIX}(?P<reason>.*)", text, re.MULTILINE)
     if marker and not _BLOCK.search(text):
         return ParsedOutput(blocked_reason=marker.group("reason").strip())
+
+    # Read even when files came back with it. An executor that believes the
+    # ticket is unsatisfiable will often implement its best guess *and* say so,
+    # which is exactly what happened on the run this exists for — the edits
+    # parsed, the sentence did not, and the claim was lost 372 attempts before
+    # anyone read it. The edits still land; the claim travels with them.
+    claim = re.search(rf"^{IMPOSSIBLE_PREFIX}(?P<reason>.*)", text, re.MULTILINE)
+    if claim:
+        reason = claim.group("reason").strip()
+        if not _BLOCK.search(text):
+            return ParsedOutput(impossible_reason=reason)
+    else:
+        reason = ""
 
     edits: list[FileEdit] = []
     truncated: list[str] = []
@@ -183,7 +226,11 @@ def parse_output(text: str) -> ParsedOutput:
             continue
         edits.append(FileEdit(path=path, content=body))
     if edits or truncated:
-        return ParsedOutput(edits=_drop_repeats(edits), truncated=truncated)
+        return ParsedOutput(
+            edits=_drop_repeats(edits),
+            truncated=truncated,
+            impossible_reason=reason,
+        )
 
     # Nothing named a file the way the protocol asks. Before giving up, read
     # the shape the model actually used.
@@ -525,7 +572,12 @@ def enforce_scope(
             continue
         kept.append(edit)
 
-    return ParsedOutput(edits=kept, blocked_reason=parsed.blocked_reason, rejected=rejected)
+    return ParsedOutput(
+        edits=kept,
+        blocked_reason=parsed.blocked_reason,
+        impossible_reason=parsed.impossible_reason,
+        rejected=rejected,
+    )
 
 
 def is_safe_path(root: Path, candidate: str) -> bool:

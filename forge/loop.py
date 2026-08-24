@@ -27,6 +27,7 @@ respecs it from the recorded failures, and runs the whole backlog again.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -48,6 +49,7 @@ from .budget import BudgetGate, Wait
 from .config import ANY_LANGUAGE, REPO_ROOT, ROLES, Config, ConfigError, Workspace
 from .failures import (
     blocks_naming,
+    classify,
     distill,
     environment_failure,
     errors_naming,
@@ -55,6 +57,7 @@ from .failures import (
     locations,
     reroot,
     signatures,
+    strip_ansi,
     test_count,
 )
 from .ingest import write_tickets
@@ -85,13 +88,21 @@ from .providers import (
 from .prompts import (
     CONTEXT_HEADING,
     EXAMPLE_PATH_PREFIX,
+    FAILURE_CLASSES_HEADING,
+    LEARNED_HEADING,
     PRIOR_ATTEMPT_HEADING,
     PRIOR_FAILURES_HEADING,
     PRIOR_VERDICTS_HEADING,
     RATIFICATION_HEADING,
+    TOOLCHAIN_HEADING,
     build_prompt,
     ratification_message,
+    STUCK_UNCLEAR,
+    STUCK_UNWINNABLE,
+    convention_prompt,
     parse_record,
+    parse_stuck_review,
+    stuck_review_prompt,
     parse_verdict,
     parse_bug,
     parse_scope_argument,
@@ -130,10 +141,14 @@ MEMORY_FAILURE_LIMIT = 3
 # and stays whatever the window costs.
 _DROPPABLE_HEADINGS = (
     CONTEXT_HEADING,
+    FAILURE_CLASSES_HEADING,
+    LEARNED_HEADING,
     PRIOR_FAILURES_HEADING,
     PRIOR_VERDICTS_HEADING,
     PRIOR_ATTEMPT_HEADING,
+    LEARNED_HEADING,
     RATIFICATION_HEADING,
+    TOOLCHAIN_HEADING,
 )
 
 
@@ -241,6 +256,23 @@ CONTROL_STOP = "stop"
 CURRENT_RUN_KEY = "current-run"
 
 
+def _ordinal(n: int) -> str:
+    """`3` as "third". Falls back to `14th` past the words that read well.
+
+    A number in a warning about a run going nowhere is read by a person
+    deciding whether to let it keep going, and "for the third cycle running"
+    lands where "flat_cycles=3" does not.
+    """
+    words = {
+        1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth",
+        6: "sixth", 7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth",
+    }
+    if n in words:
+        return words[n]
+    suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
 def evidence_key(run_id: int) -> str:
     """Control-channel key holding the last retry cycle's failure fingerprint."""
     return f"retry-evidence:{run_id}"
@@ -334,6 +366,13 @@ class Orchestrator:
         # `{ticket_id: {test path: the lines blaming it}}`. Read at respec,
         # which is where retiring an assertion is settled.
         self._contradictions: dict[str, dict[str, list[str]]] = {}
+        # What the reviewer said when a stalled ticket was put to it, and what
+        # its executor claimed with `IMPOSSIBLE:`, as
+        # `{ticket_id: (verdict, reasoning)}` and `{ticket_id: claim}`. Both
+        # feed the rung below them and neither survives the process: they are
+        # this run's working notes, and the durable record is the step log.
+        self._stuck_opinion: dict[str, tuple[str, str]] = {}
+        self._impossible_claims: dict[str, str] = {}
         # Why the run gave up on verifying anything, once it has. Set when a
         # ticket's every verify step was excused, which means the project no
         # longer builds and no later ticket can be checked either. Ends the
@@ -480,7 +519,70 @@ class Orchestrator:
             )
             return
 
-        title, entry = parse_record(completion.text)
+        self._remember(run_id, ticket, step_id, completion.text)
+
+    def _record_conventions(self, run_id: int, ticket: Ticket) -> None:
+        """What a ticket that never passed established about the project.
+
+        The step above refuses this case, and its reason is right: a conclusion
+        drawn from unverified work is a rumour every future ticket will read as
+        fact. The reason does not reach a toolchain fact. Whether
+        `noUncheckedIndexedAccess` is set is not a claim about this ticket's
+        code — the compiler said so, and it stays true whether or not the
+        ticket that ran into it went on to pass.
+
+        Worth having because the tickets that learn most are the ones that fail
+        most. On the run this comes from, the two tickets that spent 650
+        attempts between them ended blocked, and everything their failures had
+        demonstrated about the project — a compiler flag, a line-length limit,
+        an import convention — was thrown away with them.
+
+        Narrower than `_record_outcome` on every axis except that one. The
+        recorder is shown no diff, no verdict, and no failure text: only the
+        ticket's `learned` entries, which are already respec-authored,
+        waiver-screened, and derived from what the project's own tools printed.
+        Nothing here can reach memory that did not come through that field.
+        """
+        if self.memory is None or not self.memory.settings.write:
+            return
+        if not ticket.learned:
+            return
+
+        retrieved = self._retrieve_context(run_id, ticket)
+        step_id = self.store.start_step(run_id, ticket.ticket_id, "record")
+        try:
+            completion = self._call(
+                run_id,
+                self.config.record_role,
+                convention_prompt(ticket, retrieved),
+                max_tokens=self._output_budget(self.config.record_role),
+                temperature=0.0,
+            )
+        except ProviderError as exc:
+            # A ticket is already being given up on. Losing the note as well is
+            # the smaller loss, and it must not change how the ticket ends.
+            self.store.end_step(step_id, "failed", str(exc))
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: could not evaluate conventions for memory "
+                f"({exc}).",
+                level="warn",
+                kind="memory",
+            )
+            return
+
+        self._remember(run_id, ticket, step_id, completion.text)
+
+    def _remember(
+        self, run_id: int, ticket: Ticket, step_id: int, reply: str
+    ) -> None:
+        """Parse a recorder reply and write it, or record that there was nothing.
+
+        Shared by both recorder passes so a memory write goes through one set
+        of guards however it was proposed — the refusal, the outage, and what
+        the step log ends up saying are the same in both directions.
+        """
+        title, entry = parse_record(reply)
         if not entry:
             self.store.end_step(step_id, "ok", "nothing durable to record")
             return
@@ -721,8 +823,16 @@ class Orchestrator:
             self.store.end_step(step_id, "failed", f"{name} timed out after 1800s")
             return StepResult(ok=False, detail=f"{name} timed out")
 
+        # Stripped before anything reads it, for the same reason it is rerooted
+        # here rather than at each reader: every pattern in `failures` is
+        # anchored at the start of a line, and a runner that colours its output
+        # puts an escape sequence there. `vitest` does, and across an 18-hour
+        # run not one of its failures parsed — no signatures, so the baseline
+        # amnesty compared nothing to nothing; no blamed files; and `distill`
+        # falling through to the run banner, which is what the executor was
+        # shown as the failure it had to fix.
         output = reroot(
-            f"{result.stdout}\n{result.stderr}".strip(),
+            strip_ansi(f"{result.stdout}\n{result.stderr}").strip(),
             workspace.prefix,
             self.config.root,
         )
@@ -2334,22 +2444,205 @@ class Orchestrator:
     def _evidence_fingerprint(self, run_id: int, ticket_ids: Sequence[str]) -> str:
         """A stable digest of why these tickets are unfinished.
 
-        Built from the recorded step failures, which `ticket_failures` already
-        deduplicates — so a cycle that reproduces the previous one's failures
-        exactly produces the same digest, and one that fails in any new way
-        does not. Hashed rather than stored whole: this goes in a control row,
-        and the failures it summarizes can run to tens of kilobytes.
+        Built from the failure *classes* each ticket produced, so a cycle that
+        fails the same way as the last produces the same digest and one that
+        fails in a genuinely new way does not. Hashed rather than stored whole:
+        this goes in a control row.
+
+        Classes rather than the failure text, and the difference is the whole
+        value of the brake. Keyed on text it never fired once in 86 consecutive
+        cycles on one ticket: the assertions it was failing quoted a hash that
+        differed every attempt, so every cycle's evidence hashed to something
+        new and "this reproduced the previous cycle's failures exactly" was
+        never true of any two of them. The same seven classes were failing
+        throughout. See docs/CONVERGENCE.md.
         """
         material: list[str] = []
         for ticket_id in sorted(ticket_ids):
-            for failure in self.store.ticket_failures(run_id, ticket_id):
-                material.append(f"{ticket_id}::{failure['name']}::{failure['detail']}")
+            for entry in self.store.ticket_classes(run_id, ticket_id):
+                material.append(f"{ticket_id}::{entry['name']}")
         if not material:
             # No recorded evidence at all. Never equal to a previous cycle's
             # digest, so an absent step log can never be the thing that stops
             # a retry — it is the one case where nothing has been learned.
             return f"none::{time.time()}"
         return hashlib.sha256("\n".join(material).encode("utf-8")).hexdigest()
+
+    # How a cycle compares to the one before it, per ticket.
+    #
+    # Written out because these lines are read by a person deciding whether to
+    # let a long run keep going, and "the 14th cycle running" is the sentence
+    # that decides it.
+    #
+    # The distinction the loop had no way to draw. A run that spends 18 hours
+    # descending has earned them, and one that spends 18 hours resampling reads
+    # identically from the outside — same log lines, same attempt counts, same
+    # "re-delegating" every five minutes. The difference is whether the set of
+    # things going wrong is getting smaller.
+    FIRST = "first"          # nothing to compare against yet
+    DESCENDING = "descending"  # classes went away and none arrived
+    CHURNING = "churning"      # some went, others came: a fix breaking something else
+    FLAT = "flat"              # the same set, again
+    CLEARED = "cleared"        # nothing failed this cycle at all
+
+    def _convergence(self, run_id: int, ticket: Ticket) -> tuple[str, list[str]]:
+        """Where this ticket's cycle stands against the last, and its classes.
+
+        Measured on failure *classes* rather than on the raw text, because that
+        is the only form in which two attempts at the same mistake are the same
+        thing — see `failures.classify`. Keyed on text, the sets never repeated
+        once in 86 cycles.
+
+        `CHURNING` is worth separating from `FLAT` rather than folding both
+        into "not descending". They ask for different things: churning is the
+        executor trading one failure for another, which the anti-oscillation
+        block in its own prompt is written for and which more attempts can
+        genuinely resolve; flat is nothing varying at all, which more attempts
+        cannot.
+        """
+        current = sorted(
+            entry["name"]
+            for entry in self.store.ticket_classes(
+                run_id, ticket.ticket_id, after=ticket.cycle_mark
+            )
+        )
+        previous = sorted(ticket.cycle_classes)
+        if not current:
+            return self.CLEARED, current
+        if not previous:
+            return self.FIRST, current
+        if current == previous:
+            return self.FLAT, current
+        gone = set(previous) - set(current)
+        arrived = set(current) - set(previous)
+        if arrived and gone:
+            return self.CHURNING, current
+        return self.DESCENDING if gone else self.CHURNING, current
+
+    def _measure_cycle(self, run_id: int, ticket: Ticket) -> str:
+        """Record where the ticket's cycle stands, and say so. Returns the state.
+
+        Said out loud on purpose. The state of a long run was not observable
+        from anything it wrote: `_evidence_fingerprint` compared the whole
+        backlog at once and answered a yes/no question about ending the run,
+        and nothing anywhere answered "is this ticket getting closer". A
+        descending ticket should be visibly worth its next cycle.
+        """
+        state, current = self._convergence(run_id, ticket)
+        # Read before the assignment below overwrites it.
+        before = len(ticket.cycle_classes)
+        ticket.flat_cycles = ticket.flat_cycles + 1 if state == self.FLAT else 0
+        ticket.cycle_classes = current
+        ticket.cycle_mark = self.store.last_step_id(run_id, ticket.ticket_id)
+        self.store.record_convergence(run_id, ticket)
+
+        if state in (self.FIRST, self.CLEARED):
+            return state
+        if state == self.DESCENDING:
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: converging — {len(current)} kind(s) of "
+                f"failure left, down from {before}. The next cycle is worth "
+                f"running.",
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "state": state, "classes": current},
+            )
+            return state
+        if state == self.CHURNING:
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: churning — the failures changed but did "
+                f"not shrink ({len(current)} kind(s)). A fix is breaking "
+                f"something the last one satisfied.",
+                level="warn",
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "state": state, "classes": current},
+            )
+            return state
+
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: flat — this cycle failed on exactly the same "
+            f"{len(current)} kind(s) as the last, for the "
+            f"{_ordinal(ticket.flat_cycles)} cycle running:\n"
+            + "\n".join(f"  - {name}" for name in current[:6]),
+            level="warn",
+            kind="ticket",
+            data={
+                "ticket": ticket.ticket_id,
+                "state": state,
+                "classes": current,
+                "flat_cycles": ticket.flat_cycles,
+            },
+        )
+        return state
+
+    def _stuck_review(self, run_id: int, ticket: Ticket) -> tuple[str, str]:
+        """Ask the reviewer whether a stalled ticket can be met at all.
+
+        Rung one of the ladder, and the cheapest thing the loop can do with a
+        ticket that has stopped moving. Review normally sits behind
+        verification, so a ticket failing the same way for cycles never reaches
+        the one role positioned to say the contract is wrong: on the run this
+        comes from, 1,350 executor calls produced 17 reviews, and the ticket
+        that spent 6.7M tokens against an unsatisfiable contract gave the
+        reviewer 43k of them.
+
+        Advisory in both directions. It cannot pass a red tree, it does not
+        change the ticket's status, and a `winnable` verdict does not excuse
+        anything. What it produces is an opinion the planner is shown on the
+        next rung, and a line in the log for a person.
+
+        Returns `(verdict, reasoning)`; `unclear` on any failure, because a
+        step whose whole purpose is advice must not be able to end a ticket.
+        """
+        classes = self.store.ticket_classes(run_id, ticket.ticket_id)
+        failures = self.store.ticket_failures(run_id, ticket.ticket_id, limit=1)
+        step_id = self.store.start_step(run_id, ticket.ticket_id, "stuck-review")
+        try:
+            completion = self._call(
+                run_id,
+                "reviewer",
+                stuck_review_prompt(
+                    ticket,
+                    self._diff(),
+                    classes[:8],
+                    failures[-1]["detail"] if failures else "",
+                    self._retrieve_context(run_id, ticket),
+                ),
+                max_tokens=self._output_budget("reviewer"),
+                temperature=0.0,
+            )
+        except ProviderError as exc:
+            self.store.end_step(step_id, "failed", str(exc))
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: could not ask the reviewer whether this "
+                f"ticket is winnable ({exc}).",
+                level="warn",
+                kind="review",
+            )
+            return STUCK_UNCLEAR, ""
+
+        verdict, reasoning = parse_stuck_review(completion.text)
+        self._record_call(
+            ticket, "stuck-review", "reviewer", completion, extra={"verdict": verdict}
+        )
+        self.store.end_step(step_id, "ok", f"{verdict}\n{reasoning}")
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: asked whether this ticket is winnable at all "
+            f"after {ticket.flat_cycles} identical cycles — the reviewer says "
+            f"**{verdict}**. {reasoning[:400]}",
+            level="warn" if verdict == STUCK_UNWINNABLE else "info",
+            kind="review",
+            data={
+                "ticket": ticket.ticket_id,
+                "verdict": verdict,
+                "reasoning": reasoning,
+            },
+        )
+        return verdict, reasoning
 
     def _retries_spent(self, run_id: int) -> int:
         try:
@@ -2431,6 +2724,71 @@ class Orchestrator:
             and ticket.route == "delegate"
             and ticket.ticket_id not in unprovable
         ]
+
+        # Measured per ticket, before the backlog-wide comparison below. The
+        # two answer different questions and the run-level one cannot answer
+        # this: it asks whether *every* unfinished ticket reproduced the last
+        # cycle, so a ticket that is going nowhere is invisible for as long as
+        # any other ticket is still moving — which is correct for the run and
+        # ruinous for the ticket. One spent the full 18 hours of a run in that
+        # position, taking a fresh attempt budget every cycle, while two others
+        # were still landing work.
+        by_ticket = {ticket.ticket_id: ticket for ticket in tickets}
+        stalled: list[str] = []
+        # Rung one: ask the reviewer whether the ticket is winnable at all.
+        escalate: list[str] = []
+        # Rung two: ask the planner the inverted question, and let it say the
+        # ticket is unsatisfiable.
+        interrogate: list[str] = []
+        for ticket_id in list(eligible):
+            ticket = by_ticket[ticket_id]
+            self._measure_cycle(run_id, ticket)
+            # The ladder. One rung per flat cycle, cheapest first, and each
+            # fires once rather than every cycle after it.
+            rung = self.config.loop.review_when_stuck
+            if rung and ticket.flat_cycles == rung:
+                escalate.append(ticket_id)
+            elif rung and ticket.flat_cycles == rung + 1:
+                interrogate.append(ticket_id)
+            elif self._impossible_claims.get(ticket_id):
+                # An executor that said `IMPOSSIBLE:` does not wait for the
+                # flat count. It is the reason the rung exists: on the run this
+                # comes from the claim was made on attempt 58 of 430, in prose,
+                # and the ticket went on to produce 23 descending and churning
+                # cycles that would each have reset a flat counter. Waiting for
+                # three identical cycles would have read it 300 attempts late.
+                interrogate.append(ticket_id)
+            limit = self.config.loop.flat_cycles
+            if limit and ticket.flat_cycles >= limit:
+                stalled.append(ticket_id)
+        for ticket_id in escalate:
+            ticket = by_ticket[ticket_id]
+            verdict, reasoning = self._stuck_review(run_id, ticket)
+            self._stuck_opinion[ticket_id] = (verdict, reasoning)
+
+        for ticket_id in stalled:
+            eligible.remove(ticket_id)
+            ticket = by_ticket[ticket_id]
+            ticket.status = TICKET_BLOCKED
+            ticket.blocked_note = (
+                f"stalled: {ticket.flat_cycles} consecutive cycles failed on "
+                f"exactly the same "
+                f"{len(ticket.cycle_classes)} kind(s) of failure — "
+                + "; ".join(ticket.cycle_classes[:4])
+                + ". Nothing is varying, so another cycle spends the same calls "
+                "for the same result."
+            )
+            self.store.update_ticket(run_id, ticket)
+            self.store.log(
+                run_id,
+                f"{ticket_id}: parked after {ticket.flat_cycles} flat cycles. "
+                f"The rest of the backlog keeps going.",
+                level="error",
+                kind="ticket",
+                data={"ticket": ticket_id, "classes": ticket.cycle_classes},
+            )
+            self._record_conventions(run_id, ticket)
+
         if not eligible:
             # Nothing here is the loop's to retry: either every ticket landed
             # and the *final* verify is failing on breakage no ticket in this
@@ -2439,7 +2797,8 @@ class Orchestrator:
             self.store.log(
                 run_id,
                 "Nothing left for the loop to retry — what remains needs a human "
-                "(claude-only tickets, or a failure no ticket in this backlog owns).",
+                "(claude-only tickets, a ticket parked for going nowhere, or a "
+                "failure no ticket in this backlog owns).",
                 level="warn",
                 kind="lifecycle",
             )
@@ -2491,7 +2850,18 @@ class Orchestrator:
                 for ticket_id in eligible
                 if by_id[ticket_id].attempts > 0
             ]
-            revised, asked, parked = self._respec(run_id, attempted, notes)
+            # Rung two travels with the ordinary respec rather than as a call
+            # of its own: it is the same planner, over the same ticket, with
+            # the same evidence — only the question differs. A second call
+            # would double the cost to ask half of it.
+            stuck_context = {
+                ticket_id: self._stuck_context(by_id[ticket_id])
+                for ticket_id in interrogate
+                if ticket_id in by_id
+            }
+            revised, asked, parked = self._respec(
+                run_id, attempted, notes, stuck=stuck_context
+            )
             # A ticket the planner has just called unsatisfiable stays parked.
             eligible = [ticket_id for ticket_id in eligible if ticket_id not in parked]
             # Nothing ran this cycle, so there is nothing for a respec to have
@@ -2542,8 +2912,29 @@ class Orchestrator:
         self.store.set_run_status(run_id, RUN_RUNNING, f"retry cycle {label}")
         return True
 
+    def _stuck_context(self, ticket: Ticket) -> dict:
+        """What the planner is shown when it is asked the inverted question.
+
+        The ticket's flat count, the classes it keeps producing, whatever the
+        reviewer said on the rung before, and the executor's own `IMPOSSIBLE:`
+        claim if it made one. All four are evidence about the *contract* rather
+        than about the code, which is what the inverted question is about.
+        """
+        verdict, reasoning = self._stuck_opinion.get(ticket.ticket_id, ("", ""))
+        return {
+            "flat_cycles": ticket.flat_cycles,
+            "classes": list(ticket.cycle_classes),
+            "verdict": verdict,
+            "review": reasoning,
+            "executor_claim": self._impossible_claims.get(ticket.ticket_id, ""),
+        }
+
     def _respec(
-        self, run_id: int, tickets: list[Ticket], notes: dict[str, str]
+        self,
+        run_id: int,
+        tickets: list[Ticket],
+        notes: dict[str, str],
+        stuck: dict[str, dict] | None = None,
     ) -> tuple[list[Ticket], bool, set[str]]:
         """Rewrite each ticket from why it failed. Never raises.
 
@@ -2602,6 +2993,15 @@ class Orchestrator:
                 # So a revised read scope is checked against the tree rather
                 # than taken on the planner's word for where a file lives.
                 root=self.config.root,
+                # Set only for a ticket that has stopped moving, and it
+                # inverts the question: not *revise this so the next attempt
+                # succeeds*, which has an answer whether or not one exists, but
+                # *state which criterion cannot be satisfied, or what the next
+                # attempt must do differently*. `impossible` has been available
+                # on every respec call since the field existed and was never
+                # reached for in 86 consecutive cycles, because nothing ever
+                # asked for it.
+                stuck=(stuck or {}).get(ticket.ticket_id),
             )
             if result.impossible:
                 # Spending a full attempt budget on a ticket the planner has
@@ -2611,6 +3011,10 @@ class Orchestrator:
                 ticket.status = TICKET_BLOCKED
                 ticket.blocked_note = f"respec: {result.impossible}"
                 self.store.update_ticket(run_id, ticket)
+                # A ticket nobody can satisfy has usually spent a long time
+                # finding that out, and what it learned about the project on
+                # the way is true whatever happens to the ticket.
+                self._record_conventions(run_id, ticket)
                 continue
 
             # Respec asked to retire an assertion. It does not get to decide
@@ -2995,7 +3399,7 @@ class Orchestrator:
             history = [
                 f"Earlier cycle, {item['name']} failed:\n{item['detail']}"
                 for item in self.store.ticket_failures(
-                    run_id, ticket.ticket_id, limit=self._PRIOR_FAILURES
+                    run_id, ticket.ticket_id, limit=self._prior_failures
                 )
             ]
             # Stripped on the way in for the same reason the live list is: this
@@ -3015,7 +3419,7 @@ class Orchestrator:
             outcome = self._attempt(
                 run_id, ticket, failure_context, retrieved, baseline,
                 pre_existing=pre_existing, authored=authored, touched=touched,
-                prior_failures=history[-self._PRIOR_FAILURES:],
+                prior_failures=history[-self._prior_failures:],
                 rejections=rejections,
                 repro=repro,
             )
@@ -3056,6 +3460,7 @@ class Orchestrator:
                     level="warn",
                     kind="ticket",
                 )
+                self._record_conventions(run_id, ticket)
                 # After the revert, not before: what matters is whether the
                 # tree is still red once this ticket's work is out of it.
                 self._red_left_behind(run_id, ticket)
@@ -3106,6 +3511,11 @@ class Orchestrator:
             level="error",
             kind="ticket",
         )
+        # The tickets that learn most are the ones that fail most, and until
+        # now everything they worked out went into the artifact directory and
+        # nowhere else. Only what is in `learned` can reach memory here — no
+        # diff, no verdict, no claim about the code that just failed.
+        self._record_conventions(run_id, ticket)
         # Asked here rather than left for the next ticket to discover halfway
         # through its own verify step, which is a full attempt spent to learn
         # something that was already true.
@@ -3128,15 +3538,28 @@ class Orchestrator:
     # ticket blocks instead. Saying "split this ticket" is a worse outcome than
     # succeeding and a far better one than silent data loss.
     _WRITABLE_CEILING = 200_000
-    # Earlier failures carried forward alongside the newest one. Two is enough
-    # to expose an A-then-B-then-A cycle without crowding the spec out of the
-    # window; the full history is in the step log either way.
-    _PRIOR_FAILURES = 2
+    # Fallback for a caller with no config in hand. The number that governs a
+    # run is `loop.priorFailures` — see `_prior_failures`.
+    _PRIOR_FAILURES = 8
     # Earlier rejections shown to the reviewer, for the same reason and with
     # the same ceiling. Uncapped, this was the one block that grew with every
     # attempt: three is enough to show an objection repeating, which is the
     # signal the block exists for.
     _PRIOR_VERDICTS = 3
+
+    @property
+    def _prior_failures(self) -> int:
+        """How many earlier failures travel with the newest one.
+
+        Two, until `ticket_failures` began deduplicating by class. Two was
+        chosen to expose an A-then-B-then-A cycle without crowding the spec out
+        of the window, and it could not: keyed by text, two entries were
+        reliably two instances of the *same* mistake with different line
+        numbers, so the window held one fact and the cycle stayed invisible.
+        Deduplicated by class, eight entries are eight distinct mistakes and
+        cost less than the two used to.
+        """
+        return self.config.loop.prior_failures
 
     def _grant_contradicted_scope(
         self, run_id: int, ticket: Ticket, wanted: list[str]
@@ -3597,6 +4020,215 @@ class Orchestrator:
             lines.insert(0, "Nothing was written: every edit fell outside scope.\n")
         return "\n".join(lines)
 
+    def _format_pass(
+        self, run_id: int, ticket: Ticket, paths: Sequence[str]
+    ) -> list[str]:
+        """Run the project's formatter over what this attempt just wrote.
+
+        Between the tests step and verification, over the files the loop itself
+        landed this attempt — the executor's and the tester's, not the ticket's
+        whole glob. A ticket scoped `src/*.py` has not touched most of `src/`,
+        and reformatting a file it never wrote is an out-of-scope edit dressed
+        as a tidy-up.
+
+        The reason it exists is a run where 117 of one ticket's 160 lint
+        failures had trailing whitespace as their *only* problem, in a file the
+        tester had just written, against a `gdlintrc` nobody had shown it. Each
+        one cost an executor call, a tester call, an 8-second suite run and a
+        share of a respec cycle, and a formatter would have cleared every one
+        of them in milliseconds. See docs/CONVERGENCE.md.
+
+        **This lowers no bar.** The linter is the project's and its thresholds
+        are untouched; what changes is that the code is made to meet them
+        before it is judged, rather than the judgement being softened. A run
+        that quietly relaxed its own verification is the failure
+        `docs/LOOP-INVARIANTS.md` exists to prevent, and this is the opposite
+        move.
+
+        Ordered before verify rather than after a red one on purpose. Running
+        it only on failure would need a second full verification to find out
+        whether it helped, which on the run this comes from would have been 400
+        further gdUnit sweeps; running it first costs milliseconds and makes
+        every failure that remains a real one. The formatter's own failure is
+        never the ticket's: a missing binary is a configuration problem, and
+        parking a correct implementation over one would be a worse bug than the
+        one this fixes.
+
+        Returns the paths it changed, for the caller to report.
+        """
+        commands = self.config.commands_for("format")
+        if not commands:
+            return []
+
+        # Grouped by the command that will run them and the directory it runs
+        # in, so each formatter is handed only its own language's files and a
+        # subproject's formatter is not asked about the parent's tree.
+        groups: dict[tuple[str, str], list[str]] = {}
+        for path in dict.fromkeys(paths):
+            if any(character in path for character in "*?["):
+                continue
+            if not is_safe_path(self.config.root, path):
+                continue
+            if not (self.config.root / path).is_file():
+                continue
+            command = self.config.command_for("format", path)
+            if not command.strip():
+                continue
+            workspace = self.config.workspace_for(path) or self.config.root_workspace
+            groups.setdefault((command, workspace.root), []).append(path)
+
+        changed: list[str] = []
+        for (command, root), group in sorted(groups.items()):
+            workspace = next(
+                (w for w in self.config.workspaces if w.root == root),
+                self.config.root_workspace,
+            )
+            before = {path: self._read_or_none(path) for path in group}
+            # The paths are appended, which is the one thing `format` does
+            # differently from the verify kinds: those are whole commands, and
+            # a formatter is a command plus the files to rewrite. Every
+            # mainstream one takes them that way — `gdformat`, `prettier
+            # --write`, `ruff format`, `rustfmt`, `gofmt -w`, `black`.
+            arguments = " ".join(
+                f'"{path[len(workspace.prefix):]}"' for path in group
+            )
+            result = self._shell(
+                run_id,
+                self._step_label("format", "", 1, workspace),
+                f"{command} {arguments}",
+                ticket.ticket_id,
+                workspace=workspace,
+            )
+            if not result.ok:
+                # Logged, never charged. See the docstring: a formatter that
+                # cannot run is a configuration fault, and the code it did not
+                # reach is still judged by the same verify commands it always
+                # was.
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: the format command failed and was "
+                    f"skipped — {(result.detail or '').strip().splitlines()[0][:200] if result.detail.strip() else 'no output'}. "
+                    f"Nothing was reformatted; the ticket is judged exactly as "
+                    f"it would have been without a formatter configured.",
+                    level="warn",
+                    kind="ticket",
+                )
+                continue
+            changed.extend(
+                path
+                for path in group
+                if self._read_or_none(path) != before[path]
+            )
+
+        if changed:
+            # Reported because it is model output being rewritten by something
+            # other than the model. Small and mechanical every time it has been
+            # looked at, and the moment it stops being that is the moment
+            # somebody needs to be able to see it in the log.
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: the formatter rewrote "
+                f"{len(changed)} file(s) before verification: "
+                f"{', '.join(sorted(changed)[:6])}"
+                + ("…" if len(changed) > 6 else ""),
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "formatted": sorted(changed)},
+            )
+        return changed
+
+    def _read_or_none(self, path: str) -> str | None:
+        """A file's text, or `None` if it cannot be read.
+
+        `None` rather than `""` so a file that vanished is not mistaken for one
+        the formatter emptied.
+        """
+        try:
+            return (self.config.root / path).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            return None
+
+    def _tests_fingerprint(self, ticket: Ticket, test_path: str) -> str:
+        """The inputs the tester's answer is a function of.
+
+        Deliberately not the implementation. The tests encode the *criteria* —
+        that is the whole reason the tester is a separate role from the
+        executor, and the reason its file is outside the executor's scope. A
+        fingerprint that moved with the code would regenerate on every attempt,
+        which is the behaviour this replaces.
+
+        The spec is in it because the tester is shown the spec and a revision
+        can change what a criterion means without changing its words. The scope
+        is in it because the file under test is what the assertions import.
+        """
+        material = json.dumps(
+            {
+                "criteria": list(ticket.criteria),
+                "spec": ticket.spec,
+                "scope": sorted(ticket.allowed_files),
+                "path": test_path,
+                "command": self.config.command_for("test", test_path),
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _tests_are_current(
+        self, ticket: Ticket, test_path: str, fingerprint: str, failure: str
+    ) -> str:
+        """Why the tests must be rewritten, or "" to keep the ones on disk.
+
+        The tester is the most expensive role in the loop — 916 calls and
+        18,253 seconds on one run, more wall clock than the executor — and
+        almost all of it re-derived the same assertions from criteria that had
+        not moved. One ticket regenerated a functionally identical file 430
+        times, several of them byte-identical in groups of fifteen. Worse than
+        the cost: the executor was being judged against a target that moved
+        under it every attempt.
+
+        Four things unfreeze it, and each is a case where the file on disk is
+        genuinely wrong rather than merely old.
+        """
+        if not self.config.loop.freeze_tests:
+            return "freezeTests is off"
+        if not ticket.tests_fingerprint:
+            return "no tests have been written for this ticket yet"
+        if not (self.config.root / test_path).is_file():
+            # Reclaimed by `_discard_tests`, taken out by `_quarantine`, or
+            # never landed. Whatever the reason, there is nothing to keep.
+            return "the test file is not on disk"
+        if ticket.tests_fingerprint != fingerprint:
+            return "the criteria, spec, scope or test command changed"
+        if errors_naming(failure, test_path):
+            # The one failure that is the tester's own. A test that does not
+            # compile, does not import, or breaks the linter is the tester's to
+            # fix and nobody else's — the file is outside every other role's
+            # scope.
+            return "the last failure was in the test file itself"
+        return ""
+
+    def _toolchain_for(self, ticket: Ticket, extra: Sequence[str] = ()) -> dict[str, str]:
+        """The linter and compiler settings that will grade this work.
+
+        Resolved from the paths the role actually writes, not from the whole
+        repository: a ticket writing TypeScript has no use for the GDScript
+        linter's thresholds, and sending both is how a small prompt stops being
+        one. `extra` carries paths the caller owns that the ticket does not —
+        the tester's own file, which is the file it is graded on.
+
+        Never raises and never blocks. An empty answer is the state every role
+        was in before this existed.
+        """
+        if not self.config.loop.toolchain_context:
+            return {}
+        try:
+            return toolchain.toolchain_context(
+                self.config, list(ticket.allowed_files) + list(extra)
+            )
+        except Exception:  # noqa: BLE001 - context is never worth an attempt
+            return {}
+
     def _sources_for(
         self,
         ticket: Ticket,
@@ -3809,6 +4441,11 @@ class Orchestrator:
                         failure_context,
                         retrieved,
                         sources,
+                        toolchain=self._toolchain_for(ticket),
+                        learned_limit=self.config.loop.learned_limit,
+                        failure_classes=self.store.ticket_classes(
+                            run_id, ticket.ticket_id
+                        ),
                         prior_failures=prior_failures,
                         malformed=malformed,
                         prior_turns=prior_turns,
@@ -3867,6 +4504,35 @@ class Orchestrator:
 
         if parsed.is_blocked:
             return StepResult(ok=False, blocked=True, detail=parsed.blocked_reason)
+
+        # Kept, never acted on here. `IMPOSSIBLE:` is a claim about the ticket
+        # from the party least able to judge it: an executor that cannot pass a
+        # ticket has every reason to conclude nobody can. So it is held for the
+        # escalation rung, where the planner is shown it beside the criteria
+        # and asked to confirm or refute it.
+        #
+        # Recorded even when the reply also carried files — that is the shape
+        # it actually arrives in. One executor implemented its best guess and
+        # wrote "there's a contradiction in the acceptance criteria" alongside
+        # it on attempt 58 of 430. It was right, the edits parsed, and the
+        # sentence was read by nothing.
+        if parsed.is_impossible:
+            first = ticket.ticket_id not in self._impossible_claims
+            self._impossible_claims[ticket.ticket_id] = parsed.impossible_reason
+            if first:
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: the executor says this ticket cannot "
+                    f"be satisfied as written — {parsed.impossible_reason[:400]}. "
+                    f"Held for the planner to confirm or refute; the attempt "
+                    f"continues.",
+                    level="warn",
+                    kind="ticket",
+                    data={
+                        "ticket": ticket.ticket_id,
+                        "impossible": parsed.impossible_reason,
+                    },
+                )
 
         # Still unreadable after being told exactly what was wrong with it —
         # which for a local model is the common case rather than the rare one,
@@ -4044,7 +4710,30 @@ class Orchestrator:
                 "Review will check the criteria instead.",
                 kind="ticket",
             )
-        if ticket.criteria and test_path and repro is None:
+        fingerprint = self._tests_fingerprint(ticket, test_path)
+        rewrite_because = self._tests_are_current(
+            ticket, test_path, fingerprint, failure_context
+        )
+        if ticket.criteria and test_path and repro is None and not rewrite_because:
+            # Kept, not rewritten. The assertions are a function of the criteria
+            # and the criteria have not moved, so the answer would be the same
+            # one at the price of the loop's most expensive role — and the
+            # executor gets a fixed target instead of one that moves under it
+            # every attempt.
+            self._record_step(
+                ticket,
+                "tests",
+                "ok",
+                {"kept": test_path, "reason": "criteria unchanged"},
+            )
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: kept the tests already written for these "
+                f"criteria ({test_path}); nothing they are derived from has "
+                f"changed.",
+                kind="ticket",
+            )
+        elif ticket.criteria and test_path and repro is None:
             step_id = self.store.start_step(run_id, ticket.ticket_id, "tests")
             existed = (self.config.root / test_path).exists()
             # Whether the suite is *supposed* to have grown this attempt, which
@@ -4083,6 +4772,14 @@ class Orchestrator:
                         # nothing to do with it. All read-only here: the tester
                             # writes its own file and returns none of these.
                             sources=self._sources_for(ticket, extra=written)[0],
+                            # Keyed on the tester's own file as well as the
+                            # ticket's: the test file is what the tester is
+                            # graded on, and on one run it carried 117 lint
+                            # failures against a config it had never seen.
+                            toolchain=self._toolchain_for(
+                                ticket, extra=[test_path]
+                            ),
+                            learned_limit=self.config.loop.learned_limit,
                             rejected_bindings=rejected_bindings,
                             # Pointed at rather than left to be noticed. The
                             # tester is the only role that can edit this file,
@@ -4159,6 +4856,11 @@ class Orchestrator:
                         # existence. Overwriting one that was already there is
                         # not a licence to delete it later.
                         authored.setdefault(test_path, not existed)
+                    # Noted only once the file is on disk. A fingerprint
+                    # recorded for tests that never landed would keep the next
+                    # attempt from writing any.
+                    ticket.tests_fingerprint = fingerprint
+                    self.store.record_tests_fingerprint(run_id, ticket)
                 self.store.end_step(
                     step_id, "ok", "\n".join(e.path for e in test_parsed.edits)
                 )
@@ -4183,6 +4885,23 @@ class Orchestrator:
                     level="warn",
                     kind="ticket",
                 )
+
+        # --- FORMAT --------------------------------------------------
+        # Between authoring and judging, over what this attempt actually
+        # landed: the executor's files and the tester's. Nothing here can fail
+        # the attempt — see `_format_pass`.
+        #
+        # Never the reproduction. On a bug ticket `test_path` is the test that
+        # proved the fault, and it is the standard the fix is measured against
+        # — the one file in the pipeline nothing may rewrite, for the same
+        # reason the executor cannot edit it and `_discard_tests` does not
+        # reclaim it. "It only changes whitespace" is a claim about a
+        # third-party binary, and it is not one worth making about the
+        # contract.
+        formattable = list(written)
+        if test_path and repro is None:
+            formattable.append(test_path)
+        self._format_pass(run_id, ticket, formattable)
 
         # --- VERIFY --------------------------------------------------
         inherited = pre_existing or {}

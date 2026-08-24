@@ -163,6 +163,215 @@ _SKIP_DIRS = frozenset(
 MAX_WORKSPACE_DEPTH = 3
 
 
+# What states the rules a language is *graded* against, keyed by ecosystem.
+# A different question from `LANGUAGE_MANIFESTS`, which answers "can this be
+# built here at all". This answers "what did somebody configure that will
+# reject the code before a human reads it" — the compiler flags, the linter
+# thresholds, the disabled checks and the reasons for them.
+#
+# The question is worth asking because nothing else in the pipeline asked it.
+# The roles are measured by `commands.lint` and `commands.typecheck` and were
+# never shown what those commands enforce. One repository set
+# `noUncheckedIndexedAccess` in a `tsconfig.json` no prompt contained, and the
+# executor spent 512 failures inferring it from `TS2532` two at a time; another
+# set `max-line-length: 125` in a `gdlintrc` nobody saw. See
+# docs/CONVERGENCE.md.
+#
+# Ordered most-authoritative first within an ecosystem, because the total cap
+# takes from the end.
+#
+# Linter and compiler configuration only. A build manifest earns a place here
+# only where it genuinely grades the code rather than listing dependencies:
+# `package.json` because `type` and `scripts` decide what module resolution
+# rejects — this run's 33 `TS5097` import-extension failures came from exactly
+# that pair — `Cargo.toml` for `[lints]`, `go.mod` for the language version,
+# `pyproject.toml` and friends because that is where `ruff` and `mypy` are
+# configured. `project.godot`, `Gemfile`, `mix.exs`, `pubspec.yaml` and
+# `Package.swift` are deliberately absent: they say nothing about how the code
+# is judged, and one of them is 4 KB of input maps that would ride on every
+# GDScript prompt in the run.
+_TOOLCHAIN_FAMILIES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        (".ts", ".tsx", ".mts", ".cts"),
+        (
+            "tsconfig.json",
+            "eslint.config.js", "eslint.config.mjs", "eslint.config.ts",
+            ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs", ".eslintrc",
+            "vitest.config.ts", "vitest.config.js",
+            "jest.config.js", "jest.config.ts",
+            "biome.json",
+            "package.json",
+        ),
+    ),
+    (
+        (".js", ".mjs", ".cjs", ".jsx"),
+        (
+            "jsconfig.json",
+            "eslint.config.js", "eslint.config.mjs",
+            ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs", ".eslintrc",
+            "vitest.config.js", "jest.config.js",
+            "biome.json",
+            "package.json",
+        ),
+    ),
+    ((".gd",), ("gdlintrc", ".gdlintrc")),
+    (
+        (".py",),
+        (
+            "ruff.toml", ".ruff.toml", "mypy.ini", ".mypy.ini", "setup.cfg",
+            ".flake8", "tox.ini", "pyrightconfig.json", "pyproject.toml",
+        ),
+    ),
+    (
+        (".rs",),
+        ("clippy.toml", ".clippy.toml", "rustfmt.toml", ".rustfmt.toml", "Cargo.toml"),
+    ),
+    ((".go",), (".golangci.yml", ".golangci.yaml", "go.mod")),
+    ((".rb",), (".rubocop.yml",)),
+    ((".php",), ("phpstan.neon", "phpcs.xml", "composer.json")),
+    ((".swift",), (".swiftlint.yml",)),
+    (
+        (".java", ".kt", ".kts"),
+        ("checkstyle.xml", "detekt.yml", "build.gradle", "build.gradle.kts", "pom.xml"),
+    ),
+    ((".ex", ".exs"), (".credo.exs",)),
+    ((".dart",), ("analysis_options.yaml",)),
+)
+
+TOOLCHAIN_FILES: dict[str, tuple[str, ...]] = {
+    suffix: names for suffixes, names in _TOOLCHAIN_FAMILIES for suffix in suffixes
+}
+
+# Caps. Far tighter than `MAX_FILE_CHARS`, because this rides on *every* build
+# and tests call rather than once per setup: a `tsconfig.json` is 400 bytes,
+# and a config needing 4,000 of them is not one the executor is failing on.
+MAX_TOOLCHAIN_FILE_CHARS = 4_000
+MAX_TOOLCHAIN_TOTAL_CHARS = 12_000
+
+# Keys worth keeping from a manifest that is mostly a dependency list. A
+# `package.json` with 200 dependencies says nothing about how code is graded;
+# its `scripts` say everything. A file not listed here is sent whole, clipped.
+_MANIFEST_KEYS: dict[str, tuple[str, ...]] = {
+    "package.json": (
+        "name", "type", "scripts", "exports", "main", "module",
+        "imports", "workspaces", "engines", "packageManager",
+    ),
+    "composer.json": ("name", "type", "scripts", "autoload", "require-dev"),
+    "deno.json": ("tasks", "compilerOptions", "lint", "fmt", "imports"),
+}
+
+
+def _distil_manifest(name: str, text: str) -> str:
+    """A manifest reduced to the keys that describe how the code is graded.
+
+    Returns the text unchanged when the file is not a manifest this knows, or
+    when it does not parse — a `package.json` with a trailing comma is still
+    better read than dropped, and guessing at its structure is what this avoids.
+
+    What was dropped is named rather than silently removed. A role told the
+    file is abridged can say so; one shown a `package.json` with no
+    `dependencies` key may conclude the project has none.
+    """
+    wanted = _MANIFEST_KEYS.get(name)
+    if not wanted:
+        return text
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return text
+    if not isinstance(data, dict):
+        return text
+    kept = {key: data[key] for key in wanted if key in data}
+    if not kept:
+        return text
+    dropped = sorted(set(data) - set(kept))
+    rendered = json.dumps(kept, indent=2)
+    if dropped:
+        rendered += (
+            "\n\nomitted, and not part of how this code is graded: "
+            + ", ".join(dropped)
+        )
+    return rendered
+
+
+def toolchain_context(config: Any, paths: Sequence[str]) -> dict[str, str]:
+    """The configuration that grades `paths`, as `{repo-relative path: text}`.
+
+    Resolved per language, walking up from each file's own directory to its
+    workspace root — a `tsconfig.json` beside the code wins over the one at the
+    repository root, which is the whole reason a nested build has its own.
+
+    Read-only, and never writable. The caller puts these behind their own
+    heading rather than folding them into the reference sources, because the
+    instruction is different: a reference file says *take the signatures from
+    here*, and one of these says *this is the standard you are measured
+    against, and code that breaks it fails before anyone reads it*.
+
+    Never raises. A repository with none of these files is ordinary and gets an
+    empty answer; so does one whose config cannot be read, because a role shown
+    nothing is exactly where it was before this existed.
+    """
+    root = Path(config.root)
+    found: dict[str, str] = {}
+    for path in sorted({str(item) for item in paths}):
+        if any(character in path for character in "*?["):
+            continue  # a scope glob, not a file
+        wanted = TOOLCHAIN_FILES.get(Path(path).suffix.lower())
+        if not wanted:
+            continue
+        workspace = config.workspace_for(path)
+        ceiling = _normal(workspace.root) if workspace is not None else ""
+        for name in wanted:
+            resolved = _nearest(root, path, name, ceiling)
+            if resolved is None or resolved in found:
+                continue
+            text = _read_capped(root / resolved)
+            if text.strip():
+                found[resolved] = _distil_manifest(name, text)
+
+    # Truncating the set rather than the files: half a `tsconfig.json` states
+    # compiler flags the other half turns off. The order the loop above built
+    # is most-authoritative first, so what goes is the least load-bearing.
+    total = 0
+    kept: dict[str, str] = {}
+    for resolved, text in found.items():
+        total += len(text)
+        if total > MAX_TOOLCHAIN_TOTAL_CHARS:
+            break
+        kept[resolved] = text
+    return kept
+
+
+def _nearest(root: Path, path: str, name: str, ceiling: str) -> str | None:
+    """`name` in the closest directory at or above `path`, within `ceiling`.
+
+    `ceiling` is the owning workspace's root, normalised, or "" for the
+    repository itself. Stopping there matters: a nested build's rules are its
+    own, and walking past it hands the executor the parent project's compiler
+    flags for files the parent cannot see.
+    """
+    directory = (Path(path).parent.as_posix() or ".").strip("/")
+    while True:
+        candidate = f"{directory}/{name}" if directory not in ("", ".") else name
+        if (root / candidate).is_file():
+            return candidate
+        if directory in ("", ".") or _normal(directory) == ceiling:
+            return None
+        parent, _, _tail = directory.rpartition("/")
+        directory = parent or "."
+
+
+def _read_capped(path: Path) -> str:
+    """A toolchain file's text, clipped, or "" if it cannot be read."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if len(text) <= MAX_TOOLCHAIN_FILE_CHARS:
+        return text
+    return text[:MAX_TOOLCHAIN_FILE_CHARS] + "\n… truncated\n"
+
+
 def manifest_gaps(config: Any, tickets: Sequence[Any]) -> list[str]:
     """Languages a backlog writes that its build cannot build yet.
 
@@ -294,10 +503,20 @@ Rules:
   command's real form depends on a CI variable, leave it empty and say so.
 - Some projects have no separate type-check step. That is normal — return empty
   rather than inventing one.
+- `format` is different from the other three and the difference matters. It is
+  a command that **rewrites files in place**, and the harness appends the paths
+  to rewrite: report `gdformat`, `prettier --write`, `ruff format`, `rustfmt`,
+  `gofmt -w`, `black`, `dart format` — never a whole-tree invocation like
+  `prettier --write .`, never a check-only mode like `black --check` or
+  `gofmt -l`, and never a `make fmt` target whose own arguments you cannot see.
+  A command that ignores the files appended to it would reformat the whole
+  repository on every attempt, which is an out-of-scope edit the loop cannot
+  undo. If the project's formatter can only be run over everything, return
+  empty — no formatter is a supported answer and a wrong one is not.
 
 Reply with a single JSON object and nothing else:
 
-{"lint": "...", "typecheck": "...", "test": "...",
+{"lint": "...", "typecheck": "...", "test": "...", "format": "...",
  "source": "which file each command came from, one short line",
  "confidence": "high" | "low"}
 """
@@ -307,7 +526,9 @@ Reply with a single JSON object and nothing else:
 class Detection:
     """What a detection attempt produced, successful or not."""
 
-    commands: dict[str, str] = field(default_factory=lambda: {"lint": "", "typecheck": "", "test": ""})
+    commands: dict[str, str] = field(
+        default_factory=lambda: {"lint": "", "typecheck": "", "test": "", "format": ""}
+    )
     source: str = ""
     confidence: str = "low"
     # Populated when detection could not run or could not be trusted. The
@@ -481,7 +702,10 @@ def parse_detection(text: str) -> Detection:
         return Detection(error=f"could not read the reply as JSON ({exc})")
 
     return Detection(
-        commands={name: clean_command(data.get(name)) for name in ("lint", "typecheck", "test")},
+        commands={
+            name: clean_command(data.get(name))
+            for name in ("lint", "typecheck", "test", "format")
+        },
         source=str(data.get("source", ""))[:300],
         confidence="high" if str(data.get("confidence", "")).lower() == "high" else "low",
     )

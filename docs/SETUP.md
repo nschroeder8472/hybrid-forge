@@ -810,7 +810,7 @@ the attempts it saves:
 "loop": { "maxAttempts": 3, "baselineVerify": false }
 ```
 
-**`executorTurns`** (default `0`, off) replays that many prior attempts to the
+**`executorTurns`** (default `4`) replays that many prior attempts to the
 executor as real conversation turns — its own reply as an `assistant` message,
 the failure that followed as the next `user` one — instead of one user message
 rewritten every attempt. What it buys is the one thing the flat prompt cannot
@@ -820,13 +820,16 @@ claiming authorship, a model reads its own work as somebody else's and answers
 mutate, so the KV prefix stays stable instead of being re-prefilled each time —
 which matters most with a single local model loaded.
 
-It is off because the trade is not clean: a model shown its own wrong answer as
-an assistant turn defends it more readily, and the flat prompt already anchors
-that way through disk state. Which effect wins is a measurement, so run the same
-backlog both ways rather than assuming:
+The trade is not free: a model shown its own wrong answer as an assistant turn
+defends it more readily, and the flat prompt already anchors that way through
+disk state. Which effect wins was a measurement, and the Puzzle-Path run of
+2026-08-22/23 made it — with this at `0`, one ticket ran 430 attempts whose
+failure curve never descended, each attempt meeting its own previous work as a
+stranger's. See [CONVERGENCE.md](CONVERGENCE.md). Set it to `0` to restore the
+flat prompt:
 
 ```json
-"loop": { "maxAttempts": 3, "executorTurns": 2 }
+"loop": { "maxAttempts": 3, "executorTurns": 0 }
 ```
 
 Nothing else changes. The conversation is rebuilt from `run.db` on every call,

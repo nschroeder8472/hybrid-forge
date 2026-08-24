@@ -247,7 +247,9 @@ class TestWizardFlow(unittest.TestCase):
         # Probes and detection are stubbed: this exercises the flow, not the
         # network and not a model.
         found = detection or toolchain.Detection(
-            commands={"lint": "", "typecheck": "", "test": "detected-test"},
+            commands={
+                "lint": "", "typecheck": "", "test": "detected-test", "format": ""
+            },
             confidence="high",
             evidence=[".github/workflows/ci.yml"],
         )
@@ -267,7 +269,7 @@ class TestWizardFlow(unittest.TestCase):
             "1", "opus",                                     # claude-cli
             "http://gpu:8787/mcp", "n",                      # memory, no write-back
             "myroom",                                        # room
-            "y", "", "", "",                                 # detect, accept commands
+            "y", "", "", "", "",                             # detect, commands, format
             "src/auth/**, migrations/**",                    # neverDelegate
             "y",                                             # write
         ])
@@ -299,7 +301,7 @@ class TestWizardFlow(unittest.TestCase):
             "1", "opus",
             "http://gpu:8787/mcp", "n",
             "myroom",
-            "y", "", "", "",
+            "y", "", "", "", "",
             "",
             "y",
         ], profile=Profile(path=path))
@@ -318,7 +320,7 @@ class TestWizardFlow(unittest.TestCase):
         root = temp_repo("Cargo.toml")
         result = self._run(root, [
             "http://gpu:11434/v1", "m", "", "1", "opus", "",
-            "r", "y", "", "", "", "", "n",
+            "r", "y", "", "", "", "", "", "n",
         ])
         self.assertIsNone(result)
         self.assertFalse((root / ".hybridforge").exists())
@@ -336,20 +338,26 @@ class TestWizardFlow(unittest.TestCase):
                 Profile(path=Path(tempfile.mkdtemp()) / "profile.json"),
                 wizard.Prompter(enabled=True, reader=scripted([
                     "http://gpu:11434/v1", "m", "", "1", "opus", "",
-                    "r", "n", "", "", "", "", "y",
+                    "r", "n", "", "", "", "", "", "y",
                 ])),
             )
         detect.assert_not_called()
-        self.assertEqual(config.commands, {"lint": "", "typecheck": "", "test": ""})
+        self.assertEqual(
+            config.commands,
+            {"lint": "", "typecheck": "", "test": "", "format": ""},
+        )
 
     def test_a_failed_detection_leaves_the_commands_blank(self):
         config, _ = self._run(
             temp_repo("Cargo.toml"),
             ["http://gpu:11434/v1", "m", "", "1", "opus", "",
-             "r", "y", "", "", "", "", "y"],
+             "r", "y", "", "", "", "", "", "y"],
             detection=toolchain.Detection(error="planner unreachable"),
         )
-        self.assertEqual(config.commands, {"lint": "", "typecheck": "", "test": ""})
+        self.assertEqual(
+            config.commands,
+            {"lint": "", "typecheck": "", "test": "", "format": ""},
+        )
 
     def test_saved_profile_supplies_every_default_on_the_next_repo(self):
         profile = Profile(
@@ -366,7 +374,7 @@ class TestWizardFlow(unittest.TestCase):
         # room and commands, which is the whole point of saving the profile.
         config, _ = self._run(
             temp_repo("go.mod"),
-            ["", "", "", "", "", "", "n", "", "", "", "", "", "", "y"],
+            ["", "", "", "", "", "", "n", "", "", "", "", "", "", "", "y"],
             profile=profile,
         )
         self.assertEqual(config.models["local"]["baseUrl"], "http://gpu:11434/v1")
@@ -374,11 +382,33 @@ class TestWizardFlow(unittest.TestCase):
         self.assertEqual(config.memory["url"], "http://gpu:8787/mcp")
         self.assertEqual(config.commands["test"], "detected-test")
 
+    def test_write_back_is_offered_with_yes_as_the_default(self):
+        # Enter through the memory question and it comes back on, in dry-run.
+        # Defaulting to no produced a run with 262 memory retrievals and zero
+        # writes, which rediscovered the same conventions eleven times. Dry-run
+        # is what makes yes safe to default to: it writes nothing and logs what
+        # it would have written.
+        config, _ = self._run(temp_repo("pyproject.toml"), [
+            "http://gpu:11434/v1", "m", "", "1", "opus",
+            "http://gpu:8787/mcp", "",           # memory, write-back defaulted
+            "r", "y", "", "", "", "", "", "y",
+        ])
+        self.assertTrue(config.memory["write"])
+        self.assertTrue(config.memory["dryRun"])
+
+    def test_write_back_when_declined_is_absent(self):
+        config, _ = self._run(temp_repo("pyproject.toml"), [
+            "http://gpu:11434/v1", "m", "", "1", "opus",
+            "http://gpu:8787/mcp", "n",          # memory, write-back no
+            "r", "y", "", "", "", "", "", "y",
+        ])
+        self.assertNotIn("write", config.memory)
+
     def test_write_back_when_accepted_starts_in_dry_run(self):
         config, _ = self._run(temp_repo("pyproject.toml"), [
             "http://gpu:11434/v1", "m", "", "1", "opus",
             "http://gpu:8787/mcp", "y",          # memory, write-back yes
-            "r", "y", "", "", "", "", "y",
+            "r", "y", "", "", "", "", "", "y",
         ])
         self.assertTrue(config.memory["write"])
         self.assertTrue(config.memory["dryRun"])
@@ -387,7 +417,7 @@ class TestWizardFlow(unittest.TestCase):
         config, _ = self._run(temp_repo(), [
             "http://gpu:11434/v1", "m", "",
             "4",                                  # same model as executor
-            "", "r", "y", "", "", "", "", "y",
+            "", "r", "y", "", "", "", "", "", "y",
         ])
         config.validate()
         self.assertEqual(config.roles["reviewer"], "local")
@@ -468,7 +498,9 @@ class TestSetupProposesTheBuildsItFinds(unittest.TestCase):
 
     def _run(self, root: Path, answers: list[str]):
         found = toolchain.Detection(
-            commands={"lint": "", "typecheck": "", "test": "detected-test"},
+            commands={
+                "lint": "", "typecheck": "", "test": "detected-test", "format": ""
+            },
             confidence="high",
             evidence=[".github/workflows/ci.yml"],
         )
@@ -494,7 +526,7 @@ class TestSetupProposesTheBuildsItFinds(unittest.TestCase):
         root = self._repo("pyproject.toml")
 
         config, _profile = self._run(
-            root, self._MODELS + ["y", "", "", "", "", "y"]
+            root, self._MODELS + ["y", "", "", "", "", "", "y"]
         )
 
         self.assertEqual([w.root for w in config.workspaces], ["."])
@@ -509,8 +541,9 @@ class TestSetupProposesTheBuildsItFinds(unittest.TestCase):
             self._MODELS
             + [
                 "y",                                    # configure separately
-                "y", "gdlint", "", "godot-test",        # the root build
+                "y", "gdlint", "", "godot-test", "gdformat",      # root build
                 "y", "npm run lint", "tsc --noEmit", "npm test",  # path-forge
+                "prettier --write",                              # its formatter
                 "",                                     # neverDelegate
                 "y",                                    # write
             ],
@@ -534,7 +567,7 @@ class TestSetupProposesTheBuildsItFinds(unittest.TestCase):
 
         config, _profile = self._run(
             root,
-            self._MODELS + ["n", "y", "", "", "", "", "y"],
+            self._MODELS + ["n", "y", "", "", "", "", "", "y"],
         )
 
         self.assertEqual([w.root for w in config.workspaces], ["."])
@@ -561,7 +594,7 @@ class TestSetupProposesTheBuildsItFinds(unittest.TestCase):
                     enabled=True,
                     reader=scripted(
                         self._MODELS
-                        + ["y", "y", "", "", "", "y", "", "", "", "", "y"]
+                        + ["y", "y", "", "", "", "", "y", "", "", "", "", "", "y"]
                     ),
                 ),
             )
@@ -574,7 +607,7 @@ class TestSetupProposesTheBuildsItFinds(unittest.TestCase):
         config, _profile = self._run(
             root,
             self._MODELS
-            + ["y", "y", "", "", "a", "y", "", "", "b", "", "y"],
+            + ["y", "y", "", "", "a", "", "y", "", "", "b", "", "", "y"],
         )
 
         preview = wizard._preview(config)

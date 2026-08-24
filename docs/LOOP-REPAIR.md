@@ -998,7 +998,7 @@ backticks — which feeds the 1.1 false positives.
 
 An experiment, not a fix. Run it only against a green Phase 1–3 baseline.
 
-**Built — `loop.executorTurns`, default 0.** `Store.ticket_turns` rebuilds the
+**Built — `loop.executorTurns`, default 4.** `Store.ticket_turns` rebuilds the
 exchange from `steps` on every call: each `build` step's reply paired with the
 step that failed next. A reply with no failure after it is dropped rather than
 paired with the next one along — an attempt can end without a failed step, and
@@ -1234,7 +1234,7 @@ land too — one branch to push when the backlog is green.
 | — | 3.3 | Done — both lists seeded from the step log on a retry cycle |
 | — | 3.6 | Done — a review-only ticket is named at run end |
 | — | 3.1 | Done — spec-entailed criteria admitted, `forge criteria` adopts the rest |
-| — | 4.1 | Built behind `loop.executorTurns`; unmeasured |
+| — | 4.1 | Built as `loop.executorTurns`; measured, now default 4 |
 | 1 | 2.4 | Conditional on the reviewer still fabricating |
 
 1.6 is a decision, not a code change, and should be settled before the next

@@ -7,6 +7,24 @@ deleted rather than implemented.
 
 ---
 
+## Convergence — specified, not built
+
+**Status:** ten features specified in [CONVERGENCE.md](CONVERGENCE.md), derived
+from the `Puzzle-Path` run of 2026-08-22/23.
+
+The problem that document names: a run can be long without being wrong, and
+this one was neither converging nor able to tell. 18.2 hours, 24.5M tokens, 430
+attempts on one ticket, and the distinct-error-kinds-per-failure curve is flat
+across every decile of every stuck ticket. The loop had no measure of progress,
+its only durable per-ticket learning slot was rebuilt from the plan every cycle,
+and the models were being graded against linter and compiler configuration they
+were never shown.
+
+The stall-detection note under *Deferred from the review* below is the same
+problem seen from the image loop, and Feature 7 is its general answer.
+
+---
+
 ## Bug-report loop — built
 
 **Status:** shipped as `forge bug`. See [BUG-LOOP.md](BUG-LOOP.md) for how it

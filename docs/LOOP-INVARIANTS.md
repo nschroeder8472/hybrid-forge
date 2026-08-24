@@ -83,11 +83,17 @@ reviewer helps settle the contract it will later judge work against. That is a
 weaker version of this rule, taken deliberately: the failure it removes (review
 rejecting a diff over a bar the reviewer never agreed to, on a ticket that did
 what it was told) has been observed, and the failure it risks (a reviewer
-anchored on a contract it helped write) has not. The mitigations are that it is
-off by default, that the criteria may only move *before* any attempt exists —
-after that respec's ratchet protects the ratified contract exactly as it
-protects a human's — and that the whole argument is recorded on the ticket
-where a person can read it. See [RATIFY.md](RATIFY.md).
+anchored on a contract it helped write) has not. The mitigations are that the
+criteria may only move *before* any attempt exists — after that respec's
+ratchet protects the ratified contract exactly as it protects a human's — and
+that the whole argument is recorded on the ticket where a person can read it.
+
+Being off by default used to be a third mitigation and is not any more: it is
+`2` since the Puzzle-Path run of 2026-08-22/23, where two unbuildable tickets
+reached the executor because nothing had asked whether they were buildable.
+`ratifyPasses: 0` still restores the old behaviour, and the trade is argued in
+[RATIFY.md](RATIFY.md). See [RATIFY.md](RATIFY.md) and
+[CONVERGENCE.md](CONVERGENCE.md).
 
 ---
 
