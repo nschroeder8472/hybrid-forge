@@ -10747,6 +10747,51 @@ class TestTheLoopCountsWhatKeepsFailing(unittest.TestCase):
 
         self.assertEqual(store.ticket_classes(run_id, "T-1"), [])
 
+    def test_a_step_that_cannot_fail_the_ticket_is_not_one_of_its_failures(self):
+        # `record` and `stuck-review` are already documented as unable to
+        # change how a ticket ends. But a failed step filed under a ticket id
+        # was classified like any other, and the classes are what convergence
+        # counts. On one run the planner exhausted its output budget on hidden
+        # reasoning during `record`; the memory step failing and then
+        # succeeding flipped a ticket's class count 2 -> 3 -> 2, the loop
+        # reported "converging — 2 kind(s) left, down from 3", and the flat
+        # counter reset. Eight cycles of identical test failures ended at
+        # `flat_cycles = 0`, so the ticket never reached the rung that asks
+        # whether it is winnable.
+        store, run_id = self._store()
+        self._fail(store, run_id, "test", "FAIL tests/a.test.ts\nAssertionError: x")
+        self._fail(store, run_id, "record", "the planner spent its whole budget")
+        self._fail(store, run_id, "stuck-review", "the reviewer could not be reached")
+
+        self.assertEqual(
+            [entry["name"] for entry in store.ticket_classes(run_id, "T-1")],
+            ["test AssertionError", "test test failed in tests/a.test.ts"],
+        )
+
+    def test_it_is_not_stored_as_a_class_either(self):
+        # Not filtered on read alone: a class recorded against a step that
+        # cannot produce one is wrong on disk too, and a second reader would
+        # have to know to drop it.
+        store, run_id = self._store()
+        self._fail(store, run_id, "record", "src/a.ts(4,1): error TS2532: x")
+
+        row = store._connection.execute(
+            "SELECT classes FROM steps WHERE name = 'record'"
+        ).fetchone()
+
+        self.assertEqual(json.loads(row["classes"]), [])
+
+    def test_the_executor_is_not_shown_them_as_prior_failures(self):
+        # `ticket_failures` feeds the prompt. A recorder that ran out of budget
+        # is not something the next attempt can act on.
+        store, run_id = self._store()
+        self._fail(store, run_id, "test", "FAIL tests/a.test.ts\nAssertionError: x")
+        self._fail(store, run_id, "record", "the planner spent its whole budget")
+
+        failures = store.ticket_failures(run_id, "T-1")
+
+        self.assertEqual([f["name"] for f in failures], ["test"])
+
     def test_the_count_is_how_many_attempts_produced_it(self):
         store, run_id = self._store()
         for line in (4, 51, 92):

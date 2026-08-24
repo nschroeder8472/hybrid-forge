@@ -32,6 +32,35 @@ from .failures import classify, clip, distill
 # which part of an over-long output that buys; see its docstring.
 DETAIL_CHARS = 20_000
 
+# Steps whose failure says nothing about the ticket's code, and which therefore
+# must not appear in its failure classes.
+#
+# Both are already documented as unable to change how a ticket ends — the
+# recorder because "losing the note is the smaller loss", the stuck reviewer
+# because it is asked a question *about* the ticket rather than run against it.
+# But a failed step filed under a ticket id is classified like any other, and
+# the classes are what convergence counts.
+#
+# That is not theoretical. On one run the planner exhausted its output budget
+# on hidden reasoning during `record`, and PF-007's class set became:
+#
+#     record forge-plan:latest spent its entire # #-token output budget o
+#     test[path_forge] AssertionError
+#     test[path_forge] test failed in tests/vector3i_hash.test.ts
+#
+# The memory step failing and then succeeding flipped the count 2 -> 3 -> 2, so
+# the loop reported "converging — 2 kind(s) of failure left, down from 3" and
+# reset the flat counter. The ticket finished eight cycles of *identical* test
+# failures at `flat_cycles = 0`, never reached the next rung of the ladder, and
+# was never asked whether it was winnable.
+NOT_ABOUT_THE_CODE = ("record", "stuck-review")
+
+
+def _placeholders(values: tuple[str, ...]) -> str:
+    """`?, ?, ?` for an `IN` clause. sqlite3 binds no sequences."""
+    return ", ".join("?" * len(values))
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -932,8 +961,9 @@ class Store:
         rows = self._connection.execute(
             "SELECT name, detail, classes FROM steps "
             "WHERE run_id = ? AND ticket_id = ? AND status = 'failed' AND detail != '' "
+            f"AND name NOT IN ({_placeholders(NOT_ABOUT_THE_CODE)}) "
             "ORDER BY id DESC LIMIT ?",
-            (run_id, ticket_id, limit * 4),
+            (run_id, ticket_id, *NOT_ABOUT_THE_CODE, limit * 4),
         ).fetchall()
 
         # Steps keep the raw output — it is the durable record. Distil here,
@@ -1211,7 +1241,9 @@ class Store:
             row = self._connection.execute(
                 "SELECT name FROM steps WHERE id = ?", (step_id,)
             ).fetchone()
-            if row is not None:
+            # A step that cannot fail the ticket has no class. See
+            # `NOT_ABOUT_THE_CODE` for what one cost.
+            if row is not None and row["name"] not in NOT_ABOUT_THE_CODE:
                 classes = sorted(classify(row["name"], detail))
         with self._write() as connection:
             connection.execute(
@@ -1291,8 +1323,9 @@ class Store:
         rows = self._connection.execute(
             "SELECT id, classes FROM steps "
             "WHERE run_id = ? AND ticket_id = ? AND status = 'failed' AND id > ? "
+            f"AND name NOT IN ({_placeholders(NOT_ABOUT_THE_CODE)}) "
             "ORDER BY id",
-            (run_id, ticket_id, after),
+            (run_id, ticket_id, after, *NOT_ABOUT_THE_CODE),
         ).fetchall()
 
         seen: dict[str, dict] = {}
