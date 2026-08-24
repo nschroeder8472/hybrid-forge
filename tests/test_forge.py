@@ -78,6 +78,7 @@ from forge.failures import (
     _file_of,
     blocks_naming,
     classify,
+    clip,
     distill,
     environment_failure,
     errors_naming,
@@ -13119,6 +13120,74 @@ class TestLocationsReadsEveryDialect(unittest.TestCase):
             locations("/usr/lib/python3.11/site-packages/x.py:4: error"),
             ["/usr/lib/python3.11/site-packages/x.py"],
         )
+
+
+class TestWhatIsKeptOfAnOverlongStep(unittest.TestCase):
+    """A step's stored output was the first 20,000 characters of it. Which end
+    carries the verdict depends on the tool, and taking a side is wrong for
+    half of them: a compiler leads with its diagnostics, a test runner logs a
+    line per case and states what failed at the bottom.
+
+    On the run this comes from, 17 of one ticket's 37 recorded test failures
+    stored not one line of failure text. All 17 were exactly at the cap, and
+    every one of them was a run where discovery had succeeded — so there was
+    nothing at the head either. What was kept was the engine banner and several
+    hundred passing tests, filed as the evidence for a red step."""
+
+    def test_output_that_fits_is_untouched(self):
+        self.assertEqual(clip("a\nb\nc", 20_000), "a\nb\nc")
+
+    def test_both_ends_survive(self):
+        text = "\n".join(f"line {n}" for n in range(5_000))
+
+        kept = clip(text, 2_000)
+
+        self.assertLessEqual(len(kept), 2_000)
+        self.assertIn("line 0", kept)
+        self.assertIn("line 4999", kept)
+        self.assertIn("not stored", kept)
+
+    def test_it_never_cuts_a_line_in_half(self):
+        text = "\n".join(f"line {n} " + "x" * 60 for n in range(5_000))
+
+        for line in clip(text, 2_000).splitlines():
+            with self.subTest(line=line):
+                self.assertTrue(line.startswith("line ") or line.startswith("[…"))
+
+    def test_a_line_repeated_thousands_of_times_is_counted_not_kept(self):
+        # Position is the wrong thing to select on when most of the output is
+        # one sentence. A green gdUnit4 run of a 400-test suite is 738,000
+        # characters, 87% of which is two lines Godot writes while shutting
+        # down its renderer — *after* the run's verdict. The summary sits 29%
+        # of the way in with half a megabyte of that couplet behind it, so a
+        # head cut misses it and so does a tail cut.
+        noise = "ERROR: Condition is true. Returning: ERR_CANT_CREATE\n   at: swap_chain_resize (drivers/d3d12/rd.cpp:2837)\n"
+        text = "GdUnit4 Comandline Tool\n" + "filler\n" * 200 + (
+            "Overall Summary: 403 test cases | 2 failures\n"
+        ) + noise * 3_000
+
+        kept = clip(text, 20_000)
+
+        self.assertIn("GdUnit4 Comandline Tool", kept)
+        self.assertIn("Overall Summary: 403 test cases | 2 failures", kept)
+        self.assertIn("identical to", kept)
+        self.assertLessEqual(len(kept), 20_000)
+
+    def test_the_count_of_a_repeat_is_kept(self):
+        # "This happened 3,475 times" is itself a fact about the run.
+        kept = clip("head\n" + "same\n" * 4_000 + "tail\n", 1_000)
+
+        self.assertIn("3998 further line(s) identical to 1 shown above", kept)
+
+    def test_repeats_are_only_capped_when_the_output_is_too_long(self):
+        text = "same\n" * 5
+
+        self.assertEqual(clip(text, 20_000), text)
+
+    def test_a_diagnostic_repeated_twice_still_reads_as_repeated(self):
+        text = "error: boom\n" * 3 + "x\n" * 20_000
+
+        self.assertEqual(clip(text, 2_000).count("error: boom"), 2)
 
 
 class TestTheRuntimeIsNotTheProject(unittest.TestCase):

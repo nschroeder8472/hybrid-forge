@@ -20,6 +20,7 @@ never cut inside a line.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from pathlib import Path
 
 # Start of a diagnostic block. Deliberately broad — this runs over cargo, tsc,
@@ -539,6 +540,104 @@ def _clip_lines(lines: list[str], limit: int, *, note: str) -> str:
     if len(kept) < len(lines):
         kept.append(f"[{note}: {len(lines) - len(kept)} more line(s)]")
     return "\n".join(kept)
+
+
+# Room reserved for `clip`'s marker, which cannot be measured until the size of
+# what it is reporting is known. Generous: the message is fixed and the number
+# in it cannot exceed a step's output.
+_CLIP_MARKER = 120
+
+
+def clip(text: str, limit: int) -> str:
+    """`text` cut to `limit` characters, keeping both ends.
+
+    Which end carries the verdict depends on the tool, and taking a side is
+    wrong for half of them. A compiler leads with its diagnostics — tsc prints
+    nothing else, and Godot reports a parse error nine lines in, right under
+    its banner. A test runner ends with them: it logs a line per case as it
+    goes and states what failed at the bottom.
+
+    Head-only truncation lost the second kind completely. A gdUnit4 suite
+    prints `STARTED` and `PASSED` for every case, so a project with a few
+    hundred tests overruns any sane cap long before the summary — and on the
+    run this comes from, 17 of one ticket's 37 recorded test failures stored
+    not one line of failure text. All 17 were exactly at the cap, and every one
+    of them was a run where discovery had *succeeded*, so there was nothing at
+    the head either: what was kept was the engine banner and several hundred
+    passing tests, filed as the evidence for a red step.
+
+    The tail gets the larger share. A tool that leads with its diagnostics has
+    said what it has to say within a few KB; one that ends with them has its
+    per-case log running right up to the summary.
+    """
+    text = text or ""
+    if len(text) <= limit:
+        return text
+
+    text = _cap_repeats(text)
+    if len(text) <= limit:
+        return text
+
+    room = max(limit - _CLIP_MARKER, 0)
+    head, tail = room * 2 // 5, room - room * 2 // 5
+    # Whole lines, for the reason `_clip_lines` does it: a diagnostic cut in
+    # half reads as a claim about a symbol that is not in the source.
+    front = text[:head].rpartition("\n")[0] or text[:head]
+    back = text[len(text) - tail :].partition("\n")[2] or text[len(text) - tail :]
+    dropped = len(text) - len(front) - len(back)
+    return f"{front}\n[… {dropped} characters not stored …]\n{back}"
+
+
+# How many times one line may appear before the rest are counted instead of
+# kept. Two rather than one, so a genuinely repeated diagnostic still reads as
+# repeated.
+_REPEAT_LIMIT = 2
+
+
+def _cap_repeats(text: str) -> str:
+    """The same line over and over, replaced by a count of how often.
+
+    Position is the wrong thing to select on when most of the output is one
+    sentence. A green gdUnit4 run of a 400-test suite is 738,000 characters, of
+    which 633,000 — 87% — is two lines alternating 3,475 times apiece:
+
+        ERROR: Condition "!((HRESULT)(res) >= 0)" is true. Returning: …
+           at: swap_chain_resize (drivers/d3d12/rendering_device_driver_d3d12…)
+
+    Godot writes them while shutting down its renderer, *after* the run's
+    verdict. So the summary sits 29% of the way in, with half a megabyte of
+    that couplet behind it: a head cut misses it and so does a tail cut. With
+    the repeats counted the same run is 84,000 characters, the verdict is near
+    the end of it where a tail cut finds it, and exactly two distinct lines
+    were affected.
+
+    Only reached when the output is already over the limit, so nothing that
+    fits is ever altered — and the count is kept, because "this happened 3,475
+    times" is itself a fact about the run.
+    """
+    seen: Counter[str] = Counter()
+    dropped: Counter[str] = Counter()
+    kept: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            # Runs of blank lines are what removing thousands of lines leaves
+            # behind, and they cost the room this is trying to save.
+            if kept and kept[-1].strip():
+                kept.append(line)
+            continue
+        seen[stripped] += 1
+        if seen[stripped] <= _REPEAT_LIMIT:
+            kept.append(line)
+        else:
+            dropped[stripped] += 1
+
+    if not dropped:
+        return text
+    return "\n".join(kept) + (
+        f"\n[{sum(dropped.values())} further line(s) identical to "
+        f"{len(dropped)} shown above, not stored]"
+    )
 
 
 # A file location inside a diagnostic. Deliberately loose about the path shape,
