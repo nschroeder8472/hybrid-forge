@@ -560,18 +560,116 @@ class LoopSettings:
     # own reply as an `assistant` message, the failure that followed as the
     # next `user` one — capped at this many. 0 keeps the single-message shape.
     #
-    # Off by default because it is an experiment with a known risk in both
-    # directions. The executor has never seen its own output: it is shown the
-    # files as they exist on disk, with nothing saying it wrote them, which is
-    # the state that produced "Looking at the files provided, I can see they
-    # already implement the spec correctly." As a conversation that confusion
-    # cannot arise, and the turns append rather than mutate, so the KV prefix
-    # stays stable instead of being re-prefilled every attempt. Against that:
-    # a model shown its own wrong answer as an assistant turn defends it more
-    # readily. The current shape already anchors through disk state, so the
-    # trade is not clean either way — which is why this is measured on a
-    # backlog rather than switched on.
-    executor_turns: int = 0
+    # This was an experiment with a known risk in both directions. The executor
+    # has never seen its own output: it is shown the files as they exist on
+    # disk, with nothing saying it wrote them, which is the state that produced
+    # "Looking at the files provided, I can see they already implement the spec
+    # correctly." As a conversation that confusion cannot arise, and the turns
+    # append rather than mutate, so the KV prefix stays stable instead of being
+    # re-prefilled every attempt. Against that: a model shown its own wrong
+    # answer as an assistant turn defends it more readily.
+    #
+    # On by default since the Puzzle-Path run of 2026-08-22/23, where it was 0
+    # and the cost of the flat shape was measured rather than argued: 430
+    # attempts on one ticket, each meeting its own previous work as a
+    # stranger's, and a failure curve that never descended. The defending risk
+    # is real and is the smaller one — a model that defends a wrong answer at
+    # least knows it made one. See docs/CONVERGENCE.md.
+    #
+    # 4 covers a full attempt budget without the oldest turns crowding the
+    # prompt; 0 restores the single-message shape.
+    executor_turns: int = 4
+    # Whether the executor and tester are shown the linter, compiler and test
+    # runner configuration that grades what they write — the real files, at
+    # their real paths, resolved per language from the ticket's own scope.
+    #
+    # On, because the alternative was measured. The roles are judged by
+    # `commands.lint` and `commands.typecheck` and were never shown what those
+    # enforce, so they inferred it from failures: 512 attempts against a
+    # `noUncheckedIndexedAccess` nobody had mentioned, 1,125 against a line
+    # length in a `gdlintrc` nobody had opened. It costs a few hundred
+    # characters a call and the budget gate may drop it first. See
+    # docs/CONVERGENCE.md.
+    toolchain_context: bool = True
+    # Earlier failures carried into the executor's prompt alongside the newest
+    # one, deduplicated by failure class rather than by text.
+    #
+    # Was 2, and the number was not the problem — the deduplication was. Keyed
+    # by raw text, two entries were reliably two instances of one mistake with
+    # different line numbers, so the window held a single fact and the prompt's
+    # own "if you have seen this failure before, the two changes are undoing
+    # each other" paragraph could never fire. One ticket produced 512 instances
+    # of one compiler flag and the executor saw the newest two of them. Keyed
+    # by class, eight entries are eight distinct mistakes.
+    # See docs/CONVERGENCE.md.
+    prior_failures: int = 8
+    # How many of a ticket's accumulated learnings reach a prompt, commonest
+    # first. Facts about the repository that earlier attempts established, kept
+    # so the loop stops rediscovering them — one run rediscovered the same
+    # three conventions eleven times across two tickets. They are not a bar and
+    # nothing downstream enforces them; `0` renders none. See
+    # docs/CONVERGENCE.md.
+    learned_limit: int = 12
+    # Consecutive cycles a ticket may fail on exactly the same set of failure
+    # classes before it is parked for a human. `0`, the default, never parks
+    # one — the measurement still runs and still says what it found.
+    #
+    # Off by default because the threshold was measured and there is no safe
+    # one. Replayed against the run this comes from, at real cycle boundaries,
+    # the longest run of identical cycles per ticket was:
+    #
+    #     PF-007  failed, unsatisfiable   3
+    #     PF-005  done                    4
+    #     PF-009  blocked                 2
+    #     PF-003  done                    1
+    #
+    # A ticket that went on to pass sat still for longer than the one that
+    # never could. At `3` this parks PF-005 on cycle 16 of 40 and lets PF-007
+    # run to cycle 40 of 86; no value separates them. Consecutive identical
+    # cycles are a real signal that something needs to change and they are not
+    # evidence that nothing can.
+    #
+    # What the signal is for is the escalation ladder — force a review on the
+    # red tree, then ask respec directly whether the ticket is satisfiable —
+    # and parking is the rung after those, not instead of them. Until they
+    # exist, turning this on trades a stalled ticket for a killed one.
+    flat_cycles: int = 0
+    # Consecutive flat cycles before the loop escalates a ticket that has
+    # stopped moving. `0` never escalates.
+    #
+    # Two rungs, cheapest first, one per flat cycle after this count is
+    # reached. At `n`, the reviewer is asked against the red tree whether the
+    # ticket is winnable at all — the one role positioned to say the contract
+    # is wrong, and normally unreachable for a ticket that never verifies. At
+    # `n + 1`, the planner is asked the inverted question: not *revise this so
+    # the next attempt succeeds*, which has an answer whether or not one
+    # exists, but *name the criterion that cannot be satisfied, or what the
+    # next attempt must do differently*.
+    #
+    # The second rung is where a stalled ticket actually stops, and it stops
+    # for a reason rather than for a count. `loop.flatCycles` parks on the
+    # count alone and is off by default because no threshold was safe — see its
+    # comment. A planner naming the contradiction is a different kind of
+    # evidence, and it is the one that ended the only ticket on the reference
+    # run that ever ended correctly.
+    review_when_stuck: int = 2
+    # Whether a ticket's tests are kept while the criteria they encode are
+    # unchanged, rather than re-derived on every attempt.
+    #
+    # On, because the tester is the most expensive role in the loop and almost
+    # none of what it spent was new work: 916 calls and 18,253 seconds on one
+    # run, more wall clock than the executor's 16,726, and one ticket
+    # regenerated a functionally identical file 430 times — several of them
+    # byte-identical in groups of fifteen. The worse cost is not the seconds:
+    # an executor judged against assertions rewritten under it every attempt is
+    # aiming at a moving target.
+    #
+    # The tests are a function of the criteria, which is why this is safe and
+    # why the fingerprint does not include the implementation. Four things
+    # still rewrite them — see `_tests_are_current` — and the one that matters
+    # in practice is a failure in the test file itself, which is the tester's
+    # to fix and nobody else's. See docs/CONVERGENCE.md.
+    freeze_tests: bool = True
     # Hypotheses a bug ticket may go through before it parks for a human. The
     # first is the planner's reading of the report; each one after it is a
     # re-diagnosis, asked for when the reproduction could not be written —
@@ -584,16 +682,24 @@ class LoopSettings:
     # planner turns the objections into a revision and the pass repeats. 0 is
     # off — no calls, no steps, and a run that behaves exactly as it did.
     #
-    # Off by default because it is not free: `roles × passes` calls per ticket
-    # before a line is written, one of them on the reviewer, which is most of
-    # the money on a hybrid run. What it buys is the disagreement that would
-    # otherwise surface as a rejected diff — a scope the executor cannot work
-    # in, a criterion the tester cannot assert, a bar the reviewer never agreed
-    # to — moved to the one moment when changing the ticket is free.
+    # It is not free: `roles × passes` calls per ticket before a line is
+    # written, one of them on the reviewer, which is most of the money on a
+    # hybrid run. What it buys is the disagreement that would otherwise surface
+    # as a rejected diff — a scope the executor cannot work in, a criterion the
+    # tester cannot assert, a bar the reviewer never agreed to — moved to the
+    # one moment when changing the ticket is free.
+    #
+    # On by default since the Puzzle-Path run of 2026-08-22/23, which is what
+    # settled the price question. It ran with this at 0 and handed the loop two
+    # tickets that no implementation could satisfy: one whose spec described an
+    # algorithm its own criteria contradicted, one demanding a count of 13 from
+    # a fixture holding 15. They cost 650 attempts, 16.6M tokens, and roughly
+    # 16 hours between them. Eight calls per ticket is cheap against that, and
+    # a ticket nobody can build is exactly the objection this pass asks for.
     #
     # See docs/RATIFY.md, including the rule it knowingly bends: a reviewer
     # that helped write the contract is not independent of it.
-    ratify_passes: int = 0
+    ratify_passes: int = 2
 
 
 @dataclass
@@ -780,9 +886,15 @@ class Config:
             poll_seconds=float(loop.get("pollSeconds", 2.0)),
             max_runtime_seconds=int(loop.get("maxRuntimeSeconds", 0)),
             baseline_verify=bool(loop.get("baselineVerify", True)),
-            executor_turns=int(loop.get("executorTurns", 0)),
+            executor_turns=int(loop.get("executorTurns", 4)),
+            prior_failures=int(loop.get("priorFailures", 8)),
+            learned_limit=int(loop.get("learnedLimit", 12)),
+            flat_cycles=int(loop.get("flatCycles", 0)),
+            review_when_stuck=int(loop.get("reviewWhenStuck", 2)),
+            freeze_tests=bool(loop.get("freezeTests", True)),
+            toolchain_context=bool(loop.get("toolchainContext", True)),
             bug_hypotheses=int(loop.get("bugHypotheses", 3)),
-            ratify_passes=int(loop.get("ratifyPasses", 0)),
+            ratify_passes=int(loop.get("ratifyPasses", 2)),
         )
 
         ui = data.get("ui", {}) or {}
@@ -815,6 +927,28 @@ class Config:
                 f"loop.bugHypotheses is {self.loop.bug_hypotheses}; expected 1 "
                 f"(park on the first hypothesis that cannot be reproduced) or "
                 f"more."
+            )
+        if self.loop.review_when_stuck < 0:
+            raise ConfigError(
+                f"loop.reviewWhenStuck is {self.loop.review_when_stuck}; "
+                f"expected 0 or more. 0 never escalates a stalled ticket."
+            )
+        if self.loop.flat_cycles < 0:
+            raise ConfigError(
+                f"loop.flatCycles is {self.loop.flat_cycles}; expected 0 or "
+                f"more. 0 never parks a ticket for going nowhere, which is how "
+                f"the brake is turned off."
+            )
+        if self.loop.learned_limit < 0:
+            raise ConfigError(
+                f"loop.learnedLimit is {self.loop.learned_limit}; expected 0 or "
+                f"more. 0 renders none, which is how the feature is turned off."
+            )
+        if self.loop.prior_failures < 1:
+            raise ConfigError(
+                f"loop.priorFailures is {self.loop.prior_failures}; expected 1 "
+                f"or more. The newest failure always travels with the attempt; "
+                f"this is how many earlier ones go with it."
             )
         if self.loop.executor_turns < 0:
             raise ConfigError(
@@ -1128,6 +1262,12 @@ class Config:
                 "maxRuntimeSeconds": self.loop.max_runtime_seconds,
                 "baselineVerify": self.loop.baseline_verify,
                 "executorTurns": self.loop.executor_turns,
+                "priorFailures": self.loop.prior_failures,
+                "learnedLimit": self.loop.learned_limit,
+                "flatCycles": self.loop.flat_cycles,
+                "reviewWhenStuck": self.loop.review_when_stuck,
+                "freezeTests": self.loop.freeze_tests,
+                "toolchainContext": self.loop.toolchain_context,
                 "bugHypotheses": self.loop.bug_hypotheses,
                 "ratifyPasses": self.loop.ratify_passes,
             },

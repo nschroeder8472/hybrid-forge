@@ -39,6 +39,7 @@ from . import evidence, modelfiles, replay, respec, toolchain, wizard
 from .artifacts import ARTIFACTS_DIR, GITIGNORE_LINES
 from .config import (
     ANY_LANGUAGE,
+    REPO_ROOT,
     Config,
     ConfigError,
     Workspace,
@@ -318,6 +319,8 @@ def _report_coverage(config: Config) -> list[str]:
         uncovered.extend(_print_matrix(config, workspace, counts))
 
     _report_typecheck_gaps(config, census)
+    _report_undeclared_builds(config)
+    _report_duplicated_typecheck(config)
 
     orphans = sorted(
         {
@@ -333,6 +336,86 @@ def _report_coverage(config: Config) -> list[str]:
             f"one is refused at ingest."
         )
     return uncovered
+
+
+def _report_undeclared_builds(config: Config) -> None:
+    """Directories that hold their own manifest and are not declared as builds.
+
+    Discovery proposes and the person decides — `_ask_builds` says so, and
+    saying no is a real answer. What was missing is the price of saying no,
+    which is not visible from the config and is not small.
+
+    A repository configured as one workspace runs every `*` command against
+    every ticket, whatever the ticket writes. On one run that meant a
+    TypeScript ticket under `tools/path_forge` paid for the whole Godot gdUnit
+    suite on every attempt: 908 runs at about 8.2 seconds, 2.1 hours of a
+    18-hour run, and 229 MB of passing output under `.hybridforge/artifacts`
+    for a single ticket. Nothing failed and nothing was learned.
+
+    Reported, never gated. A monorepo whose subdirectories genuinely share one
+    toolchain is a real shape and this is wrong about it.
+    """
+    if len(config.workspaces) > 1:
+        return
+    found = [
+        build
+        for build in toolchain.discover_workspaces(config.root)
+        if build != REPO_ROOT
+    ]
+    if not found:
+        return
+    print(
+        f"\n  undeclared builds: {', '.join(found)}\n"
+        f"    Each holds its own manifest and none is declared under "
+        f"`workspaces`,\n"
+        f"    so this repository verifies as one. Every `*` command runs on "
+        f"every\n"
+        f"    ticket — including the ones whose files it cannot see.\n"
+        f"    Declare them:  forge init   (it offers this when it finds two)"
+    )
+
+
+def _report_duplicated_typecheck(config: Config) -> None:
+    """Test commands that re-run the type check the previous step just ran.
+
+    Cheap in seconds and worth a line anyway: the two kinds are filled in
+    independently, by a model or by hand, and a `test` that opens with the
+    whole `typecheck` command means one of them is not what the operator
+    thinks it is. The observed case was `tsc --noEmit -p tools/path_forge &&
+    npm run test` sitting under `test[".ts"]` while `typecheck[".ts"]` held
+    `tsc --noEmit -p tools/path_forge` on its own — the type check ran twice
+    per attempt, 757 times in one run.
+    """
+    for workspace in config.workspaces:
+        checks = workspace.commands_for("typecheck")
+        tests = workspace.commands_for("test")
+        # One finding per command pair, not per extension. The same pair is
+        # normally set for every extension of a language, and printing it four
+        # times for `.ts .tsx .mts .cts` buries the other checks.
+        duplicated: dict[tuple[str, str], list[str]] = {}
+        for suffix, test in sorted(tests.items()):
+            check = checks.get(suffix, "")
+            if not check or not test or check == test:
+                continue
+            if not test.startswith(check):
+                continue
+            duplicated.setdefault((check, test), []).append(suffix)
+        where = (
+            ""
+            if workspace.is_repo_root or len(config.workspaces) == 1
+            else f" in {workspace.root}"
+        )
+        for (check, test), suffixes in duplicated.items():
+            print(
+                f"\n  test[{', '.join(suffixes)}]{where} re-runs the typecheck "
+                f"command:\n"
+                f"    typecheck  {check}\n"
+                f"    test       {test}\n"
+                f"    The check already ran and passed before this step "
+                f"started. Drop the\n"
+                f"    prefix, or clear the `typecheck` entry if the test "
+                f"command is the check."
+            )
 
 
 def _report_typecheck_gaps(config: Config, census) -> None:

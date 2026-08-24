@@ -38,10 +38,11 @@ flowchart LR
 The green steps are model calls, each wrapped by the budget gate. The rest are
 your own shell commands and `git`, and cost nothing.
 
-RATIFY is the one that is off unless asked for: `loop.ratifyPasses` puts the
-ticket to every role before it is built, so a scope the executor cannot work
-in, a criterion the tester cannot assert, or a bar the reviewer will not accept
-surfaces while changing the ticket is still free. See [RATIFY.md](RATIFY.md).
+RATIFY is the one that can be turned off: `loop.ratifyPasses` (default `2`)
+puts the ticket to every role before it is built, so a scope the executor
+cannot work in, a criterion the tester cannot assert, or a bar the reviewer
+will not accept surfaces while changing the ticket is still free. Set it to `0`
+on a backlog you have already vetted by hand. See [RATIFY.md](RATIFY.md).
 
 Verification runs **before** any model reviews, so the reviewer judges a diff
 that already compiles and passes — it is never asked to guess whether it would.

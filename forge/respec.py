@@ -689,6 +689,7 @@ def revise(
     contradiction: dict[str, list[str]] | None = None,
     protected: Sequence[str] = (),
     root: Path | None = None,
+    stuck: dict | None = None,
 ) -> Revision:
     """Rewrite one ticket in place from its recorded failures.
 
@@ -749,6 +750,9 @@ def revise(
                 report=report,
                 contradiction=contradiction or {},
                 reproduction=protected,
+                # Set only on the escalation path, where the question the
+                # planner is asked is inverted. See `respec_prompt`.
+                stuck=stuck,
             ),
             budget,
         )
@@ -999,6 +1003,29 @@ def revise(
                 data={"ticket": ticket.ticket_id, "was": ticket.context[:2000]},
             )
 
+    # Facts, not demands, and screened for the difference. `learned` is read by
+    # every later attempt and never revised away, so a sentence saying a
+    # failing check does not count would teach every role after it to discard
+    # the evidence a revision is made from — the durable form of the failure
+    # `_refuse_verification_waivers` exists for.
+    learned_add = [
+        entry
+        for entry in revision.pop("learned_add", [])
+        if not _waiver_language(entry)
+    ]
+    if learned_add:
+        added = store.learn(run_id, ticket, learned_add)
+        if added:
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: recorded {len(added)} thing(s) this ticket "
+                f"established about the repository. They travel with every later "
+                f"attempt and are not a bar — nothing downstream enforces them:\n"
+                + "\n".join(f"  - {entry}" for entry in added[:5]),
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "learned": added},
+            )
+
     # Instruction-following is not an access control, so provenance is enforced
     # here rather than merely described in the prompt.
     refused: list[str] = []
@@ -1081,7 +1108,6 @@ def revise(
             # changes. `forge criteria` reads this.
             data={"minted": minted, "ticket": ticket.ticket_id},
         )
-
     if not changed:
         return Revision(
             ticket.ticket_id,

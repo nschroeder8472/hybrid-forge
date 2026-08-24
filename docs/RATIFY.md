@@ -1,6 +1,6 @@
 # Ratification — design spec
 
-**Status:** built. `loop.ratifyPasses`, default `0` (off).
+**Status:** built. `loop.ratifyPasses`, default `2`. `0` turns it off.
 
 A ticket enters the loop as a contract nobody has agreed to. The plan was
 written by one party — a human, or the planner at `forge ingest` — and the four
@@ -151,9 +151,23 @@ told — is one the loop has actually produced, repeatedly. The failure it risks
 is a reviewer anchored on a contract it helped write. Both are real; only the
 first has been observed.
 
-**No evidence yet.** Like the image-loop spec, every claim above about what
-ratification will improve is derived from reading the loop rather than from
-watching ratification run. Section 9 of [LOOP-INVARIANTS.md](LOOP-INVARIANTS.md)
-exists to distrust exactly that. The mitigation is the default: a run that does
-not turn it on is unchanged, and the first evidence should come from a backlog
-run twice — `ratifyPasses: 0` and `ratifyPasses: 2` — over the same plan.
+**Still no evidence about ratification itself, and it is now on by default.**
+That tension is deliberate and worth stating plainly. Every claim above about
+what ratification improves is still derived from reading the loop rather than
+from watching it run; Section 9 of
+[LOOP-INVARIANTS.md](LOOP-INVARIANTS.md) exists to distrust exactly that.
+
+What changed is not the evidence for this pass, it is the evidence for the
+problem. The Puzzle-Path run of 2026-08-22/23 handed the loop two tickets no
+implementation could satisfy — one whose spec described an algorithm its own
+criteria contradicted, one demanding a count of 13 from a fixture holding 15 —
+and with `ratifyPasses: 0` the loop had no moment at which anyone was asked
+whether the ticket was buildable. They cost 650 attempts, 16.6M tokens, and
+about 16 hours. See [CONVERGENCE.md](CONVERGENCE.md).
+
+Eight calls per ticket against that is a defensible default even without
+knowing how well the pass performs, because the alternative is not "cheaper",
+it is "no check at all". The evidence still owed is the one this section always
+asked for: the same backlog run twice, `ratifyPasses: 0` and `ratifyPasses: 2`,
+compared. Until that exists, treat the default as a judgement about the cost of
+the failure rather than a measurement of the fix.

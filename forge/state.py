@@ -18,12 +18,13 @@ import re
 import sqlite3
 import threading
 import time
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-from .failures import distill
+from .failures import classify, distill
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -251,6 +252,54 @@ class Ticket:
     # a person actually wrote.
     ratified_spec: str = ""
     ratified_criteria: list[str] = field(default_factory=list)
+    # What earlier attempts on this ticket established about *this repository*,
+    # as `[{"text", "count"}]`, commonest first.
+    #
+    # The one field on a ticket that only ever grows. Everything else a cycle
+    # produces is rebuilt from the plan each time it runs: `context` is
+    # re-derived from `original_context`, `spec` and `criteria` are anchored so
+    # a revision cannot drift from them, and the failures live in the step log
+    # where nothing reads them as conclusions. That was the right rule for a
+    # contract and it left the loop nowhere to put a fact. Eighty-six respec
+    # cycles on one ticket ended with its `context` holding the plan's
+    # paragraph, verbatim, twice — not one operational conclusion survived 18
+    # hours, and the same three project conventions were rediscovered eleven
+    # times across two tickets that never exchanged a word.
+    #
+    # It is not a bar. The reviewer is not given it, no criterion is minted
+    # from it, and nothing downstream enforces it — which is exactly what keeps
+    # it out of the criteria ratchet's jurisdiction. The ratchet exists to stop
+    # the loop raising its own bar; this stops the loop forgetting.
+    #
+    # Written only by `Store.learn`, for the reason `original_*` is absent from
+    # `update_ticket`: a field any caller can shorten is not append-only.
+    # See docs/CONVERGENCE.md.
+    learned: list[dict] = field(default_factory=list)
+    # The failure classes this ticket's *last completed cycle* produced, and
+    # the step it had reached when that cycle ended. Together they are how a
+    # cycle is compared to the one before it: everything after `cycle_mark` is
+    # the current cycle's evidence, and `cycle_classes` is the previous one's.
+    #
+    # Per ticket, which is the whole point. The run-level brake asks whether
+    # *every* unfinished ticket reproduced the last cycle, and one ticket
+    # failing identically forever while the others still move is invisible to
+    # it — correctly, because the run is still going somewhere. On the run this
+    # comes from, one ticket was flat for 85 consecutive cycles across the full
+    # 18 hours while two others were still landing work, and it cost a fresh
+    # attempt budget every one of them. See docs/CONVERGENCE.md.
+    cycle_classes: list[str] = field(default_factory=list)
+    cycle_mark: int = 0
+    # The tester's inputs, as of the test file currently on disk. The tests
+    # encode the *criteria*, so re-deriving them from unchanged criteria
+    # produces the same file at the price of the most expensive role in the
+    # loop: 916 tester calls on one run, 18,253 seconds, more wall clock than
+    # the executor spent. One ticket regenerated a functionally identical file
+    # 430 times, several of them byte-identical in groups of 15.
+    # See docs/CONVERGENCE.md.
+    tests_fingerprint: str = ""
+    # Consecutive cycles that produced exactly the classes the one before them
+    # did. Reset by any cycle that changes the set in either direction.
+    flat_cycles: int = 0
 
     @property
     def contract_criteria(self) -> list[str]:
@@ -363,7 +412,23 @@ class Ticket:
             ratify_fingerprint=row["ratify_fingerprint"],
             ratified_spec=row["ratified_spec"],
             ratified_criteria=json.loads(row["ratified_criteria"]),
+            learned=json.loads(row["learned"] or "[]"),
+            cycle_classes=json.loads(row["cycle_classes"] or "[]"),
+            cycle_mark=row["cycle_mark"] or 0,
+            tests_fingerprint=row["tests_fingerprint"] or "",
+            flat_cycles=row["flat_cycles"] or 0,
         )
+
+
+def _learned_key(text: str) -> str:
+    """What makes two learnings the same one.
+
+    Punctuation, backticks and case are free to change between two statements
+    of one fact; the words are not. The same reduction `respec._normalise`
+    applies to a decision, kept here so `state` does not import from a module
+    that imports it.
+    """
+    return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
 
 
 class Store:
@@ -427,6 +492,12 @@ class Store:
         ("tickets", "ratify_fingerprint", "TEXT NOT NULL DEFAULT ''"),
         ("tickets", "ratified_spec", "TEXT NOT NULL DEFAULT ''"),
         ("tickets", "ratified_criteria", "TEXT NOT NULL DEFAULT '[]'"),
+        ("steps", "classes", "TEXT NOT NULL DEFAULT '[]'"),
+        ("tickets", "learned", "TEXT NOT NULL DEFAULT '[]'"),
+        ("tickets", "cycle_classes", "TEXT NOT NULL DEFAULT '[]'"),
+        ("tickets", "cycle_mark", "INTEGER NOT NULL DEFAULT 0"),
+        ("tickets", "flat_cycles", "INTEGER NOT NULL DEFAULT 0"),
+        ("tickets", "tests_fingerprint", "TEXT NOT NULL DEFAULT ''"),
     )
 
     def _migrate(self) -> None:
@@ -682,6 +753,56 @@ class Store:
                 {**ticket.as_row(), "run_id": run_id, "now": time.time()},
             )
 
+    def learn(self, run_id: int, ticket: Ticket, entries: Sequence[str]) -> list[str]:
+        """Add what this cycle established to the ticket, keeping what was there.
+
+        Merged rather than written, and merged *here* rather than by the
+        caller: this is the field's whole invariant, and a caller that builds
+        the list itself is a caller that can drop half of it. `update_ticket`
+        does not name the column at all, for the same reason it does not name
+        `original_spec`.
+
+        Deduplicated on a normalised form, so the same conclusion reached on
+        cycle 12 and again on cycle 40 is one entry with a count of two rather
+        than two entries saying the same thing. The count is the useful part:
+        a fact the loop keeps rediscovering is a fact the plan should have
+        stated, and it is worth being able to see which one.
+
+        `ticket.learned` is updated in place so the caller's object matches
+        what is on disk. Returns the entries that were genuinely new.
+        """
+        merged = {_learned_key(entry["text"]): dict(entry) for entry in ticket.learned}
+        added: list[str] = []
+        for raw in entries:
+            text = " ".join(str(raw or "").split())[:400]
+            if not text:
+                continue
+            key = _learned_key(text)
+            if not key:
+                continue
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = {"text": text, "count": 1}
+                added.append(text)
+                continue
+            existing["count"] = int(existing.get("count", 1)) + 1
+
+        ticket.learned = sorted(
+            merged.values(), key=lambda entry: (-entry["count"], entry["text"])
+        )
+        with self._write() as connection:
+            connection.execute(
+                "UPDATE tickets SET learned = :learned, updated_at = :now "
+                "WHERE run_id = :run_id AND ticket_id = :ticket_id",
+                {
+                    "learned": json.dumps(ticket.learned),
+                    "run_id": run_id,
+                    "ticket_id": ticket.ticket_id,
+                    "now": time.time(),
+                },
+            )
+        return added
+
     def record_ratification(self, run_id: int, ticket: Ticket) -> None:
         """Write what a sign-off pass settled, and what was said in it.
 
@@ -803,7 +924,7 @@ class Store:
         the implementation, is what needs changing.
         """
         rows = self._connection.execute(
-            "SELECT name, detail FROM steps "
+            "SELECT name, detail, classes FROM steps "
             "WHERE run_id = ? AND ticket_id = ? AND status = 'failed' AND detail != '' "
             "ORDER BY id DESC LIMIT ?",
             (run_id, ticket_id, limit * 4),
@@ -820,7 +941,16 @@ class Store:
                 continue
             # The same lint error on all three attempts is one fact, not three.
             # Repeating it crowds out the other failures inside the budget.
-            key = f"{row['name']}::{detail}"
+            #
+            # Keyed by *class*, not by text. Keyed by text this deduplicated
+            # almost nothing: `TS2532` at line 40 and `TS2532` at line 51 are
+            # two strings and one misunderstanding, and an assertion quoting a
+            # random hash is a new string every attempt. One ticket's 512
+            # instances of one compiler flag arrived here as 512 facts, of
+            # which the caller saw the newest two.
+            key = json.dumps(sorted(json.loads(row["classes"] or "[]"))) or ""
+            if not key or key == "[]":
+                key = f"{row['name']}::{detail}"
             if key in seen:
                 continue
             seen.add(key)
@@ -1058,11 +1188,124 @@ class Store:
         return int(cursor.lastrowid)
 
     def end_step(self, step_id: int, status: str, detail: str = "") -> None:
+        """Close a step, recording what kind of failure it was.
+
+        The classes are computed here rather than when something asks for them.
+        A ticket accumulates hundreds of failed steps and a single gdUnit run
+        can leave 780 KB of output behind, so classifying on read would mean
+        re-parsing megabytes on every prompt; classifying on write costs one
+        pass over output that has just been produced anyway.
+        """
+        classes: list[str] = []
+        if status == "failed" and detail.strip():
+            row = self._connection.execute(
+                "SELECT name FROM steps WHERE id = ?", (step_id,)
+            ).fetchone()
+            if row is not None:
+                classes = sorted(classify(row["name"], detail))
         with self._write() as connection:
             connection.execute(
-                "UPDATE steps SET status = ?, ended_at = ?, detail = ? WHERE id = ?",
-                (status, time.time(), detail[:20000], step_id),
+                "UPDATE steps SET status = ?, ended_at = ?, detail = ?, classes = ? "
+                "WHERE id = ?",
+                (status, time.time(), detail[:20000], json.dumps(classes), step_id),
             )
+
+    def last_step_id(self, run_id: int, ticket_id: str) -> int:
+        """The newest step recorded against this ticket, or 0.
+
+        The boundary a cycle is measured from. Step ids are monotonic, so
+        "everything after this" is the evidence a later cycle produced without
+        needing a cycle number written on each row.
+        """
+        row = self._connection.execute(
+            "SELECT MAX(id) AS newest FROM steps WHERE run_id = ? AND ticket_id = ?",
+            (run_id, ticket_id),
+        ).fetchone()
+        return int(row["newest"] or 0)
+
+    def record_tests_fingerprint(self, run_id: int, ticket: Ticket) -> None:
+        """Note the inputs the test file on disk was written from."""
+        with self._write() as connection:
+            connection.execute(
+                "UPDATE tickets SET tests_fingerprint = :fingerprint, "
+                "updated_at = :now "
+                "WHERE run_id = :run_id AND ticket_id = :ticket_id",
+                {
+                    "fingerprint": ticket.tests_fingerprint,
+                    "run_id": run_id,
+                    "ticket_id": ticket.ticket_id,
+                    "now": time.time(),
+                },
+            )
+
+    def record_convergence(self, run_id: int, ticket: Ticket) -> None:
+        """Write where a ticket's cycle comparison stands.
+
+        Its own statement rather than a field on `update_ticket`, for the
+        reason the ratified contract is: this is what decides whether the
+        ticket is still worth retrying, and a caller holding a stale copy must
+        not be able to reset it on the way past.
+        """
+        with self._write() as connection:
+            connection.execute(
+                "UPDATE tickets SET cycle_classes = :cycle_classes, "
+                "cycle_mark = :cycle_mark, flat_cycles = :flat_cycles, "
+                "updated_at = :now "
+                "WHERE run_id = :run_id AND ticket_id = :ticket_id",
+                {
+                    "cycle_classes": json.dumps(sorted(ticket.cycle_classes)),
+                    "cycle_mark": int(ticket.cycle_mark),
+                    "flat_cycles": int(ticket.flat_cycles),
+                    "run_id": run_id,
+                    "ticket_id": ticket.ticket_id,
+                    "now": time.time(),
+                },
+            )
+
+    def ticket_classes(
+        self, run_id: int, ticket_id: str, after: int = 0
+    ) -> list[dict]:
+        """Every kind of failure this ticket has produced, commonest first.
+
+        `{"name", "count", "first_attempt", "last_attempt"}` per class, where
+        the attempt numbers are step ids ordered within the ticket rather than
+        the ticket's own counter — `attempts` restarts at 1 on every retry
+        cycle, and a class that has been failing since cycle 2 must not read as
+        one that appeared in the last five minutes.
+
+        This is what a repeated failure looks like when it is counted rather
+        than re-read. One ticket produced 339 failed steps holding 627 distinct
+        raw signatures and exactly 7 classes, and nothing in the loop could see
+        that the same seven had been failing for 430 attempts.
+        """
+        rows = self._connection.execute(
+            "SELECT id, classes FROM steps "
+            "WHERE run_id = ? AND ticket_id = ? AND status = 'failed' AND id > ? "
+            "ORDER BY id",
+            (run_id, ticket_id, after),
+        ).fetchall()
+
+        seen: dict[str, dict] = {}
+        for position, row in enumerate(rows, start=1):
+            try:
+                names = json.loads(row["classes"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            for name in names:
+                entry = seen.get(name)
+                if entry is None:
+                    seen[name] = {
+                        "name": name,
+                        "count": 1,
+                        "first_attempt": position,
+                        "last_attempt": position,
+                    }
+                    continue
+                entry["count"] += 1
+                entry["last_attempt"] = position
+        return sorted(
+            seen.values(), key=lambda entry: (-entry["count"], entry["name"])
+        )
 
     def recent_steps(self, run_id: int, limit: int = 40) -> list[sqlite3.Row]:
         return list(
