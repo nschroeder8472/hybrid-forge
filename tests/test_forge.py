@@ -4553,6 +4553,155 @@ class TestRespecMayWidenScopeButNotTheGraph(unittest.TestCase):
         self.assertTrue(result.revised)
 
 
+class TestRespecMayNotWidenIntoASecondBuild(unittest.TestCase):
+    """`_scope_gate` refuses a ticket writing into two builds, correctly and
+    permanently: each has its own commands and its own working directory, so
+    only one can verify it. What the gate cannot do is tell a scoping error the
+    plan made from one respec invented on attempt 46, and it parks either way.
+
+    A ticket writing two `.gd` files spent nine cycles on real GDScript
+    failures. Respec then added `tools/path_forge/fixtures/` to its scope and
+    the gate blocked it at the start of the next cycle — the repair step ending
+    the ticket it was called in to repair, and taking nine cycles of
+    accumulated context with it."""
+
+    # `.` owns everything the second does not, which is how the loop's own
+    # `workspace_for` answers.
+    WORKSPACE = staticmethod(
+        lambda path: "tools/path_forge" if path.startswith("tools/path_forge/") else "."
+    )
+
+    def _store(self, allowed=("tools/dump.gd", "tests/theme/test_decor.gd")):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        store.add_tickets(
+            run_id,
+            [Ticket("PF-009", status="failed", attempts=5, allowed_files=list(allowed), spec="one")],
+        )
+        step = store.start_step(run_id, "PF-009", "test")
+        store.end_step(step, "failed", "Parse Error: nope")
+        return store, run_id
+
+    def _revise(self, store, run_id, workspace_of=None, **payload):
+        def call(_messages, _budget):
+            return Completion(text=json.dumps(payload), usage=Usage())
+
+        ticket = store.list_tickets(run_id)[0]
+        return respec.revise(
+            store, run_id, ticket, call=call, budget=1024,
+            workspace_of=self.WORKSPACE if workspace_of is None else workspace_of,
+        )
+
+    def test_the_straying_path_is_dropped(self):
+        store, run_id = self._store()
+
+        self._revise(
+            store, run_id,
+            spec="revised",
+            allowed_files=["tools/dump.gd", "tests/theme/test_decor.gd",
+                           "tools/path_forge/fixtures/"],
+        )
+
+        self.assertEqual(
+            store.list_tickets(run_id)[0].allowed_files,
+            ["tools/dump.gd", "tests/theme/test_decor.gd"],
+        )
+
+    def test_the_rest_of_the_revision_stands(self):
+        # Dropped rather than refused whole, the way the other scope guards
+        # here work: the rest may still be right.
+        store, run_id = self._store()
+
+        self._revise(
+            store, run_id,
+            spec="revised spec", allowed_files=["tools/dump.gd", "tools/path_forge/x.ts"],
+        )
+
+        self.assertEqual(store.list_tickets(run_id)[0].spec, "revised spec")
+
+    def test_it_says_what_it_refused_and_why(self):
+        store, run_id = self._store()
+
+        self._revise(
+            store, run_id,
+            spec="revised", allowed_files=["tools/dump.gd", "tools/path_forge/fixtures/"],
+        )
+
+        messages = " ".join(e["message"] for e in store.events_after(0))
+        self.assertIn("tools/path_forge/fixtures/", messages)
+        self.assertIn("second build", messages)
+
+    def test_a_scope_left_empty_is_absent_rather_than_blank(self):
+        # An empty `allowed_files` would silently narrow the ticket to nothing,
+        # which is why `parse_respec` treats an empty list as absent.
+        store, run_id = self._store()
+
+        self._revise(
+            store, run_id, spec="revised", allowed_files=["tools/path_forge/x.ts"],
+        )
+
+        self.assertEqual(
+            store.list_tickets(run_id)[0].allowed_files,
+            ["tools/dump.gd", "tests/theme/test_decor.gd"],
+        )
+
+    def test_staying_in_the_same_build_is_untouched(self):
+        store, run_id = self._store()
+
+        self._revise(
+            store, run_id,
+            spec="revised", allowed_files=["tools/dump.gd", "tests/theme/other.gd"],
+        )
+
+        self.assertEqual(
+            store.list_tickets(run_id)[0].allowed_files,
+            ["tools/dump.gd", "tests/theme/other.gd"],
+        )
+
+    def test_a_ticket_that_already_straddles_is_not_respec_s_fault(self):
+        # The plan's error and the gate's to report. Blaming respec for it
+        # would also stop it proposing the narrowing that fixes it.
+        store, run_id = self._store(
+            allowed=("tools/dump.gd", "tools/path_forge/fixtures/")
+        )
+
+        self._revise(
+            store, run_id,
+            spec="revised", allowed_files=["tools/dump.gd", "tools/path_forge/x.ts"],
+        )
+
+        self.assertEqual(
+            store.list_tickets(run_id)[0].allowed_files,
+            ["tools/dump.gd", "tools/path_forge/x.ts"],
+        )
+
+    def test_a_file_no_build_owns_is_a_different_fault_and_passes_through(self):
+        # `_unowned_files` reports it, with a message about declaring the build
+        # rather than about splitting the ticket.
+        store, run_id = self._store()
+
+        self._revise(
+            store, run_id,
+            spec="revised", allowed_files=["tools/dump.gd", "outside/x.rs"],
+            workspace_of=lambda path: "" if path.startswith("outside/") else ".",
+        )
+
+        self.assertIn("outside/x.rs", store.list_tickets(run_id)[0].allowed_files)
+
+    def test_a_caller_that_names_no_builds_changes_nothing(self):
+        store, run_id = self._store()
+
+        self._revise(
+            store, run_id, spec="revised",
+            allowed_files=["tools/dump.gd", "tools/path_forge/fixtures/"],
+            workspace_of=False,
+        )
+
+        self.assertIn(
+            "tools/path_forge/fixtures/", store.list_tickets(run_id)[0].allowed_files
+        )
+
+
 class TestRespecMayNotRaiseTheBar(unittest.TestCase):
     """Respec runs on a ticket that has just exhausted its attempts, and its
     job is to produce one the next attempt can satisfy. Adding criteria there

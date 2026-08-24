@@ -29,6 +29,10 @@ from .state import Store, Ticket, _criterion_key
 
 # `(messages, max_tokens) -> Completion`. Temperature is the caller's business.
 Caller = Callable[[list[Message], int], Completion]
+# A path to the root of the build that owns it, or "" when no build does. Used
+# only to keep a revision inside the build the ticket already belongs to; see
+# the guard in `_apply`.
+WorkspaceOf = Callable[[str], str]
 
 
 @dataclass
@@ -690,6 +694,7 @@ def revise(
     protected: Sequence[str] = (),
     root: Path | None = None,
     stuck: dict | None = None,
+    workspace_of: WorkspaceOf | None = None,
 ) -> Revision:
     """Rewrite one ticket in place from its recorded failures.
 
@@ -713,6 +718,11 @@ def revise(
     taken on trust — see `_ground_references` for what that cost. Optional only
     because a caller may have no tree to check against; every caller in this
     codebase passes it.
+
+    `workspace_of` says which build owns a path, and keeps a widened scope
+    inside the one the ticket already belongs to. A function rather than the
+    config, because that is all this needs to know and a module that took the
+    config would grow into asking it other things.
     """
     failures = store.ticket_failures(run_id, ticket.ticket_id)
     # A ticket that never ran has nothing to learn from, and its `blocked_note`
@@ -842,6 +852,59 @@ def revise(
         ]
         if pending_scope:
             revision["allowed_files"] = kept
+
+    # A widened scope that reaches into a second build. `_scope_gate` already
+    # refuses such a ticket, correctly and permanently: each build has its own
+    # commands and its own working directory, so only one of them can verify
+    # the ticket and splitting it is the fix. What it cannot do is tell a
+    # scoping error the plan made from one respec invented on attempt 46, and
+    # it parks either way.
+    #
+    # That is what happened. A ticket writing two `.gd` files spent nine cycles
+    # on real GDScript failures, respec added `tools/path_forge/fixtures/` to
+    # its scope, and the gate blocked it at the start of the next cycle — the
+    # repair step ending the ticket it was called in to repair, and taking
+    # nine cycles of accumulated context with it. Dropped rather than refused
+    # whole, the way the guards above drop what they refuse: the rest of the
+    # revision is the part that might still be right.
+    #
+    # Only when the ticket is in one build to begin with. A scope that already
+    # straddles is the plan's error and the gate's to report, and respec must
+    # not be blamed for it or be prevented from proposing a narrowing that
+    # fixes it.
+    if workspace_of and "allowed_files" in revision:
+        # `""` is a path no build owns, which is a different fault with its own
+        # message. Passed through so the gate reports it as what it is.
+        home = {workspace_of(path) for path in ticket.allowed_files} - {""}
+        strayed = (
+            [
+                path
+                for path in revision["allowed_files"]
+                if workspace_of(path) not in home | {""}
+            ]
+            if len(home) == 1
+            else []
+        )
+        if strayed:
+            kept = [p for p in revision["allowed_files"] if p not in strayed]
+            if kept:
+                revision["allowed_files"] = kept
+            else:
+                # An empty list would blank the scope, and `parse_respec`
+                # treats absent as "leave it alone" for exactly this reason.
+                revision.pop("allowed_files")
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: respec proposed widening the scope into "
+                f"a second build with {', '.join(strayed)}; dropped. Each build "
+                f"has its own commands and its own working directory, so a "
+                f"ticket writing into two can only be verified by one of them "
+                f"— this ticket would have been blocked on its next start "
+                f"rather than retried. The rest of the revision stands.",
+                level="warn",
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "refused": strayed},
+            )
 
     # A revision that re-proposes a cause the loop already disproved by running
     # a test against it. Refused whole rather than merged, because the scope

@@ -3007,6 +3007,11 @@ class Orchestrator:
                 # So a revised read scope is checked against the tree rather
                 # than taken on the planner's word for where a file lives.
                 root=self.config.root,
+                # So a revised *write* scope stays in the build that can verify
+                # it. See the guard this feeds.
+                workspace_of=lambda path: getattr(
+                    self.config.workspace_for(path), "root", ""
+                ),
                 # Set only for a ticket that has stopped moving, and it
                 # inverts the question: not *revise this so the next attempt
                 # succeeds*, which has an answer whether or not one exists, but
