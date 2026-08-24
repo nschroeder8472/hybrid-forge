@@ -2607,6 +2607,13 @@ class Orchestrator:
         anything. What it produces is an opinion the planner is shown on the
         next rung, and a line in the log for a person.
 
+        An `unwinnable` verdict does move the ladder on: the caller asks the
+        inverted question in the same cycle rather than the next one. That is
+        not the review ending a ticket — the planner still answers, and can
+        disagree — it is the rung firing when the thing it was waiting for has
+        happened. Waiting a cycle cost thirty-five attempts across two tickets
+        the reviewer had already been right about.
+
         Returns `(verdict, reasoning)`; `unclear` on any failure, because a
         step whose whole purpose is advice must not be able to end a ticket.
         """
@@ -2762,7 +2769,14 @@ class Orchestrator:
             rung = self.config.loop.review_when_stuck
             if rung and ticket.flat_cycles == rung:
                 escalate.append(ticket_id)
-            elif rung and ticket.flat_cycles == rung + 1:
+            elif rung and ticket.flat_cycles > rung:
+                # Every cycle past the rung, not only the one immediately
+                # after it. Rung two travels with the ordinary respec — same
+                # call, same evidence, only the question differs — so asking it
+                # again costs nothing, and a ticket that is *still* flat two
+                # cycles later has made the case harder rather than gone away.
+                # Asked once, one ticket went on to spend two more cycles being
+                # asked the ordinary question instead.
                 interrogate.append(ticket_id)
             elif self._impossible_claims.get(ticket_id):
                 # An executor that said `IMPOSSIBLE:` does not wait for the
@@ -2779,6 +2793,24 @@ class Orchestrator:
             ticket = by_ticket[ticket_id]
             verdict, reasoning = self._stuck_review(run_id, ticket)
             self._stuck_opinion[ticket_id] = (verdict, reasoning)
+            if verdict == STUCK_UNWINNABLE and ticket_id not in interrogate:
+                # The rungs exist to spend more only once cheaper things have
+                # failed, and a rung-one answer of `unwinnable` is the thing
+                # rung two was waiting for. Waiting a further cycle to ask is
+                # the delay itself: on the run this comes from the reviewer
+                # said unwinnable about two tickets, naming the exact
+                # arithmetic each time — `fmix32(0,0,0)` is 0 where the
+                # criterion demands 1691721052, and a seeding clause saying
+                # `#inc = 3n` where the expected state needs
+                # 1442695040888963407n. Both were right. The loop then ran them
+                # for five and two more cycles, thirty-five attempts, before
+                # the brake stopped everything.
+                #
+                # Still the planner's call, not the reviewer's. The verdict
+                # advances the ladder; it does not park anything, and it must
+                # not — on an earlier run the same reviewer called a genuinely
+                # unsatisfiable ticket **winnable**.
+                interrogate.append(ticket_id)
 
         for ticket_id in stalled:
             eligible.remove(ticket_id)

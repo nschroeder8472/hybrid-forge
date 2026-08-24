@@ -13,6 +13,7 @@ import argparse
 import contextlib
 import dataclasses
 import io
+import itertools
 import json
 import subprocess
 import sys
@@ -9769,6 +9770,10 @@ class TestAStuckTicketReachesTheReviewer(unittest.TestCase):
             **loop_settings,
         )
 
+    def _respeccing(self, **loop_settings):
+        """The same, with respec on — the ladder's second rung rides on it."""
+        return self._orchestrator(respec_on_retry=True, **loop_settings)
+
     def _fail(self, store, run_id, detail, ticket_id="T-1"):
         step = store.start_step(run_id, ticket_id, "typecheck")
         store.end_step(step, "failed", detail)
@@ -9879,6 +9884,135 @@ class TestAStuckTicketReachesTheReviewer(unittest.TestCase):
 
         self.assertEqual(orchestrator._stuck_review(run_id, ticket)[0], "unclear")
         self.assertNotEqual(store.list_tickets(run_id)[0].status, "blocked")
+
+    def _stalled(self, **loop_settings):
+        """A backlog where one ticket is stuck and another is still moving.
+
+        Two tickets because the retry brake compares the *backlog's* evidence
+        between cycles: with T-1 alone, its unchanging class set stops the
+        retries after one cycle and the ladder never gets a second. T-2 is the
+        rest of a real backlog — still producing new failures — and it is why
+        the cycles keep coming while T-1 sits flat. That is the shape the run
+        this comes from had: one ticket flat for four cycles beside another
+        turning up a fresh typecheck error every time.
+        """
+        return TestAutomaticRetryCycles._orchestrator(
+            self,
+            tickets=[
+                Ticket("T-1", status="failed", attempts=3, position=0),
+                Ticket("T-2", status="failed", attempts=3, position=1),
+            ],
+            retry_cycles=-1,
+            respec_on_retry=True,
+            **loop_settings,
+        )
+
+    def _cycle(self, orchestrator, store, run_id, detail, moving=0):
+        self._fail(store, run_id, detail)
+        self._fail(store, run_id, f"src/b{moving}.ts(1,1): error TS9{moving}: x", "T-2")
+        orchestrator._retry_cycle(run_id, "blocked")
+        for ticket in store.list_tickets(run_id):
+            if ticket.status == "pending":
+                # The requeue zeroes both, and a ticket with no attempts is not
+                # respecced at all — so put back the state a real cycle would
+                # have rebuilt by running the ticket.
+                ticket.status = "failed"
+                ticket.attempts = 3
+                store.update_ticket(run_id, ticket)
+
+    def _watching(self, orchestrator, verdict, inverted):
+        """Record every respec prompt that asked the inverted question.
+
+        The planner answers with a real revision every time: a cycle whose
+        respec changed nothing stops the retries, which would end the run
+        before the rung under test could fire.
+        """
+        revisions = itertools.count()
+
+        def call(_run_id, role, messages, **_kwargs):
+            shown = " ".join(m.content for m in messages)
+            if role == "reviewer" and "satisfied as written" in shown:
+                return Completion(
+                    text=f"VERDICT: {verdict}\nCriteria 1 and 2 disagree.",
+                    usage=Usage(),
+                    finish_reason="stop",
+                )
+            if "This ticket has stopped moving" in shown:
+                inverted.append(shown)
+            return Completion(
+                text=json.dumps({"spec": f"revised {next(revisions)}"}),
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        orchestrator._call = call
+
+    def test_unwinnable_asks_the_planner_in_the_same_cycle(self):
+        # The rungs exist to spend more only once cheaper things have failed,
+        # and a rung-one answer of `unwinnable` is the thing rung two was
+        # waiting for. Waiting a further cycle to ask is the delay itself: on
+        # one run the reviewer said unwinnable about two tickets, naming the
+        # exact arithmetic each time and being right both times, and the loop
+        # then ran them for five and two more cycles — thirty-five attempts.
+        orchestrator, store, run_id = self._stalled(review_when_stuck=2)
+        inverted: list[str] = []
+        self._watching(orchestrator, "unwinnable", inverted)
+
+        for cycle in range(3):
+            self._cycle(
+                orchestrator, store, run_id,
+                "src/a.ts(4,1): error TS2532: x", moving=cycle,
+            )
+
+        self.assertTrue(inverted, "the planner was never asked the inverted question")
+        self.assertIn("Criteria 1 and 2 disagree", inverted[0])
+
+    def test_winnable_waits_for_the_next_rung_as_before(self):
+        # An `unwinnable` verdict advances the ladder. Nothing else does, and a
+        # `winnable` one excuses nothing either way.
+        orchestrator, store, run_id = self._stalled(review_when_stuck=2)
+        inverted: list[str] = []
+        self._watching(orchestrator, "winnable", inverted)
+
+        for cycle in range(3):
+            self._cycle(
+                orchestrator, store, run_id,
+                "src/a.ts(4,1): error TS2532: x", moving=cycle,
+            )
+
+        self.assertEqual(inverted, [])
+
+    def test_the_planner_still_decides(self):
+        # Not the review ending a ticket: the verdict advances the ladder and
+        # the planner answers. On an earlier run this same reviewer called a
+        # genuinely unsatisfiable ticket **winnable**.
+        orchestrator, store, run_id = self._stalled(review_when_stuck=2)
+        inverted: list[str] = []
+        self._watching(orchestrator, "unwinnable", inverted)
+
+        for cycle in range(3):
+            self._cycle(
+                orchestrator, store, run_id,
+                "src/a.ts(4,1): error TS2532: x", moving=cycle,
+            )
+
+        self.assertNotEqual(store.list_tickets(run_id)[0].status, "blocked")
+
+    def test_a_ticket_still_flat_is_asked_again_rather_than_once(self):
+        # Rung two travels with the ordinary respec — same call, same evidence,
+        # only the question differs — so asking it again costs nothing, and a
+        # ticket still flat two cycles later has made the case harder.
+        orchestrator, store, run_id = self._stalled(review_when_stuck=2)
+        inverted: list[str] = []
+        self._watching(orchestrator, "unclear", inverted)
+
+        for cycle in range(5):
+            self._cycle(
+                orchestrator, store, run_id,
+                "src/a.ts(4,1): error TS2532: x", moving=cycle,
+            )
+
+        self.assertGreater(len(inverted), 1)
 
 
 class TestThePlannerIsAskedWhetherTheTicketIsPossible(unittest.TestCase):
