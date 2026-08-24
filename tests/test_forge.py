@@ -10015,6 +10015,131 @@ class TestAStuckTicketReachesTheReviewer(unittest.TestCase):
         self.assertGreater(len(inverted), 1)
 
 
+class TestAnImpossibleTicketIsAskedAboutOnce(unittest.TestCase):
+    """A retry cycle requeues blocked tickets, which is right in general: a
+    human may have edited the spec, or the dependency the ticket was waiting on
+    may have landed. It is wrong for a ticket the planner has already read and
+    called unsatisfiable, because nothing between cycles changes an unchanged
+    contract.
+
+    One ticket produced the identical verdict seven times from the same spec —
+    seven planner calls, each a full reasoning budget, each naming the same two
+    criteria that contradict each other."""
+
+    def _parked(self, **loop_settings):
+        """T-1 parked as impossible, beside a T-2 that keeps the cycles coming.
+
+        Two tickets because a cycle whose respec changed nothing stops the
+        retries: with T-1 alone there would be no second cycle to observe. T-2
+        is the rest of a real backlog, still being revised.
+        """
+        orchestrator, store, run_id = TestAutomaticRetryCycles._orchestrator(
+            self,
+            tickets=[
+                Ticket("T-1", status="failed", attempts=3, spec="the stuck one",
+                       criteria=["c"]),
+                Ticket("T-2", status="failed", attempts=3, spec="the moving one",
+                       criteria=["d"]),
+            ],
+            retry_cycles=-1,
+            respec_on_retry=True,
+            **loop_settings,
+        )
+        for ticket_id in ("T-1", "T-2"):
+            step = store.start_step(run_id, ticket_id, "test")
+            store.end_step(step, "failed", f"AssertionError in {ticket_id}")
+
+        orchestrator._call = self._answering(orchestrator)
+        return orchestrator, store, run_id
+
+    def _answering(self, orchestrator, asked=None):
+        """`impossible` for T-1, a fresh revision for anything else."""
+        revisions = itertools.count()
+
+        def call(_run_id, _role, messages, **_kwargs):
+            shown = " ".join(m.content for m in messages)
+            if asked is not None:
+                asked.append(shown)
+            if "the stuck one" in shown:
+                return Completion(
+                    text=json.dumps({"impossible": "criteria 1 and 2 disagree"}),
+                    usage=Usage(),
+                    finish_reason="stop",
+                )
+            return Completion(
+                text=json.dumps({"spec": f"the moving one, revised {next(revisions)}"}),
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        return call
+
+    def test_the_verdict_is_recorded_against_the_contract_it_was_about(self):
+        orchestrator, store, run_id = self._parked()
+
+        orchestrator._retry_cycle(run_id, "blocked")
+
+        parked = {t.ticket_id: t for t in store.list_tickets(run_id)}["T-1"]
+        self.assertEqual(parked.status, TICKET_BLOCKED)
+        self.assertEqual(parked.impossible_fingerprint, parked.fingerprint)
+
+    def test_the_next_cycle_does_not_ask_again(self):
+        orchestrator, store, run_id = self._parked()
+        orchestrator._retry_cycle(run_id, "blocked")
+        asked: list[str] = []
+
+        orchestrator._call = self._answering(orchestrator, asked)
+        orchestrator._retry_cycle(run_id, "blocked")
+
+        self.assertFalse([shown for shown in asked if "the stuck one" in shown])
+
+    def test_it_says_why_and_how_to_override(self):
+        orchestrator, store, run_id = self._parked()
+        orchestrator._retry_cycle(run_id, "blocked")
+        orchestrator._retry_cycle(run_id, "blocked")
+
+        messages = " ".join(row["message"] for row in store.events_after(0))
+
+        self.assertIn("already read this ticket", messages)
+        self.assertIn("forge retry --ticket T-1", messages)
+
+    def test_a_changed_contract_puts_it_back_in_the_cycle(self):
+        # Anything that genuinely alters the contract — a human's edit,
+        # `forge criteria --accept` — is a different question, so it is asked.
+        orchestrator, store, run_id = self._parked()
+        orchestrator._retry_cycle(run_id, "blocked")
+
+        parked = {t.ticket_id: t for t in store.list_tickets(run_id)}["T-1"]
+        parked.criteria = ["c", "something a human added"]
+        store.update_ticket(run_id, parked)
+        asked: list[str] = []
+
+        orchestrator._call = self._answering(orchestrator, asked)
+        orchestrator._retry_cycle(run_id, "blocked")
+
+        self.assertTrue([shown for shown in asked if "something a human added" in shown])
+
+    def test_the_rest_of_the_backlog_keeps_going(self):
+        # The exclusion is one ticket's, not the cycle's.
+        orchestrator, store, run_id = self._parked()
+
+        self.assertTrue(orchestrator._retry_cycle(run_id, "blocked"))
+
+        after = {t.ticket_id: t.status for t in store.list_tickets(run_id)}
+        self.assertEqual(after["T-2"], "pending")
+        self.assertEqual(after["T-1"], TICKET_BLOCKED)
+
+    def test_a_backlog_of_nothing_else_ends_the_run(self):
+        orchestrator, store, run_id = self._parked()
+        orchestrator._retry_cycle(run_id, "blocked")
+        for ticket in store.list_tickets(run_id):
+            if ticket.ticket_id == "T-2":
+                ticket.status = TICKET_DONE
+                store.update_ticket(run_id, ticket)
+
+        self.assertFalse(orchestrator._retry_cycle(run_id, "blocked"))
+
+
 class TestThePlannerIsAskedWhetherTheTicketIsPossible(unittest.TestCase):
     """`impossible` has been available on every respec call since the field
     existed, and in 86 consecutive cycles on one ticket the planner never

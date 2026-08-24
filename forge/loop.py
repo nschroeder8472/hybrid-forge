@@ -2738,12 +2738,40 @@ class Orchestrator:
                 kind="lifecycle",
             )
 
+        # Already read and answered. Requeueing a blocked ticket is right in
+        # general — a human may have edited the spec, or the dependency it was
+        # waiting on may have landed — and wrong for one the planner has
+        # already called unsatisfiable, because nothing between cycles changes
+        # an unchanged contract. One ticket produced the identical verdict
+        # seven times from the same spec, seven planner calls apiece naming the
+        # same two criteria that contradict each other.
+        settled = {
+            ticket.ticket_id
+            for ticket in tickets
+            if ticket.status == TICKET_BLOCKED
+            and ticket.impossible_fingerprint
+            and ticket.impossible_fingerprint == ticket.fingerprint
+        }
+        for ticket_id in sorted(settled):
+            self.store.log(
+                run_id,
+                f"{ticket_id}: not retried — the planner has already read this "
+                f"ticket and reported that it cannot be satisfied, and neither "
+                f"its spec nor its criteria have changed since. Asking again "
+                f"spends the same call for the same answer. Read the blocked "
+                f"note; change what it names, or `forge retry --ticket "
+                f"{ticket_id}` to run it anyway.",
+                level="warn",
+                kind="lifecycle",
+            )
+
         eligible = [
             ticket.ticket_id
             for ticket in tickets
             if ticket.status in self.store.RETRYABLE
             and ticket.route == "delegate"
             and ticket.ticket_id not in unprovable
+            and ticket.ticket_id not in settled
         ]
 
         # Measured per ticket, before the backlog-wide comparison below. The
@@ -3061,6 +3089,9 @@ class Orchestrator:
                 parked.add(ticket.ticket_id)
                 ticket.status = TICKET_BLOCKED
                 ticket.blocked_note = f"respec: {result.impossible}"
+                # So the next cycle does not ask the same question about the
+                # same contract. See `Ticket.impossible_fingerprint`.
+                ticket.impossible_fingerprint = ticket.fingerprint
                 self.store.update_ticket(run_id, ticket)
                 # A ticket nobody can satisfy has usually spent a long time
                 # finding that out, and what it learned about the project on

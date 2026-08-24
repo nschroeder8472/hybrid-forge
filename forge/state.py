@@ -280,6 +280,20 @@ class Ticket:
     # is put through ratification again rather than built to a version nobody
     # signed off on.
     ratify_fingerprint: str = ""
+    # The contract this ticket had when respec last reported it unsatisfiable.
+    #
+    # A retry cycle requeues blocked tickets, which is right: a human may have
+    # edited the spec, or the ticket a dependency was waiting on may have
+    # landed. It is wrong for a ticket the planner has already read and called
+    # impossible, because nothing between cycles changes an unchanged contract.
+    # One ticket produced the identical impossibility verdict seven times from
+    # the same spec — seven planner calls, each a full reasoning budget, each
+    # naming the same two criteria that contradict each other.
+    #
+    # Compared against `fingerprint`, so anything that genuinely alters the
+    # contract — a human's edit, `forge criteria --accept` — puts it back in
+    # the cycle on its own.
+    impossible_fingerprint: str = ""
     # The settled contract. Written when a ticket ratifies, and read by respec
     # in preference to `original_*`: from that moment the ratified criteria are
     # protected exactly as a human's are, because four roles agreed to them.
@@ -434,6 +448,7 @@ class Ticket:
             "ratify_passes": self.ratify_passes,
             "ratify_notes": json.dumps(self.ratify_notes),
             "ratify_fingerprint": self.ratify_fingerprint,
+            "impossible_fingerprint": self.impossible_fingerprint,
             "ratified_spec": self.ratified_spec,
             "ratified_criteria": json.dumps(self.ratified_criteria),
         }
@@ -466,6 +481,7 @@ class Ticket:
             ratify_passes=row["ratify_passes"],
             ratify_notes=json.loads(row["ratify_notes"]),
             ratify_fingerprint=row["ratify_fingerprint"],
+            impossible_fingerprint=row["impossible_fingerprint"] or "",
             ratified_spec=row["ratified_spec"],
             ratified_criteria=json.loads(row["ratified_criteria"]),
             learned=json.loads(row["learned"] or "[]"),
@@ -556,6 +572,7 @@ class Store:
         ("tickets", "flat_cycles", "INTEGER NOT NULL DEFAULT 0"),
         ("tickets", "tests_fingerprint", "TEXT NOT NULL DEFAULT ''"),
         ("tickets", "abandoned_values", "TEXT NOT NULL DEFAULT '[]'"),
+        ("tickets", "impossible_fingerprint", "TEXT NOT NULL DEFAULT ''"),
     )
 
     def _migrate(self) -> None:
@@ -806,7 +823,8 @@ class Store:
                 "criteria = :criteria, needs = :needs, dep_stamp = :dep_stamp, "
                 "baseline_tree = :baseline_tree, "
                 "charged_failures = :charged_failures, context = :context, "
-                "blocked_note = :blocked_note, updated_at = :now "
+                "blocked_note = :blocked_note, "
+                "impossible_fingerprint = :impossible_fingerprint, updated_at = :now "
                 "WHERE run_id = :run_id AND ticket_id = :ticket_id",
                 {**ticket.as_row(), "run_id": run_id, "now": time.time()},
             )
