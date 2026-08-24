@@ -9197,6 +9197,135 @@ class TestALanguageNothingTypeChecks(unittest.TestCase):
         self.assertNotIn("no type check", captured.getvalue())
 
 
+class TestATestIsNamedTheWayTheProjectNamesTests(unittest.TestCase):
+    """A runner collects the files its pattern matches and is silent about the
+    rest, so a test it does not collect is not a failing test — it is an
+    invisible one. `_test` is mandatory for `go test` and one of pytest's two
+    patterns, and it is not what JavaScript and TypeScript use.
+
+    One project's `vitest.config.ts` read `include: ["tests/**/*.test.ts"]`.
+    A file named `pf_002_test.ts` was never collected, the suite reported green
+    having never parsed it, and the preflight canary — which is the one file
+    whose whole job is to be collected and fail — stopped the run reporting
+    that the command did not run TypeScript at all. It was right about the
+    file and wrong about the runner."""
+
+    TICKET = Ticket("PF-002")
+
+    def _stem(self, suffix, example=None):
+        return Orchestrator._test_stem(
+            self.TICKET, suffix, (example, "") if example else None
+        )
+
+    def test_a_dotted_example_gives_a_dotted_name(self):
+        self.assertEqual(
+            self._stem(".ts", "tools/path_forge/tests/smoke.test.ts"), "pf_002.test"
+        )
+
+    def test_an_underscored_example_keeps_the_underscore(self):
+        self.assertEqual(self._stem(".ts", "tests/tt_004_test.ts"), "pf_002_test")
+
+    def test_nothing_to_read_off_keeps_the_default(self):
+        # `_test` is inert in most ecosystems and required in two of them, so
+        # it stays the answer when the repository has not said otherwise.
+        self.assertEqual(self._stem(".rs"), "pf_002_test")
+        self.assertEqual(self._stem(".ts"), "pf_002_test")
+
+    def test_an_example_that_marks_nothing_keeps_the_default(self):
+        # `helpers.ts` says nothing about how the runner finds a test, and
+        # guessing from it would be worse than the default.
+        self.assertEqual(self._stem(".ts", "tests/helpers.ts"), "pf_002_test")
+
+    def test_pytest_prefix_naming_is_read_as_a_prefix(self):
+        self.assertEqual(self._stem(".py", "tests/test_scanner.py"), "test_pf_002")
+
+    def test_pytest_suffix_naming_still_works(self):
+        self.assertEqual(self._stem(".py", "tests/scanner_test.py"), "pf_002_test")
+
+    def test_a_spec_convention_is_kept_as_spec(self):
+        self.assertEqual(self._stem(".ts", "tests/parse.spec.ts"), "pf_002.spec")
+
+    def test_the_separator_the_project_used_is_the_one_returned(self):
+        # A hyphen read back as an underscore lands outside the runner's
+        # pattern again, which is the whole failure.
+        self.assertEqual(self._stem(".js", "__tests__/app-test.js"), "pf_002-test")
+
+    def test_a_type_named_language_ignores_the_example(self):
+        # `pn_001_test.java` cannot declare `Pn001Test`, and javac rejects the
+        # file wherever it is put. The language decides and no example
+        # overrides it.
+        self.assertEqual(
+            self._stem(".java", "src/test/java/scanner.test.java"), "Pf002Test"
+        )
+
+    def test_the_canary_is_named_the_same_way(self):
+        # The one file whose entire purpose is to be collected and fail. A name
+        # the runner skips defeats it completely, and the verdict it produces
+        # then stops a run that had nothing wrong with it.
+        root = _workspace_repo(
+            [
+                {"root": ".", "commands": {"test": "pytest -q"}},
+                {"root": "tools/pf", "commands": {"test": "npm test"}},
+            ],
+            files=("tools/pf/tests/smoke.test.ts", "tools/pf/src/a.ts"),
+        )
+        config = Config.load(root)
+        orch = Orchestrator(config, Store(root / "t.db"))
+        workspace = next(w for w in config.workspaces if w.root == "tools/pf")
+
+        self.assertEqual(
+            orch._canary_path(workspace, ".ts"),
+            "tools/pf/tests/forge_preflight_canary.test.ts",
+        )
+
+    def test_the_canary_keeps_the_default_where_nothing_says_otherwise(self):
+        root = _workspace_repo(None, files=("src/a.rs",), commands={"test": "cargo test"})
+        config = Config.load(root)
+        orch = Orchestrator(config, Store(root / "t.db"))
+
+        self.assertTrue(
+            orch._canary_path(config.workspaces[0], ".rs").endswith(
+                "forge_preflight_canary_test.rs"
+            )
+        )
+
+    def test_a_test_written_under_any_spelling_is_still_reclaimable(self):
+        # The hazard this change introduces if it is got wrong. `_test_stem`
+        # decides a name from the repository as it stands; `_owned_test_files`
+        # deletes by name later, possibly after the repository changed. A stem
+        # set narrowed to today's answer would strand yesterday's file: owned
+        # by nobody, failing every ticket after it, deletable only by hand.
+        orch, root, _run_id = _stub_orchestrator()
+        (root / "tests").mkdir()
+        for name in (
+            "pf_002_test.ts",
+            "pf_002.test.ts",
+            "pf_002.spec.ts",
+            "test_pf_002.py",
+            "pf_002-test.js",
+        ):
+            (root / "tests" / name).write_text("x\n", encoding="utf-8")
+
+        owned = orch._owned_test_files(Ticket("PF-002"))
+
+        for name in (
+            "pf_002_test.ts",
+            "pf_002.test.ts",
+            "pf_002.spec.ts",
+            "test_pf_002.py",
+            "pf_002-test.js",
+        ):
+            self.assertIn(f"tests/{name}", owned, name)
+
+    def test_somebody_elses_test_is_still_not_reclaimed(self):
+        orch, root, _run_id = _stub_orchestrator()
+        (root / "tests").mkdir()
+        (root / "tests" / "pf_003.test.ts").write_text("x\n", encoding="utf-8")
+        (root / "tests" / "parse.test.ts").write_text("x\n", encoding="utf-8")
+
+        self.assertEqual(orch._owned_test_files(Ticket("PF-002")), [])
+
+
 class TestTheTestsStopMovingUnderTheExecutor(unittest.TestCase):
     """The tester was the most expensive role in the loop and almost none of
     what it spent was new work: 916 calls and 18,253 seconds on one run, more

@@ -1849,6 +1849,10 @@ class Orchestrator:
     # suite ever having run.
     _CANARY_STEM = "forge_preflight_canary_test"
     _CANARY_TYPE_STEM = "ForgePreflightCanaryTest"
+    # What `_test_marker` builds the canary's name around, so a project using
+    # `name.test.ts` gets `forge_preflight_canary.test.ts` rather than a file
+    # its runner ignores.
+    _CANARY_SLUG = "forge_preflight_canary"
 
     def _canary(self, run_id: int) -> list[str]:
         """Prove each build can check the languages this backlog will write.
@@ -2025,11 +2029,19 @@ class Orchestrator:
         if not directory:
             directory = self._TEST_ROOTS.get(suffix, "tests")
 
-        stem = (
-            self._CANARY_TYPE_STEM
-            if suffix in self._TYPE_NAMED_SUFFIXES
-            else self._CANARY_STEM
-        )
+        if suffix in self._TYPE_NAMED_SUFFIXES:
+            stem = self._CANARY_TYPE_STEM
+        else:
+            # Named the way this project names tests, for the reason the canary
+            # exists at all: a file the runner's pattern does not match is not
+            # collected, the suite passes over it, and the canary reports the
+            # command as not running the language. That verdict is right about
+            # the file and wrong about the runner, and it stops a run that had
+            # nothing wrong with it.
+            stem = (
+                self._test_marker(self._CANARY_SLUG, example, suffix)
+                or self._CANARY_STEM
+            )
         prefix = "" if directory in ("", ".") else f"{directory}/"
         return f"{workspace.prefix}{prefix}{stem}{suffix}"
 
@@ -5516,24 +5528,90 @@ class Orchestrator:
                 counts[suffix] += 1
         return counts.most_common(1)[0][0] if counts else ""
 
+    # How a project marks a file as a test, as `(regex, template)`. Ordered
+    # most-specific first; the first one an example matches decides.
+    #
+    # `_test` is not universal and assuming it was cost a run. It is mandatory
+    # for `go test` and one of pytest's two patterns, and it is *not* what
+    # JavaScript and TypeScript use: the near-universal convention there is
+    # `name.test.ts`, and a runner configured for it collects nothing else. One
+    # project's `vitest.config.ts` read `include: ["tests/**/*.test.ts"]`, so a
+    # file this loop named `pf_002_test.ts` was never collected — the suite
+    # reported green having never parsed it. The preflight canary is what found
+    # it, correctly, and reported the runner as not covering the language at
+    # all.
+    _TEST_MARKERS: tuple[tuple[str, str], ...] = (
+        (r"^test[_-]", "test_{slug}"),
+        (r"^spec[_-]", "spec_{slug}"),
+        (r"[._-]test$", "{slug}{sep}test"),
+        (r"[._-]spec$", "{slug}{sep}spec"),
+    )
+
     @classmethod
-    def _test_stem(cls, ticket: Ticket, suffix: str) -> str:
+    def _test_stem(
+        cls, ticket: Ticket, suffix: str, example: tuple[str, str] | None = None
+    ) -> str:
         """The filename this loop gives a test it had to invent a home for.
 
         Shared with `_owned_test_files`, and it has to be: that is what deletes
         an unverified test, it finds the file by this exact name, and a stem
-        derived in two places drifts into orphans nothing can reclaim.
+        derived in two places drifts into orphans nothing can reclaim. Which is
+        why that one matches *every* spelling this can produce rather than the
+        one today's rule picks — see its comment.
 
-        `_test` rather than a bare slug — mandatory for `go test`, one of
-        pytest's two default collection patterns, inert everywhere else. Except
-        where the filename has to match a public type, which rules the
-        underscore out: `pn_001_test.java` cannot declare `Pn001Test`, and javac
-        rejects the file wherever it is put.
+        Read off an existing test in the same language where the repository has
+        one, because the naming convention is a hard constraint in exactly the
+        way the framework is: a runner collects the files its pattern matches
+        and is silent about the rest, so a test it does not collect is not a
+        failing test, it is an invisible one. `_example_test` already decides
+        the directory this way. The name is the same question.
+
+        `_test` remains the answer with nothing to read off — mandatory for
+        `go test`, one of pytest's two default patterns, inert in most places.
+        Except where the filename has to match a public type, which rules the
+        separator out entirely: `pn_001_test.java` cannot declare `Pn001Test`,
+        and javac rejects the file wherever it is put. That case is decided by
+        the language and no example overrides it.
         """
         slug = cls._ticket_slug(ticket)
-        if suffix.lower() not in cls._TYPE_NAMED_SUFFIXES:
-            return f"{slug}_test"
-        return "".join(part.capitalize() for part in slug.split("_") if part) + "Test"
+        if suffix.lower() in cls._TYPE_NAMED_SUFFIXES:
+            return "".join(part.capitalize() for part in slug.split("_") if part) + "Test"
+
+        marker = cls._test_marker(slug, example, suffix)
+        if marker:
+            return marker
+        return f"{slug}_test"
+
+    @classmethod
+    def _test_marker(
+        cls, slug: str, example: tuple[str, str] | None, suffix: str
+    ) -> str:
+        """This project's own test naming, applied to the ticket's slug, or "".
+
+        Empty whenever there is nothing to read off or the example does not
+        mark itself as a test in any way this recognises — `smoke.ts` says
+        nothing about how the runner finds it, and guessing from it would be
+        worse than the default.
+        """
+        if not example:
+            return ""
+        stem = Path(example[0]).name
+        if suffix and stem.lower().endswith(suffix.lower()):
+            stem = stem[: -len(suffix)]
+        if not stem:
+            return ""
+        for pattern, template in cls._TEST_MARKERS:
+            found = re.search(pattern, stem, re.IGNORECASE)
+            if not found:
+                continue
+            # The separator the example actually used, so `.test` does not come
+            # back as `_test` and land outside the runner's pattern again.
+            separator = next(
+                (character for character in found.group(0) if character in "._-"),
+                "_",
+            )
+            return template.format(slug=slug, sep=separator)
+        return ""
 
     @staticmethod
     def _closest_designated(designated: list[str], written: list[str]) -> str:
@@ -5638,7 +5716,7 @@ class Orchestrator:
                 f"{self._TEST_ROOTS.get(suffix, 'tests')}"
             )
         prefix = "" if directory in ("", ".") else f"{directory}/"
-        return f"{prefix}{self._test_stem(ticket, suffix)}{suffix}", ""
+        return f"{prefix}{self._test_stem(ticket, suffix, example)}{suffix}", ""
 
     def _ticket_workspace(self, ticket: Ticket) -> Workspace:
         """The build a ticket's writable files belong to.
@@ -6050,7 +6128,7 @@ class Orchestrator:
             else f"{workspace.prefix}{self._TEST_ROOTS.get(suffix, 'tests')}"
         )
         prefix = "" if directory in ("", ".") else f"{directory}/"
-        # `_test_stem`, not a bare slug plus `_test`. Building the name here
+        # `_test_stem`, not a bare slug plus a marker. Building the name here
         # instead meant a Java reproduction was filed at `bug_002_test.java`,
         # and javac rejects any public type in a file not named after it — so
         # the tester's `public class Bug002Test` could not compile wherever it
@@ -6058,7 +6136,7 @@ class Orchestrator:
         # class package-private: BUG-001 did and was fine, BUG-002 did not and
         # the run was over in one cycle. `_test_stem` has spelled this
         # correctly for the ordinary test path all along.
-        return f"{prefix}{self._test_stem(ticket, suffix)}{suffix}", ""
+        return f"{prefix}{self._test_stem(ticket, suffix, example)}{suffix}", ""
 
     # Extensions that hold behavior a test suite could have covered. A ticket
     # that cannot reproduce a fault in one language is worth pointing at the
@@ -6482,9 +6560,21 @@ class Orchestrator:
         # to the current answer would strand it: owned by nobody, failing every
         # ticket after it, deletable only by hand.
         slug = self._ticket_slug(ticket)
-        stems = {f"{slug}_test"} | {
-            self._test_stem(ticket, suffix) for suffix in self._TYPE_NAMED_SUFFIXES
-        }
+        stems = (
+            {f"{slug}_test"}
+            | {self._test_stem(ticket, suffix) for suffix in self._TYPE_NAMED_SUFFIXES}
+            # Every marker `_test_stem` can read off an example, whatever this
+            # repository's example happens to look like today. A test written
+            # when the project had one convention and reclaimed after it
+            # changed is still this ticket's, and a stem set narrowed to the
+            # current answer would strand it. `Path.stem` takes one extension
+            # off, so the dotted spellings are stems in their own right.
+            | {
+                template.format(slug=slug, sep=separator)
+                for _pattern, template in self._TEST_MARKERS
+                for separator in "._-"
+            }
+        )
         found: set[str] = set()
         for pattern in self._TEST_GLOBS:
             for path in self.config.root.glob(pattern):
