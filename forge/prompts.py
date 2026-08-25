@@ -1567,6 +1567,7 @@ def review_prompt(
     state: dict[str, str] | None = None,
     unchanged: dict[str, str] | None = None,
     reproduced: tuple[str, str] | None = None,
+    unchecked: str = "",
 ) -> list[Message]:
     messages = [Message(role="system", content=REVIEWER_SYSTEM)]
 
@@ -1657,6 +1658,31 @@ in the diff above. They are **not** missing. This is their current content —
 judge the criteria against it, exactly as if it were in the diff.
 
 {_sources_block(unchanged)}
+"""
+
+    if unchecked:
+        # The one case where "the tests pass" means nothing, and the reviewer
+        # has no way to know it. A tester that kept reshaping the value before
+        # comparing it had its file discarded twice, so nothing ran against
+        # these criteria at all — and the reviewer that saw the *previous*
+        # version of this ticket read `expect(u32(pcg.randi())).toBe(...)` as
+        # evidence the criterion was met and approved an implementation
+        # returning -223148877 where the criterion said 4071818419.
+        body += f"""
+## No test was written for these criteria
+
+{unchecked}
+
+So nothing in the suite checks the criteria above; whatever else went green
+went green without them. You are the only thing standing between this ticket
+and being recorded as done.
+
+Check each criterion against the diff directly, and check it against what the
+code **returns**, not what a caller could convert it to. A criterion naming an
+exact value is not met by a function that produces the right bits in the wrong
+representation — the wrong sign, the wrong width, the wrong units. If you
+cannot tell from the diff what a criterion's expression evaluates to, that is a
+REJECT and not a benefit of the doubt.
 """
 
     messages.append(Message(role="user", content=body))

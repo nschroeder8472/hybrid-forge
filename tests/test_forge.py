@@ -18181,6 +18181,186 @@ class TestRatificationInTheLoop(unittest.TestCase):
         self.assertEqual(store.list_tickets(run_id)[0].status, "blocked")
 
 
+class TestTheReviewerIsToldNothingCheckedTheCriteria(unittest.TestCase):
+    """A tester that kept reshaping the value before comparing it has its file
+    discarded, and the ticket goes to review with a suite that went green
+    without ever touching these criteria. The reviewer had no way to tell that
+    from one the tests cover — and the reviewer that saw the previous version
+    of this ticket read `expect(u32(pcg.randi())).toBe(...)` as evidence the
+    criterion was met, and approved an implementation returning -223148877
+    where the criterion said 4071818419."""
+
+    def _body(self, **kwargs):
+        return review_prompt(
+            Ticket(
+                "PF-005",
+                title="PCG32",
+                spec="Port the generator.",
+                criteria=["`randi()` returns 4071818419 on the third draw."],
+            ),
+            "diff --git a b",
+            **kwargs,
+        )[-1].content
+
+    def test_a_ticket_whose_tests_were_discarded_says_so(self):
+        body = self._body(
+            unchecked="tester kept asserting through its own reshaping helper; "
+            "tests discarded rather than reporting green for a criterion they "
+            "do not check"
+        )
+
+        self.assertIn("No test was written for these criteria", body)
+        self.assertIn("reshaping helper", body)
+
+    def test_the_reviewer_is_told_to_judge_the_returned_value(self):
+        body = self._body(unchecked="the attempt wrote no files")
+
+        self.assertIn("what the", body)
+        self.assertIn("returns", body)
+        self.assertIn("not what a caller could convert it to", body)
+
+    def test_uncertainty_is_a_reject_and_not_a_benefit_of_the_doubt(self):
+        body = self._body(unchecked="the attempt wrote no files")
+
+        self.assertIn("REJECT and not a benefit of the doubt", body)
+
+    def test_a_ticket_whose_tests_were_written_carries_none_of_it(self):
+        self.assertNotIn("No test was written", self._body())
+
+    def test_the_loop_passes_the_reason_through(self):
+        # End to end: the tester launders twice, its tests are discarded, and
+        # the reason reaches the reviewer rather than only the run log.
+        seen: list[str] = []
+        orch, root, run_id = _stub_orchestrator()
+        orch.config.loop.max_attempts = 1
+        replies = _replies(
+            "src/wasm.rs\n```rust\npub fn game_new(s: u32) -> u32 { s }\n```",
+            "tests/tt_004_test.rs\n```rust\nfn u32v(n: u32) -> u32 {\n    return n >> 0;\n}\n"
+            "#[test]\nfn t() { assert_eq!(u32v(wasm::game_new(1)), 0); }\n```",
+            "tests/tt_004_test.rs\n```rust\nfn u32v(n: u32) -> u32 {\n    return n >> 0;\n}\n"
+            "#[test]\nfn t() { assert_eq!(u32v(wasm::game_new(1)), 0); }\n```",
+            "ACCEPT\nfine",
+        )
+
+        def call(run_id_, role, messages, **kwargs):
+            if role == "reviewer":
+                seen.append("\n".join(m.content for m in messages))
+            return replies(run_id_, role, messages, **kwargs)
+
+        orch._call = call
+        orch._work_ticket(
+            run_id,
+            Ticket("TT-004", allowed_files=["src/wasm.rs"], criteria=["game_new returns 0"]),
+        )
+
+        self.assertTrue(seen)
+        self.assertIn("No test was written for these criteria", seen[-1])
+        self.assertIn("reshaping helper", seen[-1])
+
+
+class TestWhatTheFormatterCouldNotReadReachesTheNextAttempt(unittest.TestCase):
+    """The formatter is the first thing in the pipeline to read a file the
+    attempt just wrote, and when it refuses one it says why with a line number.
+    On one ticket that was `Unexpected token Token('TYPE_HINT', 'import') at
+    line 3` against a test file, cycle after cycle, while the loop spent eight
+    seconds a time running the whole gdUnit suite to reach the same
+    conclusion — and then showed the executor the suite's version of it."""
+
+    # What `gdformat` actually printed, trimmed. It reformats what it can,
+    # names what it cannot on a bare line of its own, and exits non-zero.
+    REAL = (
+        "reformatted tools/dump_decor_fixtures.gd\n"
+        "1 file reformatted, 1 file left unchanged.\n"
+        "\n"
+        "tests/theme/test_decor_fixtures.gd:\n"
+        "\n"
+        'import "res://tools/dump_decor_fixtures.\n'
+        "^\n"
+        "\n"
+        "Unexpected token Token('TYPE_HINT', 'import') at line 3, column 1.\n"
+    )
+
+    def setUp(self):
+        self.tool = Path(tempfile.mkdtemp()) / "refusing_formatter.py"
+        self.tool.write_text(
+            "import pathlib, sys\n"
+            "refused = []\n"
+            "for argument in sys.argv[1:]:\n"
+            "    target = pathlib.Path(argument)\n"
+            "    text = target.read_text(encoding='utf-8')\n"
+            "    if text.startswith('NOPARSE'):\n"
+            "        refused.append(argument)\n"
+            "        continue\n"
+            "    target.write_text(\n"
+            "        '\\n'.join(line.rstrip() for line in text.split('\\n')),\n"
+            "        encoding='utf-8',\n"
+            "    )\n"
+            "    print('reformatted ' + argument)\n"
+            "for argument in refused:\n"
+            "    print(argument + ':')\n"
+            "    print(\"Unexpected token Token('TYPE_HINT', 'import') at line 3\")\n"
+            "sys.exit(1 if refused else 0)\n",
+            encoding="utf-8",
+        )
+        self.formatter = f'"{sys.executable}" "{self.tool}"'
+
+    def _orch(self):
+        return _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": "", "format": self.formatter}
+        )
+
+    def test_the_file_it_refused_is_reported_and_the_one_it_rewrote_is_not(self):
+        orch, root, run_id = self._orch()
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "good.py").write_text("x = 1   \n", encoding="utf-8")
+        (root / "src" / "bad.py").write_text("NOPARSE\nimport x\n", encoding="utf-8")
+
+        refused: dict[str, str] = {}
+        orch._format_pass(
+            run_id, Ticket("T-1"), ["src/bad.py", "src/good.py"], refused
+        )
+
+        self.assertEqual(sorted(refused), ["src/bad.py"])
+
+    def test_a_success_banner_never_reports_the_file_it_names(self):
+        # `gdformat` leads with `reformatted tools/dump_decor_fixtures.gd`, so
+        # matching on the path alone reports the file it just fixed as the
+        # broken one. A file it rewrote is never one it refused.
+        self.assertIn("reformatted tools/dump_decor_fixtures.gd", self.REAL)
+        self.assertIn("tests/theme/test_decor_fixtures.gd", self.REAL)
+
+    def test_a_formatter_that_never_ran_names_nothing(self):
+        # A missing binary is a configuration fault and says nothing about the
+        # code. `command not found` carries no path, so nothing is reported.
+        orch, root, run_id = _stub_orchestrator({
+            "lint": "", "typecheck": "", "test": "",
+            "format": "this-command-does-not-exist-anywhere",
+        })
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "a.py").write_text("x = 1   \n", encoding="utf-8")
+
+        refused: dict[str, str] = {}
+        orch._format_pass(run_id, Ticket("T-1"), ["src/a.py"], refused)
+
+        self.assertEqual(refused, {})
+
+    def test_the_note_is_shaped_so_the_tester_is_told_it_is_its_own(self):
+        # `errors_naming` reads out of `failures._blocks`, and that is what
+        # decides whether the frozen test file is the tester's to rewrite.
+        # Phrased as ordinary prose the sentence reached the prompt without
+        # ever reaching that decision — `errors_naming` found nothing in it.
+        composed = (
+            "test failed:\nsomething unrelated\n\n"
+            "ERROR: the formatter could not read tests/theme/test_decor_fixtures.gd, "
+            "so nothing downstream could parse it either:\n" + self.REAL
+        )
+
+        found = errors_naming(composed, "tests/theme/test_decor_fixtures.gd")
+
+        self.assertEqual(len(found), 1)
+        self.assertIn("could not read", found[0])
+
+
 class TestAFormatterThatDidHalfTheJobIsNotAFailedOne(unittest.TestCase):
     """`gdformat` handed a good file and one it cannot parse rewrites the good
     one, says so on the first line of its output, and exits non-zero for the

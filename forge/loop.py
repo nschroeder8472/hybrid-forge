@@ -4128,7 +4128,11 @@ class Orchestrator:
         return "\n".join(lines)
 
     def _format_pass(
-        self, run_id: int, ticket: Ticket, paths: Sequence[str]
+        self,
+        run_id: int,
+        ticket: Ticket,
+        paths: Sequence[str],
+        refused: dict[str, str] | None = None,
     ) -> list[str]:
         """Run the project's formatter over what this attempt just wrote.
 
@@ -4161,7 +4165,9 @@ class Orchestrator:
         parking a correct implementation over one would be a worse bug than the
         one this fixes.
 
-        Returns the paths it changed, for the caller to report.
+        Returns the paths it changed, for the caller to report. `refused`, when
+        given, is filled with `{path: what the formatter said}` for the files it
+        read and would not accept — see the note where it is populated.
         """
         commands = self.config.commands_for("format")
         if not commands:
@@ -4232,6 +4238,31 @@ class Orchestrator:
                 # `Unexpected token Token('TYPE_HINT', 'import') at line 3`,
                 # which was the whole answer to a ticket that spent eighty-four
                 # builds on it.
+                # Which files it read and objected to, as opposed to never
+                # reaching at all. The distinction is the whole reason a
+                # formatter's failure can be evidence: a missing binary names
+                # no path — `command not found` is about the toolchain — while
+                # a parse error names the file it could not read, and that is a
+                # fact about what this attempt just wrote.
+                #
+                # A file it rewrote is never one it refused, which is what
+                # keeps a success banner out of this. `gdformat` leads its
+                # output with `reformatted tools/dump_decor_fixtures.gd` and
+                # matching on the path alone would report that file as the
+                # broken one — the mistake `errors_naming` carries its own
+                # warning about. `errors_naming` itself finds nothing here:
+                # a formatter's refusal is not shaped like a compiler's, and
+                # the diagnosis sits three lines below a bare `path:`.
+                if refused is not None:
+                    detail = result.detail or ""
+                    for path in group:
+                        if path in written:
+                            continue
+                        if any(
+                            name in detail
+                            for name in (path, path.replace("/", "\\"))
+                        ):
+                            refused[path] = detail
                 did = (
                     f"the format command exited non-zero on part of what it was "
                     f"given; {len(written)} file(s) were reformatted anyway: "
@@ -4828,12 +4859,16 @@ class Orchestrator:
             self._tests_authored.add(ticket.ticket_id)
         if ticket.criteria and no_tests_because and repro is None:
             self._tests_skipped.add(ticket.ticket_id)
+        # Why nothing in the suite covers these criteria, for the reviewer that
+        # has to check them instead. Empty when the tests were written.
+        unchecked = ""
         if ticket.criteria and no_tests_because:
             # Not a failure. The criteria are still checked at review, which is
             # the right place for "the build script takes a --release flag" or
             # "the page has a canvas element" — neither is something this
             # project's test command can collect, and forcing a file into it
             # only adds a target that later tickets have to keep green.
+            unchecked = no_tests_because
             self.store.log(
                 run_id,
                 f"{ticket.ticket_id}: no tests authored — {no_tests_because}. "
@@ -5038,6 +5073,15 @@ class Orchestrator:
             except (ProviderError, ValueError) as exc:
                 # A missing test is a weaker result, not a failed ticket — the
                 # criteria are still checked by review.
+                #
+                # Carried to the reviewer rather than only logged. Without it
+                # the reviewer judges a ticket whose suite went green without
+                # ever touching these criteria, and has no way to tell that
+                # from one the tests actually cover. The reviewer that saw the
+                # previous version of this ticket read the tester's own
+                # `expect(u32(pcg.randi()))` wrapper as evidence a criterion
+                # was met — being told nothing ran is strictly more than it had.
+                unchecked = str(exc)
                 self.store.end_step(step_id, "failed", str(exc))
                 self._record_step(ticket, "tests", "failed", {"error": str(exc)})
                 self.store.log(
@@ -5062,7 +5106,15 @@ class Orchestrator:
         formattable = list(written)
         if test_path and repro is None:
             formattable.append(test_path)
-        self._format_pass(run_id, ticket, formattable)
+        # The formatter is the first thing in the pipeline to read a file this
+        # attempt wrote, and when it refuses one it says why with a line
+        # number. On one ticket that was `Unexpected token Token('TYPE_HINT',
+        # 'import') at line 3` against a test file, on cycle after cycle, while
+        # the loop spent eight seconds a time running the whole gdUnit suite to
+        # arrive at the same conclusion. Attached to whatever verify goes on to
+        # report, below.
+        unformattable: dict[str, str] = {}
+        self._format_pass(run_id, ticket, formattable, unformattable)
 
         # --- VERIFY --------------------------------------------------
         inherited = pre_existing or {}
@@ -5196,6 +5248,35 @@ class Orchestrator:
             # never landed.
             if scope_note:
                 detail += f"\n\n{scope_note}"
+            # Said first and said plainest. A file the formatter could not read
+            # does not compile, and every other failure in this output is
+            # downstream of that — a test suite reporting `identifier not
+            # declared` about a file whose third line is a syntax error is
+            # describing the same fault twice, from further away. Attaching it
+            # here also puts it in front of the tester, which is what
+            # `errors_naming` reads to decide whether the frozen test file is
+            # the tester's to rewrite; a parse error in that file is nobody
+            # else's.
+            if unformattable:
+                # Grouped by what the formatter said, since one command run
+                # over several files reports them together.
+                said_about: dict[str, list[str]] = {}
+                for path, said in sorted(unformattable.items()):
+                    said_about.setdefault(said, []).append(path)
+                for said, paths in said_about.items():
+                    # Opened with `ERROR:` deliberately, and not for emphasis:
+                    # that is what makes the line a diagnostic block to
+                    # `failures._blocks`, which is what `errors_naming` reads
+                    # out of — and `errors_naming` is what decides whether the
+                    # frozen test file is the tester's to rewrite. A parse
+                    # error in that file is nobody else's, and phrased as
+                    # ordinary prose this sentence reached the prompt without
+                    # ever reaching that decision.
+                    detail += (
+                        f"\n\nERROR: the formatter could not read "
+                        f"{', '.join(paths)}, so nothing downstream could parse "
+                        f"it either:\n" + clip(said.strip(), _FORMAT_DETAIL_CHARS)
+                    )
             return StepResult(ok=False, detail=detail)
 
         # Every step the project has was red, and every one of them was excused.
@@ -5257,6 +5338,7 @@ class Orchestrator:
                     state=state,
                     unchanged=invisible,
                     reproduced=repro,
+                    unchecked=unchecked,
                 ),
                 max_tokens=self._output_budget("reviewer"),
                 temperature=0.0,
