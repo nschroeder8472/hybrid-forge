@@ -169,6 +169,12 @@ Never:
   code under test. Import it the way the rest of the project imports it. An
   `extern` block re-declares a symbol instead of referencing it, so the linker
   never pulls it in and the target fails to link rather than to assert.
+- Reshape a value before comparing it to what a criterion pins. A helper of
+  your own that masks, shifts, scales or offsets the call's result — `>>> 0`,
+  `& 0xFFFFFFFF`, `% 256` — turns the criterion into something it does not say
+  and the assertion into one that cannot fail for the reason it exists. If the
+  value comes back in the wrong form, report that; do not correct it on the way
+  to the comparison.
 - Write anything to a path other than the one file you are told to write.
 
 Output the complete contents of that one test file: the path on its own line,
@@ -813,6 +819,7 @@ def tests_prompt(
     toolchain: dict[str, str] | None = None,
     learned_limit: int = 12,
     rejected_bindings: list[str] | None = None,
+    laundered: list[str] | None = None,
     own_file_errors: list[str] | None = None,
 ) -> list[Message]:
     """Ask the tester for assertions, with the evidence to match the repo.
@@ -955,6 +962,28 @@ in the same target.
 Call the functions the way the rest of this project calls them: import the
 module and call it directly. These tests run on the host, where an exported
 function is an ordinary function of its own language.
+"""
+
+    if laundered:
+        quoted = "\n".join(f"  {line}" for line in laundered)
+        body += f"""
+## Your last answer was rejected before it reached disk
+
+It compared a reshaped value instead of the one the code returned:
+
+```
+{quoted}
+```
+
+A criterion pins what the implementation must produce. Putting the call through
+a helper you defined — `>>> 0`, `& 0xFFFFFFFF`, `% 256`, a scale, an offset —
+before comparing means the assertion no longer says anything about that
+criterion. It passes for an implementation that returns the wrong value in the
+right bits, which is precisely the bug the criterion exists to catch.
+
+Assert on the call itself. If the value comes back in a form the criterion does
+not describe, that is the implementation's defect to fix and your test's job to
+report — not something to correct on the way to the comparison.
 """
 
     messages = [Message(role="system", content=TESTER_SYSTEM)]

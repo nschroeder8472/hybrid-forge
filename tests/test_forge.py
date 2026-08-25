@@ -69,6 +69,7 @@ from forge.patch import (
     foreign_bindings,
     infer_single_file,
     is_safe_path,
+    laundered_assertions,
     matches_any,
     normalize_path,
     parse_output,
@@ -6201,6 +6202,177 @@ class TestTheTesterIsAskedAgainForForeignBindings(unittest.TestCase):
         orch, root, _run_id = self._run(self.GOOD)
 
         self.assertTrue(self._tests_file(root).exists())
+
+
+class TestAnAssertionThatReshapesTheValueFirst(unittest.TestCase):
+    """The other way a green suite proves nothing.
+
+    A criterion pinned `randi()` at 4071818419. The tester wrote
+    `const u32 = (n: number) => n >>> 0;`, asserted `expect(u32(pcg.randi()))`,
+    and every value matched — against an implementation ending in
+    `& 0xFFFFFFFF` that returns -223148877. The ticket's own spec said, in as
+    many words, that a test wrapping the call in its own `>>> 0` is not testing
+    the function. The tester wrote the helper anyway, with a comment saying
+    what it was for, and the reviewer cited the wrapper as evidence the
+    criterion was met."""
+
+    # The file that shipped the wrong implementation, trimmed.
+    REAL = (
+        'import { describe, expect, it } from "vitest";\n'
+        'import { Pcg32 } from "../src/engine/pcg32.js";\n'
+        'describe("Pcg32", () => {\n'
+        "  const u32 = (n: number) => n >>> 0;\n"
+        '  it("draws", () => {\n'
+        "    const pcg = new Pcg32(3130775471);\n"
+        "    expect(u32(pcg.randi())).toBe(4071818419);\n"
+        "  });\n"
+        "});\n"
+    )
+
+    def test_the_file_that_shipped_the_wrong_implementation_is_caught(self):
+        found = laundered_assertions(self.REAL)
+
+        self.assertEqual(len(found), 1)
+        self.assertIn("u32", found[0])
+        self.assertIn("n >>> 0", found[0])
+
+    def test_the_honest_version_of_the_same_test_is_clean(self):
+        good = self.REAL.replace("  const u32 = (n: number) => n >>> 0;\n", "").replace(
+            "u32(pcg.randi())", "pcg.randi()"
+        )
+
+        self.assertEqual(laundered_assertions(good), [])
+
+    def test_every_spelling_of_a_reshaping_helper_is_caught(self):
+        for text in (
+            "const u32 = n => n >>> 0;\nexpect(u32(f())).toBe(1);",
+            "const u32 = (n: number): number => n >>> 0;\nexpect(u32(f())).toBe(1);",
+            "function u32(n) { return n >>> 0; }\nexpect(u32(f())).toBe(1);",
+            "function u32(n: number): number {\n  return n >>> 0;\n}\nexpect(u32(f())).toBe(1);",
+            "fn u32v(n: u32) -> u32 {\n    return n >> 0;\n}\nassert_eq!(u32v(g()), 0);",
+            "u32 = lambda n: n & 0xFFFFFFFF\nassert u32(f()) == 1",
+            "def _u32(n): return n % 256\nassert _u32(f()) == 1",
+            "func _u32(n): return n & 0xFFFF\n\tassert_int(_u32(f())).is_equal(1)",
+            "const half = (v) => v / 2;\nexpect(half(area())).toBe(8);",
+        ):
+            with self.subTest(text=text.splitlines()[0]):
+                self.assertTrue(laundered_assertions(text), text)
+
+    def test_an_ordinary_helper_is_not_a_reshaping_one(self):
+        # Each of these fails exactly one of the four conditions, and dropping
+        # any one condition would turn this list into false positives.
+        for text in (
+            # Delegates — contains a call.
+            "const ids = (rows) => rows.map(r => r.id);\nexpect(ids(f())).toEqual([1]);",
+            "const trimmed = (s) => s.trim();\nexpect(trimmed(f())).toBe('x');",
+            # No operator: a projection, not a reshaping.
+            "const first = (a) => a[0];\nexpect(first(f())).toBe(3);",
+            "function width(g) { return g.cols; }\nexpect(width(f())).toBe(7);",
+            # Two arguments: a computation of its own.
+            "const add = (a, b) => a + b;\nexpect(add(1, 2)).toBe(3);",
+            # Reads something from the file around it.
+            "const scaled = (n) => n * FACTOR;\nexpect(scaled(f())).toBe(6);",
+            "const off = (a) => a.length - 1;\nexpect(off(f())).toBe(2);",
+        ):
+            with self.subTest(text=text.splitlines()[0]):
+                self.assertEqual(laundered_assertions(text), [], text)
+
+    def test_a_hex_mask_reads_as_a_number_and_not_as_a_name(self):
+        # `0xFFFFFFFF` contains `xFFFFFFFF`, which matched as an identifier and
+        # made the body look like it referenced something outside itself. Every
+        # mask in the language went through unflagged.
+        self.assertTrue(
+            laundered_assertions("const u32 = (n) => n & 0xFFFFFFFF;\nexpect(u32(f())).toBe(1);")
+        )
+
+    def test_a_helper_used_outside_an_assertion_is_nobodys_business(self):
+        self.assertEqual(
+            laundered_assertions("const u32 = (n) => n >>> 0;\nconst seed = u32(raw());"),
+            [],
+        )
+
+    def test_a_comment_is_not_a_definition(self):
+        self.assertEqual(
+            laundered_assertions("// const u32 = (n) => n >>> 0;\nexpect(u32(f())).toBe(1);"),
+            [],
+        )
+
+    def test_a_file_defining_nothing_is_clean(self):
+        self.assertEqual(laundered_assertions("expect(f()).toBe(1);"), [])
+
+
+class TestTheTesterIsAskedAgainForLaunderedAssertions(unittest.TestCase):
+    """Same enforcement point as a foreign binding, and for the same reason:
+    the prohibition was already written down — in the ticket's own spec, not
+    merely in the prompt — and it was ignored."""
+
+    BAD = (
+        "tests/tt_004_test.rs\n```rust\n"
+        "fn u32v(n: u32) -> u32 {\n    return n >> 0;\n}\n"
+        "#[test]\nfn t() { assert_eq!(u32v(wasm::game_new(1)), 0); }\n```"
+    )
+    GOOD = (
+        "tests/tt_004_test.rs\n```rust\n"
+        "use tetris::wasm;\n#[test]\nfn t() { assert_eq!(wasm::game_new(1), 0); }\n```"
+    )
+
+    def _run(self, *tester_replies):
+        orch, root, run_id = _stub_orchestrator()
+        orch.config.loop.max_attempts = 1
+        orch._call = _replies(
+            "src/wasm.rs\n```rust\npub fn game_new(s: u32) -> u32 { s }\n```",
+            *tester_replies,
+            "ACCEPT\nfine",
+        )
+        orch._work_ticket(
+            run_id,
+            Ticket("TT-004", allowed_files=["src/wasm.rs"], criteria=["game_new returns 0"]),
+        )
+        return orch, root, run_id
+
+    def _tests_file(self, root):
+        return root / "tests" / "tt_004_test.rs"
+
+    def test_a_second_answer_that_asserts_on_the_call_is_kept(self):
+        _orch, root, _run_id = self._run(self.BAD, self.GOOD)
+
+        self.assertTrue(self._tests_file(root).exists())
+        self.assertNotIn("u32v", self._tests_file(root).read_text(encoding="utf-8"))
+
+    def test_a_tester_that_keeps_doing_it_gets_its_tests_discarded(self):
+        # Discarded rather than kept: review checks the criteria itself when
+        # there is nothing to run, and cannot when a rigged suite reports green.
+        _orch, root, _run_id = self._run(self.BAD, self.BAD)
+
+        self.assertFalse(self._tests_file(root).exists())
+
+    def test_the_rejection_is_reported(self):
+        orch, _root, _run_id = self._run(self.BAD, self.BAD)
+
+        messages = " ".join(e["message"] for e in orch.store.events_after(0))
+        self.assertIn("reshapes the value", messages)
+
+    def test_a_clean_first_answer_is_not_asked_twice(self):
+        _orch, root, _run_id = self._run(self.GOOD)
+
+        self.assertTrue(self._tests_file(root).exists())
+
+    def test_the_prompt_quotes_back_what_was_rejected(self):
+        body = tests_prompt(
+            Ticket("TT-004", criteria=["randi() returns 4071818419"]),
+            ["src/rng.ts"],
+            test_path="tests/rng.test.ts",
+            laundered=["u32 - defined as `const u32 = (n) => n >>> 0;` - in: expect(u32(f()))"],
+        )[1].content
+
+        self.assertIn("rejected before it reached disk", body)
+        self.assertIn("n >>> 0", body)
+        self.assertIn("Assert on the call itself", body)
+
+    def test_the_tester_is_told_the_rule_up_front_as_well(self):
+        from forge.prompts import TESTER_SYSTEM
+
+        self.assertIn("Reshape a value before comparing it", TESTER_SYSTEM)
 
 
 class TestTheTestCommandDecidesTheLanguage(unittest.TestCase):

@@ -676,3 +676,168 @@ def foreign_bindings(text: str) -> list[str]:
                 found.append(f"{label}: {line[:120]}")
                 break
     return found
+
+
+# A one-argument helper the test file defines for itself, whose whole body is
+# an operator expression over that one argument. `const u32 = (n) => n >>> 0`,
+# `def _u32(n): return n & 0xFFFFFFFF`, `func _u32(n): return n % 256`.
+#
+# Each pattern captures (name, parameter list, body) where the body is on the
+# same line, or (name, parameter list) where `_returned_body` reads it off the
+# next `return`.
+_NORMALIZER_INLINE: tuple[tuple[str, str], ...] = (
+    # JS/TS arrow with a parenthesised parameter, optionally typed and
+    # optionally with a return type: `const u32 = (n: number): number => n >>> 0`.
+    (
+        r"^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*?)?=\s*"
+        r"\(\s*([A-Za-z_$][\w$]*)\s*(?::[^),]*)?\)\s*(?::[^=]*?)?=>\s*(.+?)\s*;?\s*$",
+        "arrow",
+    ),
+    # The same without parentheses: `const u32 = n => n >>> 0`.
+    (
+        r"^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+        r"([A-Za-z_$][\w$]*)\s*=>\s*(.+?)\s*;?\s*$",
+        "arrow",
+    ),
+    # Python lambda: `u32 = lambda n: n & 0xFFFFFFFF`.
+    (
+        r"^\s*([A-Za-z_][\w]*)\s*=\s*lambda\s+([A-Za-z_][\w]*)\s*:\s*(.+?)\s*$",
+        "lambda",
+    ),
+    # A single-line body on the header itself, which Python and GDScript both
+    # allow: `def _u32(n): return n & 0xFFFFFFFF`.
+    (
+        r"^\s*(?:def|func)\s+([A-Za-z_][\w]*)\s*\(\s*([A-Za-z_][\w]*)\s*"
+        r"(?::[^),]*)?\)\s*(?:->[^:]*)?:\s*return\s+(.+?)\s*$",
+        "function",
+    ),
+    # `function u32(n) { return n >>> 0; }` on one line, and the Rust `fn`
+    # spelling of the same.
+    (
+        r"^\s*(?:export\s+|pub\s+)?(?:function|fn)\s+([A-Za-z_$][\w$]*)\s*\(\s*([A-Za-z_$][\w$]*)\s*"
+        r"(?::[^),]*)?\)\s*(?::[^{]*|->[^{]*)?\{\s*return\s+(.+?)\s*;?\s*\}\s*$",
+        "function",
+    ),
+)
+
+# The same headers with the body on a following line, paired with the `return`
+# that supplies it.
+_NORMALIZER_HEADER = re.compile(
+    r"^\s*(?:export\s+|pub\s+)?(?:function|fn|def|func)\s+([A-Za-z_$][\w$]*)\s*"
+    r"\(\s*([A-Za-z_$][\w$]*)\s*(?::[^),]*)?\)\s*(?::[^{]*|->[^:]*)?[:{]\s*$"
+)
+_RETURN = re.compile(r"^\s*return\s+(.+?)\s*;?\s*$")
+
+_NORMALIZER_INLINE_RES = tuple(
+    (re.compile(pattern), label) for pattern, label in _NORMALIZER_INLINE
+)
+
+# What makes the body a *normalization* rather than a computation: it reshapes
+# one value with operators. Bitwise and modulo are the representation-changing
+# ones and the reason this check exists, but a scale or an offset launders a
+# pinned value just as completely.
+_OPERATOR = re.compile(r">>>|>>|<<|[&|^~%*/+-]")
+# The lookbehind is what keeps a number from reading as a name. Without it the
+# `x` of `0xFFFFFFFF` matches as the identifier `xFFFFFFFF`, the body appears to
+# reference something outside itself, and every hex mask in the language — which
+# is most of what this check is looking for — passes as a computation.
+_IDENTIFIER = re.compile(r"(?<![\w$])[A-Za-z_$][\w$]*")
+# Word-shaped literals that are not references to anything.
+_NOT_A_REFERENCE = frozenset({"true", "false", "null", "undefined", "None", "True", "False"})
+
+# Enough assertion vocabulary to cover the runners this loop has met. A helper
+# call anywhere else in the file is somebody's business but not this check's.
+_ASSERTION = re.compile(
+    r"\bexpect\s*\(|\bassert|\bAssert|\bEXPECT_|\bASSERT_|\bXCTAssert|"
+    r"\bshould\b|\brequire\s*\.|\bt\s*\.\s*(?:Error|Fatal)|\bis_equal|\bis_true",
+)
+
+_COMMENT_STARTS = ("//", "#", "*", "--", "/*")
+
+
+def _is_normalizer(param: str, body: str) -> bool:
+    """Whether `body` reshapes `param` with operators and nothing else.
+
+    Four conditions, and dropping any one of them lets a legitimate helper
+    through as a finding. The body has to contain an operator, so `a.length`
+    and `rows.map(f)` are not normalizations. It has to contain no call, so a
+    helper that delegates is left alone. Every name in it has to be the
+    parameter, so a helper reading a fixture or a constant from the file around
+    it is a computation, not a reshaping. And it has to be one expression —
+    anything with a statement separator is a function with a body.
+    """
+    if "(" in body or ";" in body:
+        return False
+    if not _OPERATOR.search(body):
+        return False
+    names = {
+        name
+        for name in _IDENTIFIER.findall(body)
+        if name not in _NOT_A_REFERENCE
+    }
+    return names <= {param}
+
+
+def _normalizers(lines: list[str]) -> dict[str, str]:
+    """Normalizing helpers the file defines, as `{name: definition line}`."""
+    found: dict[str, str] = {}
+    for index, raw in enumerate(lines):
+        line = raw.strip()
+        if not line or line.startswith(_COMMENT_STARTS):
+            continue
+        for pattern, _ in _NORMALIZER_INLINE_RES:
+            match = pattern.match(raw)
+            if match and _is_normalizer(match.group(2), match.group(3)):
+                found[match.group(1)] = line
+                break
+        else:
+            header = _NORMALIZER_HEADER.match(raw)
+            if not header:
+                continue
+            # The body is whatever the next line returns, and only if the line
+            # after *that* closes the function — a `return` that is one branch
+            # of several is not the whole body.
+            body = _RETURN.match(lines[index + 1]) if index + 1 < len(lines) else None
+            if body and _is_normalizer(header.group(2), body.group(1)):
+                found[header.group(1)] = line
+    return found
+
+
+def laundered_assertions(text: str) -> list[str]:
+    """Assertions in `text` that reshape the value before comparing it.
+
+    Returned as `helper: assertion line` so the tester can be shown the exact
+    pair that was rejected, empty when every assertion compares what the code
+    under test actually returned.
+
+    A criterion pins a value the implementation must produce. A test that
+    defines `const u32 = (n) => n >>> 0` and then asserts
+    `expect(u32(pcg.randi())).toBe(4071818419)` is not checking that criterion:
+    it checks that some 32 bits match, and passes for an implementation that
+    ends with `& 0xFFFFFFFF` and returns -223148877. That happened. The
+    ticket's own spec said in as many words that a test wrapping the call in
+    its own `>>> 0` is not testing the function, the tester wrote the helper
+    anyway with a comment admitting what it was for, and the reviewer read the
+    wrapper as evidence the criterion was met and approved the ticket.
+
+    So the prohibition is mechanical now rather than written down. Like
+    `foreign_bindings` this is a net and not a parser, and like it the cost of
+    a false positive is one rewrite that was not needed.
+    """
+    lines = text.splitlines()
+    helpers = _normalizers(lines)
+    if not helpers:
+        return []
+    calls = {name: re.compile(rf"\b{re.escape(name)}\s*\(") for name in helpers}
+    found: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith(_COMMENT_STARTS):
+            continue
+        if not _ASSERTION.search(line):
+            continue
+        for name, pattern in calls.items():
+            if pattern.search(line):
+                found.append(f"{name} — defined as `{helpers[name]}` — in: {line[:120]}")
+                break
+    return found

@@ -73,6 +73,7 @@ from .patch import (
     foreign_bindings,
     infer_single_file,
     is_safe_path,
+    laundered_assertions,
     matches_any,
     normalize_path,
     parse_output,
@@ -4843,6 +4844,7 @@ class Orchestrator:
             authored_now = not existed
             try:
                 rejected_bindings: list[str] = []
+                laundered: list[str] = []
                 for remaining in (1, 0):
                     completion = self._call(
                         run_id,
@@ -4880,6 +4882,7 @@ class Orchestrator:
                             ),
                             learned_limit=self.config.loop.learned_limit,
                             rejected_bindings=rejected_bindings,
+                            laundered=laundered,
                             # Pointed at rather than left to be noticed. The
                             # tester is the only role that can edit this file,
                             # and a style error in it fails the ticket for as
@@ -4922,22 +4925,51 @@ class Orchestrator:
                         for edit in test_parsed.edits
                         for line in foreign_bindings(edit.content)
                     ]
-                    if not rejected_bindings:
+                    # The other way a test file passes without checking
+                    # anything: reshape the value before comparing it. Same
+                    # treatment as a foreign binding and for the same reason —
+                    # the prohibition was already written down, in the ticket's
+                    # own spec, and the tester wrote the helper anyway.
+                    laundered = [
+                        line
+                        for edit in test_parsed.edits
+                        for line in laundered_assertions(edit.content)
+                    ]
+                    if not rejected_bindings and not laundered:
                         break
-                    self.store.log(
-                        run_id,
-                        f"{ticket.ticket_id}: tester declared the code under test "
-                        f"as a foreign binding "
-                        f"({'; '.join(rejected_bindings)[:200]}); "
-                        + ("asking again." if remaining else "discarding the tests."),
-                        level="warn",
-                        kind="ticket",
-                    )
+                    if rejected_bindings:
+                        self.store.log(
+                            run_id,
+                            f"{ticket.ticket_id}: tester declared the code under test "
+                            f"as a foreign binding "
+                            f"({'; '.join(rejected_bindings)[:200]}); "
+                            + ("asking again." if remaining else "discarding the tests."),
+                            level="warn",
+                            kind="ticket",
+                        )
+                    if laundered:
+                        self.store.log(
+                            run_id,
+                            f"{ticket.ticket_id}: tester asserted through a helper of "
+                            f"its own that reshapes the value first "
+                            f"({'; '.join(laundered)[:200]}); "
+                            + ("asking again." if remaining else "discarding the tests."),
+                            level="warn",
+                            kind="ticket",
+                        )
                     if not remaining:
+                        # Discarded rather than kept. A rigged test is worse
+                        # than no test: review checks the criteria itself when
+                        # there is nothing to run, and cannot when a green
+                        # suite says the criteria are already met.
                         raise ValueError(
                             "tester kept declaring the code under test as a "
                             "foreign binding; tests discarded rather than "
                             "breaking the link for every other ticket"
+                            if rejected_bindings
+                            else "tester kept asserting through its own "
+                            "reshaping helper; tests discarded rather than "
+                            "reporting green for a criterion they do not check"
                         )
 
                 if test_parsed.rejected:
@@ -6495,10 +6527,21 @@ class Orchestrator:
             bindings = [
                 line for edit in scoped.edits for line in foreign_bindings(edit.content)
             ]
-            if not scoped.edits or bindings:
+            # A reproduction is the contract the fix is measured against, so a
+            # reshaping helper in it is worse here than in an ordinary test: it
+            # decides when the bug is considered fixed.
+            washed = [
+                line
+                for edit in scoped.edits
+                for line in laundered_assertions(edit.content)
+            ]
+            if not scoped.edits or bindings or washed:
                 detail = (
                     "the tester declared the code under test as a foreign binding"
                     if bindings
+                    else "the tester asserted through a helper of its own that "
+                    "reshapes the value first"
+                    if washed
                     else "the tester wrote no test file"
                 )
                 self.store.end_step(step_id, "failed", detail)
