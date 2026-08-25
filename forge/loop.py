@@ -162,6 +162,13 @@ _DROPPABLE_HEADINGS = (
 # loop could actually have fixed — so anything not matched here counts as
 # evidence, and a build error that slips through fails the attempt the ordinary
 # way instead of discarding the proof.
+# How much of a refusing formatter's output is worth keeping in the run log.
+# Enough for a parse error and the token table under it, which is what the two
+# formatters this has been run against print, and not so much that a formatter
+# listing every file it skipped fills the log.
+_FORMAT_DETAIL_CHARS = 2_000
+
+
 _UNBUILDABLE = re.compile(
     r"syntaxerror|indentationerror|importerror|modulenotfounderror|"
     r"error\[e\d+\]|cannot find|unresolved|undeclared|not declared|"
@@ -4199,26 +4206,49 @@ class Orchestrator:
                 ticket.ticket_id,
                 workspace=workspace,
             )
+            # Read back whatever the run did to disk, whether it exited 0 or
+            # not. A formatter handed several files does as many of them as it
+            # can: `gdformat` given a good file and one it cannot parse
+            # rewrites the good one, reports it on the first line of its
+            # output, and exits non-zero for the other. Skipping the read-back
+            # on a non-zero exit made the loop log "Nothing was reformatted"
+            # directly underneath its own quotation of `reformatted
+            # tools/dump_decor_fixtures.gd`, and leave the rewrite unreported
+            # sixty-odd times on one ticket.
+            written = [
+                path for path in group if self._read_or_none(path) != before[path]
+            ]
+            changed.extend(written)
             if not result.ok:
                 # Logged, never charged. See the docstring: a formatter that
                 # cannot run is a configuration fault, and the code it did not
                 # reach is still judged by the same verify commands it always
                 # was.
+                #
+                # The output is worth quoting properly rather than clipping to
+                # its first line. A formatter is the first thing to read a file
+                # this attempt wrote, and what it says when it refuses is a
+                # syntax diagnosis with a line number in it — on one run,
+                # `Unexpected token Token('TYPE_HINT', 'import') at line 3`,
+                # which was the whole answer to a ticket that spent eighty-four
+                # builds on it.
+                did = (
+                    f"the format command exited non-zero on part of what it was "
+                    f"given; {len(written)} file(s) were reformatted anyway: "
+                    f"{', '.join(sorted(written)[:6])}"
+                    if written
+                    else "the format command failed and was skipped; nothing was "
+                    "reformatted"
+                )
                 self.store.log(
                     run_id,
-                    f"{ticket.ticket_id}: the format command failed and was "
-                    f"skipped — {(result.detail or '').strip().splitlines()[0][:200] if result.detail.strip() else 'no output'}. "
-                    f"Nothing was reformatted; the ticket is judged exactly as "
-                    f"it would have been without a formatter configured.",
+                    f"{ticket.ticket_id}: {did}. The ticket is judged by the "
+                    f"same verify commands either way:\n"
+                    + clip((result.detail or "").strip() or "no output", _FORMAT_DETAIL_CHARS),
                     level="warn",
                     kind="ticket",
+                    data={"formatted": sorted(written)},
                 )
-                continue
-            changed.extend(
-                path
-                for path in group
-                if self._read_or_none(path) != before[path]
-            )
 
         if changed:
             # Reported because it is model output being rewritten by something

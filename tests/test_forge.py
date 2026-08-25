@@ -18181,6 +18181,195 @@ class TestRatificationInTheLoop(unittest.TestCase):
         self.assertEqual(store.list_tickets(run_id)[0].status, "blocked")
 
 
+class TestAFormatterThatDidHalfTheJobIsNotAFailedOne(unittest.TestCase):
+    """`gdformat` handed a good file and one it cannot parse rewrites the good
+    one, says so on the first line of its output, and exits non-zero for the
+    other. Skipping the read-back on a non-zero exit made the loop log
+    `Nothing was reformatted` directly underneath its own quotation of
+    `reformatted tools/dump_decor_fixtures.gd`, and leave the rewrite
+    unreported on sixty-two of one ticket's eighty-four cycles."""
+
+    def setUp(self):
+        # Strips trailing whitespace from every file it can, refuses any file
+        # whose first line is `NOPARSE`, and exits non-zero if it refused one —
+        # which is what gdformat does with a file it cannot parse.
+        self.tool = Path(tempfile.mkdtemp()) / "half_formatter.py"
+        self.tool.write_text(
+            "import pathlib, sys\n"
+            "refused = []\n"
+            "for argument in sys.argv[1:]:\n"
+            "    target = pathlib.Path(argument)\n"
+            "    text = target.read_text(encoding='utf-8')\n"
+            "    if text.startswith('NOPARSE'):\n"
+            "        refused.append(argument)\n"
+            "        continue\n"
+            "    target.write_text(\n"
+            "        '\\n'.join(line.rstrip() for line in text.split('\\n')),\n"
+            "        encoding='utf-8',\n"
+            "    )\n"
+            "    print('reformatted ' + argument)\n"
+            "for argument in refused:\n"
+            "    print(\"Unexpected token Token('TYPE_HINT', 'import') at line 3\")\n"
+            "sys.exit(1 if refused else 0)\n",
+            encoding="utf-8",
+        )
+        self.formatter = f'"{sys.executable}" "{self.tool}"'
+
+    def _orch(self):
+        return _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": "", "format": self.formatter}
+        )
+
+    def _both(self, root):
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "good.py").write_text("x = 1   \n", encoding="utf-8")
+        (root / "src" / "bad.py").write_text("NOPARSE\nimport x   \n", encoding="utf-8")
+        return ["src/bad.py", "src/good.py"]
+
+    def _logged(self, orch) -> str:
+        return " ".join(row["message"] for row in orch.store.events_after(0))
+
+    def test_the_file_it_did_reformat_is_reported(self):
+        orch, root, run_id = self._orch()
+        paths = self._both(root)
+
+        changed = orch._format_pass(run_id, Ticket("T-1"), paths)
+
+        self.assertEqual(changed, ["src/good.py"])
+
+    def test_the_file_it_did_reformat_is_actually_reformatted(self):
+        orch, root, run_id = self._orch()
+        paths = self._both(root)
+
+        orch._format_pass(run_id, Ticket("T-1"), paths)
+
+        self.assertEqual((root / "src" / "good.py").read_text(encoding="utf-8"), "x = 1\n")
+
+    def test_the_log_no_longer_contradicts_itself(self):
+        orch, root, run_id = self._orch()
+        paths = self._both(root)
+
+        orch._format_pass(run_id, Ticket("T-1"), paths)
+        logged = self._logged(orch)
+
+        self.assertIn("reformatted anyway", logged)
+        self.assertNotIn("nothing was reformatted", logged)
+
+    def test_what_the_formatter_refused_to_read_is_quoted(self):
+        # A formatter is the first thing to read a file this attempt wrote, and
+        # what it says when it refuses is a syntax diagnosis with a line number
+        # in it. Clipping to the first line threw that away and kept the
+        # success message instead.
+        orch, root, run_id = self._orch()
+        paths = self._both(root)
+
+        orch._format_pass(run_id, Ticket("T-1"), paths)
+
+        self.assertIn("Unexpected token", self._logged(orch))
+
+    def test_a_formatter_that_refuses_everything_still_says_so(self):
+        orch, root, run_id = self._orch()
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "bad.py").write_text("NOPARSE\n", encoding="utf-8")
+
+        changed = orch._format_pass(run_id, Ticket("T-1"), ["src/bad.py"])
+
+        self.assertEqual(changed, [])
+        self.assertIn("format command failed and was skipped", self._logged(orch))
+
+
+class TestTheFormattersReportIsNotAFailureClass(unittest.TestCase):
+    """`format` reports what it rewrote, not what is wrong, and the report
+    changes every cycle with whichever file it touched. One ticket's class set
+    carried `format reformatted tests theme test_decor_fixtures.gd` beside the
+    real failures, and the count moved whenever a different file needed
+    tidying — so the loop reported churn on cycles where the only thing that
+    changed was which file the formatter had got to."""
+
+    def _store(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        return store, store.create_run("goal")
+
+    def _failed(self, store, run_id, name, detail):
+        step_id = store.start_step(run_id, "T-1", name)
+        store.end_step(step_id, "failed", detail)
+        return step_id
+
+    def test_a_formatters_output_produces_no_class(self):
+        store, run_id = self._store()
+
+        step_id = self._failed(
+            store, run_id, "format", "reformatted tools/dump_decor_fixtures.gd"
+        )
+
+        row = store._connection.execute(
+            "SELECT classes FROM steps WHERE id = ?", (step_id,)
+        ).fetchone()
+        self.assertEqual(json.loads(row["classes"]), [])
+
+    def test_a_second_builds_formatter_produces_no_class_either(self):
+        # The exclusion list was compared against the whole step name, so
+        # `format[path_forge]` went straight past it — and a suffix only
+        # appears at all in the multi-build repositories where it matters.
+        store, run_id = self._store()
+
+        step_id = self._failed(
+            store, run_id, "format[path_forge]", "reformatted src/parse.ts"
+        )
+
+        row = store._connection.execute(
+            "SELECT classes FROM steps WHERE id = ?", (step_id,)
+        ).fetchone()
+        self.assertEqual(json.loads(row["classes"]), [])
+
+    def test_a_real_failure_from_a_suffixed_step_still_produces_one(self):
+        store, run_id = self._store()
+
+        step_id = self._failed(
+            store,
+            run_id,
+            "typecheck[path_forge]",
+            "src/parse.ts(80,17): error TS2532: Object is possibly 'undefined'.",
+        )
+
+        row = store._connection.execute(
+            "SELECT classes FROM steps WHERE id = ?", (step_id,)
+        ).fetchone()
+        self.assertTrue(json.loads(row["classes"]))
+
+    def test_the_formatter_is_left_out_of_what_a_ticket_failed_on(self):
+        store, run_id = self._store()
+        store.add_tickets(run_id, [Ticket("T-1")])
+        self._failed(store, run_id, "format", "reformatted src/a.py")
+        self._failed(store, run_id, "lint", "src/a.py:1: line too long")
+
+        named = " ".join(
+            f["name"] for f in store.ticket_failures(run_id, "T-1", limit=10)
+        )
+
+        self.assertIn("lint", named)
+        self.assertNotIn("format", named)
+
+    def test_a_formatter_rewriting_a_different_file_is_not_a_changed_class(self):
+        # The shape that manufactured churn: same real failure both cycles,
+        # different file reformatted, and the class count moves.
+        store, run_id = self._store()
+        store.add_tickets(run_id, [Ticket("T-1")])
+
+        self._failed(store, run_id, "format", "reformatted src/a.py")
+        self._failed(store, run_id, "lint", "src/a.py:1: line too long")
+        first = {c["name"] for c in store.ticket_classes(run_id, "T-1")}
+
+        mark = store.last_step_id(run_id, "T-1")
+        self._failed(store, run_id, "format", "reformatted src/b.py")
+        self._failed(store, run_id, "lint", "src/a.py:1: line too long")
+        second = {
+            c["name"] for c in store.ticket_classes(run_id, "T-1", after=mark)
+        }
+
+        self.assertEqual(first, second)
+
+
 class TestOneSubjectDoesNotEatTheWholeList(unittest.TestCase):
     """`learned` is ordered by how often each conclusion was rediscovered, and
     on a ticket that kept rediscovering one convention that ordering handed it

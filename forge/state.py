@@ -53,12 +53,48 @@ DETAIL_CHARS = 20_000
 # reset the flat counter. The ticket finished eight cycles of *identical* test
 # failures at `flat_cycles = 0`, never reached the next rung of the ladder, and
 # was never asked whether it was winnable.
-NOT_ABOUT_THE_CODE = ("record", "stuck-review")
+# `format` is here for a different reason and cost as much. It reports what it
+# rewrote, not what is wrong, and the report changes every cycle with whichever
+# file it touched — so one ticket's class set carried
+#
+#     format reformatted tests theme test_decor_fixtures.gd
+#     format # files reformatted # files left unchanged.
+#
+# beside the real failures, and the count moved whenever a different file
+# needed reformatting. That is manufactured churn: the loop reported "the
+# failures changed but did not shrink" on cycles where the only thing that
+# changed was which file the formatter had tidied.
+#
+# It is also, on the run this comes from, a *success* message being counted as
+# a failure signature. `gdformat` handed two files exits non-zero when it
+# cannot parse one of them, having already reformatted the other, and the first
+# line of that output is `reformatted tools/dump_decor_fixtures.gd`.
+NOT_ABOUT_THE_CODE = ("record", "stuck-review", "format")
 
 
 def _placeholders(values: tuple[str, ...]) -> str:
     """`?, ?, ?` for an `IN` clause. sqlite3 binds no sequences."""
     return ", ".join("?" * len(values))
+
+
+def _step_kind(name: str) -> str:
+    """A step name without the workspace and language it ran in.
+
+    `format[path_forge]` and `format` are the same step for the purpose of
+    deciding whether it says anything about the code. Comparing the whole name
+    let a multi-build project past every exclusion in `NOT_ABOUT_THE_CODE`,
+    which is where they matter most: a repository with one build never suffixes
+    a step name at all.
+    """
+    return (name or "").split("[", 1)[0]
+
+
+# The same reduction in SQL, for the two queries that read the step log by
+# name. sqlite has no split, so the suffix comes off with instr and substr.
+_STEP_KIND_SQL = (
+    "CASE WHEN instr(name, '[') > 0 "
+    "THEN substr(name, 1, instr(name, '[') - 1) ELSE name END"
+)
 
 
 SCHEMA = """
@@ -1010,7 +1046,7 @@ class Store:
         rows = self._connection.execute(
             "SELECT name, detail, classes FROM steps "
             "WHERE run_id = ? AND ticket_id = ? AND status = 'failed' AND detail != '' "
-            f"AND name NOT IN ({_placeholders(NOT_ABOUT_THE_CODE)}) "
+            f"AND {_STEP_KIND_SQL} NOT IN ({_placeholders(NOT_ABOUT_THE_CODE)}) "
             "ORDER BY id DESC LIMIT ?",
             (run_id, ticket_id, *NOT_ABOUT_THE_CODE, limit * 4),
         ).fetchall()
@@ -1292,7 +1328,7 @@ class Store:
             ).fetchone()
             # A step that cannot fail the ticket has no class. See
             # `NOT_ABOUT_THE_CODE` for what one cost.
-            if row is not None and row["name"] not in NOT_ABOUT_THE_CODE:
+            if row is not None and _step_kind(row["name"]) not in NOT_ABOUT_THE_CODE:
                 classes = sorted(classify(row["name"], detail))
         with self._write() as connection:
             connection.execute(
@@ -1406,7 +1442,7 @@ class Store:
         rows = self._connection.execute(
             "SELECT id, classes FROM steps "
             "WHERE run_id = ? AND ticket_id = ? AND status = 'failed' AND id > ? "
-            f"AND name NOT IN ({_placeholders(NOT_ABOUT_THE_CODE)}) "
+            f"AND {_STEP_KIND_SQL} NOT IN ({_placeholders(NOT_ABOUT_THE_CODE)}) "
             "ORDER BY id",
             (run_id, ticket_id, after, *NOT_ABOUT_THE_CODE),
         ).fetchall()
