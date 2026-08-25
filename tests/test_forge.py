@@ -98,6 +98,8 @@ from forge.failures import (
 from forge.prompts import (
     FAILURE_CLASSES_HEADING,
     LEARNED_HEADING,
+    contested_subjects,
+    learned_message,
     convention_prompt,
     parse_stuck_review,
     record_prompt,
@@ -18177,6 +18179,135 @@ class TestRatificationInTheLoop(unittest.TestCase):
         self.assertIn("src/secrets.rs", ticket.allowed_files)
         self.assertFalse(orchestrator._scope_gate(run_id, ticket))
         self.assertEqual(store.list_tickets(run_id)[0].status, "blocked")
+
+
+class TestOneSubjectDoesNotEatTheWholeList(unittest.TestCase):
+    """`learned` is ordered by how often each conclusion was rediscovered, and
+    on a ticket that kept rediscovering one convention that ordering handed it
+    the whole budget. Twenty-three entries, fourteen of them restating that
+    local imports need a `.js` extension — and the rule the ticket was actually
+    failing on, `noUncheckedIndexedAccess`, crowded out of the twelve shown."""
+
+    # Real entries from the ticket, trimmed.
+    JS = [
+        {"text": "Local imports in test files must use the `.js` extension.", "count": 1},
+        {"text": "Local imports in tests must resolve to `.js` extensions relative to "
+                 "the test file's directory.", "count": 1},
+        {"text": "In this project, importing a `.ts` file requires a `.js` extension "
+                 "in the import path.", "count": 1},
+        {"text": "Local imports of `.ts` files must use the `.js` extension; omitting "
+                 "it causes TS2307.", "count": 1},
+    ]
+    OTHER = [
+        {"text": "The type checker runs with `noUncheckedIndexedAccess`, so every "
+                 "index needs a guard.", "count": 1},
+        {"text": "Godot's `load-constant-name` rule requires UPPER_CASE names.", "count": 1},
+    ]
+
+    def _ticket(self, entries):
+        ticket = Ticket("T-1")
+        ticket.learned = entries
+        return ticket
+
+    def test_a_convention_restated_four_times_takes_two_places(self):
+        shown = learned_message(self._ticket(self.JS), limit=12).content
+
+        self.assertEqual(shown.count("`.js`"), 2)
+
+    def test_what_it_stops_crowding_out_is_shown_instead(self):
+        shown = learned_message(self._ticket([*self.JS, *self.OTHER]), limit=4).content
+
+        self.assertIn("noUncheckedIndexedAccess", shown)
+        self.assertIn("load-constant-name", shown)
+
+    def test_a_restatement_is_not_saved_by_what_it_mentions_in_passing(self):
+        # Every restatement of a convention arrives carrying a second token, so
+        # skipping only when *all* of an entry's subjects are capped lets all
+        # of them through on the strength of the token they differ on.
+        shown = learned_message(self._ticket(self.JS), limit=12).content
+
+        self.assertEqual(shown.count("\n- "), 2)
+
+    def test_an_entry_naming_nothing_is_never_crowded_out(self):
+        plain = {"text": "This project prefers small commits.", "count": 1}
+        shown = learned_message(self._ticket([*self.JS, plain]), limit=12).content
+
+        self.assertIn("prefers small commits", shown)
+
+    def test_turning_the_section_off_still_turns_it_off(self):
+        self.assertIsNone(learned_message(self._ticket(self.JS), limit=0))
+
+
+class TestALearningTheLoopContradictedIsMarkedNotHidden(unittest.TestCase):
+    """`gdUnit4 requires `import` at the top of a test file` sat beside
+    `GDScript does not support `import` for scripts` for the whole of one
+    ticket's eighty-four builds, presented to the executor as an established
+    fact about the project. The language has no `import`."""
+
+    IMPORTS = [
+        {"text": "gdUnit4 requires `import` at the top of a test file to resolve "
+                 "`class_name` symbols.", "count": 1},
+        {"text": "GDScript does not support `import` statements; `class_name` "
+                 "registers classes globally.", "count": 1},
+    ]
+
+    def _ticket(self, entries):
+        ticket = Ticket("T-1")
+        ticket.learned = entries
+        return ticket
+
+    def test_the_subject_they_disagree_about_is_found(self):
+        self.assertIn("import", contested_subjects(self.IMPORTS))
+
+    def test_both_sides_are_still_shown(self):
+        # Withheld is the wrong answer. Counting which side was reached more
+        # often looked like a tiebreak and would have suppressed `Tool scripts
+        # with class_name are not visible to gdUnit4 tests at parse time` —
+        # true, and the most useful line on that ticket — because four other
+        # entries mentioned `class_name` while requiring something.
+        shown = learned_message(self._ticket(self.IMPORTS), limit=12).content
+
+        self.assertIn("gdUnit4 requires", shown)
+        self.assertIn("does not support", shown)
+
+    def test_both_sides_are_marked_as_unsettled(self):
+        shown = learned_message(self._ticket(self.IMPORTS), limit=12).content
+
+        self.assertEqual(shown.count("earlier attempts disagreed"), 2)
+        self.assertIn("should not be built on", shown)
+
+    def test_a_list_that_agrees_with_itself_carries_no_marks(self):
+        agreed = [
+            {"text": "GDScript does not support `import` statements.", "count": 1},
+            {"text": "`class_name` registers classes globally.", "count": 1},
+        ]
+        shown = learned_message(self._ticket(agreed), limit=12).content
+
+        self.assertNotIn("disagreed", shown)
+
+    def test_a_backticked_operator_is_not_a_subject(self):
+        # `!` was read as one, so every entry advising a non-null assertion
+        # shared a subject with every entry explaining why one was needed, and
+        # the two were reported as disagreeing.
+        assertions = [
+            {"text": "The project enables `noUncheckedIndexedAccess`, so every index "
+                     "access must be guarded with `!`.", "count": 1},
+            {"text": "Control flow analysis does not narrow array length checks; use "
+                     "`!` or explicit guards.", "count": 1},
+        ]
+
+        self.assertEqual(contested_subjects(assertions), set())
+
+    def test_a_subject_stated_plainly_matches_one_in_backticks(self):
+        # The pair that contradicted each other on one run was split exactly
+        # that way: one entry quoted `OS.exit_code`, the other wrote it bare.
+        split = [
+            {"text": "Tool scripts terminate automatically; do not set `OS.exit_code`.",
+             "count": 1},
+            {"text": "The dumper must use OS.exit_code = 0 for termination.", "count": 1},
+        ]
+
+        self.assertIn("os.exit_code", contested_subjects(split))
 
 
 class TestRatificationCannotHandBackFewerCriteria(unittest.TestCase):
