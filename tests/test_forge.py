@@ -13763,6 +13763,88 @@ class TestWhatIsKeptOfAnOverlongStep(unittest.TestCase):
         self.assertEqual(clip(text, 2_000).count("error: boom"), 2)
 
 
+class TestARunnerThatPutsItsVerdictLast(unittest.TestCase):
+    """gdUnit4 reports a failing case as `res://tests/a.gd > name FAILED 2ms` —
+    indented, with the timing after the word — and puts the report under it.
+    None of the patterns here started there and the end-of-line rule stopped at
+    `FAILED`, so a Godot suite that actually *ran* parsed to no block at all.
+
+    What the loop had instead was `Failed to request display timeout
+    override.`, which Godot prints on every headless run including the green
+    ones, and which was matching the bare `FAILED` alternative because this
+    module matches case-insensitively. On one ticket that sentence became the
+    whole of the blocked note a person reads."""
+
+    # The shape, captured from a real gdUnit4 run rather than guessed at.
+    GDUNIT = (
+        "Run Test Suite: res://tests/theme/test_decor.gd\n"
+        "  res://tests/theme/test_decor.gd > test_first_grass STARTED\n"
+        "  res://tests/theme/test_decor.gd > test_first_grass FAILED 2ms\n"
+        "  Report:\n"
+        "    line 5: Expecting:\n"
+        "     '42'\n"
+        "     but was\n"
+        "     '41'\n"
+        "\n"
+        "Statistics: 1 test cases | 0 errors | 1 failures | 0 flaky | 0 skipped\n"
+    )
+
+    def test_the_verdict_opens_a_block(self):
+        blocks, _ = _blocks(self.GDUNIT.splitlines())
+
+        self.assertEqual(len(blocks), 1)
+        self.assertIn("test_first_grass FAILED 2ms", blocks[0][0])
+
+    def test_the_report_under_it_is_part_of_the_diagnostic(self):
+        # The whole value of recognising the verdict: the expectation is what
+        # the next attempt has to act on.
+        shown = distill(self.GDUNIT, limit=400)
+
+        self.assertIn("but was", shown)
+        self.assertIn("'41'", shown)
+
+    def test_it_classes_by_file_rather_than_by_test_case(self):
+        # Read only at the start of the line, this fell through to
+        # `_message_of`, which keeps the test's own name and so mints a class
+        # per case — the opposite of what `_VERDICT` is for.
+        self.assertEqual(
+            classify("test", self.GDUNIT),
+            {"test test failed in tests/theme/test_decor.gd"},
+        )
+
+    def test_two_failing_cases_in_one_file_are_one_class(self):
+        two = self.GDUNIT + (
+            "  res://tests/theme/test_decor.gd > test_first_accent FAILED 1ms\n"
+            "  Report:\n"
+            "    line 9: Expecting: '1' but was '0'\n"
+        )
+
+        self.assertEqual(len(classify("test", two)), 1)
+
+    def test_gradle_keeps_working_without_a_duration(self):
+        gradle = (
+            "Bug001Test > jar_has_main_class() FAILED\n"
+            "    org.opentest4j.AssertionFailedError at Bug001Test.java:12\n"
+        )
+
+        self.assertIn("test failed", " ".join(classify("test", gradle)))
+
+    def test_godots_startup_chatter_is_not_a_diagnostic(self):
+        # Printed on every headless run, green ones included.
+        blocks, _ = _blocks(
+            ["Failed to request display timeout override.", "  and its continuation"]
+        )
+
+        self.assertEqual(blocks, [])
+
+    def test_a_runner_that_shouts_it_still_opens_one(self):
+        # pytest, unittest and ctest all print this in capitals. Title case at
+        # the start of a line is prose.
+        blocks, _ = _blocks(["FAILED tests/test_a.py::test_b - AssertionError"])
+
+        self.assertEqual(len(blocks), 1)
+
+
 class TestTheRuntimeIsNotTheProject(unittest.TestCase):
     """Godot prints its own C++ source in a frame under every engine error, and
     prints those errors on every run — a debugger port it was not given, a

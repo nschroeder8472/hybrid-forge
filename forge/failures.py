@@ -30,7 +30,14 @@ _ERROR = re.compile(
     r"^(?:"
     r"error(?:\[[A-Z]?\d+\])?\s*[:\[]"          # cargo / rustc
     r"|error\s+TS\d+"                            # tsc
-    r"|E\s+\w|FAILED|ERROR\b"                    # pytest
+    # `(?-i:FAILED)` against this module's `IGNORECASE`. Every runner that
+    # opens a line with this word shouts it — pytest, unittest, ctest — while
+    # Title case at the start of a line is prose. Godot prints `Failed to
+    # request display timeout override.` on every headless run, green ones
+    # included, and it was matching here: on one ticket it became the *whole*
+    # of what the loop had to say about a failure, right down to the blocked
+    # note a person reads.
+    r"|E\s+\w|(?-i:FAILED)|ERROR\b"              # pytest
     r"|.*\berror\b\s*(?:TS\d+)?\s*:"             # eslint, generic "path: error:"
     # Rust panics. Matched on `panicked at` wherever it appears in the line
     # rather than on the header's shape: current rustc prints the thread's pid
@@ -55,7 +62,13 @@ _ERROR = re.compile(
     # the failure it was being asked to fix, and every attribution the loop
     # makes — baseline amnesty, contradiction detection, scope blame — was
     # blind on the language for as long as it has supported it.
-    r"|.*\s(?:FAILED|ERROR)\s*$"
+    # The duration is gdUnit4's, and it is why none of this matched a Godot
+    # suite that actually ran. Its verdict is
+    # `  res://tests/a.gd > test_name FAILED 2ms`, indented, with the timing
+    # after the word — so the end-of-line rule above missed it and the whole
+    # failure report under it was never a block. What the loop had instead was
+    # the engine's startup chatter.
+    r"|.*\s(?:FAILED|ERROR)(?:\s+\d+(?:\.\d+)?\s*(?:ms|s|m))?\s*$"
     # `\s*` because a runner indents its verdict line. vitest prints
     # ` FAIL  tests/a.test.ts > suite > case` above the assertion, and that
     # header is the only place the failing *file* appears — the
@@ -336,7 +349,18 @@ _CODES: tuple[re.Pattern[str], ...] = (
 # written as a symbol has a space there. Without the split, every `× suite >
 # case` line fell through to `_message_of` and minted a class per test case —
 # the opposite of what this exists for.
-_VERDICT = re.compile(r"^\s*(?:(?:FAIL|FAILED|ERROR)\b|[✗×])", re.IGNORECASE)
+#
+# Matched at either end of the line. vitest and pytest lead with the word;
+# gdUnit4 and gradle put it last — `res://tests/a.gd > test_name FAILED 2ms`,
+# `Bug001Test > jar_has_main_class() FAILED`. Read only at the start, those two
+# fell through to `_message_of`, which keeps the *test's own name* and so mints
+# a class per case: the opposite of what this is for, and invisible because the
+# classes look reasonable one at a time.
+_VERDICT = re.compile(
+    r"^\s*(?:(?:FAIL|FAILED|ERROR)\b|[✗×])"
+    r"|\s(?:FAILED|ERROR)(?:\s+\d+(?:\.\d+)?\s*(?:ms|s|m))?\s*$",
+    re.IGNORECASE,
+)
 
 # A path with no line number after it, which `_LOCATION` deliberately does not
 # match. Required to contain a separator: without that, `Object.is` and
@@ -365,7 +389,9 @@ def _code_of(head: str) -> str:
             return found.group(1).strip()
     # After the codes, not before: a verdict line that also carries a code —
     # `FAILED ... error[E0603]` — should be classed by the code.
-    if _VERDICT.match(head):
+    # `search`, not `match`: the second branch of `_VERDICT` is anchored at the
+    # end of the line.
+    if _VERDICT.search(head):
         return "test failed"
     return ""
 
