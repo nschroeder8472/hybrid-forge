@@ -51,7 +51,12 @@ from forge.ingest import (
     undeclared_order,
 )
 from forge.ingest import ingest as ingest_document
-from forge.respec import _constants, _merge_criteria, _refuse_protocol_edits
+from forge.respec import (
+    _constants,
+    _merge_criteria,
+    _refuse_protocol_edits,
+    dropped_criteria,
+)
 from forge.loop import (
     _ASSERTED,
     _DROPPABLE_HEADINGS,
@@ -18172,6 +18177,178 @@ class TestRatificationInTheLoop(unittest.TestCase):
         self.assertIn("src/secrets.rs", ticket.allowed_files)
         self.assertFalse(orchestrator._scope_gate(run_id, ticket))
         self.assertEqual(store.list_tickets(run_id)[0].status, "blocked")
+
+
+class TestRatificationCannotHandBackFewerCriteria(unittest.TestCase):
+    """The hole `contract_criteria` was standing on.
+
+    A ticket was ingested with eleven criteria and ratified into ten: the pass
+    dropped the one requiring `gdtoolkit.linter` to exit 0. Because
+    `contract_criteria` prefers `ratified_criteria`, the ten became the floor
+    respec's ratchet defended for the rest of the run — the bar ratify lowered
+    was then protected against being raised again.
+
+    Ratify may still reword, split and add. Only the shortfall is refused."""
+
+    PLAN = [
+        "capture for game_001 returns a seed of 3130775471.",
+        "That same call returns a decorable_count of 13.",
+        "`python -m gdtoolkit.linter scripts scenes tests` exits 0 with the new "
+        "test file present.",
+    ]
+
+    def _ticket(self, criteria=None):
+        return Ticket(
+            "PF-009",
+            criteria=list(criteria or self.PLAN),
+            original_criteria=list(self.PLAN),
+        )
+
+    def test_the_criterion_that_went_missing_on_the_real_run_is_named(self):
+        gone = dropped_criteria(self._ticket(), self.PLAN[:2])
+
+        self.assertEqual(len(gone), 1)
+        self.assertIn("gdtoolkit.linter", gone[0])
+
+    def test_the_same_list_back_is_not_a_drop(self):
+        self.assertEqual(dropped_criteria(self._ticket(), self.PLAN), [])
+
+    def test_sharpening_a_vague_criterion_is_what_the_pass_is_for(self):
+        # The two share no word at all. Judging each criterion on whether it
+        # survives in some form would refuse exactly the revision the tester's
+        # blocking objection asked for.
+        ticket = Ticket("T-1", criteria=["it parses"], original_criteria=["it parses"])
+
+        self.assertEqual(
+            dropped_criteria(ticket, ["returns Err(ParseError) for a missing brace"]),
+            [],
+        )
+
+    def test_splitting_one_criterion_into_two_is_allowed(self):
+        ticket = Ticket(
+            "T-1",
+            criteria=["ox and oy are both within 0.000001"],
+            original_criteria=["ox and oy are both within 0.000001"],
+        )
+
+        self.assertEqual(
+            dropped_criteria(ticket, ["ox is within 0.000001", "oy is within 0.000001"]),
+            [],
+        )
+
+    def test_adding_a_criterion_a_role_asked_for_is_allowed(self):
+        self.assertEqual(
+            dropped_criteria(self._ticket(), [*self.PLAN, "posts has length 0."]), []
+        )
+
+    def test_merging_two_into_one_is_still_a_shorter_list(self):
+        # Every survivor covers something, so nothing can be named as missing.
+        # The shortfall is reported anyway: a pass that consolidates is doing
+        # something the ratchet downstream cannot tell from a deletion.
+        ticket = Ticket(
+            "T-1",
+            criteria=["a returns 1.", "b returns 2."],
+            original_criteria=["a returns 1.", "b returns 2."],
+        )
+
+        self.assertTrue(dropped_criteria(ticket, ["a returns 1 and b returns 2."]))
+
+    def test_a_later_pass_is_judged_against_the_plan_not_the_last_pass(self):
+        # Otherwise pass one shrinks the list and pass two is measured against
+        # the shorter one, which is the same hole one level down.
+        ticket = self._ticket(criteria=self.PLAN[:2])
+
+        self.assertTrue(dropped_criteria(ticket, self.PLAN[:2]))
+
+
+class TestRatifyRefusesTheShorterListInTheLoop(unittest.TestCase):
+    """End to end: a planner revision that returns fewer criteria than it was
+    given keeps none of them, and the ticket ships with the contract it was
+    ingested with."""
+
+    PLAN = ["it parses the header", "`cargo clippy` exits 0 with the new file present"]
+
+    def _orchestrator(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "src").mkdir()
+        (root / "src" / "a.rs").write_text("fn main() {}\n", encoding="utf-8")
+        config = Config(
+            root=root,
+            models={"m": {"kind": "openai", "model": "stub", "contextWindow": 8192,
+                          "maxOutputTokens": 1024}},
+            roles={role: "m" for role in ROLES},
+            commands={"lint": "", "typecheck": "", "test": "cargo test"},
+            loop=LoopSettings(preflight=False, ratify_passes=2),
+        )
+        store = Store(config.db_path)
+        run_id = store.create_run("goal")
+        store.add_tickets(
+            run_id,
+            [
+                Ticket(
+                    "T-1",
+                    title="Parse",
+                    spec="Parse the header.",
+                    allowed_files=["src/a.rs"],
+                    criteria=list(self.PLAN),
+                )
+            ],
+        )
+        orchestrator = Orchestrator(config, store)
+        orchestrator.artifacts = Artifacts(config.config_dir, run_id)
+        return orchestrator, store, run_id
+
+    def _run(self, revision):
+        orchestrator, store, run_id = self._orchestrator()
+
+        # One list per role, consumed across both passes.
+        scripts = {
+            "planner": ["SIGNOFF: yes", json.dumps(revision), "SIGNOFF: yes"],
+            "executor": ["SIGNOFF: no\nBLOCKING:\n- criterion 2 is not mine", "SIGNOFF: yes"],
+            "tester": ["SIGNOFF: yes", "SIGNOFF: yes"],
+            "reviewer": ["SIGNOFF: yes", "SIGNOFF: yes"],
+        }
+
+        def call(_run_id, role, _messages, *, max_tokens, temperature=0.2):
+            return Completion(text=scripts[role].pop(0), usage=Usage(), finish_reason="stop")
+
+        orchestrator._call = call
+        ticket = store.list_tickets(run_id)[0]
+        orchestrator._ratify(run_id, ticket)
+        return orchestrator, store, run_id, ticket
+
+    def test_the_dropped_criterion_is_still_on_the_ticket(self):
+        _orch, _store, _run_id, ticket = self._run({"criteria": [self.PLAN[0]]})
+
+        self.assertEqual(ticket.criteria, self.PLAN)
+
+    def test_the_ratchet_floor_is_the_full_contract(self):
+        _orch, _store, _run_id, ticket = self._run({"criteria": [self.PLAN[0]]})
+
+        self.assertEqual(ticket.contract_criteria, self.PLAN)
+
+    def test_the_refusal_is_reported(self):
+        orch, _store, _run_id, _ticket = self._run({"criteria": [self.PLAN[0]]})
+
+        messages = " ".join(e["message"] for e in orch.store.events_after(0))
+        self.assertIn("rather than rewording them", messages)
+        self.assertIn("cargo clippy", messages)
+
+    def test_a_revision_that_only_rewords_is_kept(self):
+        reworded = ["it parses the header and rejects a missing brace", self.PLAN[1]]
+        _orch, _store, _run_id, ticket = self._run({"criteria": reworded})
+
+        self.assertEqual(ticket.criteria, reworded)
+
+    def test_the_rest_of_a_refused_revision_still_applies(self):
+        # Only the criteria field is dropped. A pass that fixed the spec and
+        # miscounted the criteria should not lose the spec too.
+        _orch, _store, _run_id, ticket = self._run(
+            {"criteria": [self.PLAN[0]], "spec": "Parse the header and the footer."}
+        )
+
+        self.assertEqual(ticket.spec, "Parse the header and the footer.")
+        self.assertEqual(ticket.criteria, self.PLAN)
 
 
 class TestTheRatifiedContractIsTheAnchor(unittest.TestCase):

@@ -378,6 +378,14 @@ class Ticket:
         The ratified ones where a sign-off pass settled them, the plan's
         otherwise. Both are somebody's decision on the record; neither is the
         loop's own invention, which is the distinction the ratchet turns on.
+
+        Preferring the ratified list is only safe because ratification cannot
+        return a shorter one — `respec.dropped_criteria` refuses a revision
+        that drops a plan-authored criterion instead of rewording it. Without
+        that, a pass could lower the bar and the lowered bar would become the
+        floor this property hands the ratchet to defend, which is how one
+        ticket came to be judged against ten of the eleven criteria it was
+        ingested with.
         """
         return self.ratified_criteria or self.original_criteria
 

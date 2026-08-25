@@ -47,6 +47,7 @@ from .respec import (
     _preserve_plan_context,
     _refuse_protocol_edits,
     _refuse_verification_waivers,
+    dropped_criteria,
 )
 from .state import Store, Ticket
 
@@ -329,6 +330,25 @@ def _apply(
             revision[key] = safe
         else:
             revision.pop(key)
+
+    if "criteria" in revision:
+        # Refused whole, like a spec revision that drops a settled decision.
+        # Putting the missing criterion back would land it beside a reworded
+        # version of itself, and this pass is allowed to reword.
+        gone = dropped_criteria(ticket, revision["criteria"])
+        if gone:
+            revision.pop("criteria")
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: ratify dropped {len(gone)} of the plan's "
+                f"criteria rather than rewording them; the criteria revision "
+                f"was refused. This pass may sharpen a criterion and may add "
+                f"one; a criterion it cannot see met is a blocking vote, not a "
+                f"shorter list:\n" + "\n".join(f"  - {c.strip()[:160]}" for c in gone[:5]),
+                level="warn",
+                kind="ticket",
+                data={"dropped": gone},
+            )
 
     if "criteria" in revision:
         revision["criteria"], pinned = _drop_whole_file_claims(
