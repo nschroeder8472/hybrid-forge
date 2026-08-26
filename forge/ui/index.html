@@ -82,6 +82,43 @@ th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px; p
 td { padding: 4px 0; border-top: 1px solid var(--line); font-family: var(--mono); font-size: 12.5px; }
 td:last-child, th:last-child { text-align: right; }
 .empty { color: var(--muted); font-style: italic; }
+
+/* Steps read as a transcript rather than a list of names. The detail was
+   always in the payload and was never rendered — for a model step it is the
+   reply itself, which is the closest thing the loop has to showing its work. */
+.step { border-top: 1px solid var(--line); padding: 0; }
+.step:first-child { border-top: 0; }
+.step > .head {
+  display: flex; gap: 10px; align-items: baseline; padding: 7px 0; cursor: pointer;
+}
+.step > .head:hover .title { color: var(--accent); }
+.step .caret { color: var(--muted); font-size: 10px; width: 10px; flex-shrink: 0; }
+.step .id { font-family: var(--mono); font-size: 12px; color: var(--accent); min-width: 74px; }
+.step .title { flex: 1; font-family: var(--mono); font-size: 12.5px; }
+.step .took { color: var(--muted); font-size: 11px; font-family: var(--mono); }
+.step.voice .title { color: var(--text); }
+.step.tool .title { color: var(--muted); }
+.step .snip {
+  margin: 0 0 9px 20px; padding: 8px 10px; border-radius: 6px;
+  background: var(--panel-2); border: 1px solid var(--line);
+  font-family: var(--mono); font-size: 12px; line-height: 1.55;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 30vh; overflow-y: auto; color: var(--muted);
+}
+/* The model's own words, so they read as prose and not as tool output. */
+.step.voice .snip { color: var(--text); white-space: pre-wrap; }
+.step.failed .snip { border-color: color-mix(in srgb, var(--err) 32%, transparent); }
+.step .peek {
+  flex: 1; color: var(--muted); font-size: 12px; font-family: var(--mono);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+.step.running .title { color: var(--accent); }
+.pulse {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); animation: pulse 1.1s ease-in-out infinite;
+}
+@keyframes pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+#steps { max-height: 60vh; overflow-y: auto; }
 </style>
 </head>
 <body>
@@ -157,15 +194,94 @@ function renderTickets(tickets) {
     </li>`).join("");
 }
 
+// Steps whose detail is a model's reply rather than a tool's output. Worth
+// telling apart: one is prose to read, the other is a diagnostic to scan.
+const VOICE = /^(build|tests|review|ratify|record|respec|stuck-review|reproduce|locate|bug)\b/;
+
+// Steps the reader has opened or closed by hand. The newest is open by
+// default, and stays open unless it is closed here — so a run left alone reads
+// as a transcript, and one being read does not jump around under the cursor.
+const opened = new Set();
+const closed = new Set();
+
+function isOpen(step, newest) {
+  if (opened.has(step.id)) return true;
+  if (closed.has(step.id)) return false;
+  return step.id === newest;
+}
+
+function took(step) {
+  if (!step.started_at) return "";
+  const end = step.ended_at || (Date.now() / 1000);
+  const seconds = end - step.started_at;
+  if (seconds < 1) return `${Math.round(seconds * 1000)}ms`;
+  if (seconds < 90) return `${seconds.toFixed(1)}s`;
+  return `${Math.floor(seconds / 60)}m${String(Math.floor(seconds % 60)).padStart(2, "0")}s`;
+}
+
+// One line of it, for a step that is closed. The first line of a model reply is
+// usually the sentence saying what it thinks it is doing, which is the line
+// worth showing. Tool output opens with its own banner instead — the real
+// `typecheck` step leads with `> path-forge@0.1.0 typecheck` and puts the
+// error four lines down — so a diagnostic wins where the output has one, and
+// the banner is skipped where it does not.
+const BANNER = /^[>$#]\s|^(?:npm|yarn|pnpm|Running|Compiling|Godot Engine)\b/;
+const DIAGNOSTIC = /\berror\b|\bfailed\b|\bwarning\b|^\S+[:(]\d+/i;
+
+function peek(detail, kind) {
+  const lines = (detail || "").split("\n").map(l => l.trim()).filter(Boolean);
+  // A model reply is read from the top: the first line is the sentence saying
+  // what it is about to do. Hunting for a diagnostic inside one finds whatever
+  // line of the code it emitted happens to contain the word — on the real
+  // ticket, `return { ok: false, error: "empty level" };` in place of `I see
+  // the issue now. The problem is that I'm using if (result.ok)...`.
+  const said = kind === "voice"
+    ? lines.find(l => !BANNER.test(l))
+    : lines.find(l => DIAGNOSTIC.test(l)) || lines.find(l => !BANNER.test(l));
+  return (said || lines[0] || "").slice(0, 200);
+}
+
 function renderSteps(steps) {
   if (!steps.length) return '<li class="empty">Nothing yet.</li>';
-  return steps.map(s => `
-    <li class="ticket">
-      <span class="id">${esc(s.ticket || "—")}</span>
-      <span class="title">${esc(s.name)}</span>
-      <span class="pill ${esc(s.status)}">${esc(s.status)}</span>
-    </li>`).join("");
+  const newest = steps.length ? steps[0].id : 0;
+  return steps.map(s => {
+    const running = s.status === "running";
+    const open = !running && s.detail && isOpen(s, newest);
+    const kind = VOICE.test(s.name) ? "voice" : "tool";
+    return `
+    <li class="step ${kind} ${esc(s.status)}" data-id="${s.id}">
+      <div class="head" onclick="toggleStep(${s.id})">
+        <span class="caret">${s.detail ? (open ? "▾" : "▸") : "\u00a0"}</span>
+        <span class="id">${esc(s.ticket || "—")}</span>
+        <span class="title">${esc(s.name)}</span>
+        ${open || running ? "" : `<span class="peek">${esc(peek(s.detail, kind))}</span>`}
+        <span class="took" data-since="${running ? s.started_at : ""}">${esc(took(s))}</span>
+        <span class="pill ${esc(s.status)}">${running ? '<i class="pulse"></i> ' : ""}${esc(s.status)}</span>
+      </div>
+      ${open ? `<pre class="snip">${esc(s.detail)}</pre>` : ""}
+    </li>`;
+  }).join("");
 }
+
+function toggleStep(id) {
+  if (opened.has(id)) { opened.delete(id); closed.add(id); }
+  else { closed.delete(id); opened.add(id); }
+  $("steps").innerHTML = renderSteps(lastSteps);
+}
+
+// Kept so a toggle can re-render without waiting for the next poll.
+let lastSteps = [];
+
+// The elapsed time on a running step, ticked without re-rendering the panel —
+// a full re-render every second would fight the scroll position of whatever is
+// open above it.
+setInterval(() => {
+  document.querySelectorAll("#steps .took[data-since]").forEach(node => {
+    const since = parseFloat(node.dataset.since);
+    if (!since) return;
+    node.textContent = took({ started_at: since, ended_at: 0 });
+  });
+}, 1000);
 
 async function refresh() {
   let state;
@@ -190,7 +306,8 @@ async function refresh() {
     ? `<p class="notice">${esc(run.note || "Waiting for a usage window to reopen.")}</p>` : "";
 
   $("tickets").innerHTML = renderTickets(state.tickets || []);
-  $("steps").innerHTML = renderSteps(state.steps || []);
+  lastSteps = state.steps || [];
+  $("steps").innerHTML = renderSteps(lastSteps);
   $("usage").innerHTML = (state.usage || [])
     .map(u => `<tr><td>${esc(u.model)}</td><td>${u.calls}</td><td>${esc(u.display)}</td></tr>`)
     .join("") || '<tr><td colspan="3" class="empty">No calls yet.</td></tr>';
