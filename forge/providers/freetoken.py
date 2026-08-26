@@ -55,6 +55,19 @@ DEFAULT_PORT = 1919
 _POLL_SECONDS = 2.0
 
 
+# What the daemon says when it could not drain the serve it was about to
+# replace: `{"error": "prepare-stop returned HTTP 503",
+# "code": "accounting_prepare_failed", "enginePreserved": true}`. Matched on
+# these markers rather than on the status code, because a 503 from a daemon
+# that is not running means something else entirely and forcing would not help.
+_DRAIN_MARKERS = ("accounting_prepare_failed", "prepare-stop", "prepare_stop")
+
+
+def _drain_failed(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in _DRAIN_MARKERS)
+
+
 class FreeTokenProvider(OpenAICompatProvider):
     kind = "freetoken"
 
@@ -147,10 +160,12 @@ class FreeTokenProvider(OpenAICompatProvider):
             return ""
         return served
 
-    def _switch(self) -> None:
+    def _ask(self, *, force: bool) -> None:
         body: dict[str, Any] = {"model": self.model_path, "port": self.port}
         if self.engine_args:
             body["args"] = self.engine_args
+        if force:
+            body["force"] = True
         try:
             post_json(
                 f"{self.daemon_url}/engine/switch",
@@ -164,6 +179,26 @@ class FreeTokenProvider(OpenAICompatProvider):
             raise ProviderUnreachable(
                 f"FreeToken daemon refused to load {self.model_path!r}: {exc}"
             ) from exc
+
+    def _switch(self) -> None:
+        try:
+            self._ask(force=False)
+        except ProviderError as exc:
+            if not _drain_failed(str(exc)):
+                raise
+            # The daemon drains the running serve before replacing it, and a
+            # serve that is mid-generation will not drain. That is the ordinary
+            # case here rather than an exotic one: the engine this is replacing
+            # was answering a moment ago, and a model that reasons past its
+            # output budget is still answering for a long time afterwards. One
+            # run lost ten builds and two records to it, all of them reported
+            # as the build step failing.
+            #
+            # Forcing is safe precisely because the drain failed: the daemon
+            # says `enginePreserved`, so nothing has been torn down and the
+            # only thing lost is the usage receipt for the model being
+            # replaced. A receipt is worth less than the attempt.
+            self._ask(force=True)
 
         deadline = time.time() + self.switch_seconds
         while time.time() < deadline:
