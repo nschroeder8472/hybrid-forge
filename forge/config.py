@@ -346,30 +346,66 @@ def _validate_commands(commands: dict[str, Any], where: str) -> None:
     several times in the file.
     """
     for kind, raw in commands.items():
-        if not isinstance(raw, (str, dict)):
+        # A list is a chain — a fixer and then a formatter, each run over the
+        # same files. Only `format` may be one. The verify kinds are judged by
+        # what they report, and two commands reporting separately would need a
+        # rule for which answer counts; `format` has no such problem because
+        # nothing it says can fail a ticket.
+        if isinstance(raw, (list, tuple)) and kind != "format":
+            raise ConfigError(
+                f"{where}.{kind} is a list. Only `format` may be several "
+                f"commands run in turn — a step that is judged by its output "
+                f"has to be one command, or nothing decides which answer counts."
+            )
+        if not isinstance(raw, (str, dict, list, tuple)):
             raise ConfigError(
                 f"{where}.{kind} is {type(raw).__name__}; expected a "
-                f'command string, or a map of language to command like '
+                f'command string, a list of them for `format`, or a map of '
+                f'language to command like '
                 f'{{".rs": "cargo test", ".js": "node --test"}}.'
             )
+        for item in raw if isinstance(raw, (list, tuple)) else ():
+            if not isinstance(item, str):
+                raise ConfigError(
+                    f"{where}.{kind} has a {type(item).__name__} in its list; "
+                    f"expected a command string."
+                )
         if isinstance(raw, dict):
             for key, value in raw.items():
                 if _is_exemption(value):
+                    continue
+                if isinstance(value, (list, tuple)):
+                    if key != "format" and kind != "format":
+                        raise ConfigError(
+                            f"{where}.{kind}.{key} is a list; only `format` "
+                            f"may be several commands run in turn."
+                        )
+                    for item in value:
+                        if not isinstance(item, str):
+                            raise ConfigError(
+                                f"{where}.{kind}.{key} has a "
+                                f"{type(item).__name__} in its list; expected "
+                                f"a command string."
+                            )
                     continue
                 if not isinstance(value, str):
                     raise ConfigError(
                         f"{where}.{kind}.{key} is {type(value).__name__}; "
                         f"expected a command string."
                     )
-        for suffix, command in _commands_for(commands, kind).items():
-            mismatch = _wrong_language(suffix, command)
-            if mismatch:
-                raise ConfigError(
-                    f"{where}.{kind} runs {command!r} for {suffix} files, "
-                    f"but that command runs {mismatch}. A command keyed to "
-                    f"a language it cannot run fails every ticket in that "
-                    f"language and reports it as the ticket's fault."
-                )
+        # Every command in the chain is checked, not only the first: a chain
+        # whose second command is for another language is as broken as one
+        # whose first is, and reads as the ticket's fault either way.
+        for suffix in _commands_for(commands, kind):
+            for command in _chain_for(commands, kind, f"x{suffix}"):
+                mismatch = _wrong_language(suffix, command)
+                if mismatch:
+                    raise ConfigError(
+                        f"{where}.{kind} runs {command!r} for {suffix} files, "
+                        f"but that command runs {mismatch}. A command keyed to "
+                        f"a language it cannot run fails every ticket in that "
+                        f"language and reports it as the ticket's fault."
+                    )
 
 
 # The root of a repository that declares no workspaces of its own.
