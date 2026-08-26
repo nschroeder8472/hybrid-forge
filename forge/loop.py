@@ -4325,10 +4325,15 @@ class Orchestrator:
         if not commands:
             return []
 
-        # Grouped by the command that will run them and the directory it runs
+        # Grouped by the commands that will run them and the directory they run
         # in, so each formatter is handed only its own language's files and a
         # subproject's formatter is not asked about the parent's tree.
-        groups: dict[tuple[str, str], list[str]] = {}
+        #
+        # A group's key is the whole chain, not one command: `format` may be a
+        # list — a fixer and then a formatter — and every file in a group has
+        # to be handed to every command in it, in order. See `config._chain_for`
+        # for why the two cannot simply be joined with `&&`.
+        groups: dict[tuple[tuple[str, ...], str], list[str]] = {}
         for path in dict.fromkeys(paths):
             if any(character in path for character in "*?["):
                 continue
@@ -4336,14 +4341,14 @@ class Orchestrator:
                 continue
             if not (self.config.root / path).is_file():
                 continue
-            command = self.config.command_for("format", path)
-            if not command.strip():
+            chain = tuple(c for c in self.config.chain_for("format", path) if c.strip())
+            if not chain:
                 continue
             workspace = self.config.workspace_for(path) or self.config.root_workspace
-            groups.setdefault((command, workspace.root), []).append(path)
+            groups.setdefault((chain, workspace.root), []).append(path)
 
         changed: list[str] = []
-        for (command, root), group in sorted(groups.items()):
+        for (chain, root), group in sorted(groups.items()):
             workspace = next(
                 (w for w in self.config.workspaces if w.root == root),
                 self.config.root_workspace,
@@ -4353,17 +4358,27 @@ class Orchestrator:
             # differently from the verify kinds: those are whole commands, and
             # a formatter is a command plus the files to rewrite. Every
             # mainstream one takes them that way — `gdformat`, `prettier
-            # --write`, `ruff format`, `rustfmt`, `gofmt -w`, `black`.
+            # --write`, `ruff format`, `rustfmt`, `gofmt -w`, `black`, and the
+            # fixers too: `ruff check --fix`, `eslint --fix`.
             arguments = " ".join(
                 f'"{path[len(workspace.prefix):]}"' for path in group
             )
-            result = self._shell(
-                run_id,
-                self._step_label("format", "", 1, workspace),
-                f"{command} {arguments}",
-                ticket.ticket_id,
-                workspace=workspace,
-            )
+            # Each command in the chain over the same files, in order. A later
+            # one runs whatever the one before it said: a fixer that removes an
+            # import leaves the line it was on badly spaced, and the formatter
+            # after it is what tidies that — refusing to run it because the
+            # fixer reported something would leave the file worse than either
+            # tool alone. The result carried forward is the last one's, so a
+            # chain reports the state the files are actually left in.
+            result = StepResult(ok=True, detail="")
+            for command in chain:
+                result = self._shell(
+                    run_id,
+                    self._step_label("format", "", 1, workspace),
+                    f"{command} {arguments}",
+                    ticket.ticket_id,
+                    workspace=workspace,
+                )
             # Read back whatever the run did to disk, whether it exited 0 or
             # not. A formatter handed several files does as many of them as it
             # can: `gdformat` given a good file and one it cannot parse

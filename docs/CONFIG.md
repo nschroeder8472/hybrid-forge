@@ -247,6 +247,37 @@ judged. One run spent 117 of a ticket's 160 lint failures on trailing
 whitespace in a file the tester had just written, each costing a full attempt.
 See [CONVERGENCE](CONVERGENCE.md).
 
+**`format` may be a list**, run in order over the same files. Most linters fix
+a good deal of what they report, and what a fixer settles never reaches a model
+as a failure at all — but a fixer and a formatter are not substitutes for each
+other. One removes the unused import and leaves the blank line it was on; the
+other tidies the blank line and cannot remove the import.
+
+```json
+"commands": {
+  "format": ["ruff check --fix", "ruff format"]
+}
+```
+
+They cannot be joined into one string with `&&`. The files the attempt wrote
+are appended to the command, so only the last would receive them and the first
+would run over the whole tree — reformatting files the ticket never touched,
+which is the out-of-scope edit this step exists to avoid. A plain string still
+means one command, and the list form works inside the per-language map too.
+
+A later command runs whatever the one before it reported. `eslint --fix` and
+`ruff check --fix` both exit non-zero when they found something, fixed or not,
+and stopping there would leave the file worse than either tool alone.
+
+**Keep fixers to their safe modes.** A formatter is semantics-preserving by
+definition, which is what makes "the code is made to meet the bar before it is
+judged" an honest claim. A fixer is not always: `ruff check --fix` applies only
+safe fixes unless `--unsafe-fixes` is passed, and most of `eslint --fix` is
+safe, while `cargo clippy --fix` will rewrite logic. Turning those on means the
+harness edits behaviour the model wrote, and the acceptance criteria then judge
+something nobody authored. That is a different act from tidying whitespace, and
+this step does not distinguish them for you.
+
 **Each one may also be a map from language to command**, because a repository is
 rarely one language and a single command silently means "everything is Rust":
 

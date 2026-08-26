@@ -18621,6 +18621,122 @@ class TestWhatTheFormatterCouldNotReadReachesTheNextAttempt(unittest.TestCase):
         self.assertIn("could not read", found[0])
 
 
+class TestAFixerAndAFormatterBothGetTheFiles(unittest.TestCase):
+    """`format` may be a list. A fixer settles what the linter can settle by
+    itself and a formatter settles the layout, and neither substitutes for the
+    other — one leaves the import it removed badly indented, the other cannot
+    remove it. They cannot be joined with `&&` because the files this attempt
+    wrote are appended to the command, so only the last would get them and the
+    first would run over the whole tree."""
+
+    def setUp(self):
+        home = Path(tempfile.mkdtemp())
+        # Stands in for `ruff check --fix`: deletes lines marked UNUSED.
+        self.fixer = home / "fixer.py"
+        self.fixer.write_text(
+            "import pathlib, sys\n"
+            "for argument in sys.argv[1:]:\n"
+            "    target = pathlib.Path(argument)\n"
+            "    kept = [l for l in target.read_text(encoding='utf-8').splitlines()\n"
+            "            if 'UNUSED' not in l]\n"
+            "    target.write_text(chr(10).join(kept) + chr(10), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        # Stands in for `ruff format`: strips trailing whitespace.
+        self.formatter = home / "formatter.py"
+        self.formatter.write_text(
+            "import pathlib, sys\n"
+            "for argument in sys.argv[1:]:\n"
+            "    target = pathlib.Path(argument)\n"
+            "    text = target.read_text(encoding='utf-8')\n"
+            "    target.write_text(\n"
+            "        chr(10).join(l.rstrip() for l in text.splitlines()) + chr(10), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+
+    def _orch(self, value):
+        orch, root, run_id = _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": "", "format": value}
+        )
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "a.py").write_text(
+            "import os  # UNUSED\nx = 1   \n", encoding="utf-8"
+        )
+        return orch, root, run_id
+
+    def _both(self):
+        return [
+            f'"{sys.executable}" "{self.fixer}"',
+            f'"{sys.executable}" "{self.formatter}"',
+        ]
+
+    def test_every_command_in_the_chain_runs_over_the_same_files(self):
+        orch, root, run_id = self._orch(self._both())
+
+        orch._format_pass(run_id, Ticket("T-1"), ["src/a.py"])
+
+        # The fixer removed the import; the formatter tidied what was left.
+        self.assertEqual((root / "src" / "a.py").read_text(encoding="utf-8"), "x = 1\n")
+
+    def test_the_file_is_reported_changed_once_not_twice(self):
+        orch, _root, run_id = self._orch(self._both())
+
+        changed = orch._format_pass(run_id, Ticket("T-1"), ["src/a.py"])
+
+        self.assertEqual(changed, ["src/a.py"])
+
+    def test_a_plain_string_still_means_one_command(self):
+        orch, root, run_id = self._orch(f'"{sys.executable}" "{self.formatter}"')
+
+        orch._format_pass(run_id, Ticket("T-1"), ["src/a.py"])
+
+        # Only the formatter ran, so the import is still there.
+        self.assertIn("UNUSED", (root / "src" / "a.py").read_text(encoding="utf-8"))
+
+    def test_a_fixer_that_reports_something_does_not_stop_the_formatter(self):
+        # A fixer exiting non-zero because it found something is the normal
+        # case for `eslint --fix` and `ruff check --fix`. Refusing to run the
+        # formatter after it would leave the file worse than either tool alone.
+        loud = Path(tempfile.mkdtemp()) / "loud_fixer.py"
+        loud.write_text(
+            "import pathlib, sys\n"
+            "for argument in sys.argv[1:]:\n"
+            "    target = pathlib.Path(argument)\n"
+            "    kept = [l for l in target.read_text(encoding='utf-8').splitlines()\n"
+            "            if 'UNUSED' not in l]\n"
+            "    target.write_text(chr(10).join(kept) + chr(10), encoding='utf-8')\n"
+            "print('1 issue fixed')\n"
+            "sys.exit(1)\n",
+            encoding="utf-8",
+        )
+        orch, root, run_id = self._orch([
+            f'"{sys.executable}" "{loud}"',
+            f'"{sys.executable}" "{self.formatter}"',
+        ])
+
+        orch._format_pass(run_id, Ticket("T-1"), ["src/a.py"])
+
+        self.assertEqual((root / "src" / "a.py").read_text(encoding="utf-8"), "x = 1\n")
+
+    def test_a_chain_can_be_declared_per_language(self):
+        config = Config(
+            root=Path(tempfile.mkdtemp()),
+            models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
+            roles={r: "m" for r in ("planner", "executor", "tester", "reviewer")},
+            commands={
+                "lint": "", "typecheck": "", "test": "",
+                "format": {".py": ["ruff check --fix", "ruff format"],
+                           ".ts": "prettier --write"},
+            },
+        )
+
+        self.assertEqual(
+            config.chain_for("format", "src/a.py"), ("ruff check --fix", "ruff format")
+        )
+        self.assertEqual(config.chain_for("format", "src/a.ts"), ("prettier --write",))
+        self.assertEqual(config.chain_for("format", "src/a.rs"), ())
+
+
 class TestAFormatterThatDidHalfTheJobIsNotAFailedOne(unittest.TestCase):
     """`gdformat` handed a good file and one it cannot parse rewrites the good
     one, says so on the first line of its output, and exits non-zero for the
