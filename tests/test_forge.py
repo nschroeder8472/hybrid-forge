@@ -18302,6 +18302,36 @@ class TestACompileFailureGoesBackWithoutSpendingAnAttempt(unittest.TestCase):
         self.assertIn("charging the attempt instead of asking again", self._logged(orch))
         self.assertNotIn("inner turn 3 of 4", self._logged(orch))
 
+    def test_a_stall_hands_the_next_attempt_back_to_the_tester(self):
+        # The gate returns before the tests step, so while it keeps firing the
+        # tester never runs — and the allowance resets on a charged attempt, so
+        # the next one gates again from the top. One ticket went 43 cycles and
+        # 20 attempts that way without the tester being asked once, every cycle
+        # ending on the same `TS2339` in the tester's own file.
+        orch, _root, run_id = self._orch()
+        asked: list[str] = []
+        replies = _replies(*([self._reply("BROKEN = 1")] * 6
+                             + ["tests/t_test.py\n```python\ndef test_x():\n    assert True\n```"] * 4
+                             + ["REJECT\nno"] * 4))
+
+        def call(run_id_, role, messages, **kwargs):
+            asked.append(role)
+            return replies(run_id_, role, messages, **kwargs)
+
+        orch._call = call
+        orch._work_ticket(
+            run_id, Ticket("T-1", allowed_files=["src/a.py"], criteria=["it works"])
+        )
+
+        self.assertIn("tester", asked)
+
+    def test_the_stall_says_why_the_next_attempt_is_ungated(self):
+        orch, _root, run_id = self._orch()
+
+        self._run(orch, run_id, *[self._reply("BROKEN = 1")] * 12)
+
+        self.assertIn("next attempt runs ungated", self._logged(orch))
+
     def test_off_by_default_means_the_gate_never_runs(self):
         orch, _root, run_id = self._orch(inner_turns=0)
 

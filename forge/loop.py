@@ -3532,6 +3532,20 @@ class Orchestrator:
         # cannot compile would spend all of it before the second attempt began.
         spent = 0
         errors_left = 0
+        # Whether the next attempt runs with the compile gate switched off.
+        #
+        # Set after a stall, and this is load-bearing. The gate returns before
+        # the tests step, so while it keeps firing the tester never runs — and
+        # resetting the allowance on a charged attempt means the next one gates
+        # again from the top. One ticket went 43 cycles and 20 attempts that
+        # way without the tester being asked once, every cycle ending on the
+        # same `TS2339` in the tester's own file. The role whose file that was
+        # had been locked out of its own ticket.
+        #
+        # Alternating costs little. The stall lands on turn 2 in most cases —
+        # 14 of that ticket's 23 inner turns never reached turn 2 at all — so
+        # nearly all of the saving is in the first turn, which still happens.
+        gate_off = False
 
         while ticket.attempts < self.config.loop.max_attempts:
             ticket.attempts += 1
@@ -3543,7 +3557,7 @@ class Orchestrator:
                 prior_failures=history[-self._prior_failures:],
                 rejections=rejections,
                 repro=repro,
-                inner_turns=self.config.loop.inner_turns - spent,
+                inner_turns=0 if gate_off else self.config.loop.inner_turns - spent,
             )
 
             if outcome.retry_build:
@@ -3590,11 +3604,18 @@ class Orchestrator:
                         else f"{len(remaining)} compile error(s) left after "
                         f"{spent} inner turn(s)"
                     )
-                    + "; charging the attempt instead of asking again.",
+                    + "; charging the attempt instead of asking again. The "
+                    "next attempt runs ungated, so the tester is asked about "
+                    "the file it owns.",
                     level="warn",
                     kind="ticket",
                 )
                 outcome = StepResult(ok=False, detail=outcome.detail)
+                gate_off = True
+            else:
+                # An attempt that reached the end of the pipeline has had its
+                # tester. Whatever it failed on, the gate is worth trying again.
+                gate_off = False
 
             # Reached only when the attempt was charged, whatever came of it.
             spent = 0
