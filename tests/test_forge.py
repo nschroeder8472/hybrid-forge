@@ -18181,6 +18181,236 @@ class TestRatificationInTheLoop(unittest.TestCase):
         self.assertEqual(store.list_tickets(run_id)[0].status, "blocked")
 
 
+class TestACompileFailureGoesBackWithoutSpendingAnAttempt(unittest.TestCase):
+    """An attempt is the unit the loop charges and the unit respec measures,
+    and it is far bigger than the mistake it usually ends on. One ticket's 95
+    cycles averaged 14.5s of executor, 0.7s of `typecheck` — and 12.0s of
+    tester, spent 58 times writing assertions for an implementation that then
+    failed to compile. Because one compile error cost one of five attempts,
+    that ticket got five corrections against a spec and then a rewritten spec:
+    nineteen ratifications and eighteen respecs, while it sat two errors from
+    done."""
+
+    # Fails while `src/a.py` still says `BROKEN`, passes once it does not.
+    CHECKER = (
+        "import pathlib, sys\n"
+        "target = pathlib.Path('src/a.py')\n"
+        # Green while the file does not exist, so the baseline this ticket is
+        # measured against is green and the amnesty has nothing to excuse.
+        "text = target.read_text(encoding='utf-8') if target.exists() else ''\n"
+        "if 'BROKEN' in text:\n"
+        "    print('src/a.py:1:1: error: broken')\n"
+        "    sys.exit(1)\n"
+    )
+
+    def setUp(self):
+        self.tool = Path(tempfile.mkdtemp()) / "checker.py"
+        self.tool.write_text(self.CHECKER, encoding="utf-8")
+
+    def _orch(self, inner_turns=2, kind="typecheck"):
+        commands = {"lint": "", "typecheck": "", "test": ""}
+        commands[kind] = f'"{sys.executable}" "{self.tool}"'
+        orch, root, run_id = _stub_orchestrator(commands)
+        orch.config.loop.inner_turns = inner_turns
+        orch.config.loop.max_attempts = 2
+        (root / "src").mkdir(exist_ok=True)
+        return orch, root, run_id
+
+    @staticmethod
+    def _reply(body):
+        return f"src/a.py\n```python\n{body}\n```"
+
+    def _run(self, orch, run_id, *replies):
+        orch._call = _replies(*replies)
+        ticket = Ticket("T-1", allowed_files=["src/a.py"], criteria=["it works"])
+        orch._work_ticket(run_id, ticket)
+        return ticket
+
+    def _logged(self, orch) -> str:
+        return " ".join(row["message"] for row in orch.store.events_after(0))
+
+    def test_a_fixed_second_reply_costs_one_attempt_not_two(self):
+        orch, _root, run_id = self._orch()
+
+        ticket = self._run(
+            orch,
+            run_id,
+            self._reply("BROKEN = 1"),
+            self._reply("x = 1"),
+            "tests/t_test.py\n```python\ndef test_x():\n    assert True\n```",
+            "ACCEPT\nfine",
+        )
+
+        self.assertEqual(ticket.status, "done")
+        self.assertEqual(ticket.attempts, 1)
+
+    def test_the_tester_is_not_asked_about_code_that_does_not_compile(self):
+        orch, _root, run_id = self._orch()
+        asked: list[str] = []
+        replies = _replies(
+            self._reply("BROKEN = 1"),
+            self._reply("x = 1"),
+            "tests/t_test.py\n```python\ndef test_x():\n    assert True\n```",
+            "ACCEPT\nfine",
+        )
+
+        def call(run_id_, role, messages, **kwargs):
+            asked.append(role)
+            return replies(run_id_, role, messages, **kwargs)
+
+        orch._call = call
+        orch._work_ticket(
+            run_id, Ticket("T-1", allowed_files=["src/a.py"], criteria=["it works"])
+        )
+
+        # executor, executor, tester, reviewer — the first executor reply never
+        # reached the tester.
+        self.assertEqual(asked, ["executor", "executor", "tester", "reviewer"])
+
+    def test_the_turn_is_reported_as_uncharged(self):
+        orch, _root, run_id = self._orch()
+
+        self._run(
+            orch,
+            run_id,
+            self._reply("BROKEN = 1"),
+            self._reply("x = 1"),
+            "tests/t_test.py\n```python\ndef test_x():\n    assert True\n```",
+            "ACCEPT\nfine",
+        )
+
+        self.assertIn("the attempt was not charged", self._logged(orch))
+        self.assertIn("inner turn 1 of 2", self._logged(orch))
+
+    def test_an_executor_that_never_compiles_still_spends_the_budget(self):
+        # The turns must not become a way to never fail. Two attempts, two
+        # inner turns each, and the ticket ends failed rather than looping.
+        orch, _root, run_id = self._orch()
+
+        ticket = self._run(orch, run_id, *[self._reply("BROKEN = 1")] * 12)
+
+        self.assertEqual(ticket.status, "failed")
+        self.assertEqual(ticket.attempts, 2)
+
+    def test_a_count_that_stops_falling_charges_the_attempt(self):
+        # Turns are for closing a gap that is closing. The same one error twice
+        # is an executor that will not get nearer for being asked again.
+        orch, _root, run_id = self._orch(inner_turns=4)
+
+        self._run(orch, run_id, *[self._reply("BROKEN = 1")] * 12)
+
+        self.assertIn("charging the attempt instead of asking again", self._logged(orch))
+        self.assertNotIn("inner turn 3 of 4", self._logged(orch))
+
+    def test_off_by_default_means_the_gate_never_runs(self):
+        orch, _root, run_id = self._orch(inner_turns=0)
+
+        ticket = self._run(
+            orch,
+            run_id,
+            self._reply("BROKEN = 1"),
+            self._reply("x = 1"),
+            "tests/t_test.py\n```python\ndef test_x():\n    assert True\n```",
+            "ACCEPT\nfine",
+        )
+
+        # The first reply cost a whole attempt, exactly as it always did.
+        self.assertEqual(ticket.attempts, 2)
+        self.assertNotIn("was not charged", self._logged(orch))
+
+    def test_lint_gates_as_well_as_typecheck(self):
+        orch, _root, run_id = self._orch(kind="lint")
+
+        ticket = self._run(
+            orch,
+            run_id,
+            self._reply("BROKEN = 1"),
+            self._reply("x = 1"),
+            "tests/t_test.py\n```python\ndef test_x():\n    assert True\n```",
+            "ACCEPT\nfine",
+        )
+
+        self.assertEqual(ticket.attempts, 1)
+
+
+class TestTheCompileGateNeverLoopsOnSomebodyElsesFailure(unittest.TestCase):
+    """The turns are uncharged, so what they may be spent on is the whole
+    safety argument. Two things are never the executor's: a failure that was
+    already in the tree when the ticket started, and a red test suite — which
+    may be the tester's assertion rather than the executor's code, and which
+    the executor cannot edit the file to find out about."""
+
+    def _orch(self, commands):
+        orch, root, run_id = _stub_orchestrator(commands)
+        orch.config.loop.inner_turns = 2
+        (root / "src").mkdir(exist_ok=True)
+        return orch, root, run_id
+
+    def test_test_is_not_a_compile_gate_step(self):
+        self.assertEqual(Orchestrator._COMPILE_GATE, ("lint", "typecheck"))
+        self.assertNotIn("test", Orchestrator._COMPILE_GATE)
+
+    def test_a_red_suite_is_left_to_verify(self):
+        failing = Path(tempfile.mkdtemp()) / "always_red.py"
+        failing.write_text(
+            "import sys\nprint('t_test.py:1:1: error: assertion failed')\n"
+            "sys.exit(1)\n",
+            encoding="utf-8",
+        )
+        orch, root, run_id = self._orch(
+            {"lint": "", "typecheck": "", "test": f'"{sys.executable}" "{failing}"'}
+        )
+        (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+        self.assertEqual(
+            orch._compile_gate(run_id, Ticket("T-1", allowed_files=["src/a.py"]),
+                               ["src/a.py"], None),
+            "",
+        )
+
+    def test_a_failure_that_pre_dates_the_ticket_is_not_the_executors(self):
+        checker = Path(tempfile.mkdtemp()) / "checker.py"
+        checker.write_text(
+            "import sys\nprint('src/old.py:1:1: error: broken')\nsys.exit(1)\n",
+            encoding="utf-8",
+        )
+        orch, root, run_id = self._orch(
+            {"lint": "", "typecheck": f'"{sys.executable}" "{checker}"', "test": ""}
+        )
+        (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        ticket = Ticket("T-1", allowed_files=["src/a.py"])
+
+        # Nothing inherited: the gate reports it, because the ticket may have
+        # caused it.
+        self.assertTrue(orch._compile_gate(run_id, ticket, ["src/a.py"], None))
+
+        # Inherited from the baseline: the same amnesty verify applies. The
+        # signatures come from the gate's own report rather than being written
+        # out here, so this stays a test about the amnesty and not about how a
+        # signature is spelled.
+        name = orch._verify_plan(ticket)[0][0]
+        said = orch._compile_gate(run_id, ticket, ["src/a.py"], None)
+        inherited = {name: signatures(said)}
+        self.assertEqual(
+            orch._compile_gate(run_id, ticket, ["src/a.py"], inherited), ""
+        )
+
+    def test_an_attempt_that_wrote_nothing_is_never_gated(self):
+        checker = Path(tempfile.mkdtemp()) / "checker.py"
+        checker.write_text(
+            "import sys\nprint('src/a.py:1:1: error: broken')\nsys.exit(1)\n",
+            encoding="utf-8",
+        )
+        orch, _root, run_id = self._orch(
+            {"lint": "", "typecheck": f'"{sys.executable}" "{checker}"', "test": ""}
+        )
+
+        self.assertEqual(
+            orch._compile_gate(run_id, Ticket("T-1", allowed_files=["src/a.py"]), [], None),
+            "",
+        )
+
+
 class TestTheReviewerIsToldNothingCheckedTheCriteria(unittest.TestCase):
     """A tester that kept reshaping the value before comparing it has its file
     discarded, and the ticket goes to review with a suite that went green

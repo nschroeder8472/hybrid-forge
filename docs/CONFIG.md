@@ -463,6 +463,7 @@ run some context, never the run.
 | `baselineVerify` | `true` | Run the verify commands once before each ticket, so breakage that was already there is not blamed on whichever ticket ran next. Turn off only when a full suite is slow enough that paying it per ticket costs more than the attempts it saves. |
 | `bugHypotheses` | `3` | How many explanations a `forge bug` ticket may go through before it parks. The first is the planner's reading of the report; each one after it is a re-diagnosis, asked for when the reproduction could not be written — a test that passes against the named code has *disproved* that reading, and disproof is evidence rather than a dead end. `1` parks on the first wrong guess. See [BUG-LOOP.md](BUG-LOOP.md). |
 | `executorTurns` | `4` | Replay this many prior attempts to the executor as real conversation turns — its own reply as an `assistant` message, the failure that followed as the next `user` one. `0` restores the flat single-message prompt, in which the executor reads its own previous work as somebody else's. See [SETUP](SETUP.md#thinking-models-answer-last) for the trade and [CONVERGENCE](CONVERGENCE.md) for what the flat shape cost on a long backlog. |
+| `innerTurns` | `0` (off) | How many times a compile failure may go straight back to the executor without spending an attempt. Between apply and the tests step the loop runs the `lint` and `typecheck` commands it was going to run at verify anyway; a failure there can only be the executor's own, so the reply goes back on the same conversation thread against the same contract, and the tester is not asked to write assertions for something that does not compile. Never `test` — a red suite may be the tester's assertion rather than the executor's code, and the executor cannot edit that file to find out. A turn is spent only while the error count is falling; when it stops, the attempt is charged and the ordinary path resumes. Off because it changes how attempts are counted, and every convergence rule in the loop is written against that number. Measured on one ticket: `typecheck` averaged 0.7s against the tester's 12.0s, and 58 of its 95 cycles wrote a test file for an implementation that then failed to compile. See [CONVERGENCE](CONVERGENCE.md). |
 | `toolchainContext` | `true` | Show the executor and tester the linter, compiler and test-runner settings that grade what they write — the real files at their real paths, resolved per language from the ticket's own scope and clipped. They are measured by `commands.lint` and `commands.typecheck` and were otherwise never shown what those enforce, so they inferred it from failures. Costs a few hundred characters a call, and the budget gate drops it first. See [CONVERGENCE](CONVERGENCE.md). |
 | `priorFailures` | `8` | Earlier failures carried into the executor's prompt alongside the newest one, deduplicated by failure *class* — `(step, error code, file)`, line numbers and quoted values masked — rather than by raw text. Keyed by text this window held one mistake repeated, not several distinct ones. See [CONVERGENCE](CONVERGENCE.md). |
 | `learnedLimit` | `12` | How many of a ticket's accumulated learnings reach a prompt, commonest first. A learning is a fact about *this repository* that an earlier attempt established — a compiler flag, an import convention — recorded by respec so the loop stops rediscovering it. It is not a bar: the reviewer is not shown it and no criterion is made from it. `0` renders none. See [CONVERGENCE](CONVERGENCE.md). |
@@ -618,6 +619,7 @@ it is a one-line edit in `roles`.
     "maxRuntimeSeconds": 0,
     "baselineVerify": true,
     "executorTurns": 4,
+    "innerTurns": 0,
     "toolchainContext": true,
     "priorFailures": 8,
     "learnedLimit": 12,
@@ -648,6 +650,7 @@ Every one of these fails at startup, before a single token is spent.
 | `model 'x' has unknown kind 'y'` | Check the kind table above; aliases are listed there. |
 | `loop.retryCycles is -2; expected 0 ...` | Negative but not `-1`. Rejected rather than guessed at. |
 | `loop.executorTurns is -1; expected 0 ...` | Same reasoning. |
+| `loop.innerTurns is -1; expected 0 ...` | Same reasoning. |
 | `memory.recordRole is 'x', which is not a role` | Must be one of the four. |
 
 A config that loads is not a config that works. `forge doctor` asks every model

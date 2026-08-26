@@ -118,6 +118,7 @@ from .prompts import (
 )
 from .state import (
     DETAIL_CHARS,
+    _step_kind,
     RUN_BLOCKED,
     RUN_DONE,
     RUN_FAILED,
@@ -324,6 +325,12 @@ class StepResult:
     # that ran no assertion about it. Ends the run rather than the ticket. See
     # `_unverifiable`.
     halt: bool = False
+    # The attempt stopped at the compile gate and the executor should be asked
+    # again without being charged for it — the mistake is unambiguously its
+    # own, nothing downstream has run, and the contract has not moved. The
+    # caller decides whether an inner turn is left to spend; see
+    # `_compile_gate` and `loop.innerTurns`.
+    retry_build: bool = False
 
 
 class Stopped(Exception):
@@ -3519,6 +3526,13 @@ class Orchestrator:
                 )
             ]
 
+        # Inner turns spent on the attempt in hand, and how many compile errors
+        # the last one left behind. Both reset the moment an attempt is
+        # actually charged: the allowance is per attempt, or one ticket that
+        # cannot compile would spend all of it before the second attempt began.
+        spent = 0
+        errors_left = 0
+
         while ticket.attempts < self.config.loop.max_attempts:
             ticket.attempts += 1
             self.store.update_ticket(run_id, ticket)
@@ -3529,7 +3543,62 @@ class Orchestrator:
                 prior_failures=history[-self._prior_failures:],
                 rejections=rejections,
                 repro=repro,
+                inner_turns=self.config.loop.inner_turns - spent,
             )
+
+            if outcome.retry_build:
+                # The compile gate stopped the attempt before the tester was
+                # asked and before anything was judged. Nothing has moved: not
+                # the contract, not the test file the executor is measured
+                # against, not the tree beyond what this reply wrote. So the
+                # failure goes back to the executor on the thread it is already
+                # having — `ticket_turns` rebuilds that from the step log, and
+                # the build and the check that refused it are both in it —
+                # rather than costing a fifth of the budget that decides
+                # whether the spec is rewritten underneath the work.
+                remaining = signatures(outcome.detail)
+                stalled = bool(spent) and len(remaining) >= errors_left
+                if not stalled and spent < self.config.loop.inner_turns:
+                    spent += 1
+                    errors_left = len(remaining)
+                    ticket.attempts -= 1
+                    self.store.update_ticket(run_id, ticket)
+                    self.store.log(
+                        run_id,
+                        f"{ticket.ticket_id}: what this attempt wrote does not "
+                        f"compile, so the tester was not asked and the attempt "
+                        f"was not charged — inner turn {spent} of "
+                        f"{self.config.loop.inner_turns}, {len(remaining)} "
+                        f"error(s) to answer.",
+                        kind="ticket",
+                    )
+                    failure_context = outcome.detail
+                    continue
+                # Out of turns, or the count stopped falling. Turns are for
+                # closing a gap that is closing; an executor that is not
+                # getting nearer will not get nearer for being asked a fourth
+                # time, and the ticket is better off spending the attempt —
+                # respec, the ladder and the retry brake all measure attempts,
+                # and none of them can see a turn.
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: "
+                    + (
+                        f"{len(remaining)} compile error(s) left, against "
+                        f"{errors_left} before the last inner turn"
+                        if stalled
+                        else f"{len(remaining)} compile error(s) left after "
+                        f"{spent} inner turn(s)"
+                    )
+                    + "; charging the attempt instead of asking again.",
+                    level="warn",
+                    kind="ticket",
+                )
+                outcome = StepResult(ok=False, detail=outcome.detail)
+
+            # Reached only when the attempt was charged, whatever came of it.
+            spent = 0
+            errors_left = 0
 
             # Checked before `blocked`, and it must be: the note names the
             # files the tree is red on, and `_widen_scope` reads a block note
@@ -4127,6 +4196,68 @@ class Orchestrator:
             lines.insert(0, "Nothing was written: every edit fell outside scope.\n")
         return "\n".join(lines)
 
+    # Verify kinds whose failure can only be the executor's. A compiler
+    # reading files this ticket owns and refusing them is talking about the
+    # reply that just landed and about nothing else — there is no other author
+    # and no other explanation.
+    #
+    # `test` is deliberately absent and must stay absent. A red suite may be
+    # the tester's assertion rather than the executor's code, the executor
+    # cannot edit the test file to find out, and looping it on one would ask it
+    # to fix something outside its scope until the turns ran out. The
+    # difference is the whole safety argument for spending turns uncharged.
+    _COMPILE_GATE = ("lint", "typecheck")
+
+    def _compile_gate(
+        self,
+        run_id: int,
+        ticket: Ticket,
+        written: Sequence[str],
+        pre_existing: dict[str, set[str]] | None,
+    ) -> str:
+        """Why the files just written do not compile, or `""`.
+
+        Run between apply and the tests step, over the same commands verify
+        will run and against the same amnesty, so it can only ever report what
+        verify was going to report anyway a few seconds later — for the price
+        of the cheapest step in the pipeline. On the ticket this comes from,
+        `typecheck` averaged 0.7 seconds against the tester's 12.
+
+        What that buys is not speed. It is that the failure goes back to the
+        executor before the tester has rewritten the file the executor is
+        judged against, and before the attempt that would have been charged for
+        it moved the ticket a fifth of the way to a respec.
+
+        Returns the failure to hand back, empty when nothing here is this
+        ticket's to answer for. An empty answer is the state every attempt was
+        in before this existed: the pipeline carries on and verify runs these
+        same commands again.
+        """
+        if not written:
+            # Nothing landed, so there is nothing here that this attempt wrote.
+            # Whatever the tree says, it said it before the executor replied.
+            return ""
+        inherited = pre_existing or {}
+        for name, command, workspace in self._verify_plan(ticket):
+            if _step_kind(name) not in self._COMPILE_GATE:
+                continue
+            result = self._shell(
+                run_id, name, command, ticket.ticket_id, workspace=workspace
+            )
+            if result.ok:
+                continue
+            already = inherited.get(name, set())
+            introduced = signatures(result.detail) - already if already else set()
+            if already and not introduced:
+                # The same amnesty verify applies, for the same reason and from
+                # the same baseline. Everything this step is complaining about
+                # was broken before the ticket started, so asking the executor
+                # again would spend a turn on somebody else's file — and it is
+                # very likely not in scope to fix it either.
+                continue
+            return f"{name} failed:\n{distill(result.detail)}"
+        return ""
+
     def _format_pass(
         self,
         run_id: int,
@@ -4522,6 +4653,7 @@ class Orchestrator:
         prior_failures: Sequence[str] = (),
         rejections: list[str] | None = None,
         repro: tuple[str, str] | None = None,
+        inner_turns: int = 0,
     ) -> StepResult:
         """One attempt at a ticket: build, apply, test, verify, review.
 
@@ -4807,6 +4939,16 @@ class Orchestrator:
             return StepResult(
                 ok=False, detail=self._fence_guidance(parsed.truncated, written)
             )
+
+        # --- COMPILE GATE --------------------------------------------
+        # Only when there is a turn left to spend on the answer. With none —
+        # the default — nothing runs here at all and the attempt proceeds
+        # exactly as it always did: the same commands are about to run at
+        # verify, where a failure is charged the ordinary way.
+        if inner_turns > 0:
+            unbuilt = self._compile_gate(run_id, ticket, written, pre_existing)
+            if unbuilt:
+                return StepResult(ok=False, retry_build=True, detail=unbuilt)
 
         # --- TESTS ---------------------------------------------------
         authored_now = False
