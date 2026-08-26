@@ -25,6 +25,7 @@ from .base import (
     Usage,
 )
 from .claude_cli import ClaudeCLIProvider
+from .freetoken import FreeTokenProvider
 from .gemini import GeminiProvider
 from .openai_compat import OpenAICompatProvider
 from .subprocess_cli import SubprocessProvider
@@ -35,6 +36,7 @@ _REGISTRY: dict[str, type[Provider]] = {
     GeminiProvider.kind: GeminiProvider,
     SubprocessProvider.kind: SubprocessProvider,
     ClaudeCLIProvider.kind: ClaudeCLIProvider,
+    FreeTokenProvider.kind: FreeTokenProvider,
 }
 
 # Aliases for the names people actually type in config.
@@ -50,6 +52,7 @@ _ALIASES = {
     "cli": "command",
     "subprocess": "command",
     "claude-code": "claude-cli",
+    "ft": "freetoken",
 }
 
 

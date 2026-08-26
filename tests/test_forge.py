@@ -120,7 +120,7 @@ from forge.prompts import (
     strip_prompt_echo,
     tests_prompt,
 )
-from forge.providers import build_provider
+from forge.providers import available_kinds, build_provider
 from forge.providers.base import (
     Capabilities,
     Completion,
@@ -18619,6 +18619,261 @@ class TestWhatTheFormatterCouldNotReadReachesTheNextAttempt(unittest.TestCase):
 
         self.assertEqual(len(found), 1)
         self.assertIn("could not read", found[0])
+
+
+class TestFreeTokenLoadsTheModelItWasAskedFor(unittest.TestCase):
+    """FreeToken serves one checkpoint and answers to any name.
+
+        model="Qwen3.8-27B-NVFP4"      -> 200, served-as=Qwen3.8-27B-NVFP4
+        model="Gemma-4-26B-A4B-NVFP4"  -> 200, served-as=Gemma-4-26B-A4B-NVFP4
+        model="totally-made-up"        -> 200, served-as=totally-made-up
+
+    All three answered by the one loaded engine, which echoed the name back.
+    Pointed at it, the plain `openai` kind turns a config naming three models
+    into one model and three labels, with every artifact recording the label —
+    and no error anywhere. So this provider asks the daemon what is loaded,
+    switches when it is wrong, and verifies what came up."""
+
+    QWEN = r"C:\Users\nschr\.freetoken\models\Qwen3.8-27B-NVFP4"
+    GEMMA = r"C:\Users\nschr\.freetoken\models\Gemma-4-26B-A4B-NVFP4"
+
+    def _provider(self, name, path, **extra):
+        return build_provider("role", {
+            "kind": "freetoken", "daemonUrl": "http://127.0.0.1:1900", "port": 1919,
+            "model": name, "modelPath": path, "contextWindow": 8192, **extra,
+        })
+
+    def _wire(self, provider, loaded, comes_up=None, exit_code=None):
+        """Stand in for the daemon and the serve. Records what was asked."""
+        asked: list[str] = []
+        state = {"loaded": loaded}
+
+        def status():
+            running = bool(state["loaded"]) and exit_code is None
+            return {"running": running, "model": state["loaded"] or "",
+                    "lastExitCode": exit_code, "lastExitReason": "exited"}
+
+        def switch(_body):
+            asked.append("switch")
+            state["loaded"] = comes_up if comes_up is not None else _body["model"]
+
+        provider._status = status
+        provider._switch_wire = switch
+        provider._serving = lambda: provider._loaded_name(status())
+        original = provider._switch
+
+        def _switch():
+            switch({"model": provider.model_path})
+            if exit_code is not None or comes_up == "":
+                return original()
+            return original() if False else None
+
+        provider._switch = _switch
+        return asked, state
+
+    def test_a_model_already_loaded_is_not_reloaded(self):
+        provider = self._provider("Qwen3.8-27B-NVFP4", self.QWEN)
+        asked, _ = self._wire(provider, self.QWEN)
+
+        provider._ensure_loaded()
+
+        self.assertEqual(asked, [])
+
+    def test_a_different_model_is_switched_in(self):
+        provider = self._provider("Gemma-4-26B-A4B-NVFP4", self.GEMMA)
+        asked, state = self._wire(provider, self.QWEN)
+
+        provider._ensure_loaded()
+
+        self.assertEqual(asked, ["switch"])
+        self.assertEqual(state["loaded"], self.GEMMA)
+
+    def test_a_path_is_compared_against_the_name_the_api_reports(self):
+        # `/engine/status` reports the path it was handed and `/v1/models`
+        # reports the basename of it, so one has to be reduced or every call
+        # looks like a miss and reloads 19 GiB.
+        provider = self._provider("Qwen3.8-27B-NVFP4", self.QWEN)
+
+        self.assertEqual(
+            provider._loaded_name({"model": self.QWEN}), "Qwen3.8-27B-NVFP4"
+        )
+        self.assertEqual(
+            provider._loaded_name({"model": "a/b/Gemma-4-26B-A4B-NVFP4"}),
+            "Gemma-4-26B-A4B-NVFP4",
+        )
+        self.assertEqual(provider._loaded_name({}), "")
+
+    def test_nothing_loaded_still_switches(self):
+        provider = self._provider("Qwen3.8-27B-NVFP4", self.QWEN)
+        asked, _ = self._wire(provider, "")
+
+        provider._ensure_loaded()
+
+        self.assertEqual(asked, ["switch"])
+
+    def test_the_port_decides_the_base_url(self):
+        provider = self._provider("Qwen3.8-27B-NVFP4", self.QWEN)
+
+        self.assertEqual(provider.base_url, "http://127.0.0.1:1919/v1")
+
+    def test_a_base_url_is_left_alone_when_given(self):
+        provider = self._provider(
+            "Qwen3.8-27B-NVFP4", self.QWEN, baseUrl="http://box:9000/v1"
+        )
+
+        self.assertEqual(provider.base_url, "http://box:9000/v1")
+
+    def test_the_path_defaults_to_the_model_name(self):
+        provider = build_provider("role", {
+            "kind": "freetoken", "model": "Qwen3.8-27B-NVFP4", "contextWindow": 8192,
+        })
+
+        self.assertEqual(provider.model_path, "Qwen3.8-27B-NVFP4")
+        self.assertEqual(provider.port, 1919)
+
+    def test_engine_arguments_reach_the_daemon(self):
+        # `--moe-backend offload`, `--memory-ratio`: per model, because the two
+        # halves of a co-resident pair are never given the same budget.
+        sent: list[dict] = []
+        provider = self._provider(
+            "Gemma-4-26B-A4B-NVFP4", self.GEMMA,
+            engineArgs=["--moe-backend", "offload"],
+        )
+        provider._serving = lambda: "Gemma-4-26B-A4B-NVFP4"
+
+        import forge.providers.freetoken as ft
+        original = ft.post_json
+        ft.post_json = lambda url, body, **kw: sent.append(body) or {}
+        try:
+            provider._switch()
+        finally:
+            ft.post_json = original
+
+        self.assertEqual(sent[0]["args"], ["--moe-backend", "offload"])
+        self.assertEqual(sent[0]["model"], self.GEMMA)
+
+    def test_the_wrong_model_coming_up_is_refused_not_used(self):
+        # The failure this provider exists to prevent: answering from one
+        # checkpoint under another's name, which the endpoint does happily.
+        provider = self._provider("Gemma-4-26B-A4B-NVFP4", self.GEMMA)
+        provider._serving = lambda: "Qwen3.8-27B-NVFP4"
+        provider._status = lambda: {"running": True, "model": self.QWEN,
+                                    "lastExitCode": None}
+
+        import forge.providers.freetoken as ft
+        original = ft.post_json
+        ft.post_json = lambda url, body, **kw: {}
+        try:
+            with self.assertRaises(ProviderError) as caught:
+                provider._switch()
+        finally:
+            ft.post_json = original
+
+        self.assertIn("Qwen3.8-27B-NVFP4", str(caught.exception))
+        self.assertIn("echoes whatever model name", str(caught.exception))
+
+    def test_an_engine_that_exited_is_reported_with_the_likely_cause(self):
+        # A bare name is handed to `AutoConfig.from_pretrained`, looked up on
+        # HuggingFace, and the engine exits 1 before binding a port — while
+        # `/engine/status` still says `running: true` for a moment.
+        provider = self._provider("Qwen3.8-27B-NVFP4", "Qwen3.8-27B-NVFP4")
+        provider._serving = lambda: ""
+        provider._status = lambda: {"running": False, "model": "",
+                                    "lastExitCode": 1, "lastExitReason": "exited"}
+
+        import forge.providers.freetoken as ft
+        original = ft.post_json
+        ft.post_json = lambda url, body, **kw: {}
+        try:
+            with self.assertRaises(ProviderUnreachable) as caught:
+                provider._switch()
+        finally:
+            ft.post_json = original
+
+        self.assertIn("modelPath", str(caught.exception))
+
+    def test_the_registry_knows_the_kind_and_its_alias(self):
+        self.assertIn("freetoken", available_kinds())
+        self.assertEqual(
+            build_provider("r", {"kind": "ft", "model": "m"}).kind, "freetoken"
+        )
+
+
+class TestAFormatChainSurvivesValidation(unittest.TestCase):
+    """The chain worked at runtime and `Config.validate` refused it, because
+    the tests for it built a `Config` directly and never went through the
+    check a real config file goes through. `forge doctor` reported
+    `commands.format is list; expected a command string` against a config the
+    loop would have run correctly."""
+
+    def _config(self, commands):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps({
+                "models": {"m": {"kind": "openai", "baseUrl": "http://127.0.0.1:1/v1",
+                                 "model": "x", "contextWindow": 8192}},
+                "roles": {r: "m" for r in ROLES},
+                "commands": commands,
+            }),
+            encoding="utf-8",
+        )
+        return Config.load(root)
+
+    def test_a_format_chain_loads(self):
+        config = self._config({
+            "lint": "", "typecheck": "", "test": "",
+            "format": ["ruff check --fix", "ruff format"],
+        })
+
+        self.assertEqual(
+            config.chain_for("format", "src/a.py"), ("ruff check --fix", "ruff format")
+        )
+
+    def test_a_format_chain_loads_inside_a_language_map(self):
+        config = self._config({
+            "lint": "", "typecheck": "", "test": "",
+            "format": {".py": ["ruff check --fix", "ruff format"]},
+        })
+
+        self.assertEqual(
+            config.chain_for("format", "src/a.py"), ("ruff check --fix", "ruff format")
+        )
+
+    def test_only_format_may_be_a_chain(self):
+        # A step judged by its output has to be one command, or nothing
+        # decides which of two answers counts.
+        with self.assertRaises(ConfigError) as caught:
+            self._config({"lint": ["eslint", "stylelint"], "typecheck": "", "test": ""})
+
+        self.assertIn("Only `format` may be several commands", str(caught.exception))
+
+    def test_a_chain_of_something_other_than_commands_is_refused(self):
+        with self.assertRaises(ConfigError) as caught:
+            self._config({"lint": "", "typecheck": "", "test": "", "format": ["ok", 7]})
+
+        self.assertIn("expected a command string", str(caught.exception))
+
+    def test_every_command_in_a_chain_is_checked_against_its_language(self):
+        # Not only the first. A chain whose second command is for another
+        # language is as broken as one whose first is.
+        with self.assertRaises(ConfigError) as caught:
+            self._config({
+                "lint": "", "typecheck": "", "test": "",
+                "format": {".py": ["ruff format", "cargo fmt"]},
+            })
+
+        self.assertIn("cargo fmt", str(caught.exception))
+
+    def test_the_shipped_sample_still_loads(self):
+        sample = Path(__file__).resolve().parents[1] / "templates" / "config.sample.json"
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            sample.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+        self.assertTrue(Config.load(root).roles)
 
 
 class TestAFixerAndAFormatterBothGetTheFiles(unittest.TestCase):
