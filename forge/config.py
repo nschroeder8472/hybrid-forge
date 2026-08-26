@@ -242,18 +242,63 @@ def _commands_for(commands: dict[str, Any], kind: str) -> dict[str, str]:
     no config changes meaning by being read here.
     """
     raw = commands.get(kind, "")
-    if isinstance(raw, str):
-        return {ANY_LANGUAGE: raw.strip()} if raw.strip() else {}
+    # A list is a fix-then-format chain; see `_chain_for`. Read here as its
+    # first command, which is all the callers that ask "is anything configured
+    # for this language" need, and all a step that runs one command can use.
+    if isinstance(raw, (str, list, tuple)):
+        chain = _fix_chain(raw)
+        return {ANY_LANGUAGE: chain[0]} if chain else {}
     found: dict[str, str] = {}
     for key, value in (raw or {}).items():
         if _is_exemption(value):
             continue
-        command = str(value or "").strip()
-        if not command:
+        chain = _fix_chain(value)
+        if not chain:
             continue
         for suffix in normalize_language(str(key)):
-            found[suffix] = command
+            found[suffix] = chain[0]
     return found
+
+
+def _fix_chain(value: Any) -> tuple[str, ...]:
+    """One command, or several to run in order over the same files."""
+    if isinstance(value, (list, tuple)):
+        return tuple(str(item).strip() for item in value if str(item or "").strip())
+    command = str(value or "").strip()
+    return (command,) if command else ()
+
+
+def _chain_for(commands: dict[str, Any], kind: str, path: str) -> tuple[str, ...]:
+    """Every command that rewrites one file's language, in the order given.
+
+    `format` is the one step where a project reasonably has two things to run:
+    a fixer and then a formatter. `ruff check --fix` settles what the linter
+    can settle by itself and `ruff format` settles the layout, and neither is a
+    substitute for the other — one leaves the import it removed badly indented,
+    the other cannot remove it.
+
+    They cannot be chained inside a single string, because the files this
+    attempt wrote are appended to the command and only the last one in a
+    `a && b` would get them — so the first would run over the whole tree,
+    reformatting files the ticket never touched. That is the out-of-scope edit
+    `_format_pass` exists to avoid, dressed as a tidy-up.
+
+    A plain string still means one command, so no existing config changes
+    meaning by being read here.
+    """
+    raw = commands.get(kind, "")
+    if isinstance(raw, (str, list, tuple)):
+        return _fix_chain(raw)
+    suffix = Path(path).suffix.lower() if path else ""
+    for key in (suffix, ANY_LANGUAGE):
+        for declared, value in (raw or {}).items():
+            if _is_exemption(value):
+                continue
+            if key in normalize_language(str(declared)) or str(declared) == key:
+                chain = _fix_chain(value)
+                if chain:
+                    return chain
+    return ()
 
 
 def _command_for(commands: dict[str, Any], kind: str, path: str) -> str:
@@ -409,6 +454,9 @@ class Workspace:
 
     def command_for(self, kind: str, path: str) -> str:
         return _command_for(self.commands, kind, path)
+
+    def chain_for(self, kind: str, path: str) -> tuple[str, ...]:
+        return _chain_for(self.commands, kind, path)
 
     def exempt(self, kind: str, suffix: str) -> bool:
         return _exempt(self.commands, kind, suffix)
@@ -1164,6 +1212,18 @@ class Config:
         if workspace is None:
             return ""
         return workspace.command_for(kind, path)
+
+    def chain_for(self, kind: str, path: str) -> tuple[str, ...]:
+        """Every command that rewrites one file, in the order declared.
+
+        The list form of `commands.format`, resolved through the file's own
+        workspace. Empty where nothing is configured; one entry where a plain
+        string is. See `_chain_for`.
+        """
+        workspace = self.workspace_for(path)
+        if workspace is None:
+            return ()
+        return workspace.chain_for(kind, path)
 
     def exempt(self, kind: str, suffix: str) -> bool:
         """Whether this language is declared as one nothing needs to run.
