@@ -51,7 +51,12 @@ from forge.ingest import (
     undeclared_order,
 )
 from forge.ingest import ingest as ingest_document
-from forge.respec import _constants, _merge_criteria, _refuse_protocol_edits
+from forge.respec import (
+    _constants,
+    _merge_criteria,
+    _refuse_protocol_edits,
+    dropped_criteria,
+)
 from forge.loop import (
     _ASSERTED,
     _DROPPABLE_HEADINGS,
@@ -69,6 +74,7 @@ from forge.patch import (
     foreign_bindings,
     infer_single_file,
     is_safe_path,
+    laundered_assertions,
     matches_any,
     normalize_path,
     parse_output,
@@ -92,6 +98,8 @@ from forge.failures import (
 from forge.prompts import (
     FAILURE_CLASSES_HEADING,
     LEARNED_HEADING,
+    contested_subjects,
+    learned_message,
     convention_prompt,
     parse_stuck_review,
     record_prompt,
@@ -6201,6 +6209,177 @@ class TestTheTesterIsAskedAgainForForeignBindings(unittest.TestCase):
         orch, root, _run_id = self._run(self.GOOD)
 
         self.assertTrue(self._tests_file(root).exists())
+
+
+class TestAnAssertionThatReshapesTheValueFirst(unittest.TestCase):
+    """The other way a green suite proves nothing.
+
+    A criterion pinned `randi()` at 4071818419. The tester wrote
+    `const u32 = (n: number) => n >>> 0;`, asserted `expect(u32(pcg.randi()))`,
+    and every value matched — against an implementation ending in
+    `& 0xFFFFFFFF` that returns -223148877. The ticket's own spec said, in as
+    many words, that a test wrapping the call in its own `>>> 0` is not testing
+    the function. The tester wrote the helper anyway, with a comment saying
+    what it was for, and the reviewer cited the wrapper as evidence the
+    criterion was met."""
+
+    # The file that shipped the wrong implementation, trimmed.
+    REAL = (
+        'import { describe, expect, it } from "vitest";\n'
+        'import { Pcg32 } from "../src/engine/pcg32.js";\n'
+        'describe("Pcg32", () => {\n'
+        "  const u32 = (n: number) => n >>> 0;\n"
+        '  it("draws", () => {\n'
+        "    const pcg = new Pcg32(3130775471);\n"
+        "    expect(u32(pcg.randi())).toBe(4071818419);\n"
+        "  });\n"
+        "});\n"
+    )
+
+    def test_the_file_that_shipped_the_wrong_implementation_is_caught(self):
+        found = laundered_assertions(self.REAL)
+
+        self.assertEqual(len(found), 1)
+        self.assertIn("u32", found[0])
+        self.assertIn("n >>> 0", found[0])
+
+    def test_the_honest_version_of_the_same_test_is_clean(self):
+        good = self.REAL.replace("  const u32 = (n: number) => n >>> 0;\n", "").replace(
+            "u32(pcg.randi())", "pcg.randi()"
+        )
+
+        self.assertEqual(laundered_assertions(good), [])
+
+    def test_every_spelling_of_a_reshaping_helper_is_caught(self):
+        for text in (
+            "const u32 = n => n >>> 0;\nexpect(u32(f())).toBe(1);",
+            "const u32 = (n: number): number => n >>> 0;\nexpect(u32(f())).toBe(1);",
+            "function u32(n) { return n >>> 0; }\nexpect(u32(f())).toBe(1);",
+            "function u32(n: number): number {\n  return n >>> 0;\n}\nexpect(u32(f())).toBe(1);",
+            "fn u32v(n: u32) -> u32 {\n    return n >> 0;\n}\nassert_eq!(u32v(g()), 0);",
+            "u32 = lambda n: n & 0xFFFFFFFF\nassert u32(f()) == 1",
+            "def _u32(n): return n % 256\nassert _u32(f()) == 1",
+            "func _u32(n): return n & 0xFFFF\n\tassert_int(_u32(f())).is_equal(1)",
+            "const half = (v) => v / 2;\nexpect(half(area())).toBe(8);",
+        ):
+            with self.subTest(text=text.splitlines()[0]):
+                self.assertTrue(laundered_assertions(text), text)
+
+    def test_an_ordinary_helper_is_not_a_reshaping_one(self):
+        # Each of these fails exactly one of the four conditions, and dropping
+        # any one condition would turn this list into false positives.
+        for text in (
+            # Delegates — contains a call.
+            "const ids = (rows) => rows.map(r => r.id);\nexpect(ids(f())).toEqual([1]);",
+            "const trimmed = (s) => s.trim();\nexpect(trimmed(f())).toBe('x');",
+            # No operator: a projection, not a reshaping.
+            "const first = (a) => a[0];\nexpect(first(f())).toBe(3);",
+            "function width(g) { return g.cols; }\nexpect(width(f())).toBe(7);",
+            # Two arguments: a computation of its own.
+            "const add = (a, b) => a + b;\nexpect(add(1, 2)).toBe(3);",
+            # Reads something from the file around it.
+            "const scaled = (n) => n * FACTOR;\nexpect(scaled(f())).toBe(6);",
+            "const off = (a) => a.length - 1;\nexpect(off(f())).toBe(2);",
+        ):
+            with self.subTest(text=text.splitlines()[0]):
+                self.assertEqual(laundered_assertions(text), [], text)
+
+    def test_a_hex_mask_reads_as_a_number_and_not_as_a_name(self):
+        # `0xFFFFFFFF` contains `xFFFFFFFF`, which matched as an identifier and
+        # made the body look like it referenced something outside itself. Every
+        # mask in the language went through unflagged.
+        self.assertTrue(
+            laundered_assertions("const u32 = (n) => n & 0xFFFFFFFF;\nexpect(u32(f())).toBe(1);")
+        )
+
+    def test_a_helper_used_outside_an_assertion_is_nobodys_business(self):
+        self.assertEqual(
+            laundered_assertions("const u32 = (n) => n >>> 0;\nconst seed = u32(raw());"),
+            [],
+        )
+
+    def test_a_comment_is_not_a_definition(self):
+        self.assertEqual(
+            laundered_assertions("// const u32 = (n) => n >>> 0;\nexpect(u32(f())).toBe(1);"),
+            [],
+        )
+
+    def test_a_file_defining_nothing_is_clean(self):
+        self.assertEqual(laundered_assertions("expect(f()).toBe(1);"), [])
+
+
+class TestTheTesterIsAskedAgainForLaunderedAssertions(unittest.TestCase):
+    """Same enforcement point as a foreign binding, and for the same reason:
+    the prohibition was already written down — in the ticket's own spec, not
+    merely in the prompt — and it was ignored."""
+
+    BAD = (
+        "tests/tt_004_test.rs\n```rust\n"
+        "fn u32v(n: u32) -> u32 {\n    return n >> 0;\n}\n"
+        "#[test]\nfn t() { assert_eq!(u32v(wasm::game_new(1)), 0); }\n```"
+    )
+    GOOD = (
+        "tests/tt_004_test.rs\n```rust\n"
+        "use tetris::wasm;\n#[test]\nfn t() { assert_eq!(wasm::game_new(1), 0); }\n```"
+    )
+
+    def _run(self, *tester_replies):
+        orch, root, run_id = _stub_orchestrator()
+        orch.config.loop.max_attempts = 1
+        orch._call = _replies(
+            "src/wasm.rs\n```rust\npub fn game_new(s: u32) -> u32 { s }\n```",
+            *tester_replies,
+            "ACCEPT\nfine",
+        )
+        orch._work_ticket(
+            run_id,
+            Ticket("TT-004", allowed_files=["src/wasm.rs"], criteria=["game_new returns 0"]),
+        )
+        return orch, root, run_id
+
+    def _tests_file(self, root):
+        return root / "tests" / "tt_004_test.rs"
+
+    def test_a_second_answer_that_asserts_on_the_call_is_kept(self):
+        _orch, root, _run_id = self._run(self.BAD, self.GOOD)
+
+        self.assertTrue(self._tests_file(root).exists())
+        self.assertNotIn("u32v", self._tests_file(root).read_text(encoding="utf-8"))
+
+    def test_a_tester_that_keeps_doing_it_gets_its_tests_discarded(self):
+        # Discarded rather than kept: review checks the criteria itself when
+        # there is nothing to run, and cannot when a rigged suite reports green.
+        _orch, root, _run_id = self._run(self.BAD, self.BAD)
+
+        self.assertFalse(self._tests_file(root).exists())
+
+    def test_the_rejection_is_reported(self):
+        orch, _root, _run_id = self._run(self.BAD, self.BAD)
+
+        messages = " ".join(e["message"] for e in orch.store.events_after(0))
+        self.assertIn("reshapes the value", messages)
+
+    def test_a_clean_first_answer_is_not_asked_twice(self):
+        _orch, root, _run_id = self._run(self.GOOD)
+
+        self.assertTrue(self._tests_file(root).exists())
+
+    def test_the_prompt_quotes_back_what_was_rejected(self):
+        body = tests_prompt(
+            Ticket("TT-004", criteria=["randi() returns 4071818419"]),
+            ["src/rng.ts"],
+            test_path="tests/rng.test.ts",
+            laundered=["u32 - defined as `const u32 = (n) => n >>> 0;` - in: expect(u32(f()))"],
+        )[1].content
+
+        self.assertIn("rejected before it reached disk", body)
+        self.assertIn("n >>> 0", body)
+        self.assertIn("Assert on the call itself", body)
+
+    def test_the_tester_is_told_the_rule_up_front_as_well(self):
+        from forge.prompts import TESTER_SYSTEM
+
+        self.assertIn("Reshape a value before comparing it", TESTER_SYSTEM)
 
 
 class TestTheTestCommandDecidesTheLanguage(unittest.TestCase):
@@ -18000,6 +18179,936 @@ class TestRatificationInTheLoop(unittest.TestCase):
         self.assertIn("src/secrets.rs", ticket.allowed_files)
         self.assertFalse(orchestrator._scope_gate(run_id, ticket))
         self.assertEqual(store.list_tickets(run_id)[0].status, "blocked")
+
+
+class TestACompileFailureGoesBackWithoutSpendingAnAttempt(unittest.TestCase):
+    """An attempt is the unit the loop charges and the unit respec measures,
+    and it is far bigger than the mistake it usually ends on. One ticket's 95
+    cycles averaged 14.5s of executor, 0.7s of `typecheck` — and 12.0s of
+    tester, spent 58 times writing assertions for an implementation that then
+    failed to compile. Because one compile error cost one of five attempts,
+    that ticket got five corrections against a spec and then a rewritten spec:
+    nineteen ratifications and eighteen respecs, while it sat two errors from
+    done."""
+
+    # Fails while `src/a.py` still says `BROKEN`, passes once it does not.
+    CHECKER = (
+        "import pathlib, sys\n"
+        "target = pathlib.Path('src/a.py')\n"
+        # Green while the file does not exist, so the baseline this ticket is
+        # measured against is green and the amnesty has nothing to excuse.
+        "text = target.read_text(encoding='utf-8') if target.exists() else ''\n"
+        "if 'BROKEN' in text:\n"
+        "    print('src/a.py:1:1: error: broken')\n"
+        "    sys.exit(1)\n"
+    )
+
+    def setUp(self):
+        self.tool = Path(tempfile.mkdtemp()) / "checker.py"
+        self.tool.write_text(self.CHECKER, encoding="utf-8")
+
+    def _orch(self, inner_turns=2, kind="typecheck"):
+        commands = {"lint": "", "typecheck": "", "test": ""}
+        commands[kind] = f'"{sys.executable}" "{self.tool}"'
+        orch, root, run_id = _stub_orchestrator(commands)
+        orch.config.loop.inner_turns = inner_turns
+        orch.config.loop.max_attempts = 2
+        (root / "src").mkdir(exist_ok=True)
+        return orch, root, run_id
+
+    @staticmethod
+    def _reply(body):
+        return f"src/a.py\n```python\n{body}\n```"
+
+    def _run(self, orch, run_id, *replies):
+        orch._call = _replies(*replies)
+        ticket = Ticket("T-1", allowed_files=["src/a.py"], criteria=["it works"])
+        orch._work_ticket(run_id, ticket)
+        return ticket
+
+    def _logged(self, orch) -> str:
+        return " ".join(row["message"] for row in orch.store.events_after(0))
+
+    def test_a_fixed_second_reply_costs_one_attempt_not_two(self):
+        orch, _root, run_id = self._orch()
+
+        ticket = self._run(
+            orch,
+            run_id,
+            self._reply("BROKEN = 1"),
+            self._reply("x = 1"),
+            "tests/t_test.py\n```python\ndef test_x():\n    assert True\n```",
+            "ACCEPT\nfine",
+        )
+
+        self.assertEqual(ticket.status, "done")
+        self.assertEqual(ticket.attempts, 1)
+
+    def test_the_tester_is_not_asked_about_code_that_does_not_compile(self):
+        orch, _root, run_id = self._orch()
+        asked: list[str] = []
+        replies = _replies(
+            self._reply("BROKEN = 1"),
+            self._reply("x = 1"),
+            "tests/t_test.py\n```python\ndef test_x():\n    assert True\n```",
+            "ACCEPT\nfine",
+        )
+
+        def call(run_id_, role, messages, **kwargs):
+            asked.append(role)
+            return replies(run_id_, role, messages, **kwargs)
+
+        orch._call = call
+        orch._work_ticket(
+            run_id, Ticket("T-1", allowed_files=["src/a.py"], criteria=["it works"])
+        )
+
+        # executor, executor, tester, reviewer — the first executor reply never
+        # reached the tester.
+        self.assertEqual(asked, ["executor", "executor", "tester", "reviewer"])
+
+    def test_the_turn_is_reported_as_uncharged(self):
+        orch, _root, run_id = self._orch()
+
+        self._run(
+            orch,
+            run_id,
+            self._reply("BROKEN = 1"),
+            self._reply("x = 1"),
+            "tests/t_test.py\n```python\ndef test_x():\n    assert True\n```",
+            "ACCEPT\nfine",
+        )
+
+        self.assertIn("the attempt was not charged", self._logged(orch))
+        self.assertIn("inner turn 1 of 2", self._logged(orch))
+
+    def test_an_executor_that_never_compiles_still_spends_the_budget(self):
+        # The turns must not become a way to never fail. Two attempts, two
+        # inner turns each, and the ticket ends failed rather than looping.
+        orch, _root, run_id = self._orch()
+
+        ticket = self._run(orch, run_id, *[self._reply("BROKEN = 1")] * 12)
+
+        self.assertEqual(ticket.status, "failed")
+        self.assertEqual(ticket.attempts, 2)
+
+    def test_a_count_that_stops_falling_charges_the_attempt(self):
+        # Turns are for closing a gap that is closing. The same one error twice
+        # is an executor that will not get nearer for being asked again.
+        orch, _root, run_id = self._orch(inner_turns=4)
+
+        self._run(orch, run_id, *[self._reply("BROKEN = 1")] * 12)
+
+        self.assertIn("charging the attempt instead of asking again", self._logged(orch))
+        self.assertNotIn("inner turn 3 of 4", self._logged(orch))
+
+    def test_a_stall_hands_the_next_attempt_back_to_the_tester(self):
+        # The gate returns before the tests step, so while it keeps firing the
+        # tester never runs — and the allowance resets on a charged attempt, so
+        # the next one gates again from the top. One ticket went 43 cycles and
+        # 20 attempts that way without the tester being asked once, every cycle
+        # ending on the same `TS2339` in the tester's own file.
+        orch, _root, run_id = self._orch()
+        asked: list[str] = []
+        replies = _replies(*([self._reply("BROKEN = 1")] * 6
+                             + ["tests/t_test.py\n```python\ndef test_x():\n    assert True\n```"] * 4
+                             + ["REJECT\nno"] * 4))
+
+        def call(run_id_, role, messages, **kwargs):
+            asked.append(role)
+            return replies(run_id_, role, messages, **kwargs)
+
+        orch._call = call
+        orch._work_ticket(
+            run_id, Ticket("T-1", allowed_files=["src/a.py"], criteria=["it works"])
+        )
+
+        self.assertIn("tester", asked)
+
+    def test_the_stall_says_why_the_next_attempt_is_ungated(self):
+        orch, _root, run_id = self._orch()
+
+        self._run(orch, run_id, *[self._reply("BROKEN = 1")] * 12)
+
+        self.assertIn("next attempt runs ungated", self._logged(orch))
+
+    def test_off_by_default_means_the_gate_never_runs(self):
+        orch, _root, run_id = self._orch(inner_turns=0)
+
+        ticket = self._run(
+            orch,
+            run_id,
+            self._reply("BROKEN = 1"),
+            self._reply("x = 1"),
+            "tests/t_test.py\n```python\ndef test_x():\n    assert True\n```",
+            "ACCEPT\nfine",
+        )
+
+        # The first reply cost a whole attempt, exactly as it always did.
+        self.assertEqual(ticket.attempts, 2)
+        self.assertNotIn("was not charged", self._logged(orch))
+
+    def test_lint_gates_as_well_as_typecheck(self):
+        orch, _root, run_id = self._orch(kind="lint")
+
+        ticket = self._run(
+            orch,
+            run_id,
+            self._reply("BROKEN = 1"),
+            self._reply("x = 1"),
+            "tests/t_test.py\n```python\ndef test_x():\n    assert True\n```",
+            "ACCEPT\nfine",
+        )
+
+        self.assertEqual(ticket.attempts, 1)
+
+
+class TestTheCompileGateNeverLoopsOnSomebodyElsesFailure(unittest.TestCase):
+    """The turns are uncharged, so what they may be spent on is the whole
+    safety argument. Two things are never the executor's: a failure that was
+    already in the tree when the ticket started, and a red test suite — which
+    may be the tester's assertion rather than the executor's code, and which
+    the executor cannot edit the file to find out about."""
+
+    def _orch(self, commands):
+        orch, root, run_id = _stub_orchestrator(commands)
+        orch.config.loop.inner_turns = 2
+        (root / "src").mkdir(exist_ok=True)
+        return orch, root, run_id
+
+    def test_test_is_not_a_compile_gate_step(self):
+        self.assertEqual(Orchestrator._COMPILE_GATE, ("lint", "typecheck"))
+        self.assertNotIn("test", Orchestrator._COMPILE_GATE)
+
+    def test_a_red_suite_is_left_to_verify(self):
+        failing = Path(tempfile.mkdtemp()) / "always_red.py"
+        failing.write_text(
+            "import sys\nprint('t_test.py:1:1: error: assertion failed')\n"
+            "sys.exit(1)\n",
+            encoding="utf-8",
+        )
+        orch, root, run_id = self._orch(
+            {"lint": "", "typecheck": "", "test": f'"{sys.executable}" "{failing}"'}
+        )
+        (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+        self.assertEqual(
+            orch._compile_gate(run_id, Ticket("T-1", allowed_files=["src/a.py"]),
+                               ["src/a.py"], None),
+            "",
+        )
+
+    def test_a_failure_that_pre_dates_the_ticket_is_not_the_executors(self):
+        checker = Path(tempfile.mkdtemp()) / "checker.py"
+        checker.write_text(
+            "import sys\nprint('src/old.py:1:1: error: broken')\nsys.exit(1)\n",
+            encoding="utf-8",
+        )
+        orch, root, run_id = self._orch(
+            {"lint": "", "typecheck": f'"{sys.executable}" "{checker}"', "test": ""}
+        )
+        (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        ticket = Ticket("T-1", allowed_files=["src/a.py"])
+
+        # Nothing inherited: the gate reports it, because the ticket may have
+        # caused it.
+        self.assertTrue(orch._compile_gate(run_id, ticket, ["src/a.py"], None))
+
+        # Inherited from the baseline: the same amnesty verify applies. The
+        # signatures come from the gate's own report rather than being written
+        # out here, so this stays a test about the amnesty and not about how a
+        # signature is spelled.
+        name = orch._verify_plan(ticket)[0][0]
+        said = orch._compile_gate(run_id, ticket, ["src/a.py"], None)
+        inherited = {name: signatures(said)}
+        self.assertEqual(
+            orch._compile_gate(run_id, ticket, ["src/a.py"], inherited), ""
+        )
+
+    def test_an_attempt_that_wrote_nothing_is_never_gated(self):
+        checker = Path(tempfile.mkdtemp()) / "checker.py"
+        checker.write_text(
+            "import sys\nprint('src/a.py:1:1: error: broken')\nsys.exit(1)\n",
+            encoding="utf-8",
+        )
+        orch, _root, run_id = self._orch(
+            {"lint": "", "typecheck": f'"{sys.executable}" "{checker}"', "test": ""}
+        )
+
+        self.assertEqual(
+            orch._compile_gate(run_id, Ticket("T-1", allowed_files=["src/a.py"]), [], None),
+            "",
+        )
+
+
+class TestTheReviewerIsToldNothingCheckedTheCriteria(unittest.TestCase):
+    """A tester that kept reshaping the value before comparing it has its file
+    discarded, and the ticket goes to review with a suite that went green
+    without ever touching these criteria. The reviewer had no way to tell that
+    from one the tests cover — and the reviewer that saw the previous version
+    of this ticket read `expect(u32(pcg.randi())).toBe(...)` as evidence the
+    criterion was met, and approved an implementation returning -223148877
+    where the criterion said 4071818419."""
+
+    def _body(self, **kwargs):
+        return review_prompt(
+            Ticket(
+                "PF-005",
+                title="PCG32",
+                spec="Port the generator.",
+                criteria=["`randi()` returns 4071818419 on the third draw."],
+            ),
+            "diff --git a b",
+            **kwargs,
+        )[-1].content
+
+    def test_a_ticket_whose_tests_were_discarded_says_so(self):
+        body = self._body(
+            unchecked="tester kept asserting through its own reshaping helper; "
+            "tests discarded rather than reporting green for a criterion they "
+            "do not check"
+        )
+
+        self.assertIn("No test was written for these criteria", body)
+        self.assertIn("reshaping helper", body)
+
+    def test_the_reviewer_is_told_to_judge_the_returned_value(self):
+        body = self._body(unchecked="the attempt wrote no files")
+
+        self.assertIn("what the", body)
+        self.assertIn("returns", body)
+        self.assertIn("not what a caller could convert it to", body)
+
+    def test_uncertainty_is_a_reject_and_not_a_benefit_of_the_doubt(self):
+        body = self._body(unchecked="the attempt wrote no files")
+
+        self.assertIn("REJECT and not a benefit of the doubt", body)
+
+    def test_a_ticket_whose_tests_were_written_carries_none_of_it(self):
+        self.assertNotIn("No test was written", self._body())
+
+    def test_the_loop_passes_the_reason_through(self):
+        # End to end: the tester launders twice, its tests are discarded, and
+        # the reason reaches the reviewer rather than only the run log.
+        seen: list[str] = []
+        orch, root, run_id = _stub_orchestrator()
+        orch.config.loop.max_attempts = 1
+        replies = _replies(
+            "src/wasm.rs\n```rust\npub fn game_new(s: u32) -> u32 { s }\n```",
+            "tests/tt_004_test.rs\n```rust\nfn u32v(n: u32) -> u32 {\n    return n >> 0;\n}\n"
+            "#[test]\nfn t() { assert_eq!(u32v(wasm::game_new(1)), 0); }\n```",
+            "tests/tt_004_test.rs\n```rust\nfn u32v(n: u32) -> u32 {\n    return n >> 0;\n}\n"
+            "#[test]\nfn t() { assert_eq!(u32v(wasm::game_new(1)), 0); }\n```",
+            "ACCEPT\nfine",
+        )
+
+        def call(run_id_, role, messages, **kwargs):
+            if role == "reviewer":
+                seen.append("\n".join(m.content for m in messages))
+            return replies(run_id_, role, messages, **kwargs)
+
+        orch._call = call
+        orch._work_ticket(
+            run_id,
+            Ticket("TT-004", allowed_files=["src/wasm.rs"], criteria=["game_new returns 0"]),
+        )
+
+        self.assertTrue(seen)
+        self.assertIn("No test was written for these criteria", seen[-1])
+        self.assertIn("reshaping helper", seen[-1])
+
+
+class TestWhatTheFormatterCouldNotReadReachesTheNextAttempt(unittest.TestCase):
+    """The formatter is the first thing in the pipeline to read a file the
+    attempt just wrote, and when it refuses one it says why with a line number.
+    On one ticket that was `Unexpected token Token('TYPE_HINT', 'import') at
+    line 3` against a test file, cycle after cycle, while the loop spent eight
+    seconds a time running the whole gdUnit suite to reach the same
+    conclusion — and then showed the executor the suite's version of it."""
+
+    # What `gdformat` actually printed, trimmed. It reformats what it can,
+    # names what it cannot on a bare line of its own, and exits non-zero.
+    REAL = (
+        "reformatted tools/dump_decor_fixtures.gd\n"
+        "1 file reformatted, 1 file left unchanged.\n"
+        "\n"
+        "tests/theme/test_decor_fixtures.gd:\n"
+        "\n"
+        'import "res://tools/dump_decor_fixtures.\n'
+        "^\n"
+        "\n"
+        "Unexpected token Token('TYPE_HINT', 'import') at line 3, column 1.\n"
+    )
+
+    def setUp(self):
+        self.tool = Path(tempfile.mkdtemp()) / "refusing_formatter.py"
+        self.tool.write_text(
+            "import pathlib, sys\n"
+            "refused = []\n"
+            "for argument in sys.argv[1:]:\n"
+            "    target = pathlib.Path(argument)\n"
+            "    text = target.read_text(encoding='utf-8')\n"
+            "    if text.startswith('NOPARSE'):\n"
+            "        refused.append(argument)\n"
+            "        continue\n"
+            "    target.write_text(\n"
+            "        '\\n'.join(line.rstrip() for line in text.split('\\n')),\n"
+            "        encoding='utf-8',\n"
+            "    )\n"
+            "    print('reformatted ' + argument)\n"
+            "for argument in refused:\n"
+            "    print(argument + ':')\n"
+            "    print(\"Unexpected token Token('TYPE_HINT', 'import') at line 3\")\n"
+            "sys.exit(1 if refused else 0)\n",
+            encoding="utf-8",
+        )
+        self.formatter = f'"{sys.executable}" "{self.tool}"'
+
+    def _orch(self):
+        return _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": "", "format": self.formatter}
+        )
+
+    def test_the_file_it_refused_is_reported_and_the_one_it_rewrote_is_not(self):
+        orch, root, run_id = self._orch()
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "good.py").write_text("x = 1   \n", encoding="utf-8")
+        (root / "src" / "bad.py").write_text("NOPARSE\nimport x\n", encoding="utf-8")
+
+        refused: dict[str, str] = {}
+        orch._format_pass(
+            run_id, Ticket("T-1"), ["src/bad.py", "src/good.py"], refused
+        )
+
+        self.assertEqual(sorted(refused), ["src/bad.py"])
+
+    def test_a_success_banner_never_reports_the_file_it_names(self):
+        # `gdformat` leads with `reformatted tools/dump_decor_fixtures.gd`, so
+        # matching on the path alone reports the file it just fixed as the
+        # broken one. A file it rewrote is never one it refused.
+        self.assertIn("reformatted tools/dump_decor_fixtures.gd", self.REAL)
+        self.assertIn("tests/theme/test_decor_fixtures.gd", self.REAL)
+
+    def test_a_formatter_that_never_ran_names_nothing(self):
+        # A missing binary is a configuration fault and says nothing about the
+        # code. `command not found` carries no path, so nothing is reported.
+        orch, root, run_id = _stub_orchestrator({
+            "lint": "", "typecheck": "", "test": "",
+            "format": "this-command-does-not-exist-anywhere",
+        })
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "a.py").write_text("x = 1   \n", encoding="utf-8")
+
+        refused: dict[str, str] = {}
+        orch._format_pass(run_id, Ticket("T-1"), ["src/a.py"], refused)
+
+        self.assertEqual(refused, {})
+
+    def test_the_note_is_shaped_so_the_tester_is_told_it_is_its_own(self):
+        # `errors_naming` reads out of `failures._blocks`, and that is what
+        # decides whether the frozen test file is the tester's to rewrite.
+        # Phrased as ordinary prose the sentence reached the prompt without
+        # ever reaching that decision — `errors_naming` found nothing in it.
+        composed = (
+            "test failed:\nsomething unrelated\n\n"
+            "ERROR: the formatter could not read tests/theme/test_decor_fixtures.gd, "
+            "so nothing downstream could parse it either:\n" + self.REAL
+        )
+
+        found = errors_naming(composed, "tests/theme/test_decor_fixtures.gd")
+
+        self.assertEqual(len(found), 1)
+        self.assertIn("could not read", found[0])
+
+
+class TestAFormatterThatDidHalfTheJobIsNotAFailedOne(unittest.TestCase):
+    """`gdformat` handed a good file and one it cannot parse rewrites the good
+    one, says so on the first line of its output, and exits non-zero for the
+    other. Skipping the read-back on a non-zero exit made the loop log
+    `Nothing was reformatted` directly underneath its own quotation of
+    `reformatted tools/dump_decor_fixtures.gd`, and leave the rewrite
+    unreported on sixty-two of one ticket's eighty-four cycles."""
+
+    def setUp(self):
+        # Strips trailing whitespace from every file it can, refuses any file
+        # whose first line is `NOPARSE`, and exits non-zero if it refused one —
+        # which is what gdformat does with a file it cannot parse.
+        self.tool = Path(tempfile.mkdtemp()) / "half_formatter.py"
+        self.tool.write_text(
+            "import pathlib, sys\n"
+            "refused = []\n"
+            "for argument in sys.argv[1:]:\n"
+            "    target = pathlib.Path(argument)\n"
+            "    text = target.read_text(encoding='utf-8')\n"
+            "    if text.startswith('NOPARSE'):\n"
+            "        refused.append(argument)\n"
+            "        continue\n"
+            "    target.write_text(\n"
+            "        '\\n'.join(line.rstrip() for line in text.split('\\n')),\n"
+            "        encoding='utf-8',\n"
+            "    )\n"
+            "    print('reformatted ' + argument)\n"
+            "for argument in refused:\n"
+            "    print(\"Unexpected token Token('TYPE_HINT', 'import') at line 3\")\n"
+            "sys.exit(1 if refused else 0)\n",
+            encoding="utf-8",
+        )
+        self.formatter = f'"{sys.executable}" "{self.tool}"'
+
+    def _orch(self):
+        return _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": "", "format": self.formatter}
+        )
+
+    def _both(self, root):
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "good.py").write_text("x = 1   \n", encoding="utf-8")
+        (root / "src" / "bad.py").write_text("NOPARSE\nimport x   \n", encoding="utf-8")
+        return ["src/bad.py", "src/good.py"]
+
+    def _logged(self, orch) -> str:
+        return " ".join(row["message"] for row in orch.store.events_after(0))
+
+    def test_the_file_it_did_reformat_is_reported(self):
+        orch, root, run_id = self._orch()
+        paths = self._both(root)
+
+        changed = orch._format_pass(run_id, Ticket("T-1"), paths)
+
+        self.assertEqual(changed, ["src/good.py"])
+
+    def test_the_file_it_did_reformat_is_actually_reformatted(self):
+        orch, root, run_id = self._orch()
+        paths = self._both(root)
+
+        orch._format_pass(run_id, Ticket("T-1"), paths)
+
+        self.assertEqual((root / "src" / "good.py").read_text(encoding="utf-8"), "x = 1\n")
+
+    def test_the_log_no_longer_contradicts_itself(self):
+        orch, root, run_id = self._orch()
+        paths = self._both(root)
+
+        orch._format_pass(run_id, Ticket("T-1"), paths)
+        logged = self._logged(orch)
+
+        self.assertIn("reformatted anyway", logged)
+        self.assertNotIn("nothing was reformatted", logged)
+
+    def test_what_the_formatter_refused_to_read_is_quoted(self):
+        # A formatter is the first thing to read a file this attempt wrote, and
+        # what it says when it refuses is a syntax diagnosis with a line number
+        # in it. Clipping to the first line threw that away and kept the
+        # success message instead.
+        orch, root, run_id = self._orch()
+        paths = self._both(root)
+
+        orch._format_pass(run_id, Ticket("T-1"), paths)
+
+        self.assertIn("Unexpected token", self._logged(orch))
+
+    def test_a_formatter_that_refuses_everything_still_says_so(self):
+        orch, root, run_id = self._orch()
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "bad.py").write_text("NOPARSE\n", encoding="utf-8")
+
+        changed = orch._format_pass(run_id, Ticket("T-1"), ["src/bad.py"])
+
+        self.assertEqual(changed, [])
+        self.assertIn("format command failed and was skipped", self._logged(orch))
+
+
+class TestTheFormattersReportIsNotAFailureClass(unittest.TestCase):
+    """`format` reports what it rewrote, not what is wrong, and the report
+    changes every cycle with whichever file it touched. One ticket's class set
+    carried `format reformatted tests theme test_decor_fixtures.gd` beside the
+    real failures, and the count moved whenever a different file needed
+    tidying — so the loop reported churn on cycles where the only thing that
+    changed was which file the formatter had got to."""
+
+    def _store(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        return store, store.create_run("goal")
+
+    def _failed(self, store, run_id, name, detail):
+        step_id = store.start_step(run_id, "T-1", name)
+        store.end_step(step_id, "failed", detail)
+        return step_id
+
+    def test_a_formatters_output_produces_no_class(self):
+        store, run_id = self._store()
+
+        step_id = self._failed(
+            store, run_id, "format", "reformatted tools/dump_decor_fixtures.gd"
+        )
+
+        row = store._connection.execute(
+            "SELECT classes FROM steps WHERE id = ?", (step_id,)
+        ).fetchone()
+        self.assertEqual(json.loads(row["classes"]), [])
+
+    def test_a_second_builds_formatter_produces_no_class_either(self):
+        # The exclusion list was compared against the whole step name, so
+        # `format[path_forge]` went straight past it — and a suffix only
+        # appears at all in the multi-build repositories where it matters.
+        store, run_id = self._store()
+
+        step_id = self._failed(
+            store, run_id, "format[path_forge]", "reformatted src/parse.ts"
+        )
+
+        row = store._connection.execute(
+            "SELECT classes FROM steps WHERE id = ?", (step_id,)
+        ).fetchone()
+        self.assertEqual(json.loads(row["classes"]), [])
+
+    def test_a_real_failure_from_a_suffixed_step_still_produces_one(self):
+        store, run_id = self._store()
+
+        step_id = self._failed(
+            store,
+            run_id,
+            "typecheck[path_forge]",
+            "src/parse.ts(80,17): error TS2532: Object is possibly 'undefined'.",
+        )
+
+        row = store._connection.execute(
+            "SELECT classes FROM steps WHERE id = ?", (step_id,)
+        ).fetchone()
+        self.assertTrue(json.loads(row["classes"]))
+
+    def test_the_formatter_is_left_out_of_what_a_ticket_failed_on(self):
+        store, run_id = self._store()
+        store.add_tickets(run_id, [Ticket("T-1")])
+        self._failed(store, run_id, "format", "reformatted src/a.py")
+        self._failed(store, run_id, "lint", "src/a.py:1: line too long")
+
+        named = " ".join(
+            f["name"] for f in store.ticket_failures(run_id, "T-1", limit=10)
+        )
+
+        self.assertIn("lint", named)
+        self.assertNotIn("format", named)
+
+    def test_a_formatter_rewriting_a_different_file_is_not_a_changed_class(self):
+        # The shape that manufactured churn: same real failure both cycles,
+        # different file reformatted, and the class count moves.
+        store, run_id = self._store()
+        store.add_tickets(run_id, [Ticket("T-1")])
+
+        self._failed(store, run_id, "format", "reformatted src/a.py")
+        self._failed(store, run_id, "lint", "src/a.py:1: line too long")
+        first = {c["name"] for c in store.ticket_classes(run_id, "T-1")}
+
+        mark = store.last_step_id(run_id, "T-1")
+        self._failed(store, run_id, "format", "reformatted src/b.py")
+        self._failed(store, run_id, "lint", "src/a.py:1: line too long")
+        second = {
+            c["name"] for c in store.ticket_classes(run_id, "T-1", after=mark)
+        }
+
+        self.assertEqual(first, second)
+
+
+class TestOneSubjectDoesNotEatTheWholeList(unittest.TestCase):
+    """`learned` is ordered by how often each conclusion was rediscovered, and
+    on a ticket that kept rediscovering one convention that ordering handed it
+    the whole budget. Twenty-three entries, fourteen of them restating that
+    local imports need a `.js` extension — and the rule the ticket was actually
+    failing on, `noUncheckedIndexedAccess`, crowded out of the twelve shown."""
+
+    # Real entries from the ticket, trimmed.
+    JS = [
+        {"text": "Local imports in test files must use the `.js` extension.", "count": 1},
+        {"text": "Local imports in tests must resolve to `.js` extensions relative to "
+                 "the test file's directory.", "count": 1},
+        {"text": "In this project, importing a `.ts` file requires a `.js` extension "
+                 "in the import path.", "count": 1},
+        {"text": "Local imports of `.ts` files must use the `.js` extension; omitting "
+                 "it causes TS2307.", "count": 1},
+    ]
+    OTHER = [
+        {"text": "The type checker runs with `noUncheckedIndexedAccess`, so every "
+                 "index needs a guard.", "count": 1},
+        {"text": "Godot's `load-constant-name` rule requires UPPER_CASE names.", "count": 1},
+    ]
+
+    def _ticket(self, entries):
+        ticket = Ticket("T-1")
+        ticket.learned = entries
+        return ticket
+
+    def test_a_convention_restated_four_times_takes_two_places(self):
+        shown = learned_message(self._ticket(self.JS), limit=12).content
+
+        self.assertEqual(shown.count("`.js`"), 2)
+
+    def test_what_it_stops_crowding_out_is_shown_instead(self):
+        shown = learned_message(self._ticket([*self.JS, *self.OTHER]), limit=4).content
+
+        self.assertIn("noUncheckedIndexedAccess", shown)
+        self.assertIn("load-constant-name", shown)
+
+    def test_a_restatement_is_not_saved_by_what_it_mentions_in_passing(self):
+        # Every restatement of a convention arrives carrying a second token, so
+        # skipping only when *all* of an entry's subjects are capped lets all
+        # of them through on the strength of the token they differ on.
+        shown = learned_message(self._ticket(self.JS), limit=12).content
+
+        self.assertEqual(shown.count("\n- "), 2)
+
+    def test_an_entry_naming_nothing_is_never_crowded_out(self):
+        plain = {"text": "This project prefers small commits.", "count": 1}
+        shown = learned_message(self._ticket([*self.JS, plain]), limit=12).content
+
+        self.assertIn("prefers small commits", shown)
+
+    def test_turning_the_section_off_still_turns_it_off(self):
+        self.assertIsNone(learned_message(self._ticket(self.JS), limit=0))
+
+
+class TestALearningTheLoopContradictedIsMarkedNotHidden(unittest.TestCase):
+    """`gdUnit4 requires `import` at the top of a test file` sat beside
+    `GDScript does not support `import` for scripts` for the whole of one
+    ticket's eighty-four builds, presented to the executor as an established
+    fact about the project. The language has no `import`."""
+
+    IMPORTS = [
+        {"text": "gdUnit4 requires `import` at the top of a test file to resolve "
+                 "`class_name` symbols.", "count": 1},
+        {"text": "GDScript does not support `import` statements; `class_name` "
+                 "registers classes globally.", "count": 1},
+    ]
+
+    def _ticket(self, entries):
+        ticket = Ticket("T-1")
+        ticket.learned = entries
+        return ticket
+
+    def test_the_subject_they_disagree_about_is_found(self):
+        self.assertIn("import", contested_subjects(self.IMPORTS))
+
+    def test_both_sides_are_still_shown(self):
+        # Withheld is the wrong answer. Counting which side was reached more
+        # often looked like a tiebreak and would have suppressed `Tool scripts
+        # with class_name are not visible to gdUnit4 tests at parse time` —
+        # true, and the most useful line on that ticket — because four other
+        # entries mentioned `class_name` while requiring something.
+        shown = learned_message(self._ticket(self.IMPORTS), limit=12).content
+
+        self.assertIn("gdUnit4 requires", shown)
+        self.assertIn("does not support", shown)
+
+    def test_both_sides_are_marked_as_unsettled(self):
+        shown = learned_message(self._ticket(self.IMPORTS), limit=12).content
+
+        self.assertEqual(shown.count("earlier attempts disagreed"), 2)
+        self.assertIn("should not be built on", shown)
+
+    def test_a_list_that_agrees_with_itself_carries_no_marks(self):
+        agreed = [
+            {"text": "GDScript does not support `import` statements.", "count": 1},
+            {"text": "`class_name` registers classes globally.", "count": 1},
+        ]
+        shown = learned_message(self._ticket(agreed), limit=12).content
+
+        self.assertNotIn("disagreed", shown)
+
+    def test_a_backticked_operator_is_not_a_subject(self):
+        # `!` was read as one, so every entry advising a non-null assertion
+        # shared a subject with every entry explaining why one was needed, and
+        # the two were reported as disagreeing.
+        assertions = [
+            {"text": "The project enables `noUncheckedIndexedAccess`, so every index "
+                     "access must be guarded with `!`.", "count": 1},
+            {"text": "Control flow analysis does not narrow array length checks; use "
+                     "`!` or explicit guards.", "count": 1},
+        ]
+
+        self.assertEqual(contested_subjects(assertions), set())
+
+    def test_a_subject_stated_plainly_matches_one_in_backticks(self):
+        # The pair that contradicted each other on one run was split exactly
+        # that way: one entry quoted `OS.exit_code`, the other wrote it bare.
+        split = [
+            {"text": "Tool scripts terminate automatically; do not set `OS.exit_code`.",
+             "count": 1},
+            {"text": "The dumper must use OS.exit_code = 0 for termination.", "count": 1},
+        ]
+
+        self.assertIn("os.exit_code", contested_subjects(split))
+
+
+class TestRatificationCannotHandBackFewerCriteria(unittest.TestCase):
+    """The hole `contract_criteria` was standing on.
+
+    A ticket was ingested with eleven criteria and ratified into ten: the pass
+    dropped the one requiring `gdtoolkit.linter` to exit 0. Because
+    `contract_criteria` prefers `ratified_criteria`, the ten became the floor
+    respec's ratchet defended for the rest of the run — the bar ratify lowered
+    was then protected against being raised again.
+
+    Ratify may still reword, split and add. Only the shortfall is refused."""
+
+    PLAN = [
+        "capture for game_001 returns a seed of 3130775471.",
+        "That same call returns a decorable_count of 13.",
+        "`python -m gdtoolkit.linter scripts scenes tests` exits 0 with the new "
+        "test file present.",
+    ]
+
+    def _ticket(self, criteria=None):
+        return Ticket(
+            "PF-009",
+            criteria=list(criteria or self.PLAN),
+            original_criteria=list(self.PLAN),
+        )
+
+    def test_the_criterion_that_went_missing_on_the_real_run_is_named(self):
+        gone = dropped_criteria(self._ticket(), self.PLAN[:2])
+
+        self.assertEqual(len(gone), 1)
+        self.assertIn("gdtoolkit.linter", gone[0])
+
+    def test_the_same_list_back_is_not_a_drop(self):
+        self.assertEqual(dropped_criteria(self._ticket(), self.PLAN), [])
+
+    def test_sharpening_a_vague_criterion_is_what_the_pass_is_for(self):
+        # The two share no word at all. Judging each criterion on whether it
+        # survives in some form would refuse exactly the revision the tester's
+        # blocking objection asked for.
+        ticket = Ticket("T-1", criteria=["it parses"], original_criteria=["it parses"])
+
+        self.assertEqual(
+            dropped_criteria(ticket, ["returns Err(ParseError) for a missing brace"]),
+            [],
+        )
+
+    def test_splitting_one_criterion_into_two_is_allowed(self):
+        ticket = Ticket(
+            "T-1",
+            criteria=["ox and oy are both within 0.000001"],
+            original_criteria=["ox and oy are both within 0.000001"],
+        )
+
+        self.assertEqual(
+            dropped_criteria(ticket, ["ox is within 0.000001", "oy is within 0.000001"]),
+            [],
+        )
+
+    def test_adding_a_criterion_a_role_asked_for_is_allowed(self):
+        self.assertEqual(
+            dropped_criteria(self._ticket(), [*self.PLAN, "posts has length 0."]), []
+        )
+
+    def test_merging_two_into_one_is_still_a_shorter_list(self):
+        # Every survivor covers something, so nothing can be named as missing.
+        # The shortfall is reported anyway: a pass that consolidates is doing
+        # something the ratchet downstream cannot tell from a deletion.
+        ticket = Ticket(
+            "T-1",
+            criteria=["a returns 1.", "b returns 2."],
+            original_criteria=["a returns 1.", "b returns 2."],
+        )
+
+        self.assertTrue(dropped_criteria(ticket, ["a returns 1 and b returns 2."]))
+
+    def test_a_later_pass_is_judged_against_the_plan_not_the_last_pass(self):
+        # Otherwise pass one shrinks the list and pass two is measured against
+        # the shorter one, which is the same hole one level down.
+        ticket = self._ticket(criteria=self.PLAN[:2])
+
+        self.assertTrue(dropped_criteria(ticket, self.PLAN[:2]))
+
+
+class TestRatifyRefusesTheShorterListInTheLoop(unittest.TestCase):
+    """End to end: a planner revision that returns fewer criteria than it was
+    given keeps none of them, and the ticket ships with the contract it was
+    ingested with."""
+
+    PLAN = ["it parses the header", "`cargo clippy` exits 0 with the new file present"]
+
+    def _orchestrator(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "src").mkdir()
+        (root / "src" / "a.rs").write_text("fn main() {}\n", encoding="utf-8")
+        config = Config(
+            root=root,
+            models={"m": {"kind": "openai", "model": "stub", "contextWindow": 8192,
+                          "maxOutputTokens": 1024}},
+            roles={role: "m" for role in ROLES},
+            commands={"lint": "", "typecheck": "", "test": "cargo test"},
+            loop=LoopSettings(preflight=False, ratify_passes=2),
+        )
+        store = Store(config.db_path)
+        run_id = store.create_run("goal")
+        store.add_tickets(
+            run_id,
+            [
+                Ticket(
+                    "T-1",
+                    title="Parse",
+                    spec="Parse the header.",
+                    allowed_files=["src/a.rs"],
+                    criteria=list(self.PLAN),
+                )
+            ],
+        )
+        orchestrator = Orchestrator(config, store)
+        orchestrator.artifacts = Artifacts(config.config_dir, run_id)
+        return orchestrator, store, run_id
+
+    def _run(self, revision):
+        orchestrator, store, run_id = self._orchestrator()
+
+        # One list per role, consumed across both passes.
+        scripts = {
+            "planner": ["SIGNOFF: yes", json.dumps(revision), "SIGNOFF: yes"],
+            "executor": ["SIGNOFF: no\nBLOCKING:\n- criterion 2 is not mine", "SIGNOFF: yes"],
+            "tester": ["SIGNOFF: yes", "SIGNOFF: yes"],
+            "reviewer": ["SIGNOFF: yes", "SIGNOFF: yes"],
+        }
+
+        def call(_run_id, role, _messages, *, max_tokens, temperature=0.2):
+            return Completion(text=scripts[role].pop(0), usage=Usage(), finish_reason="stop")
+
+        orchestrator._call = call
+        ticket = store.list_tickets(run_id)[0]
+        orchestrator._ratify(run_id, ticket)
+        return orchestrator, store, run_id, ticket
+
+    def test_the_dropped_criterion_is_still_on_the_ticket(self):
+        _orch, _store, _run_id, ticket = self._run({"criteria": [self.PLAN[0]]})
+
+        self.assertEqual(ticket.criteria, self.PLAN)
+
+    def test_the_ratchet_floor_is_the_full_contract(self):
+        _orch, _store, _run_id, ticket = self._run({"criteria": [self.PLAN[0]]})
+
+        self.assertEqual(ticket.contract_criteria, self.PLAN)
+
+    def test_the_refusal_is_reported(self):
+        orch, _store, _run_id, _ticket = self._run({"criteria": [self.PLAN[0]]})
+
+        messages = " ".join(e["message"] for e in orch.store.events_after(0))
+        self.assertIn("rather than rewording them", messages)
+        self.assertIn("cargo clippy", messages)
+
+    def test_a_revision_that_only_rewords_is_kept(self):
+        reworded = ["it parses the header and rejects a missing brace", self.PLAN[1]]
+        _orch, _store, _run_id, ticket = self._run({"criteria": reworded})
+
+        self.assertEqual(ticket.criteria, reworded)
+
+    def test_the_rest_of_a_refused_revision_still_applies(self):
+        # Only the criteria field is dropped. A pass that fixed the spec and
+        # miscounted the criteria should not lose the spec too.
+        _orch, _store, _run_id, ticket = self._run(
+            {"criteria": [self.PLAN[0]], "spec": "Parse the header and the footer."}
+        )
+
+        self.assertEqual(ticket.spec, "Parse the header and the footer.")
+        self.assertEqual(ticket.criteria, self.PLAN)
 
 
 class TestTheRatifiedContractIsTheAnchor(unittest.TestCase):

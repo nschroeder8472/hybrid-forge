@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from typing import Any, Sequence
 
 from .failures import distill
@@ -169,6 +170,12 @@ Never:
   code under test. Import it the way the rest of the project imports it. An
   `extern` block re-declares a symbol instead of referencing it, so the linker
   never pulls it in and the target fails to link rather than to assert.
+- Reshape a value before comparing it to what a criterion pins. A helper of
+  your own that masks, shifts, scales or offsets the call's result — `>>> 0`,
+  `& 0xFFFFFFFF`, `% 256` — turns the criterion into something it does not say
+  and the assertion into one that cannot fail for the reason it exists. If the
+  value comes back in the wrong form, report that; do not correct it on the way
+  to the comparison.
 - Write anything to a path other than the one file you are told to write.
 
 Output the complete contents of that one test file: the path on its own line,
@@ -593,6 +600,137 @@ linter settings are above — and change the approach rather than the line.
     )
 
 
+# What a learning is *about*: the named thing it makes a claim on. Backticked
+# spans first, because a model writing about a flag or an API almost always
+# quotes it, then the bare spellings of the same shapes for the entries that do
+# not — `OS.exit_code` written plain is the same subject as `` `OS.exit_code` ``,
+# and the pair that contradicted each other on one run was split exactly that
+# way.
+_BACKTICKED = re.compile(r"`([^`\n]{1,60})`")
+_BARE_CODE = re.compile(
+    # `quit()`, `load_file()`; dotted names; snake_case; file extensions.
+    r"\b[A-Za-z_][\w]*\(\)|\b[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+|"
+    r"\b[a-z]+(?:_[a-z0-9]+)+\b|(?<![\w.])\.[a-z]{1,4}\b"
+)
+# Ordinary prose that survives the bare patterns above and is nobody's subject.
+_NOT_A_SUBJECT = frozenset({"e.g", "i.e", "etc", "vs"})
+
+
+def _subjects(text: str) -> set[str]:
+    """The named things a learning makes a claim about."""
+    found = {token for token in _BACKTICKED.findall(text)}
+    found |= set(_BARE_CODE.findall(text))
+    cleaned = set()
+    for token in found:
+        token = token.strip().strip(".,;:").lower()
+        # A backticked sentence fragment is a quotation, not a subject, and a
+        # backticked operator is not a name. `!` was read as one, which made
+        # every entry advising a non-null assertion share a subject with every
+        # entry explaining why one is needed — and the two were then reported
+        # as disagreeing.
+        if len(token.split()) > 3 or token in _NOT_A_SUBJECT:
+            continue
+        if len(token) < 2 or not any(char.isalpha() for char in token):
+            continue
+        cleaned.add(token)
+    return cleaned
+
+
+# Whether a learning says its subject is called for or ruled out. Checked in
+# this order: "must not" is a prohibition and contains "must".
+_RULES_OUT = re.compile(
+    r"\b(?:must not|cannot|can not|does not|do not|is not|are not|will not|"
+    r"never|no longer|not supported|rejects?|forbids?|disallows?|unsupported)\b",
+    re.IGNORECASE,
+)
+_CALLS_FOR = re.compile(
+    r"\b(?:must|requires?|needs?|always|has to|have to|should)\b", re.IGNORECASE
+)
+
+
+def _stance(text: str) -> str:
+    """`"out"`, `"for"`, or `""` — what the learning asks be done with its subject."""
+    if _RULES_OUT.search(text):
+        return "out"
+    if _CALLS_FOR.search(text):
+        return "for"
+    return ""
+
+
+# How many statements about one subject are worth showing. Two, because the
+# second is usually the one carrying the detail the first left out, and a third
+# on one run was the ninth restatement of `.js` extensions in a list of twelve.
+_PER_SUBJECT = 2
+
+
+def contested_subjects(entries: Sequence[dict]) -> set[str]:
+    """Things earlier attempts could not agree about.
+
+    A subject one learning says is required and another says is not supported.
+    Both cannot be facts about this repository, and the prompt introduces this
+    list as conclusions about how the project works — so a role reads
+    `gdUnit4 requires an import at the top of a test file` and acts on it. That
+    entry sat beside `GDScript does not support import for scripts` for the
+    whole of one ticket's eighty-four builds, and the language has no `import`.
+
+    Marked, not resolved, and never withheld. Counting which side was reached
+    more often looked like a tiebreak and is not one: on the same ticket it
+    would have suppressed `Tool scripts with class_name are not visible to
+    gdUnit4 tests at parse time unless explicitly preloaded` — true, and the
+    single most useful line in the list — because four other entries mentioned
+    `class_name` while requiring something. A subject many statements are made
+    about is not a subject in dispute, and nothing here can tell the two apart.
+
+    What is safe is saying so. An entry the loop flatly disagreed with itself
+    about should not be read as established, and a role told that much can go
+    and look instead of building on it.
+    """
+    stances: dict[str, set[str]] = {}
+    for entry in entries:
+        text = entry.get("text", "")
+        stance = _stance(text)
+        if not stance:
+            continue
+        for subject in _subjects(text):
+            stances.setdefault(subject, set()).add(stance)
+    return {subject for subject, sides in stances.items() if len(sides) > 1}
+
+
+def _one_subject_at_a_time(entries: Sequence[dict], limit: int) -> list[dict]:
+    """`limit` entries, no more than `_PER_SUBJECT` of them about one thing.
+
+    The list is ordered by how often each conclusion was rediscovered, and on a
+    ticket that kept rediscovering one convention that ordering hands the whole
+    budget to it. One prompt carried twelve learnings of which seven restated
+    that local imports need a `.js` extension, while the entries about
+    `noUncheckedIndexedAccess` — the rule that ticket kept actually failing on
+    — were crowded out of the list entirely.
+
+    An entry is skipped when *any* subject it names is already at the cap, not
+    when all of them are. Every restatement of a convention arrives carrying
+    one or two other tokens as well, so the weaker test lets all seven through
+    on the strength of what they mention in passing.
+
+    A rediscovered fact still deserves the top of the list; it does not deserve
+    seven places in it. An entry naming nothing in particular is never crowded
+    out, since it shares no subject with anything.
+    """
+    seen: Counter[str] = Counter()
+    kept: list[dict] = []
+    for entry in entries:
+        # Tested before the append, not after: `learnedLimit: 0` turns the
+        # whole section off, and a loop that appends first honours it as one.
+        if len(kept) >= limit:
+            break
+        subjects = _subjects(entry.get("text", ""))
+        if any(seen[subject] >= _PER_SUBJECT for subject in subjects):
+            continue
+        for subject in subjects:
+            seen[subject] += 1
+        kept.append(entry)
+    return kept
+
+
 def learned_message(ticket: Ticket, limit: int = 12) -> Message | None:
     """What earlier attempts worked out about this repository.
 
@@ -607,23 +745,36 @@ def learned_message(ticket: Ticket, limit: int = 12) -> Message | None:
     is one the plan should have stated, and it should be the first thing the
     next attempt reads.
     """
-    entries = [entry for entry in (ticket.learned or []) if entry.get("text")][:limit]
+    all_entries = [entry for entry in (ticket.learned or []) if entry.get("text")]
+    contested = contested_subjects(all_entries)
+    entries = _one_subject_at_a_time(all_entries, limit)
     if not entries:
         return None
     lines = []
+    disputed = False
     for entry in entries:
         count = int(entry.get("count", 1))
         again = f"  (established {count} separate times)" if count > 1 else ""
+        if _subjects(entry["text"]) & contested:
+            again += "  [earlier attempts disagreed about this — check it]"
+            disputed = True
         lines.append(f"- {entry['text']}{again}")
+    note = ""
+    if disputed:
+        note = (
+            "\n\nA line marked as disputed is one earlier attempts contradicted "
+            "each other on, so it is not established and should not be built on. "
+            "Check it against the files you were given."
+        )
     return Message(
         role="user",
         content=f"""{LEARNED_HEADING}
 These are conclusions earlier attempts reached about this repository, kept so
-you do not have to reach them again. They are established facts about how this
-project works, not requirements you are judged against — the acceptance
-criteria below are the bar, and nothing here adds to it.
+you do not have to reach them again. They are what the loop worked out from
+what this project's tools reported, not requirements you are judged against —
+the acceptance criteria below are the bar, and nothing here adds to it.
 
-{chr(10).join(lines)}
+{chr(10).join(lines)}{note}
 """,
     )
 
@@ -813,6 +964,7 @@ def tests_prompt(
     toolchain: dict[str, str] | None = None,
     learned_limit: int = 12,
     rejected_bindings: list[str] | None = None,
+    laundered: list[str] | None = None,
     own_file_errors: list[str] | None = None,
 ) -> list[Message]:
     """Ask the tester for assertions, with the evidence to match the repo.
@@ -955,6 +1107,28 @@ in the same target.
 Call the functions the way the rest of this project calls them: import the
 module and call it directly. These tests run on the host, where an exported
 function is an ordinary function of its own language.
+"""
+
+    if laundered:
+        quoted = "\n".join(f"  {line}" for line in laundered)
+        body += f"""
+## Your last answer was rejected before it reached disk
+
+It compared a reshaped value instead of the one the code returned:
+
+```
+{quoted}
+```
+
+A criterion pins what the implementation must produce. Putting the call through
+a helper you defined — `>>> 0`, `& 0xFFFFFFFF`, `% 256`, a scale, an offset —
+before comparing means the assertion no longer says anything about that
+criterion. It passes for an implementation that returns the wrong value in the
+right bits, which is precisely the bug the criterion exists to catch.
+
+Assert on the call itself. If the value comes back in a form the criterion does
+not describe, that is the implementation's defect to fix and your test's job to
+report — not something to correct on the way to the comparison.
 """
 
     messages = [Message(role="system", content=TESTER_SYSTEM)]
@@ -1393,6 +1567,7 @@ def review_prompt(
     state: dict[str, str] | None = None,
     unchanged: dict[str, str] | None = None,
     reproduced: tuple[str, str] | None = None,
+    unchecked: str = "",
 ) -> list[Message]:
     messages = [Message(role="system", content=REVIEWER_SYSTEM)]
 
@@ -1483,6 +1658,31 @@ in the diff above. They are **not** missing. This is their current content —
 judge the criteria against it, exactly as if it were in the diff.
 
 {_sources_block(unchanged)}
+"""
+
+    if unchecked:
+        # The one case where "the tests pass" means nothing, and the reviewer
+        # has no way to know it. A tester that kept reshaping the value before
+        # comparing it had its file discarded twice, so nothing ran against
+        # these criteria at all — and the reviewer that saw the *previous*
+        # version of this ticket read `expect(u32(pcg.randi())).toBe(...)` as
+        # evidence the criterion was met and approved an implementation
+        # returning -223148877 where the criterion said 4071818419.
+        body += f"""
+## No test was written for these criteria
+
+{unchecked}
+
+So nothing in the suite checks the criteria above; whatever else went green
+went green without them. You are the only thing standing between this ticket
+and being recorded as done.
+
+Check each criterion against the diff directly, and check it against what the
+code **returns**, not what a caller could convert it to. A criterion naming an
+exact value is not met by a function that produces the right bits in the wrong
+representation — the wrong sign, the wrong width, the wrong units. If you
+cannot tell from the diff what a criterion's expression evaluates to, that is a
+REJECT and not a benefit of the doubt.
 """
 
     messages.append(Message(role="user", content=body))

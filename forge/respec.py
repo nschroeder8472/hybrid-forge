@@ -564,6 +564,79 @@ def _spec_entailed(
     return False
 
 
+def _represented(criterion: str, among: Sequence[str]) -> bool:
+    """Whether `criterion` still survives somewhere in `among`, reworded or not.
+
+    The same content-word overlap `_spec_entailed` uses, asking a different
+    question: not "is this new" but "is this still here".
+
+    Only ever used to *name* what went missing from a list already known to
+    have got shorter, never to decide that something did. Sharpening a
+    criterion is what ratification is for, and a sharpening shares no words
+    with what it replaces when the original was vague enough to need one —
+    "it parses" becomes "returns Err(ParseError) for a missing brace", and
+    nothing in the second is in the first.
+    """
+    wanted = _content_words(criterion)
+    if not wanted:
+        return True
+    if _key(criterion) in {_key(other) for other in among}:
+        return True
+    for other in among:
+        stated = set(_content_words(other))
+        if not stated:
+            continue
+        covered = sum(1 for word in wanted if word in stated)
+        if covered / len(wanted) >= _ENTAILMENT_COVERAGE:
+            return True
+    return False
+
+
+def dropped_criteria(ticket: Ticket, proposed: Sequence[str]) -> list[str]:
+    """Plan-authored criteria a ratification revision returned fewer of.
+
+    Empty unless the list got shorter, and then the ones that look gone — or
+    the whole shortfall, said plainly, when every survivor still covers
+    something and two criteria were merged instead.
+
+    Ratification is allowed to move the criteria; that is the point of settling
+    a contract before it is expensive to change. It may reword one into
+    something a tester can actually assert, split one into two, or add one a
+    role asked for. What it may not do is hand back fewer than it was given,
+    because removing a criterion and sharpening one are the same act from the
+    outside and nothing separated them.
+
+    The gap that left is not the missing criterion. `contract_criteria` prefers
+    `ratified_criteria`, so whatever survives the pass becomes the floor the
+    ratchet defends for the rest of the run — a bar ratify lowered is then
+    protected against being raised again. One ticket arrived with eleven
+    criteria and shipped with ten: the pass dropped the one requiring the
+    linter to exit 0, and every later respec was held to the remaining ten.
+
+    Ratify has a channel for a criterion that cannot be met, and it is the
+    blocking vote. Silently returning a shorter list is not it.
+
+    Counting is the whole test, and it is deliberately the whole test. Judging
+    each criterion on whether it survives in some form would refuse the
+    sharpening this pass exists to perform. Restoring the missing one is the
+    wrong repair too — it lands beside a reworded version of itself, and a
+    ticket that collects those reaches twenty-seven criteria from a plan's
+    nine. So the caller refuses the whole criteria field, exactly as a spec
+    revision dropping a settled decision is refused, and the ticket keeps the
+    contract it already had.
+    """
+    original = list(ticket.original_criteria or [])
+    if len(proposed) >= len(original):
+        return []
+    missing = [c for c in original if not _represented(c, proposed)]
+    if missing:
+        return missing
+    return [
+        f"{len(original)} criteria were ratified into {len(proposed)}; "
+        f"each survives in some form, so two were merged rather than reworded"
+    ]
+
+
 def _drop_whole_file_claims(
     store: Store, run_id: int, ticket: Ticket, proposed: list[str]
 ) -> tuple[list[str], list[tuple[str, str]]]:

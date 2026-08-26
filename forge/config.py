@@ -579,6 +579,33 @@ class LoopSettings:
     # 4 covers a full attempt budget without the oldest turns crowding the
     # prompt; 0 restores the single-message shape.
     executor_turns: int = 4
+    # How many times a compile failure may go straight back to the executor
+    # without spending an attempt.
+    #
+    # An attempt is the unit the loop charges and the unit respec measures, and
+    # it is far bigger than the mistake it usually ends on. One ticket's steps,
+    # averaged over its 95 cycles:
+    #
+    #     build                  14.5s   the work
+    #     typecheck[path_forge]   0.7s   the answer
+    #     tests                  12.0s   paid before the answer
+    #     ratify                 48.5s   the spec, rewritten underneath
+    #
+    # Fifty-eight of those cycles wrote a test file for an implementation that
+    # then failed to compile in seven tenths of a second — twelve seconds and a
+    # model call each time, and the tester rewrote the file the executor was
+    # being judged against while it worked. And because one compile error spent
+    # one of five attempts, the ticket got five corrections against a spec and
+    # then a rewritten spec: nineteen ratifications and eighteen respecs, while
+    # it sat two errors from done.
+    #
+    # So a failure that is unambiguously the executor's own goes back to it
+    # inside the attempt, on the same conversation thread, against the same
+    # contract. Only compile-shaped checks qualify — see `_compile_gate`.
+    #
+    # Off by default. It changes how attempts are counted, which is the number
+    # every convergence rule in the loop is written against.
+    inner_turns: int = 0
     # Whether the executor and tester are shown the linter, compiler and test
     # runner configuration that grades what they write — the real files, at
     # their real paths, resolved per language from the ticket's own scope.
@@ -887,6 +914,7 @@ class Config:
             max_runtime_seconds=int(loop.get("maxRuntimeSeconds", 0)),
             baseline_verify=bool(loop.get("baselineVerify", True)),
             executor_turns=int(loop.get("executorTurns", 4)),
+            inner_turns=int(loop.get("innerTurns", 0)),
             prior_failures=int(loop.get("priorFailures", 8)),
             learned_limit=int(loop.get("learnedLimit", 12)),
             flat_cycles=int(loop.get("flatCycles", 0)),
@@ -955,6 +983,12 @@ class Config:
                 f"loop.executorTurns is {self.loop.executor_turns}; expected 0 "
                 f"(the single-message prompt) or the number of prior attempts "
                 f"to replay to the executor as conversation turns."
+            )
+        if self.loop.inner_turns < 0:
+            raise ConfigError(
+                f"loop.innerTurns is {self.loop.inner_turns}; expected 0 (a "
+                f"compile failure spends an attempt, as it always has) or the "
+                f"number of times it may go back to the executor first."
             )
         if self.loop.ratify_passes < 0:
             raise ConfigError(
@@ -1262,6 +1296,7 @@ class Config:
                 "maxRuntimeSeconds": self.loop.max_runtime_seconds,
                 "baselineVerify": self.loop.baseline_verify,
                 "executorTurns": self.loop.executor_turns,
+                "innerTurns": self.loop.inner_turns,
                 "priorFailures": self.loop.prior_failures,
                 "learnedLimit": self.loop.learned_limit,
                 "flatCycles": self.loop.flat_cycles,

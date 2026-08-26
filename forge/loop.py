@@ -73,6 +73,7 @@ from .patch import (
     foreign_bindings,
     infer_single_file,
     is_safe_path,
+    laundered_assertions,
     matches_any,
     normalize_path,
     parse_output,
@@ -117,6 +118,7 @@ from .prompts import (
 )
 from .state import (
     DETAIL_CHARS,
+    _step_kind,
     RUN_BLOCKED,
     RUN_DONE,
     RUN_FAILED,
@@ -161,6 +163,13 @@ _DROPPABLE_HEADINGS = (
 # loop could actually have fixed — so anything not matched here counts as
 # evidence, and a build error that slips through fails the attempt the ordinary
 # way instead of discarding the proof.
+# How much of a refusing formatter's output is worth keeping in the run log.
+# Enough for a parse error and the token table under it, which is what the two
+# formatters this has been run against print, and not so much that a formatter
+# listing every file it skipped fills the log.
+_FORMAT_DETAIL_CHARS = 2_000
+
+
 _UNBUILDABLE = re.compile(
     r"syntaxerror|indentationerror|importerror|modulenotfounderror|"
     r"error\[e\d+\]|cannot find|unresolved|undeclared|not declared|"
@@ -316,6 +325,12 @@ class StepResult:
     # that ran no assertion about it. Ends the run rather than the ticket. See
     # `_unverifiable`.
     halt: bool = False
+    # The attempt stopped at the compile gate and the executor should be asked
+    # again without being charged for it — the mistake is unambiguously its
+    # own, nothing downstream has run, and the contract has not moved. The
+    # caller decides whether an inner turn is left to spend; see
+    # `_compile_gate` and `loop.innerTurns`.
+    retry_build: bool = False
 
 
 class Stopped(Exception):
@@ -3511,6 +3526,27 @@ class Orchestrator:
                 )
             ]
 
+        # Inner turns spent on the attempt in hand, and how many compile errors
+        # the last one left behind. Both reset the moment an attempt is
+        # actually charged: the allowance is per attempt, or one ticket that
+        # cannot compile would spend all of it before the second attempt began.
+        spent = 0
+        errors_left = 0
+        # Whether the next attempt runs with the compile gate switched off.
+        #
+        # Set after a stall, and this is load-bearing. The gate returns before
+        # the tests step, so while it keeps firing the tester never runs — and
+        # resetting the allowance on a charged attempt means the next one gates
+        # again from the top. One ticket went 43 cycles and 20 attempts that
+        # way without the tester being asked once, every cycle ending on the
+        # same `TS2339` in the tester's own file. The role whose file that was
+        # had been locked out of its own ticket.
+        #
+        # Alternating costs little. The stall lands on turn 2 in most cases —
+        # 14 of that ticket's 23 inner turns never reached turn 2 at all — so
+        # nearly all of the saving is in the first turn, which still happens.
+        gate_off = False
+
         while ticket.attempts < self.config.loop.max_attempts:
             ticket.attempts += 1
             self.store.update_ticket(run_id, ticket)
@@ -3521,7 +3557,69 @@ class Orchestrator:
                 prior_failures=history[-self._prior_failures:],
                 rejections=rejections,
                 repro=repro,
+                inner_turns=0 if gate_off else self.config.loop.inner_turns - spent,
             )
+
+            if outcome.retry_build:
+                # The compile gate stopped the attempt before the tester was
+                # asked and before anything was judged. Nothing has moved: not
+                # the contract, not the test file the executor is measured
+                # against, not the tree beyond what this reply wrote. So the
+                # failure goes back to the executor on the thread it is already
+                # having — `ticket_turns` rebuilds that from the step log, and
+                # the build and the check that refused it are both in it —
+                # rather than costing a fifth of the budget that decides
+                # whether the spec is rewritten underneath the work.
+                remaining = signatures(outcome.detail)
+                stalled = bool(spent) and len(remaining) >= errors_left
+                if not stalled and spent < self.config.loop.inner_turns:
+                    spent += 1
+                    errors_left = len(remaining)
+                    ticket.attempts -= 1
+                    self.store.update_ticket(run_id, ticket)
+                    self.store.log(
+                        run_id,
+                        f"{ticket.ticket_id}: what this attempt wrote does not "
+                        f"compile, so the tester was not asked and the attempt "
+                        f"was not charged — inner turn {spent} of "
+                        f"{self.config.loop.inner_turns}, {len(remaining)} "
+                        f"error(s) to answer.",
+                        kind="ticket",
+                    )
+                    failure_context = outcome.detail
+                    continue
+                # Out of turns, or the count stopped falling. Turns are for
+                # closing a gap that is closing; an executor that is not
+                # getting nearer will not get nearer for being asked a fourth
+                # time, and the ticket is better off spending the attempt —
+                # respec, the ladder and the retry brake all measure attempts,
+                # and none of them can see a turn.
+                self.store.log(
+                    run_id,
+                    f"{ticket.ticket_id}: "
+                    + (
+                        f"{len(remaining)} compile error(s) left, against "
+                        f"{errors_left} before the last inner turn"
+                        if stalled
+                        else f"{len(remaining)} compile error(s) left after "
+                        f"{spent} inner turn(s)"
+                    )
+                    + "; charging the attempt instead of asking again. The "
+                    "next attempt runs ungated, so the tester is asked about "
+                    "the file it owns.",
+                    level="warn",
+                    kind="ticket",
+                )
+                outcome = StepResult(ok=False, detail=outcome.detail)
+                gate_off = True
+            else:
+                # An attempt that reached the end of the pipeline has had its
+                # tester. Whatever it failed on, the gate is worth trying again.
+                gate_off = False
+
+            # Reached only when the attempt was charged, whatever came of it.
+            spent = 0
+            errors_left = 0
 
             # Checked before `blocked`, and it must be: the note names the
             # files the tree is red on, and `_widen_scope` reads a block note
@@ -4119,8 +4217,74 @@ class Orchestrator:
             lines.insert(0, "Nothing was written: every edit fell outside scope.\n")
         return "\n".join(lines)
 
+    # Verify kinds whose failure can only be the executor's. A compiler
+    # reading files this ticket owns and refusing them is talking about the
+    # reply that just landed and about nothing else — there is no other author
+    # and no other explanation.
+    #
+    # `test` is deliberately absent and must stay absent. A red suite may be
+    # the tester's assertion rather than the executor's code, the executor
+    # cannot edit the test file to find out, and looping it on one would ask it
+    # to fix something outside its scope until the turns ran out. The
+    # difference is the whole safety argument for spending turns uncharged.
+    _COMPILE_GATE = ("lint", "typecheck")
+
+    def _compile_gate(
+        self,
+        run_id: int,
+        ticket: Ticket,
+        written: Sequence[str],
+        pre_existing: dict[str, set[str]] | None,
+    ) -> str:
+        """Why the files just written do not compile, or `""`.
+
+        Run between apply and the tests step, over the same commands verify
+        will run and against the same amnesty, so it can only ever report what
+        verify was going to report anyway a few seconds later — for the price
+        of the cheapest step in the pipeline. On the ticket this comes from,
+        `typecheck` averaged 0.7 seconds against the tester's 12.
+
+        What that buys is not speed. It is that the failure goes back to the
+        executor before the tester has rewritten the file the executor is
+        judged against, and before the attempt that would have been charged for
+        it moved the ticket a fifth of the way to a respec.
+
+        Returns the failure to hand back, empty when nothing here is this
+        ticket's to answer for. An empty answer is the state every attempt was
+        in before this existed: the pipeline carries on and verify runs these
+        same commands again.
+        """
+        if not written:
+            # Nothing landed, so there is nothing here that this attempt wrote.
+            # Whatever the tree says, it said it before the executor replied.
+            return ""
+        inherited = pre_existing or {}
+        for name, command, workspace in self._verify_plan(ticket):
+            if _step_kind(name) not in self._COMPILE_GATE:
+                continue
+            result = self._shell(
+                run_id, name, command, ticket.ticket_id, workspace=workspace
+            )
+            if result.ok:
+                continue
+            already = inherited.get(name, set())
+            introduced = signatures(result.detail) - already if already else set()
+            if already and not introduced:
+                # The same amnesty verify applies, for the same reason and from
+                # the same baseline. Everything this step is complaining about
+                # was broken before the ticket started, so asking the executor
+                # again would spend a turn on somebody else's file — and it is
+                # very likely not in scope to fix it either.
+                continue
+            return f"{name} failed:\n{distill(result.detail)}"
+        return ""
+
     def _format_pass(
-        self, run_id: int, ticket: Ticket, paths: Sequence[str]
+        self,
+        run_id: int,
+        ticket: Ticket,
+        paths: Sequence[str],
+        refused: dict[str, str] | None = None,
     ) -> list[str]:
         """Run the project's formatter over what this attempt just wrote.
 
@@ -4153,7 +4317,9 @@ class Orchestrator:
         parking a correct implementation over one would be a worse bug than the
         one this fixes.
 
-        Returns the paths it changed, for the caller to report.
+        Returns the paths it changed, for the caller to report. `refused`, when
+        given, is filled with `{path: what the formatter said}` for the files it
+        read and would not accept — see the note where it is populated.
         """
         commands = self.config.commands_for("format")
         if not commands:
@@ -4198,26 +4364,74 @@ class Orchestrator:
                 ticket.ticket_id,
                 workspace=workspace,
             )
+            # Read back whatever the run did to disk, whether it exited 0 or
+            # not. A formatter handed several files does as many of them as it
+            # can: `gdformat` given a good file and one it cannot parse
+            # rewrites the good one, reports it on the first line of its
+            # output, and exits non-zero for the other. Skipping the read-back
+            # on a non-zero exit made the loop log "Nothing was reformatted"
+            # directly underneath its own quotation of `reformatted
+            # tools/dump_decor_fixtures.gd`, and leave the rewrite unreported
+            # sixty-odd times on one ticket.
+            written = [
+                path for path in group if self._read_or_none(path) != before[path]
+            ]
+            changed.extend(written)
             if not result.ok:
                 # Logged, never charged. See the docstring: a formatter that
                 # cannot run is a configuration fault, and the code it did not
                 # reach is still judged by the same verify commands it always
                 # was.
+                #
+                # The output is worth quoting properly rather than clipping to
+                # its first line. A formatter is the first thing to read a file
+                # this attempt wrote, and what it says when it refuses is a
+                # syntax diagnosis with a line number in it — on one run,
+                # `Unexpected token Token('TYPE_HINT', 'import') at line 3`,
+                # which was the whole answer to a ticket that spent eighty-four
+                # builds on it.
+                # Which files it read and objected to, as opposed to never
+                # reaching at all. The distinction is the whole reason a
+                # formatter's failure can be evidence: a missing binary names
+                # no path — `command not found` is about the toolchain — while
+                # a parse error names the file it could not read, and that is a
+                # fact about what this attempt just wrote.
+                #
+                # A file it rewrote is never one it refused, which is what
+                # keeps a success banner out of this. `gdformat` leads its
+                # output with `reformatted tools/dump_decor_fixtures.gd` and
+                # matching on the path alone would report that file as the
+                # broken one — the mistake `errors_naming` carries its own
+                # warning about. `errors_naming` itself finds nothing here:
+                # a formatter's refusal is not shaped like a compiler's, and
+                # the diagnosis sits three lines below a bare `path:`.
+                if refused is not None:
+                    detail = result.detail or ""
+                    for path in group:
+                        if path in written:
+                            continue
+                        if any(
+                            name in detail
+                            for name in (path, path.replace("/", "\\"))
+                        ):
+                            refused[path] = detail
+                did = (
+                    f"the format command exited non-zero on part of what it was "
+                    f"given; {len(written)} file(s) were reformatted anyway: "
+                    f"{', '.join(sorted(written)[:6])}"
+                    if written
+                    else "the format command failed and was skipped; nothing was "
+                    "reformatted"
+                )
                 self.store.log(
                     run_id,
-                    f"{ticket.ticket_id}: the format command failed and was "
-                    f"skipped — {(result.detail or '').strip().splitlines()[0][:200] if result.detail.strip() else 'no output'}. "
-                    f"Nothing was reformatted; the ticket is judged exactly as "
-                    f"it would have been without a formatter configured.",
+                    f"{ticket.ticket_id}: {did}. The ticket is judged by the "
+                    f"same verify commands either way:\n"
+                    + clip((result.detail or "").strip() or "no output", _FORMAT_DETAIL_CHARS),
                     level="warn",
                     kind="ticket",
+                    data={"formatted": sorted(written)},
                 )
-                continue
-            changed.extend(
-                path
-                for path in group
-                if self._read_or_none(path) != before[path]
-            )
 
         if changed:
             # Reported because it is model output being rewritten by something
@@ -4460,6 +4674,7 @@ class Orchestrator:
         prior_failures: Sequence[str] = (),
         rejections: list[str] | None = None,
         repro: tuple[str, str] | None = None,
+        inner_turns: int = 0,
     ) -> StepResult:
         """One attempt at a ticket: build, apply, test, verify, review.
 
@@ -4746,6 +4961,16 @@ class Orchestrator:
                 ok=False, detail=self._fence_guidance(parsed.truncated, written)
             )
 
+        # --- COMPILE GATE --------------------------------------------
+        # Only when there is a turn left to spend on the answer. With none —
+        # the default — nothing runs here at all and the attempt proceeds
+        # exactly as it always did: the same commands are about to run at
+        # verify, where a failure is charged the ordinary way.
+        if inner_turns > 0:
+            unbuilt = self._compile_gate(run_id, ticket, written, pre_existing)
+            if unbuilt:
+                return StepResult(ok=False, retry_build=True, detail=unbuilt)
+
         # --- TESTS ---------------------------------------------------
         authored_now = False
         # The criteria come from the ticket, never from the executor's own
@@ -4797,12 +5022,16 @@ class Orchestrator:
             self._tests_authored.add(ticket.ticket_id)
         if ticket.criteria and no_tests_because and repro is None:
             self._tests_skipped.add(ticket.ticket_id)
+        # Why nothing in the suite covers these criteria, for the reviewer that
+        # has to check them instead. Empty when the tests were written.
+        unchecked = ""
         if ticket.criteria and no_tests_because:
             # Not a failure. The criteria are still checked at review, which is
             # the right place for "the build script takes a --release flag" or
             # "the page has a canvas element" — neither is something this
             # project's test command can collect, and forcing a file into it
             # only adds a target that later tickets have to keep green.
+            unchecked = no_tests_because
             self.store.log(
                 run_id,
                 f"{ticket.ticket_id}: no tests authored — {no_tests_because}. "
@@ -4843,6 +5072,7 @@ class Orchestrator:
             authored_now = not existed
             try:
                 rejected_bindings: list[str] = []
+                laundered: list[str] = []
                 for remaining in (1, 0):
                     completion = self._call(
                         run_id,
@@ -4880,6 +5110,7 @@ class Orchestrator:
                             ),
                             learned_limit=self.config.loop.learned_limit,
                             rejected_bindings=rejected_bindings,
+                            laundered=laundered,
                             # Pointed at rather than left to be noticed. The
                             # tester is the only role that can edit this file,
                             # and a style error in it fails the ticket for as
@@ -4922,22 +5153,51 @@ class Orchestrator:
                         for edit in test_parsed.edits
                         for line in foreign_bindings(edit.content)
                     ]
-                    if not rejected_bindings:
+                    # The other way a test file passes without checking
+                    # anything: reshape the value before comparing it. Same
+                    # treatment as a foreign binding and for the same reason —
+                    # the prohibition was already written down, in the ticket's
+                    # own spec, and the tester wrote the helper anyway.
+                    laundered = [
+                        line
+                        for edit in test_parsed.edits
+                        for line in laundered_assertions(edit.content)
+                    ]
+                    if not rejected_bindings and not laundered:
                         break
-                    self.store.log(
-                        run_id,
-                        f"{ticket.ticket_id}: tester declared the code under test "
-                        f"as a foreign binding "
-                        f"({'; '.join(rejected_bindings)[:200]}); "
-                        + ("asking again." if remaining else "discarding the tests."),
-                        level="warn",
-                        kind="ticket",
-                    )
+                    if rejected_bindings:
+                        self.store.log(
+                            run_id,
+                            f"{ticket.ticket_id}: tester declared the code under test "
+                            f"as a foreign binding "
+                            f"({'; '.join(rejected_bindings)[:200]}); "
+                            + ("asking again." if remaining else "discarding the tests."),
+                            level="warn",
+                            kind="ticket",
+                        )
+                    if laundered:
+                        self.store.log(
+                            run_id,
+                            f"{ticket.ticket_id}: tester asserted through a helper of "
+                            f"its own that reshapes the value first "
+                            f"({'; '.join(laundered)[:200]}); "
+                            + ("asking again." if remaining else "discarding the tests."),
+                            level="warn",
+                            kind="ticket",
+                        )
                     if not remaining:
+                        # Discarded rather than kept. A rigged test is worse
+                        # than no test: review checks the criteria itself when
+                        # there is nothing to run, and cannot when a green
+                        # suite says the criteria are already met.
                         raise ValueError(
                             "tester kept declaring the code under test as a "
                             "foreign binding; tests discarded rather than "
                             "breaking the link for every other ticket"
+                            if rejected_bindings
+                            else "tester kept asserting through its own "
+                            "reshaping helper; tests discarded rather than "
+                            "reporting green for a criterion they do not check"
                         )
 
                 if test_parsed.rejected:
@@ -4976,6 +5236,15 @@ class Orchestrator:
             except (ProviderError, ValueError) as exc:
                 # A missing test is a weaker result, not a failed ticket — the
                 # criteria are still checked by review.
+                #
+                # Carried to the reviewer rather than only logged. Without it
+                # the reviewer judges a ticket whose suite went green without
+                # ever touching these criteria, and has no way to tell that
+                # from one the tests actually cover. The reviewer that saw the
+                # previous version of this ticket read the tester's own
+                # `expect(u32(pcg.randi()))` wrapper as evidence a criterion
+                # was met — being told nothing ran is strictly more than it had.
+                unchecked = str(exc)
                 self.store.end_step(step_id, "failed", str(exc))
                 self._record_step(ticket, "tests", "failed", {"error": str(exc)})
                 self.store.log(
@@ -5000,7 +5269,15 @@ class Orchestrator:
         formattable = list(written)
         if test_path and repro is None:
             formattable.append(test_path)
-        self._format_pass(run_id, ticket, formattable)
+        # The formatter is the first thing in the pipeline to read a file this
+        # attempt wrote, and when it refuses one it says why with a line
+        # number. On one ticket that was `Unexpected token Token('TYPE_HINT',
+        # 'import') at line 3` against a test file, on cycle after cycle, while
+        # the loop spent eight seconds a time running the whole gdUnit suite to
+        # arrive at the same conclusion. Attached to whatever verify goes on to
+        # report, below.
+        unformattable: dict[str, str] = {}
+        self._format_pass(run_id, ticket, formattable, unformattable)
 
         # --- VERIFY --------------------------------------------------
         inherited = pre_existing or {}
@@ -5134,6 +5411,35 @@ class Orchestrator:
             # never landed.
             if scope_note:
                 detail += f"\n\n{scope_note}"
+            # Said first and said plainest. A file the formatter could not read
+            # does not compile, and every other failure in this output is
+            # downstream of that — a test suite reporting `identifier not
+            # declared` about a file whose third line is a syntax error is
+            # describing the same fault twice, from further away. Attaching it
+            # here also puts it in front of the tester, which is what
+            # `errors_naming` reads to decide whether the frozen test file is
+            # the tester's to rewrite; a parse error in that file is nobody
+            # else's.
+            if unformattable:
+                # Grouped by what the formatter said, since one command run
+                # over several files reports them together.
+                said_about: dict[str, list[str]] = {}
+                for path, said in sorted(unformattable.items()):
+                    said_about.setdefault(said, []).append(path)
+                for said, paths in said_about.items():
+                    # Opened with `ERROR:` deliberately, and not for emphasis:
+                    # that is what makes the line a diagnostic block to
+                    # `failures._blocks`, which is what `errors_naming` reads
+                    # out of — and `errors_naming` is what decides whether the
+                    # frozen test file is the tester's to rewrite. A parse
+                    # error in that file is nobody else's, and phrased as
+                    # ordinary prose this sentence reached the prompt without
+                    # ever reaching that decision.
+                    detail += (
+                        f"\n\nERROR: the formatter could not read "
+                        f"{', '.join(paths)}, so nothing downstream could parse "
+                        f"it either:\n" + clip(said.strip(), _FORMAT_DETAIL_CHARS)
+                    )
             return StepResult(ok=False, detail=detail)
 
         # Every step the project has was red, and every one of them was excused.
@@ -5195,6 +5501,7 @@ class Orchestrator:
                     state=state,
                     unchanged=invisible,
                     reproduced=repro,
+                    unchecked=unchecked,
                 ),
                 max_tokens=self._output_budget("reviewer"),
                 temperature=0.0,
@@ -6495,10 +6802,21 @@ class Orchestrator:
             bindings = [
                 line for edit in scoped.edits for line in foreign_bindings(edit.content)
             ]
-            if not scoped.edits or bindings:
+            # A reproduction is the contract the fix is measured against, so a
+            # reshaping helper in it is worse here than in an ordinary test: it
+            # decides when the bug is considered fixed.
+            washed = [
+                line
+                for edit in scoped.edits
+                for line in laundered_assertions(edit.content)
+            ]
+            if not scoped.edits or bindings or washed:
                 detail = (
                     "the tester declared the code under test as a foreign binding"
                     if bindings
+                    else "the tester asserted through a helper of its own that "
+                    "reshapes the value first"
+                    if washed
                     else "the tester wrote no test file"
                 )
                 self.store.end_step(step_id, "failed", detail)
