@@ -121,6 +121,7 @@ from forge.prompts import (
     tests_prompt,
 )
 from forge.providers import available_kinds, build_provider
+from forge.providers.freetoken import _drain_failed as freetoken_drain_failed
 from forge.providers.base import (
     Capabilities,
     Completion,
@@ -18796,6 +18797,104 @@ class TestFreeTokenLoadsTheModelItWasAskedFor(unittest.TestCase):
         self.assertIn("freetoken", available_kinds())
         self.assertEqual(
             build_provider("r", {"kind": "ft", "model": "m"}).kind, "freetoken"
+        )
+
+
+class TestASwitchIsForcedWhenTheOldEngineWillNotDrain(unittest.TestCase):
+    """The daemon drains the running serve before replacing it, and a serve
+    that is mid-generation will not drain:
+
+        503 {"error": "prepare-stop returned HTTP 503",
+             "code": "accounting_prepare_failed", "enginePreserved": true}
+
+    That is the ordinary case, not an exotic one — the engine being replaced
+    was answering a moment ago, and a model that reasons past its output budget
+    goes on answering for a long time after. One run lost ten builds and two
+    records to it, every one reported as the build step failing."""
+
+    BUSY = ('http://127.0.0.1:1900/engine/switch returned 503: '
+            '{"error":"prepare-stop returned HTTP 503",'
+            '"code":"accounting_prepare_failed","enginePreserved":true}')
+
+    def _provider(self):
+        return build_provider("role", {
+            "kind": "freetoken", "port": 1919, "model": "Gemma-4-26B-A4B-NVFP4",
+            "modelPath": r"C:\models\Gemma-4-26B-A4B-NVFP4", "contextWindow": 8192,
+        })
+
+    def _posts(self, provider, fail_first):
+        """Record every switch body; optionally 503 the un-forced one."""
+        sent: list[dict] = []
+        import forge.providers.freetoken as ft
+        original = ft.post_json
+
+        def post(url, body, **kwargs):
+            sent.append(body)
+            if fail_first and not body.get("force"):
+                raise ProviderUnreachable(self.BUSY)
+            return {}
+
+        ft.post_json = post
+        self.addCleanup(lambda: setattr(ft, "post_json", original))
+        provider._serving = lambda: provider.model
+        return sent
+
+    def test_a_busy_engine_is_retried_with_force(self):
+        provider = self._provider()
+        sent = self._posts(provider, fail_first=True)
+
+        provider._switch()
+
+        self.assertEqual(len(sent), 2)
+        self.assertNotIn("force", sent[0])
+        self.assertIs(sent[1]["force"], True)
+
+    def test_a_switch_that_works_is_not_forced(self):
+        provider = self._provider()
+        sent = self._posts(provider, fail_first=False)
+
+        provider._switch()
+
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("force", sent[0])
+
+    def test_engine_arguments_survive_the_forced_retry(self):
+        provider = build_provider("role", {
+            "kind": "freetoken", "port": 1919, "model": "Gemma-4-26B-A4B-NVFP4",
+            "modelPath": r"C:\models\Gemma-4-26B-A4B-NVFP4", "contextWindow": 8192,
+            "engineArgs": ["--max-running-requests", "1"],
+        })
+        sent = self._posts(provider, fail_first=True)
+
+        provider._switch()
+
+        self.assertEqual(sent[1]["args"], ["--max-running-requests", "1"])
+
+    def test_a_daemon_that_is_not_there_is_not_forced(self):
+        # Forcing helps only when the drain failed and the engine was
+        # preserved. A daemon that cannot be reached at all is a different
+        # fault, and retrying it as a force would report the wrong cause.
+        provider = self._provider()
+        tried: list[dict] = []
+        import forge.providers.freetoken as ft
+        original = ft.post_json
+
+        def post(url, body, **kwargs):
+            tried.append(body)
+            raise ProviderUnreachable("could not reach http://127.0.0.1:1900: refused")
+
+        ft.post_json = post
+        self.addCleanup(lambda: setattr(ft, "post_json", original))
+
+        with self.assertRaises(ProviderUnreachable):
+            provider._switch()
+        self.assertEqual(len(tried), 1)
+
+    def test_the_marker_is_read_off_the_real_error(self):
+        self.assertTrue(freetoken_drain_failed(self.BUSY))
+        self.assertFalse(freetoken_drain_failed("engine exited (exited)"))
+        self.assertFalse(
+            freetoken_drain_failed("could not reach 127.0.0.1:1900: refused")
         )
 
 
