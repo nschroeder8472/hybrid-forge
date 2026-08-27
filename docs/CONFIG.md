@@ -92,6 +92,8 @@ Default `openai`. An unknown kind fails at startup naming the ones that exist.
 | `contextWindow` | see below | Total prompt+output budget in tokens. The budget gate reserves output from it and refuses — or trims — a prompt that will not fit. |
 | `maxOutputTokens` | see below | Ceiling on one reply. Too low is not a silent failure: a truncated planner reply is reported as running out of output room, not as bad JSON. |
 | `temperature` | unset | Overrides the temperature the loop asks for. Set it when a model ships a sampling recipe you are meant to follow — several reasoning models degenerate into repetition above their recommended value. |
+| `tokensPerSecond` | `30` | What this endpoint generates at. Only used to work out how long to wait for a call — see below. The default is a floor, not a guess at your hardware. |
+| `timeoutSeconds` | derived | Hard ceiling on one call, in seconds. Overrides the derivation below. `forge doctor` warns when it is too short to generate `maxOutputTokens`. |
 | `rateLimit` | none | See [`rateLimit`](#ratelimit) below. |
 | `cwd` | the project root | Working directory for adapters that shell out. Filled in automatically; override only to point a role at a different checkout. |
 
@@ -101,6 +103,39 @@ endpoint (Ollama's native API answers) and falls back to 8192 when nothing does;
 defaults output to 8192. A window that collapsed to a default is the failure
 that reports six 1-3k-token tickets as "too large for this model" — if you see
 that, set `contextWindow` explicitly and run `forge doctor`.
+
+**How long a call is allowed to take is derived from its budget.** It used to
+be 600 seconds, hardcoded, with no way to change it — which quietly made a
+large `maxOutputTokens` unusable. Generating 65,536 tokens on an endpoint doing
+113 tok/s takes 576 seconds; the socket died first, and what got reported was
+
+```
+timed out after 600s reaching http://127.0.0.1:1919/v1/chat/completions
+```
+
+naming the endpoint, which was answering normally the whole time. It is also
+the most expensive way to fail: no response arrives, so the handler that
+diagnoses a model reasoning past its budget never runs, and a real cause is
+replaced by a false one.
+
+So the timeout now comes from the budget:
+
+```
+timeout = max(600, 120 + maxOutputTokens / tokensPerSecond)
+```
+
+At the default 30 tok/s a 65,536-token budget is allowed 2,304 seconds. That is
+deliberately generous — 30 tok/s is a floor for slow local hardware, so the
+derived timeout is loose on a fast box and still correct on a slow one, and the
+budget you configured is always reachable. Set `tokensPerSecond` to what your
+endpoint actually does to tighten it: at 113.8 the same budget gets 695
+seconds. If you do not know the figure, leave it — the default only ever makes
+the timeout more generous, never shorter than the call needs.
+
+Prefer `tokensPerSecond` over `timeoutSeconds`. An absolute ceiling has to be
+re-tuned by hand every time the budget moves, and forgetting to is exactly how
+the budget stops being reachable again. Use `timeoutSeconds` when you would
+genuinely rather abandon a call than wait for it.
 
 ### `kind: "openai"`
 

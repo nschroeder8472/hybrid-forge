@@ -15,6 +15,7 @@ from typing import Any
 
 from ._http import post_json
 from .base import (
+    DERIVE_TIMEOUT,
     Capabilities,
     Completion,
     Message,
@@ -60,8 +61,11 @@ class GeminiProvider(Provider):
         *,
         max_tokens: int,
         temperature: float = 0.2,
-        timeout: int = 600,
+        timeout: int = DERIVE_TIMEOUT,
     ) -> Completion:
+        # Zero means the caller did not care; the budget decides. An
+        # explicit timeout is always truthy and passes through.
+        timeout = timeout or self.request_timeout(max_tokens)
         system, turns = split_system(messages)
         payload: dict[str, Any] = {
             "contents": [

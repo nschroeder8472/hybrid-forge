@@ -121,6 +121,11 @@ from forge.prompts import (
     tests_prompt,
 )
 from forge.providers import available_kinds, build_provider
+from forge.providers.base import (
+    DEFAULT_TOKENS_PER_SECOND,
+    MIN_TIMEOUT_SECONDS,
+    TIMEOUT_OVERHEAD_SECONDS,
+)
 from forge.providers.freetoken import _drain_failed as freetoken_drain_failed
 from forge.providers.base import (
     Capabilities,
@@ -18798,6 +18803,122 @@ class TestFreeTokenLoadsTheModelItWasAskedFor(unittest.TestCase):
         self.assertEqual(
             build_provider("r", {"kind": "ft", "model": "m"}).kind, "freetoken"
         )
+
+
+class TestATimeoutCoversTheBudgetItWasGiven(unittest.TestCase):
+    """A timeout shorter than the budget makes the budget unreachable.
+
+    The timeout used to be 600s, hardcoded in six `complete` signatures, with
+    no config key anywhere and no call site passing one. A reviewer configured
+    for 65,536 output tokens on a 113.8 tok/s endpoint needs 576s of generation
+    to spend it, so the socket died first — three times in one run, each time
+    reported as:
+
+        timed out after 600s reaching http://127.0.0.1:1919/v1/chat/completions
+
+    which names the endpoint, and the endpoint was answering normally. Worse,
+    the response never arrives, so `_without_thinking` never runs and the
+    actual cause — a model reasoning past its budget — is never diagnosed.
+    """
+
+    def _provider(self, **extra):
+        return build_provider("role", {
+            "kind": "openai", "model": "m", "baseUrl": "http://x/v1",
+            "contextWindow": 262144, "maxOutputTokens": 65536, **extra,
+        })
+
+    def test_the_derived_timeout_can_generate_the_whole_budget(self):
+        provider = self._provider()
+        allowed = provider.request_timeout(65536)
+        self.assertGreaterEqual(
+            allowed, 65536 / DEFAULT_TOKENS_PER_SECOND,
+            "the budget must be spendable inside the timeout that guards it",
+        )
+
+    def test_it_scales_with_the_budget_rather_than_the_model(self):
+        provider = self._provider()
+        self.assertGreater(
+            provider.request_timeout(65536), provider.request_timeout(8192)
+        )
+
+    def test_nothing_is_less_patient_than_the_old_hardcoded_value(self):
+        # A small budget derives a small number; the floor keeps a short call
+        # from being given less room than it had before this was derived.
+        self.assertEqual(self._provider().request_timeout(16), MIN_TIMEOUT_SECONDS)
+
+    def test_a_measured_rate_tightens_the_guard(self):
+        # The point of `tokensPerSecond` over a flat `timeoutSeconds`: the
+        # derived timeout tracks the budget, so raising maxOutputTokens later
+        # cannot silently put it out of reach again.
+        provider = self._provider(tokensPerSecond=113.8)
+        self.assertEqual(
+            provider.request_timeout(65536),
+            int(TIMEOUT_OVERHEAD_SECONDS + 65536 / 113.8),
+        )
+
+    def test_an_explicit_ceiling_wins(self):
+        provider = self._provider(timeoutSeconds=90)
+        self.assertEqual(provider.request_timeout(65536), 90)
+
+    def test_a_ceiling_that_cannot_cover_the_budget_is_reported(self):
+        # Not corrected. Wanting a call cut off early is legitimate; finding
+        # out about it at 2am under the name of a network fault is not.
+        notes = self._provider(timeoutSeconds=600).timeout_notes()
+        self.assertEqual(len(notes), 1)
+        self.assertIn("timeoutSeconds is 600", notes[0])
+        self.assertIn("65,536", notes[0])
+
+    def test_a_derived_timeout_has_nothing_to_report(self):
+        self.assertEqual(self._provider().timeout_notes(), [])
+        self.assertEqual(
+            self._provider(timeoutSeconds=99999).timeout_notes(), []
+        )
+
+    def test_doctor_shows_it_before_the_run_pays_for_it(self):
+        self.assertTrue(
+            any("timeoutSeconds" in note
+                for note in self._provider(timeoutSeconds=600).diagnostics())
+        )
+
+    def test_what_reaches_the_socket_is_the_derived_number(self):
+        provider = self._provider()
+        seen: list[int] = []
+
+        import forge.providers.openai_compat as oc
+        original = oc.post_json
+
+        def post(url, body, *, headers, timeout):
+            seen.append(timeout)
+            return {"choices": [{"message": {"content": "ok"},
+                                 "finish_reason": "stop"}]}
+
+        oc.post_json = post
+        self.addCleanup(lambda: setattr(oc, "post_json", original))
+
+        provider.complete([Message(role="user", content="hi")], max_tokens=65536)
+        self.assertEqual(seen, [provider.request_timeout(65536)])
+
+    def test_a_caller_that_names_one_still_wins(self):
+        # `health()` asks for 60s against a 512-token probe and must keep it:
+        # a doctor sweep that waits 2,304s per dead endpoint is not a sweep.
+        provider = self._provider()
+        seen: list[int] = []
+
+        import forge.providers.openai_compat as oc
+        original = oc.post_json
+
+        def post(url, body, *, headers, timeout):
+            seen.append(timeout)
+            return {"choices": [{"message": {"content": "ok"},
+                                 "finish_reason": "stop"}]}
+
+        oc.post_json = post
+        self.addCleanup(lambda: setattr(oc, "post_json", original))
+
+        provider.complete(
+            [Message(role="user", content="hi")], max_tokens=65536, timeout=60
+        )
+        self.assertEqual(seen, [60])
 
 
 class TestASwitchIsForcedWhenTheOldEngineWillNotDrain(unittest.TestCase):

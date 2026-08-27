@@ -40,7 +40,13 @@ import time
 from typing import Any
 
 from ._http import get_json, post_json
-from .base import Completion, Message, ProviderError, ProviderUnreachable
+from .base import (
+    DERIVE_TIMEOUT,
+    Completion,
+    Message,
+    ProviderError,
+    ProviderUnreachable,
+)
 from .openai_compat import OpenAICompatProvider
 
 # How long to wait for a switched-to engine to start answering. Twenty seconds
@@ -245,7 +251,7 @@ class FreeTokenProvider(OpenAICompatProvider):
         *,
         max_tokens: int,
         temperature: float = 0.2,
-        timeout: int = 600,
+        timeout: int = DERIVE_TIMEOUT,
     ) -> Completion:
         # Before every call, not once at startup. The loop alternates roles and
         # each role is its own provider instance, so what is loaded is decided
