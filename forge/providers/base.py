@@ -188,6 +188,34 @@ class RateLimited(ProviderError):
 # --------------------------------------------------------------------------
 
 
+# What a call's timeout has to cover.
+#
+# Generating `maxOutputTokens` takes as long as it takes, and a timeout shorter
+# than that makes the budget a number the model can never reach. The failure is
+# worse than the waste: the socket dies mid-generation, and what is reported is
+# `timed out ... reaching <url>` — the endpoint, which is the one thing that was
+# not wrong. On one run a reviewer configured for 65,536 tokens against a
+# hardcoded 600s died that way three times in a row while the model behind it
+# was answering normally, and the real cause (a model reasoning past its budget)
+# was never diagnosed because the handler for it is downstream of the response.
+#
+# 30 tok/s is a floor, not an estimate of any particular box. A 26B MoE on an
+# RTX 5090 measured 113.8 tok/s; a dense model on consumer hardware runs a
+# fraction of that. Deriving from the floor is generous where the hardware is
+# fast and still correct where it is slow. `tokensPerSecond` sets the real
+# figure for a run that wants a tighter guard.
+DEFAULT_TOKENS_PER_SECOND = 30.0
+# Prefill, queueing behind another request, and loading a checkpoint that was
+# not resident. Flat, because none of it scales with the output budget.
+TIMEOUT_OVERHEAD_SECONDS = 120
+# Never shorter than the timeout that used to be hardcoded here, so deriving it
+# cannot make any existing configuration less patient than it already was.
+MIN_TIMEOUT_SECONDS = 600
+# Passed as `timeout` to mean "derive one from the budget". A real timeout is
+# always truthy, so an explicit caller — `health()` asks for 60 — still wins.
+DERIVE_TIMEOUT = 0
+
+
 class Provider(ABC):
     """A model endpoint the pipeline can send a chat completion to.
 
@@ -202,6 +230,15 @@ class Provider(ABC):
         self.name = name
         self.config = config
         self.model = config.get("model", "")
+        # An explicit ceiling in seconds. Wins over the derivation below, for
+        # the run that would rather cut a call off than wait for it.
+        self.timeout_seconds = int(config.get("timeoutSeconds", 0) or 0)
+        # What this endpoint actually generates at. Set it and the derived
+        # timeout tracks `maxOutputTokens` on its own, which is the point: an
+        # absolute `timeoutSeconds` has to be re-tuned by hand every time the
+        # budget moves, and forgetting to is exactly how the budget stops
+        # being reachable.
+        self.tokens_per_second = float(config.get("tokensPerSecond", 0) or 0)
 
     @abstractmethod
     def complete(
@@ -210,9 +247,55 @@ class Provider(ABC):
         *,
         max_tokens: int,
         temperature: float = 0.2,
-        timeout: int = 600,
+        timeout: int = DERIVE_TIMEOUT,
     ) -> Completion:
-        """Send a completion request. Raises a ProviderError subclass on failure."""
+        """Send a completion request. Raises a ProviderError subclass on failure.
+
+        `timeout` defaults to whatever `request_timeout` derives from
+        `max_tokens`; pass one only to be less patient than that.
+        """
+
+    def request_timeout(self, max_tokens: int) -> int:
+        """Seconds to allow a call that may generate `max_tokens`.
+
+        The loop never passes a timeout, and it should not have to: the only
+        thing that decides how long a call can legitimately take is the budget
+        it was given, and the provider is the one holding both.
+        """
+        if self.timeout_seconds:
+            return self.timeout_seconds
+        rate = self.tokens_per_second or DEFAULT_TOKENS_PER_SECOND
+        return max(
+            MIN_TIMEOUT_SECONDS,
+            int(TIMEOUT_OVERHEAD_SECONDS + max_tokens / rate),
+        )
+
+    def timeout_notes(self) -> list[str]:
+        """Whether a configured `timeoutSeconds` can cover the output budget.
+
+        Only reachable when someone set one: a derived timeout covers the
+        budget by construction. Reported rather than corrected, because a
+        deliberate ceiling is a legitimate thing to want — what is not
+        legitimate is finding out about it at 2am, wearing the name of a
+        network fault.
+        """
+        if not self.timeout_seconds:
+            return []
+        budget = self.capabilities().max_output_tokens
+        rate = self.tokens_per_second or DEFAULT_TOKENS_PER_SECOND
+        needed = int(TIMEOUT_OVERHEAD_SECONDS + budget / rate)
+        if self.timeout_seconds >= needed:
+            return []
+        reachable = int((self.timeout_seconds - TIMEOUT_OVERHEAD_SECONDS) * rate)
+        return [
+            f"timeoutSeconds is {self.timeout_seconds:,} but generating "
+            f"maxOutputTokens ({budget:,}) needs about {needed:,}s at "
+            f"{rate:g} tok/s. A call that uses more than roughly "
+            f"{max(reachable, 0):,} tokens will be cut off mid-generation and "
+            f"reported as the endpoint timing out. Raise timeoutSeconds to "
+            f"{needed:,}, lower maxOutputTokens, or set tokensPerSecond if "
+            f"{rate:g} tok/s is wrong for this endpoint."
+        ]
 
     def temperature(self, requested: float) -> float:
         """The sampling temperature to actually send.
@@ -284,10 +367,11 @@ class Provider(ABC):
         until a ticket behaves strangely at 2am, and all of them are visible for
         the price of a request `forge doctor` is already making.
 
-        Best-effort and provider-specific; the default is that there is nothing
-        to say.
+        Best-effort and provider-specific; the default is the one check that
+        is not provider-specific at all — whether a timeout set by hand leaves
+        room to generate the budget set by hand.
         """
-        return []
+        return self.timeout_notes()
 
 
 def split_system(messages: list[Message]) -> tuple[str, list[Message]]:

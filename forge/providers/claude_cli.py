@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from .base import (
+    DERIVE_TIMEOUT,
     Capabilities,
     Completion,
     Message,
@@ -151,8 +152,11 @@ class ClaudeCLIProvider(Provider):
         *,
         max_tokens: int,
         temperature: float = 0.2,
-        timeout: int = 600,
+        timeout: int = DERIVE_TIMEOUT,
     ) -> Completion:
+        # Zero means the caller did not care; the budget decides. An
+        # explicit timeout is always truthy and passes through.
+        timeout = timeout or self.request_timeout(max_tokens)
         system, turns = split_system(messages)
 
         argv = [self.binary, "-p", "--output-format", "json"]
