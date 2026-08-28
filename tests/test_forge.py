@@ -18805,6 +18805,263 @@ class TestFreeTokenLoadsTheModelItWasAskedFor(unittest.TestCase):
         )
 
 
+class TestTheEngineIsShapedTheWayTheRoleAsksFor(unittest.TestCase):
+    """A serve started by `/engine/switch` comes up at the engine's default
+    cache sizing, and anything applied by hand belongs to the process it was
+    applied to. So a run that swaps models lands on defaults every swap.
+
+    Measured on one checkpoint: 115,729 KV tokens by default against 759,808
+    applied from the desktop app. On the small one the reviewer reasoned past a
+    65,536-token budget twice without ever answering; on the large one the same
+    prompt finished in 7,533 tokens.
+
+    Nothing here knows anything about a particular model. Which pools exist,
+    what they may be set to, and what the reasoning gears are called all come
+    from `/v1/cache/status`, so a checkpoint with a mamba pool and no window
+    pool configures exactly as well as one with the reverse."""
+
+    GEOMETRY = {
+        "num_pages": 115729, "page_size": 1,
+        "num_swa_pages": 32819, "swa_page_size": 1,
+        "moe_cache_size": 3840, "num_mamba_slots": 0,
+        "limits": {
+            "kv_tokens": {"min": 1, "max": 1063841},
+            "moe_experts": {"min": 128, "max": 3840},
+            "mamba_slots": {"min": 0, "max": 0},
+            "swa_tokens": {"min": 8777, "max": 106384},
+        },
+        "reasoning": {
+            "gears": ["off", "on"], "default": "off",
+            "kwargs": {
+                "off": {"enable_thinking": False, "thinking_mode": "disabled"},
+                "on": {"enable_thinking": True, "thinking_mode": "enabled"},
+            },
+        },
+    }
+
+    def _provider(self, **extra):
+        return build_provider("role", {
+            "kind": "freetoken", "port": 1919, "model": "M", "modelPath": r"C:\m",
+            "contextWindow": 262144, "maxOutputTokens": 65536, **extra,
+        })
+
+    def _wire(self, provider, geometry=None, posts=None):
+        """Answer /v1/cache/status, and record what a rebuild would send."""
+        import forge.providers.freetoken as ft
+        state = {"geometry": dict(geometry or self.GEOMETRY)}
+        original_get, original_post = ft.get_json, ft.post_json
+
+        def get(url, **kwargs):
+            if "cache/status" in url:
+                return {"geometry": state["geometry"]}
+            raise AssertionError(url)
+
+        def post(url, body, **kwargs):
+            if posts is not None:
+                posts.append(body)
+            # A real rebuild is reflected in the geometry read back after it.
+            for field in ("num_pages", "num_swa_pages", "moe_cache_size"):
+                if field in body:
+                    state["geometry"][field] = body[field]
+            return {"status": "ok"}
+
+        ft.get_json, ft.post_json = get, post
+        self.addCleanup(lambda: setattr(ft, "get_json", original_get))
+        self.addCleanup(lambda: setattr(ft, "post_json", original_post))
+        return state
+
+    def test_tokens_become_pages_and_slots_stay_slots(self):
+        provider = self._provider(cache={"kv": 759808, "swa": 23146, "moe": 256})
+        self._wire(provider)
+        self.assertEqual(
+            provider._targets(provider.geometry()),
+            {"num_pages": 759808, "num_swa_pages": 23146, "moe_cache_size": 256},
+        )
+
+    def test_a_page_larger_than_one_token_is_honoured(self):
+        # Never assume 1. It is 1 on radix-SWA and is not on every backend, and
+        # a page size read as 1 when it is 16 asks for a sixteenth of the cache.
+        geometry = {**self.GEOMETRY, "page_size": 16}
+        provider = self._provider(cache={"kv": 1000})
+        self._wire(provider, geometry)
+        # 1000 tokens is 62.5 pages, and a partial page is still allocated.
+        self.assertEqual(provider._targets(provider.geometry())["num_pages"], 63)
+
+    def test_a_pool_this_model_does_not_have_is_refused(self):
+        provider = self._provider(cache={"mamba": 8})
+        self._wire(provider)
+        with self.assertRaises(ProviderError) as caught:
+            provider._targets(provider.geometry())
+        self.assertIn("no 'mamba' cache pool", str(caught.exception))
+
+    def test_a_size_outside_the_limits_is_refused_not_clamped(self):
+        # Clamping would leave the run believing it asked for something it did
+        # not get, which is the whole class of bug this exists to end.
+        provider = self._provider(cache={"swa": 100})
+        self._wire(provider)
+        with self.assertRaises(ProviderError) as caught:
+            provider._targets(provider.geometry())
+        self.assertIn("8,777-106,384", str(caught.exception))
+
+    def test_an_unknown_pool_name_says_what_it_understands(self):
+        provider = self._provider(cache={"gpu": 1})
+        self._wire(provider)
+        with self.assertRaises(ProviderError) as caught:
+            provider._targets(provider.geometry())
+        self.assertIn("kv, mamba, moe, swa", str(caught.exception))
+
+    def test_a_switch_shapes_the_new_serve(self):
+        posts: list[dict] = []
+        provider = self._provider(cache={"kv": 759808, "swa": 23146})
+        self._wire(provider, posts=posts)
+        provider._apply_cache()
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]["num_pages"], 759808)
+        self.assertEqual(posts[0]["num_swa_pages"], 23146)
+
+    def test_a_serve_already_shaped_that_way_is_left_alone(self):
+        # A rebuild stops serving while it runs, and switching back to a model
+        # this provider already shaped is the common case.
+        posts: list[dict] = []
+        provider = self._provider(cache={"kv": 115729, "swa": 32819})
+        self._wire(provider, posts=posts)
+        provider._apply_cache()
+        self.assertEqual(posts, [])
+
+    def test_a_refused_rebuild_is_not_reported_as_success(self):
+        # The endpoint answers per pool, and one that will not fit the VRAM
+        # budget is refused on its own - leaving a geometry nobody chose.
+        import forge.providers.freetoken as ft
+        provider = self._provider(cache={"kv": 759808})
+        original_get, original_post = ft.get_json, ft.post_json
+        ft.get_json = lambda url, **kw: {"geometry": self.GEOMETRY}
+        ft.post_json = lambda url, body, **kw: {"status": "rejected"}
+        self.addCleanup(lambda: setattr(ft, "get_json", original_get))
+        self.addCleanup(lambda: setattr(ft, "post_json", original_post))
+        with self.assertRaises(ProviderUnreachable) as caught:
+            provider._apply_cache()
+        self.assertIn("refused", str(caught.exception))
+
+    def test_no_cache_configured_touches_nothing(self):
+        posts: list[dict] = []
+        provider = self._provider()
+        self._wire(provider, posts=posts)
+        provider._apply_cache()
+        self.assertEqual(posts, [])
+
+    # -- reasoning gears ------------------------------------------------
+
+    def test_a_gear_resolves_to_the_engines_own_fields(self):
+        provider = self._provider(reasoning="on")
+        self._wire(provider)
+        self.assertEqual(
+            provider._reasoning_body(),
+            {"chat_template_kwargs":
+                {"enable_thinking": True, "thinking_mode": "enabled"}},
+        )
+
+    def test_the_gear_travels_as_template_kwargs_not_request_fields(self):
+        """Where these go decides whether they do anything, and the wrong
+        place fails silently.
+
+        Measured against one engine, same prompt, only the nesting moved:
+
+            nothing sent               4 tokens,   0 chars of reasoning
+            chat_template_kwargs on  216 tokens, 436 chars
+            top-level                  4 tokens,   0 chars
+
+        Sent flat they are dropped without a word and the engine falls back to
+        its default gear, which on that checkpoint is `off` — so a reviewer
+        configured to think returns an instant ACCEPT and reads like a model
+        that simply will not reason. They are the checkpoint's jinja template
+        variables, not request fields, and nesting is what makes them arrive.
+        """
+        provider = self._provider(reasoning="on")
+        self._wire(provider)
+        provider._ensure_loaded = lambda: None
+
+        import forge.providers.openai_compat as oc
+        sent: list[dict] = []
+        original = oc.post_json
+
+        def post(url, body, **kwargs):
+            sent.append(body)
+            return {"choices": [{"message": {"content": "ok"},
+                                 "finish_reason": "stop"}]}
+
+        oc.post_json = post
+        self.addCleanup(lambda: setattr(oc, "post_json", original))
+        provider.complete([Message(role="user", content="hi")], max_tokens=16)
+
+        self.assertEqual(
+            sent[0]["chat_template_kwargs"],
+            {"enable_thinking": True, "thinking_mode": "enabled"},
+        )
+        # Flat copies would be inert, and their presence would suggest the
+        # gear had been delivered when it had not.
+        self.assertNotIn("enable_thinking", sent[0])
+        self.assertNotIn("thinking_mode", sent[0])
+
+    def test_a_gear_the_model_lacks_is_refused_with_what_it_has(self):
+        # The failure this replaces was silent: the engine logged that
+        # `reasoning_effort medium` was not supported, used the template
+        # default, and answered - so two roles spent a whole run believing
+        # they had asked for something.
+        provider = self._provider(reasoning="medium")
+        self._wire(provider)
+        with self.assertRaises(ProviderError) as caught:
+            provider._reasoning_body()
+        message = str(caught.exception)
+        self.assertIn("no 'medium' reasoning gear", message)
+        self.assertIn("off, on", message)
+
+    def test_an_operators_own_body_still_wins(self):
+        provider = self._provider(
+            reasoning="on",
+            extraBody={"chat_template_kwargs": {"thinking_mode": "custom"}},
+        )
+        self._wire(provider)
+        provider._ensure_loaded = lambda: None
+        import forge.providers.openai_compat as oc
+        sent: list[dict] = []
+        original = oc.post_json
+
+        def post(url, body, **kwargs):
+            sent.append(body)
+            return {"choices": [{"message": {"content": "ok"},
+                                 "finish_reason": "stop"}]}
+
+        oc.post_json = post
+        self.addCleanup(lambda: setattr(oc, "post_json", original))
+        provider.complete([Message(role="user", content="hi")], max_tokens=16)
+        # Merged one level in, not overlaid: setting one template variable
+        # must not drop the others the gear selects.
+        self.assertEqual(
+            sent[0]["chat_template_kwargs"],
+            {"enable_thinking": True, "thinking_mode": "custom"},
+        )
+
+    def test_an_older_serve_without_geometry_passes_the_name_through(self):
+        import forge.providers.freetoken as ft
+        provider = self._provider(reasoning="low")
+        original = ft.get_json
+
+        def get(url, **kwargs):
+            raise OSError("no such endpoint")
+
+        ft.get_json = get
+        self.addCleanup(lambda: setattr(ft, "get_json", original))
+        self.assertEqual(provider._reasoning_body(), {"reasoning_effort": "low"})
+
+    def test_doctor_prints_the_pools_and_gears_a_byom_user_cannot_guess(self):
+        provider = self._provider()
+        self._wire(provider)
+        notes = " | ".join(provider.diagnostics())
+        self.assertIn("cache pools available", notes)
+        self.assertIn("swa 8,777-106,384", notes)
+        self.assertIn("reasoning gears: off, on", notes)
+
+
 class TestATimeoutCoversTheBudgetItWasGiven(unittest.TestCase):
     """A timeout shorter than the budget makes the budget unreachable.
 

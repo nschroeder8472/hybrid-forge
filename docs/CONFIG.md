@@ -137,6 +137,84 @@ re-tuned by hand every time the budget moves, and forgetting to is exactly how
 the budget stops being reachable again. Use `timeoutSeconds` when you would
 genuinely rather abandon a call than wait for it.
 
+### `kind: "freetoken"`
+
+| Key | Default | Notes |
+|---|---|---|
+| `modelPath` | `model` | Filesystem path to the checkpoint. The daemon hands this to `AutoConfig.from_pretrained`, so a bare name is looked up on HuggingFace and the engine exits before it binds a port. |
+| `port` | `1919` | Where the serve listens. `baseUrl` is the other spelling of the same thing. |
+| `daemonUrl` | `http://127.0.0.1:1900` | The control plane that owns the GPU. |
+| `engineArgs` | none | Extra launch flags for the serve. |
+| `switchSeconds` | `300` | How long to wait for a switched-to engine to answer. |
+| `cache` | none | Cache pool sizes for this role. See below. |
+| `rebuildSeconds` | `300` | How long a cache rebuild may take. Serving pauses while it runs. |
+| `reasoning` | none | Which reasoning gear to ask for, named the way this checkpoint names it. See below. |
+
+**`cache` — the knobs your model actually has.** FreeToken serves one model at
+a time, and a serve started by `/engine/switch` comes up at the engine's own
+default sizing. Anything applied by hand — the desktop app's Apply button, `ft
+ctl cache`, the shell's `/cache` — belongs to the process it was applied to and
+dies with it. A run that alternates roles replaces the serve on every swap, so
+without this block every call lands on defaults no matter what you set
+elsewhere.
+
+That is not a small difference. On one 26B checkpoint the default was 115,729
+KV tokens against 759,808 applied by hand; on the small one a reviewer reasoned
+past a 65,536-token budget twice without ever producing an answer, and on the
+large one the same prompt finished in 7,533 tokens.
+
+Counts are in **tokens** for `kv` and `swa`, **slots** for `moe` and `mamba` —
+the units the engine shows you. Name only the pools you care about; the rest
+are left alone.
+
+```json
+"reviewer": {
+  "kind": "freetoken",
+  "model": "Gemma-4-26B-A4B-NVFP4",
+  "modelPath": "C:\\models\\Gemma-4-26B-A4B-NVFP4",
+  "cache": { "kv": 759808, "swa": 23146, "moe": 256 },
+  "reasoning": "on"
+}
+```
+
+Per model block, so two roles on the same checkpoint can differ — a coder
+holding six reference files and a reviewer reading one diff do not want the
+same geometry, and they are separate blocks precisely so they need not.
+
+Nothing about this is per-model in forge. Which pools a checkpoint has, what
+each may be set to, and what its reasoning gears are called are read from
+`GET /v1/cache/status` on the running serve. A checkpoint with a mamba pool and
+no window pool configures exactly as well as one with the reverse, and a model
+released next year configures without forge learning its name. `forge doctor`
+prints what it found:
+
+```
+  reviewer: ok name=reviewer kind=freetoken model=Gemma-4-26B-A4B-NVFP4 reply='OK'
+      cache pools available: kv 1-1,063,841; moe 128-3,840; swa 8,777-106,384
+      reasoning gears: off, on (default 'off')
+```
+
+A size outside those limits is **refused, not clamped**, and a pool the model
+does not have is refused by name. Silently shrinking a budget to what fits
+leaves the run believing it asked for something it did not get, which is the
+failure this whole block exists to end.
+
+**`reasoning` — the gear, not a guess.** `extraBody.reasoning_effort` is the
+OpenAI spelling and it is a poor instrument here, because a checkpoint that
+does not grade its thinking accepts the field and ignores it. Measured on a
+26B model: the engine logged
+
+```
+reasoning_effort 'medium' is not supported by this checkpoint; using the template default
+```
+
+and answered anyway. Two roles spent an entire run believing they had asked for
+something. That checkpoint has two gears, `off` and `on`, and reports them —
+along with the request fields that select each. So name the gear and forge
+sends the engine's own fields for it; a gear the model does not have is refused
+up front, naming the ones it has. Anything you write in `extraBody` still wins
+over the gear.
+
 ### `kind: "openai"`
 
 | Key | Default | Notes |
