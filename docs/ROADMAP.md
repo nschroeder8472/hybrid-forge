@@ -7,10 +7,15 @@ deleted rather than implemented.
 
 ---
 
-## Convergence — specified, not built
+## Convergence — built, never run
 
 **Status:** ten features specified in [CONVERGENCE.md](CONVERGENCE.md), derived
-from the `Puzzle-Path` run of 2026-08-22/23.
+from the `Puzzle-Path` run of 2026-08-22/23. Nine shipped; Feature 5 was built,
+replayed against that run's own data, and reverted. **No backlog has run with
+any of it on** — every number in that document is a replay over recorded steps,
+which is the weaker evidence in the direction that matters: it shows what the
+code would have done to failures that already happened, not what a live run
+does to the failures it causes itself.
 
 The problem that document names: a run can be long without being wrong, and
 this one was neither converging nor able to tell. 18.2 hours, 24.5M tokens, 430
@@ -22,6 +27,43 @@ were never shown.
 
 The stall-detection note under *Deferred from the review* below is the same
 problem seen from the image loop, and Feature 7 is its general answer.
+
+---
+
+## Adaptive ticket loop — specified, not built
+
+**Status:** specified in [ADAPTIVE-TICKET-LOOP.md](ADAPTIVE-TICKET-LOOP.md).
+Written before the convergence work landed and revised against it, so about
+half of the original draft is now a description of shipped behaviour rather
+than a proposal.
+
+The problem it names is the half of churn the convergence work does not
+measure. `_convergence` compares this cycle's failure classes against the last
+and answers *is the set moving* — `descending`, `churning`, `flat`. Nothing
+reads *how big the set is*. A ticket failing on 38 distinct classes and one
+failing on 7 are indistinguishable to every brake in the loop, and the only
+remedies either is offered are another attempt, a respec, or a park. The
+missing remedy is decomposition, and the invariant that makes it safe where
+respec is not: the union of the children's acceptance criteria must cover the
+parent's, so scope is conserved by construction rather than by judgement.
+
+Three things the revision settled against the reference run rather than by
+argument, each worth reading before picking the document up:
+
+- **Its volume threshold splits the wrong tickets.** At the drafted value, the
+  two tickets that went on to pass are decomposed and the one genuinely
+  unsatisfiable ticket is left alone. The same shape as the `flatCycles`
+  finding, and the same conclusion: record the signal, ship the brake off.
+- **Its rule-promotion pipeline is Feature 5**, which was built and reverted —
+  the planner rephrases every lesson, so a gate keyed on recurring text
+  promotes nothing.
+- **Its respec rule is backwards.** It permits adding acceptance criteria; the
+  ratchet refuses additions, because the party that has just exhausted its
+  attempts does not get to raise the bar it is judged against.
+
+**What it asks for first is a live run**, not code. Building split on top of
+nine unvalidated features makes a second layer with no way to attribute a
+failure to either.
 
 ---
 

@@ -731,7 +731,8 @@ it is a one-line edit in `roles`.
   "commands": {
     "lint": "cargo clippy --all-targets -- -D warnings",
     "typecheck": "cargo check --all-targets",
-    "test": "cargo test"
+    "test": "cargo test",
+    "format": "rustfmt"
   },
   "neverDelegate": [
     "src/auth/**",
@@ -739,13 +740,16 @@ it is a one-line edit in `roles`.
     ".github/workflows/**"
   ],
   "memory": {
-    "command": ["mempalace-mcp"],
+    "command": [
+      "mempalace-mcp"
+    ],
     "room": "image-marquee",
     "limit": 6,
     "maxTokens": 1200,
     "write": true,
     "recordRole": "reviewer",
-    "maxWriteChars": 2000
+    "maxWriteChars": 2000,
+    "dryRun": true
   },
   "loop": {
     "maxAttempts": 3,
@@ -762,12 +766,15 @@ it is a one-line edit in `roles`.
     "pollSeconds": 2.0,
     "maxRuntimeSeconds": 0,
     "baselineVerify": true,
+    "bugHypotheses": 3,
     "executorTurns": 4,
     "innerTurns": 0,
     "toolchainContext": true,
     "priorFailures": 8,
     "learnedLimit": 12,
-    "flatCycles": 3,
+    "flatCycles": 0,
+    "reviewWhenStuck": 2,
+    "freezeTests": true,
     "ratifyPasses": 2
   },
   "ui": {
