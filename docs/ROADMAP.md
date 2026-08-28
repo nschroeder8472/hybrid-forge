@@ -67,6 +67,38 @@ failure to either.
 
 ---
 
+## Handback — specified, not built
+
+**Status:** specified in [HANDBACK.md](HANDBACK.md).
+
+The loop has seven ways to stop working on a ticket and hand it back — a route
+it will not take, an unmet dependency, `BLOCKED:`, `IMPOSSIBLE:`, a ladder
+park, ratification without a majority, a bug that never reproduced. Every one
+of them writes a sentence into `blocked_note` addressed to a person, and there
+is no channel for that person to answer on. `respec_prompt` already carries
+`report`, `ruled_out`, `contradiction` and `stuck`; a human's note is the block
+it does not have.
+
+Two smaller defects the document is built around. `TICKET_SKIPPED` means both
+*a person must write this* and *this is waiting on PF-002*, distinguishable
+only by reading prose. And a ticket routed away from the executor has no exit:
+`forge retry --all` resets it to `pending`, `_work_ticket` re-reads the route
+and skips it again, and nothing in the codebase ever writes `ticket.route`
+after ingest — so work a human has already implemented by hand cannot rejoin
+the run, and its dependents stay parked behind it.
+
+`claude-only` becomes `withheld:<reason>` over a closed vocabulary drawn from
+the categories the delegation-protocol skill already lists. The colon form is
+deliberate: every gate is written as `route != "delegate"` today, so a reason
+can be added without touching one of them, and rows recorded by older runs keep
+gating correctly.
+
+**The gate itself is not up for removal.** A withheld ticket is withheld
+because a model should not write that code, not for want of detail, and a
+better-specified auth ticket still ends with a model writing auth.
+
+---
+
 ## Bug-report loop — built
 
 **Status:** shipped as `forge bug`. See [BUG-LOOP.md](BUG-LOOP.md) for how it
