@@ -20570,3 +20570,287 @@ class TestRatifyOrderIsTheOperatorsToChoose(unittest.TestCase):
             ratify._vote, ratify._settle = original_vote, original_settle
 
         self.assertEqual(asked, ["planner", "reviewer", "executor", "tester"])
+
+
+class TestATicketCanReadWhatItsDependenciesWrote(unittest.TestCase):
+    """A dependency's output was invisible to its dependent by construction.
+
+    `reading_scope` keeps only paths that resolve and expands siblings only
+    where the directory exists, and it is computed once at ingest — before any
+    ticket has run. So at the moment a dependent's read scope is worked out,
+    the files it depends on do not exist, and nothing recomputed it when they
+    did.
+
+    Measured on one backlog: PF-003 declared `needs: ["PF-002"]` and was handed
+    a GDScript loader and a smoke test, while PF-002 wrote the `LevelModel`
+    type PF-003 exists to serialize. Four objections across two runs said so —
+    all correct, none actionable — and the ticket parked without an attempt.
+    """
+
+    def _loop(self, root):
+        loop = Orchestrator.__new__(Orchestrator)
+        loop.config = Config.load(root)
+        return loop
+
+    def _root(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"a": {"kind": "openai", "model": "m"}},
+                    "roles": {
+                        "planner": "a",
+                        "executor": "a",
+                        "tester": "a",
+                        "reviewer": "a",
+                    },
+                    "commands": {"test": "pytest"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return root
+
+    @staticmethod
+    def _write(root, path, text="x = 1\n"):
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    def _run(self, root, dependency, dependent):
+        """Wire a two-ticket store and put `dependent` through the inheritance."""
+        import types as _types
+
+        logged = []
+        updated = []
+        loop = self._loop(root)
+        loop.store = _types.SimpleNamespace(
+            list_tickets=lambda run_id: [dependency, dependent],
+            update_ticket=lambda run_id, ticket: updated.append(ticket.ticket_id),
+            log=lambda run_id, message, **kw: logged.append(message),
+        )
+        loop._inherit_dependency_reads(1, dependent)
+        return logged, updated
+
+    def test_a_dependencys_files_become_readable_once_they_exist(self):
+        root = self._root()
+        self._write(root, "src/level/types.ts")
+        self._write(root, "src/level/parse.ts")
+
+        parser = Ticket(
+            ticket_id="PF-002",
+            allowed_files=["src/level/types.ts", "src/level/parse.ts"],
+        )
+        serializer = Ticket(
+            ticket_id="PF-003",
+            allowed_files=["src/level/serialize.ts"],
+            needs=["PF-002"],
+        )
+
+        logged, updated = self._run(root, parser, serializer)
+
+        self.assertIn("src/level/types.ts", serializer.reference_files)
+        self.assertIn("src/level/parse.ts", serializer.reference_files)
+        self.assertEqual(updated, ["PF-003"])
+        self.assertIn("PF-002", logged[0])
+
+    def test_a_ticket_with_no_dependencies_is_left_alone(self):
+        root = self._root()
+        self._write(root, "src/level/types.ts")
+        alone = Ticket(ticket_id="PF-002", allowed_files=["src/level/types.ts"])
+
+        logged, updated = self._run(root, alone, alone)
+
+        self.assertEqual(updated, [])
+        self.assertEqual(logged, [])
+
+    def test_a_dependency_that_wrote_nothing_yet_contributes_nothing(self):
+        # `reading_scope` drops what it cannot open, so a dependency that never
+        # ran cannot smuggle a phantom path into a prompt — which is invariant
+        # 10's rule, and the reason this is safe to run before the build.
+        root = self._root()
+        parser = Ticket(ticket_id="PF-002", allowed_files=["src/level/types.ts"])
+        serializer = Ticket(
+            ticket_id="PF-003",
+            allowed_files=["src/level/serialize.ts"],
+            needs=["PF-002"],
+        )
+
+        logged, updated = self._run(root, parser, serializer)
+
+        self.assertEqual(serializer.reference_files, [])
+        self.assertEqual(updated, [])
+        self.assertEqual(logged, [])
+
+    def test_the_tickets_own_declared_references_are_not_displaced(self):
+        # `reading_scope` takes `reference` in order and caps the rest, so a
+        # path a human chose has to stay ahead of anything derived.
+        root = self._root()
+        self._write(root, "scripts/level_loader.gd")
+        self._write(root, "src/level/types.ts")
+        parser = Ticket(ticket_id="PF-002", allowed_files=["src/level/types.ts"])
+        serializer = Ticket(
+            ticket_id="PF-003",
+            allowed_files=["src/level/serialize.ts"],
+            reference_files=["scripts/level_loader.gd"],
+            needs=["PF-002"],
+        )
+
+        self._run(root, parser, serializer)
+
+        self.assertEqual(serializer.reference_files[0], "scripts/level_loader.gd")
+        self.assertIn("src/level/types.ts", serializer.reference_files)
+
+    def test_a_dependency_named_but_absent_from_the_run_is_not_an_error(self):
+        root = self._root()
+        self._write(root, "src/level/types.ts")
+        serializer = Ticket(
+            ticket_id="PF-003",
+            allowed_files=["src/level/serialize.ts"],
+            needs=["PF-999"],
+        )
+
+        logged, updated = self._run(root, serializer, serializer)
+
+        self.assertEqual(updated, [])
+        self.assertEqual(logged, [])
+
+
+class TestRatifyMayRewordCriteriaButNotInventThem(unittest.TestCase):
+    """Moving a criterion is this pass's job; adding one is raising the bar.
+
+    A planner asked to settle a ticket carrying four measured hash vectors
+    added four more of its own. Three were right by luck. The fourth —
+    `postVariant(3130775471, 0, 0, 10) returns 2`, where the hash it had just
+    agreed to ends in 7 — was arithmetic nobody had done. Nothing downstream
+    could tell it from a measured value: it cost five attempts, parked the
+    ticket, and skipped the two that depended on it.
+    """
+
+    @staticmethod
+    def _ticket():
+        return Ticket(
+            ticket_id="PF-007",
+            title="hash",
+            spec="port the hasher",
+            criteria=[
+                "`hashVector3i(0, 0, 0)` returns 1691721052.",
+                "`postVariant(3130775471, 0, 0, 3)` returns 0.",
+            ],
+        )
+
+    @staticmethod
+    def _store():
+        import types as _types
+
+        logged = []
+        return _types.SimpleNamespace(
+            log=lambda run_id, message, **kw: logged.append(message),
+            list_tickets=lambda run_id: [],
+            update_ticket=lambda run_id, ticket: None,
+        ), logged
+
+    def test_an_added_criterion_is_refused_and_named(self):
+        ticket = self._ticket()
+        store, logged = self._store()
+        revision = {
+            "criteria": [
+                "hashVector3i(0, 0, 0) returns 1691721052.",
+                "postVariant(3130775471, 0, 0, 3) returns 0.",
+                "postVariant(3130775471, 0, 0, 10) returns 2.",
+            ]
+        }
+
+        ratify._apply(store, 1, ticket, revision, root=None)
+
+        self.assertEqual(len(ticket.criteria), 2)
+        self.assertIn("postVariant(3130775471, 0, 0, 10)", " ".join(logged))
+        self.assertIn("respecCriteria", " ".join(logged))
+
+    def test_rewording_the_same_number_of_criteria_still_works(self):
+        # The refusal is on growth, not on change. Making an unassertable
+        # criterion assertable is the whole point of the pass.
+        ticket = self._ticket()
+        store, logged = self._store()
+        revision = {
+            "criteria": [
+                "hashVector3i(0, 0, 0) returns exactly 1691721052 as an unsigned value.",
+                "postVariant(3130775471, 0, 0, 3) returns 0.",
+            ]
+        }
+
+        ratify._apply(store, 1, ticket, revision, root=None)
+
+        self.assertIn("unsigned", ticket.criteria[0])
+        self.assertEqual(logged, [])
+
+    def test_removing_a_criterion_is_not_growth(self):
+        ticket = self._ticket()
+        store, logged = self._store()
+
+        ratify._apply(
+            store, 1, ticket, {"criteria": ["hashVector3i(0, 0, 0) returns 1691721052."]},
+            root=None,
+        )
+
+        self.assertEqual(len(ticket.criteria), 1)
+
+    def test_an_operator_can_unlock_additions(self):
+        ticket = self._ticket()
+        store, logged = self._store()
+        revision = {
+            "criteria": [
+                "hashVector3i(0, 0, 0) returns 1691721052.",
+                "postVariant(3130775471, 0, 0, 3) returns 0.",
+                "postVariant(3130775471, 0, 0, 10) returns 2.",
+            ]
+        }
+
+        ratify._apply(store, 1, ticket, revision, root=None, criteria_locked=False)
+
+        self.assertEqual(len(ticket.criteria), 3)
+
+    def test_backticks_and_case_do_not_make_a_rewrite_look_new(self):
+        self.assertEqual(
+            ratify._normalise_criterion("`hashVector3i(0, 0, 0)` returns 1691721052."),
+            ratify._normalise_criterion("hashVector3i(0, 0, 0)  returns 1691721052"),
+        )
+
+
+class TestAConfiguredTemperatureNeedNotOverrideDeterminism(unittest.TestCase):
+    """The loop asks 0.0 where it needs the same answer twice.
+
+    A scalar `temperature` overrides that as readily as it overrides the 0.2 a
+    build asks for, so following a vendor's sampling recipe silently costs
+    reproducible sign-off. Measured: the same nine-ticket backlog run twice
+    under identical configuration, two tickets swapping verdicts.
+    """
+
+    @staticmethod
+    def _at(configured, requested):
+        block = {"kind": "openai", "model": "m"}
+        if configured is not None:
+            block["temperature"] = configured
+        return build_provider("role", block).temperature(requested)
+
+    def test_a_scalar_still_wins_everywhere(self):
+        self.assertEqual(self._at(0.6, 0.0), 0.6)
+        self.assertEqual(self._at(0.6, 0.2), 0.6)
+
+    def test_a_map_lets_a_requested_zero_through(self):
+        configured = {"default": 0.6, "deterministic": 0.0}
+
+        self.assertEqual(self._at(configured, 0.0), 0.0)
+        self.assertEqual(self._at(configured, 0.2), 0.6)
+
+    def test_an_omitted_key_leaves_the_loops_own_number_alone(self):
+        # `{"default": 0.6}` is the honest spelling of "follow the recipe, but
+        # let determinism through".
+        self.assertEqual(self._at({"default": 0.6}, 0.0), 0.0)
+        self.assertEqual(self._at({"default": 0.6}, 0.2), 0.6)
+        self.assertEqual(self._at({"deterministic": 0.0}, 0.2), 0.2)
+
+    def test_nothing_configured_is_unchanged(self):
+        self.assertEqual(self._at(None, 0.0), 0.0)
+        self.assertEqual(self._at(None, 0.2), 0.2)

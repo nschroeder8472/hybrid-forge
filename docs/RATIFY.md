@@ -72,6 +72,22 @@ recorded, and the rest of the backlog carries on.
 `spec`, `context`, `allowed_files`, `reference_files` — and, unlike respec,
 **`criteria`**.
 
+**Reword them, not add them.** Making an unassertable criterion assertable is
+the work this pass exists to do; inventing a new one is raising the bar the
+ticket is judged against, and the planner has no way to compute a value it
+makes up. Asked to settle a ticket carrying measured Godot hash vectors, one
+planner grew ten criteria to fourteen. Three of the four it added happened to
+be right. The fourth — `postVariant(3130775471, 0, 0, 10) returns 2`, against a
+hash it had just agreed ends in 7 — was arithmetic nobody had done, and nothing
+downstream could tell it from a measured value. It cost five attempts, parked
+the ticket, and skipped the two that depended on it.
+
+So a revision that ends with more criteria than it started with is refused
+whole, and the added ones are named in the run log. Refused rather than
+trimmed: there is no reliable way to tell which of fourteen replaced which of
+ten, and keeping the ten a human wrote is the safe direction. `loop.respecCriteria`
+unlocks it.
+
 This is the one place in the loop where the bar may move, and it is deliberate.
 Respec refuses new criteria because of *when* it runs: on a ticket that has
 just exhausted its attempts, where raising the bar cannot serve the purpose of

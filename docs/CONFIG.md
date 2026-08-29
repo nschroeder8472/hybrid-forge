@@ -92,7 +92,7 @@ Default `openai`. An unknown kind fails at startup naming the ones that exist.
 | `model` | `""` | The model id sent to the backend. Required by `openai`, `anthropic` and `gemini`; optional for `claude-cli` (empty = whatever the CLI defaults to) and `command`. |
 | `contextWindow` | see below | Total prompt+output budget in tokens. The budget gate reserves output from it and refuses — or trims — a prompt that will not fit. |
 | `maxOutputTokens` | see below | Ceiling on one reply. Too low is not a silent failure: a truncated planner reply is reported as running out of output room, not as bad JSON. |
-| `temperature` | unset | Overrides the temperature the loop asks for. Set it when a model ships a sampling recipe you are meant to follow — several reasoning models degenerate into repetition above their recommended value. |
+| `temperature` | unset | Overrides the temperature the loop asks for. Set it when a model ships a sampling recipe you are meant to follow — several reasoning models degenerate into repetition above their recommended value. A number overrides *every* call; an object `{"default": 0.6, "deterministic": 0.0}` overrides only the ones the loop did not ask determinism for. See below. |
 | `tokensPerSecond` | `30` | What this endpoint generates at. Only used to work out how long to wait for a call — see below. The default is a floor, not a guess at your hardware. |
 | `timeoutSeconds` | derived | Hard ceiling on one call, in seconds. Overrides the derivation below. `forge doctor` warns when it is too short to generate `maxOutputTokens`. |
 | `rateLimit` | none | See [`rateLimit`](#ratelimit) below. |
@@ -137,6 +137,27 @@ Prefer `tokensPerSecond` over `timeoutSeconds`. An absolute ceiling has to be
 re-tuned by hand every time the budget moves, and forgetting to is exactly how
 the budget stops being reachable again. Use `timeoutSeconds` when you would
 genuinely rather abandon a call than wait for it.
+
+**A configured temperature need not override determinism.** The loop does not
+ask for one temperature. It asks **0.0** where it needs the same answer twice —
+the sign-off votes, the verdict parse, the respec — and 0.1 or 0.2 where it
+wants the model to reach. A scalar `temperature` overrides both, so following a
+vendor's sampling recipe silently costs reproducible ratification. Measured: one
+nine-ticket backlog run twice under identical configuration, two tickets
+swapping verdicts, because every ratify vote ran at 0.6 where the loop had asked
+for 0.
+
+An object splits the two:
+
+```json
+"plan": { "temperature": { "default": 0.6, "deterministic": 0.0 } }
+```
+
+`deterministic` applies when the loop asked for exactly zero, `default` to
+everything else. Either key may be omitted and an omitted one leaves the loop's
+own number alone, which makes `{"default": 0.6}` the honest spelling of *follow
+the recipe, but let determinism through*. A bare number still overrides
+everything, so nothing that worked before changes.
 
 ### `kind: "freetoken"`
 
@@ -738,7 +759,7 @@ run some context, never the run.
 | `stopOnBlocked` | `false` | Stop the whole run when a ticket blocks, instead of moving on. On means a blocker gets attention; off means the backlog keeps making progress elsewhere. |
 | `retryCycles` | `0` | Whole-backlog retry cycles after a run ends anything but done. `0` hands back to a human, `-1` keeps going until the backlog is clean or you stop it. Anything below `-1` is a typo and is rejected. |
 | `respecOnRetry` | `true` | Have the planner rewrite each requeued ticket from why it failed before the next cycle. A cycle that re-runs the spec which already failed is a slower version of the same failure. |
-| `respecCriteria` | `false` | Let a respec rewrite the acceptance criteria too. Off: the party being judged does not write the standard it is judged against. Left on, one ticket's criteria drifted until they asserted the opposite of what its author wrote. |
+| `respecCriteria` | `false` | Let a respec rewrite the acceptance criteria too, and let ratification *add* them. Off: the party being judged does not write the standard it is judged against. Left on, one ticket's criteria drifted until they asserted the opposite of what its author wrote — and a ratify pass grew a ten-criterion ticket to fourteen, inventing a hash value it had no way to compute. |
 | `reopenStaleDependents` | `true` | Re-open a ticket that passed on top of a dependency a respec has since rewritten — its `done` was earned against a contract that no longer exists. Can re-open a lot of a backlog after one respec; turn it off to be warned instead. |
 | `preflight` | `true` | Probe every model before the first ticket, so a dead endpoint fails in seconds rather than one ticket at a time. |
 | `preflightCanary` | `true` | Prove, rather than infer, that each build's test command actually reads each language **this backlog is about to write**. Writes an unparseable file where that language's tests live, runs the command over it, and requires the command to go red **and** to name the file — then deletes it. Coverage used to be read off the *text* of a command against a table of known runners, and a runner the table has never heard of answers "covered" for everything: one gdUnit4 launcher reported itself as the test command for 4,000 lines of TypeScript and exited 0 fifteen times. A build that fails this blocks the run before anything is delegated. Scoped to the languages the tickets declare they will write, not to every language in the tree — a Godot repository with one Python helper script beside its `project.godot` has `.py` present, nothing that runs it, and no ticket that cares. Costs one command per language per build, once per run. Turn off for a suite slow enough that paying it at startup is worse than finding out later; `forge toolchain --language X --skip` is the narrower way to excuse one language, and says so on the record. |
