@@ -20854,3 +20854,63 @@ class TestAConfiguredTemperatureNeedNotOverrideDeterminism(unittest.TestCase):
     def test_nothing_configured_is_unchanged(self):
         self.assertEqual(self._at(None, 0.0), 0.0)
         self.assertEqual(self._at(None, 0.2), 0.2)
+
+
+class TestTheSignOffPassDoesNotAskForAReview(unittest.TestCase):
+    """Ratification runs before anything is built, and the prompt has to say so
+    in the place the model is actually reading.
+
+    The system message always said it. The reviewer's *question* undercut it:
+    "rule on this ticket from a diff and these criteria alone… name any
+    criterion you could not check by reading the change" reads, to a smaller
+    model, as though a diff existed and had been withheld. One 30B reviewer
+    answered exactly that way —
+
+        Round-trip test implementation missing, so cannot verify discovery of
+        exactly 63 files.
+        serializeLevel implementation not present, cannot verify trailing LF…
+
+    — and attached suggestions that restated the ticket's own spec back as
+    instructions, which the same system message forbids. Three of the four
+    objections that parked a never-attempted ticket were of that shape.
+    """
+
+    def _system(self, role):
+        from forge.prompts import ratify_prompt
+
+        ticket = Ticket(
+            ticket_id="PF-003",
+            title="serialize a level",
+            spec="emit one character per tile",
+            criteria=["round-trips every level file"],
+        )
+        return ratify_prompt(ticket, role)[0].content
+
+    def test_the_reviewer_is_asked_about_a_diff_that_does_not_exist_yet(self):
+        from forge.prompts import RATIFY_QUESTIONS
+
+        question = RATIFY_QUESTIONS["reviewer"]
+
+        self.assertIn("Once this ticket has been built", question)
+        # The old phrasing, which read as a diff withheld rather than a diff
+        # not yet written.
+        self.assertNotIn("from a diff and these criteria alone", question)
+
+    def test_every_role_is_told_the_absence_of_code_is_the_premise(self):
+        for role in ("planner", "executor", "tester", "reviewer"):
+            with self.subTest(role=role):
+                system = self._system(role)
+                self.assertIn("Do not object that the work has not been done yet", system)
+                self.assertIn("premise of this pass", system)
+
+    def test_the_reviewer_still_gets_its_own_question_and_not_anothers(self):
+        from forge.prompts import RATIFY_QUESTIONS
+
+        # The question is the whole difference between four sign-offs and four
+        # opinions, so the guard must not have flattened them into one.
+        reviewer = self._system("reviewer")
+        tester = self._system("tester")
+
+        self.assertIn(RATIFY_QUESTIONS["reviewer"], reviewer)
+        self.assertNotIn(RATIFY_QUESTIONS["tester"], reviewer)
+        self.assertIn(RATIFY_QUESTIONS["tester"], tester)
