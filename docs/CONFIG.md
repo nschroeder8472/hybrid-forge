@@ -315,6 +315,22 @@ Q4_K_M — for a ceiling of one checkpoint. Starting the router with
 `--models-max 1` does the same thing globally; `forge doctor` reports the
 residency either way.
 
+The eviction is waited out before the next load is asked for, because
+`/models/unload` answers when the child server has been *asked* to exit rather
+than when it has, and the slot is only free once it has. A load that lands in
+that window is refused with
+
+```
+500 {"error":{"code":500,"message":"model limit reached, try again later"}}
+```
+
+which reaches the loop as a model that cannot be talked to: roles drop out of
+sign-off and delegation attempts are spent without a model ever being asked
+anything. Forge waits for the catalogue to show the evicted checkpoint gone,
+then retries a refusal that arrives anyway for up to 60s. Nothing to configure;
+the only case that survives it is a slot genuinely held by another client, and
+that is named in the error.
+
 **The context window comes from the preset, and it has to.** The router's own
 `/props` answers `n_ctx: 0` — it holds no model — and a child's port is
 ephemeral, so the argv the catalogue publishes is the only place a per-model

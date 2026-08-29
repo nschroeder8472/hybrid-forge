@@ -36,6 +36,17 @@ previous role's checkpoint loaded and the next one has nowhere to go.
 `exclusive` unloads everything else first, trading a reload per role
 alternation for a ceiling of one checkpoint at a time.
 
+**An unload is not instant either, and the router does not block for it.**
+`/models/unload` answers once the child server has been asked to exit; the
+slot it occupies is free once the child has actually exited. Claim it in
+between and the load is refused with `500 model limit reached, try again
+later` — which on this backend is an unreachable model, i.e. a role that
+cannot vote and a delegation that cannot be attempted. So the eviction is
+waited out against the catalogue before the load is asked for, and a refusal
+that arrives anyway is retried rather than raised. Measured on the same
+b10666 build: an unload lands in 0-2.3s and the window is narrow enough that
+54 alternations in one run crossed it untouched before one did not.
+
 Measured on build b10666, a 30B A3B MoE at Q4_K_M: `POST /models/load` returns
 immediately, status reaches `loaded` in 10-20s, and the model then generates at
 about 16 tok/s. That last number is why `tokensPerSecond` is worth setting on
@@ -66,9 +77,20 @@ from .openai_compat import OpenAICompatProvider
 DEFAULT_LOAD_SECONDS = 300
 # Between status probes while a load is in flight.
 _POLL_SECONDS = 2.0
+# Between probes while waiting for an eviction to land. Finer than the load
+# poll because it is paid on every role alternation and the thing it waits for
+# is short: measured on a 30B at Q4, an unload lands in 0-2.3s.
+_EVICT_POLL_SECONDS = 0.5
+# How long to wait for the router to free a `--models-max` slot. Twenty-five
+# times the measured unload, because the only thing that legitimately holds a
+# slot longer is a request still in flight on the child being evicted.
+_SLOT_SECONDS = 60.0
 # What `/v1/models` reports under `status.value`.
 _LOADED = "loaded"
 _LOADING = "loading"
+# The router's refusal when every `--models-max` slot is still spoken for. Not
+# a fault, and the message says so: the condition clears on its own.
+_LIMIT_REACHED = "model limit reached"
 # The flags a preset uses to pin a child server's context window. The router
 # reports the argv it will spawn, which is the only place a per-model window is
 # visible — `/props` belongs to the router and answers `n_ctx: 0`.
@@ -159,19 +181,42 @@ class LlamaCppProvider(OpenAICompatProvider):
         return str((entry.get("status") or {}).get("value") or "")
 
     def _load(self, model: str) -> None:
-        try:
-            post_json(
-                f"{self._router_url()}/models/load",
-                {"model": model},
-                headers={"Content-Type": "application/json", **self._headers()},
-                timeout=120,
-            )
-        except ProviderError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise ProviderUnreachable(
-                f"llama.cpp router refused to load {model!r}: {exc}"
-            ) from exc
+        """Ask for a checkpoint, waiting out a router that has no slot yet.
+
+        `500 model limit reached, try again later` is not a fault. It is the
+        router saying that an eviction it has already accepted has not finished
+        — `/models/unload` answers as soon as the child has been asked to go,
+        not once it has gone, and until it has, its `--models-max` slot is
+        still spoken for. The message names the remedy, so take it, bounded.
+        Anything else is raised as it stands.
+        """
+        deadline = time.time() + _SLOT_SECONDS
+        while True:
+            try:
+                post_json(
+                    f"{self._router_url()}/models/load",
+                    {"model": model},
+                    headers={"Content-Type": "application/json", **self._headers()},
+                    timeout=120,
+                )
+                return
+            except ProviderError as exc:
+                if _LIMIT_REACHED not in str(exc).lower():
+                    raise
+                if time.time() >= deadline:
+                    raise ProviderUnreachable(
+                        f"the llama.cpp router had no slot for {model!r} within "
+                        f"{_SLOT_SECONDS:g}s; it is still answering "
+                        f"{_LIMIT_REACHED!r}. Either a request is still in "
+                        f"flight on the checkpoint being evicted, or "
+                        f"--models-max is below the number of checkpoints the "
+                        f"roles want resident at once."
+                    ) from exc
+                time.sleep(_EVICT_POLL_SECONDS)
+            except Exception as exc:  # noqa: BLE001
+                raise ProviderUnreachable(
+                    f"llama.cpp router refused to load {model!r}: {exc}"
+                ) from exc
 
     def _unload(self, model: str) -> None:
         """Evict a checkpoint, tolerating one that was already gone.
@@ -197,16 +242,57 @@ class LlamaCppProvider(OpenAICompatProvider):
                 f"llama.cpp router refused to unload {model!r}: {exc}"
             ) from exc
 
+    def _await_unloaded(self, model: str) -> None:
+        """Wait for an evicted checkpoint to actually leave the catalogue.
+
+        The router frees the `--models-max` slot when the child exits, not when
+        it accepts the unload, and the catalogue is the only place that is
+        observable. Skipping this wait is a coin flip: 54 alternations in one
+        measured run crossed the window without incident, and then a load
+        landed inside it and came back `500 model limit reached`. On this
+        backend that reaches the loop as an unreachable model, which spends a
+        ticket's whole attempt budget in about a second.
+        """
+        deadline = time.time() + _SLOT_SECONDS
+        while True:
+            entry = self.catalog(refresh=True).get(model)
+            if entry is None or self._status(entry) not in (_LOADED, _LOADING):
+                return
+            if time.time() >= deadline:
+                raise ProviderUnreachable(
+                    f"the llama.cpp router still had {model!r} resident "
+                    f"{_SLOT_SECONDS:g}s after accepting an unload for it, so "
+                    f"there is no slot for {self.model!r}. A request still in "
+                    f"flight on that checkpoint will hold it open until the "
+                    f"request finishes; the router's log says which."
+                )
+            time.sleep(_EVICT_POLL_SECONDS)
+
     def _evict_others(self, catalog: dict[str, Any]) -> None:
-        for model, entry in catalog.items():
-            if model != self.model and self._status(entry) in (_LOADED, _LOADING):
-                self._unload(model)
+        """Ask every other resident checkpoint to go, then wait for it to.
+
+        Asked in one pass and waited for in another, so evicting three
+        checkpoints costs one wait rather than three.
+        """
+        evicted = [
+            model
+            for model, entry in catalog.items()
+            if model != self.model and self._status(entry) in (_LOADED, _LOADING)
+        ]
+        for model in evicted:
+            self._unload(model)
+        for model in evicted:
+            self._await_unloaded(model)
 
     def _ensure_loaded(self) -> None:
         catalog = self.catalog(refresh=True)
-        entry = self._entry(catalog)
+        self._entry(catalog)
         if self.exclusive:
             self._evict_others(catalog)
+            # Re-read: the eviction wait has already refreshed the catalogue
+            # under us, and this model's own status may have moved with it.
+            catalog = self.catalog(refresh=True)
+        entry = self._entry(catalog)
         if self._status(entry) == _LOADED:
             return
         if self._status(entry) != _LOADING:

@@ -20914,3 +20914,229 @@ class TestTheSignOffPassDoesNotAskForAReview(unittest.TestCase):
         self.assertIn(RATIFY_QUESTIONS["reviewer"], reviewer)
         self.assertNotIn(RATIFY_QUESTIONS["tester"], reviewer)
         self.assertIn(RATIFY_QUESTIONS["tester"], tester)
+
+
+
+class TestAnEvictionIsWaitedForBeforeTheSlotIsClaimed(unittest.TestCase):
+    """`/models/unload` answers before the checkpoint has gone.
+
+    The router accepts the unload as soon as it has asked the child server to
+    exit; the `--models-max` slot is not free until the child has actually
+    gone. Ask for the next checkpoint inside that window and the router
+    refuses:
+
+        500 {"error":{"code":500,"message":"model limit reached, try again
+        later","type":"server_error"}}
+
+    On this backend a 500 is a `ProviderUnreachable`, so that refusal reaches
+    the loop as a model that cannot be talked to. Measured cost when it landed
+    on a live run: four roles unreachable for sign-off, then five delegation
+    attempts spent and the ticket given up on, all inside two seconds --
+
+        18:26:42  PF-007: no role could be reached for sign-off; continuing
+                  without ratification.
+        18:26:45  attempt 1 failed ... attempt 5 failed
+        18:26:46  PF-007: gave up after 5 attempts.
+
+    -- against 54 alternations in the run before it that crossed the same
+    window and never noticed. A race this narrow does not announce itself; it
+    spends a ticket.
+    """
+
+    def _provider(self, model="nemo-b", **extra):
+        from forge.providers import build_provider
+
+        return build_provider("role", {
+            "kind": "llamacpp", "baseUrl": "http://127.0.0.1:8080/v1",
+            "model": model, "exclusive": True, **extra,
+        })
+
+    @staticmethod
+    def _entry(status):
+        return {"status": {"value": status, "args": []}}
+
+    @staticmethod
+    def _limit_reached():
+        from forge.providers.base import ProviderUnreachable
+
+        return ProviderUnreachable(
+            'http://127.0.0.1:8080/models/load returned 500: '
+            '{"error":{"code":500,"message":"model limit reached, try again '
+            'later","type":"server_error"}}'
+        )
+
+    @contextlib.contextmanager
+    def _no_waiting(self, slot_seconds=60.0):
+        """Run the polls without paying for them."""
+        from forge.providers import llamacpp
+
+        with unittest.mock.patch.object(llamacpp.time, "sleep"), \
+                unittest.mock.patch.object(llamacpp, "_SLOT_SECONDS", slot_seconds):
+            yield
+
+    def _wire(self, provider, catalog, *, lingers=0):
+        """A router whose unload takes `lingers` polls to actually land."""
+        asked: list[tuple[str, str]] = []
+        state = dict(catalog)
+        remaining = {}
+
+        def load(model):
+            asked.append(("load", model))
+            if any(m != model and self._status(state, m) == "loaded" for m in state):
+                raise self._limit_reached()
+            state[model] = self._entry("loaded")
+
+        def unload(model):
+            asked.append(("unload", model))
+            remaining[model] = lingers
+            if not lingers:
+                state[model] = self._entry("unloaded")
+
+        def catalog_of(refresh=False):
+            for model, left in list(remaining.items()):
+                if left <= 0:
+                    state[model] = self._entry("unloaded")
+                    remaining.pop(model)
+                else:
+                    remaining[model] = left - 1
+            return dict(state)
+
+        provider._load = load
+        provider._unload = unload
+        provider.catalog = catalog_of
+        return asked, state
+
+    @staticmethod
+    def _status(state, model):
+        return (state[model].get("status") or {}).get("value")
+
+    def test_the_load_is_not_asked_for_until_the_eviction_lands(self):
+        provider = self._provider()
+        asked, state = self._wire(provider, {
+            "nemo-a": self._entry("loaded"),
+            "nemo-b": self._entry("unloaded"),
+        }, lingers=3)
+
+        with self._no_waiting():
+            provider._ensure_loaded()
+
+        self.assertEqual(asked, [("unload", "nemo-a"), ("load", "nemo-b")])
+        self.assertEqual(self._status(state, "nemo-b"), "loaded")
+
+    def test_a_refusal_inside_the_window_is_waited_out_rather_than_raised(self):
+        # The wait above closes the window the provider opens itself. This
+        # closes the one it cannot see: the router's slot accounting can lag
+        # its own status field, and something else may hold a slot entirely.
+        from forge.providers import llamacpp
+
+        provider = self._provider()
+        provider._unload = lambda model: None
+        provider.catalog = lambda refresh=False: {"nemo-b": self._entry("unloaded")}
+
+        refusals = [self._limit_reached(), self._limit_reached(), None]
+        posted: list[str] = []
+
+        def post_json(url, payload, **kwargs):
+            posted.append(url)
+            outcome = refusals.pop(0)
+            if outcome is not None:
+                raise outcome
+            return {}
+
+        with self._no_waiting(), \
+                unittest.mock.patch.object(llamacpp, "post_json", post_json):
+            provider._load("nemo-b")
+
+        self.assertEqual(len(posted), 3)
+
+    def test_a_refusal_that_never_clears_names_what_is_holding_the_slot(self):
+        from forge.providers import llamacpp
+        from forge.providers.base import ProviderUnreachable
+
+        provider = self._provider()
+
+        def post_json(url, payload, **kwargs):
+            raise self._limit_reached()
+
+        with self._no_waiting(slot_seconds=0.0), \
+                unittest.mock.patch.object(llamacpp, "post_json", post_json):
+            with self.assertRaises(ProviderUnreachable) as caught:
+                provider._load("nemo-b")
+
+        message = str(caught.exception)
+        self.assertIn("no slot for 'nemo-b'", message)
+        self.assertIn("--models-max", message)
+
+    def test_a_refusal_that_is_not_about_slots_is_raised_at_once(self):
+        # Waiting out a 400 would turn a config error into a minute of
+        # silence, and the id in it is the commonest mistake on this backend.
+        from forge.providers import llamacpp
+        from forge.providers.base import ProviderError
+
+        provider = self._provider()
+        attempts: list[str] = []
+
+        def post_json(url, payload, **kwargs):
+            attempts.append(url)
+            raise ProviderError("returned 400: model 'nemo-b' not found")
+
+        with self._no_waiting(), \
+                unittest.mock.patch.object(llamacpp, "post_json", post_json):
+            with self.assertRaises(ProviderError):
+                provider._load("nemo-b")
+
+        self.assertEqual(len(attempts), 1)
+
+    def test_an_eviction_that_never_lands_is_reported_against_the_model(self):
+        from forge.providers.base import ProviderUnreachable
+
+        provider = self._provider()
+        self._wire(provider, {
+            "nemo-a": self._entry("loaded"),
+            "nemo-b": self._entry("unloaded"),
+        }, lingers=10_000)
+
+        with self._no_waiting(slot_seconds=0.0):
+            with self.assertRaises(ProviderUnreachable) as caught:
+                provider._ensure_loaded()
+
+        message = str(caught.exception)
+        self.assertIn("still had 'nemo-a' resident", message)
+        self.assertIn("no slot for 'nemo-b'", message)
+
+    def test_several_evictions_are_asked_for_before_any_is_waited_on(self):
+        # Serialising ask-then-wait would pay the eviction latency once per
+        # checkpoint, on every role alternation.
+        provider = self._provider()
+        asked, _ = self._wire(provider, {
+            "nemo-a": self._entry("loaded"),
+            "nemo-b": self._entry("unloaded"),
+            "nemo-c": self._entry("loading"),
+        }, lingers=2)
+
+        with self._no_waiting():
+            provider._ensure_loaded()
+
+        self.assertEqual(asked, [
+            ("unload", "nemo-a"), ("unload", "nemo-c"), ("load", "nemo-b"),
+        ])
+
+    def test_this_models_own_status_is_re_read_after_the_eviction(self):
+        # The eviction wait polls the catalogue for as long as it takes, so a
+        # status read before it is stale by the time it is acted on -- and
+        # `--models-autoload` can have this checkpoint resident by then.
+        provider = self._provider()
+        asked: list[tuple[str, str]] = []
+        provider._load = lambda model: asked.append(("load", model))
+        provider._unload = lambda model: asked.append(("unload", model))
+
+        polls = [
+            {"nemo-a": self._entry("loaded"), "nemo-b": self._entry("unloaded")},
+            {"nemo-a": self._entry("unloaded"), "nemo-b": self._entry("loaded")},
+        ]
+        provider.catalog = lambda refresh=False: polls.pop(0) if len(polls) > 1 else polls[0]
+
+        with self._no_waiting():
+            provider._ensure_loaded()
+
+        self.assertEqual(asked, [("unload", "nemo-a")])
