@@ -14,6 +14,7 @@
     forge replay [--changed]       re-read past output with today's parsers
     forge prune [--keep N]         delete the artifact trees of old runs
     forge models                   write the llama.cpp preset the local models serve from
+    forge llama [install|list]     fetch the pinned llama.cpp build for this machine
     forge pause | resume | stop    control a running loop
     forge ui [--host H] [--port N] serve the dashboard on its own
 
@@ -35,7 +36,7 @@ import webbrowser
 from collections import Counter
 from pathlib import Path
 
-from . import evidence, presets, replay, respec, toolchain, wizard
+from . import evidence, llama, presets, replay, respec, toolchain, wizard
 from .artifacts import ARTIFACTS_DIR, GITIGNORE_LINES
 from .config import (
     ANY_LANGUAGE,
@@ -193,6 +194,100 @@ def _report_preset(config: Config, *, wrote_config: bool) -> int:
     return len(entries)
 
 
+def cmd_llama(args: argparse.Namespace) -> int:
+    """Fetch, inspect or point at the llama.cpp build the local models run on.
+
+    Forge has one local backend, so "install llama.cpp" is the first step of
+    every setup and the first place one goes wrong quietly: the same 30B A3B
+    MoE at Q4_K_M measured 16 tok/s on a Vulkan build and 353 tok/s on CUDA, on
+    the same card. Nothing errors on the slow path — the run just takes twenty
+    hours — so the fix is to pick the backend rather than let someone pick it
+    by accident.
+    """
+    action = getattr(args, "llama_command", "status")
+
+    if action == "status":
+        return _llama_status(args)
+    if action == "install":
+        return _llama_install(args)
+    if action == "list":
+        for tag, binary in sorted(llama.installed().items()):
+            print(f"  {tag:<10} {binary}")
+        if not llama.installed():
+            print(f"Nothing installed. `forge llama install` fetches {llama.PINNED_BUILD}.")
+        return 0
+    return _llama_status(args)
+
+
+def _llama_status(args: argparse.Namespace) -> int:
+    target = llama.detect(getattr(args, "backend", "") or "")
+    print(f"machine:  {target.describe()}")
+
+    capability = llama.compute_capability()
+    if capability is not None:
+        print(f"nvidia:   compute capability {capability}")
+
+    binary, source = llama.resolve_server(llama.PINNED_BUILD)
+    if binary is None:
+        print(f"server:   not found — `forge llama install` fetches {llama.PINNED_BUILD}")
+        return 1
+
+    build = llama.build_of(binary) or "unknown build"
+    print(f"server:   {binary}")
+    print(f"          {build}, {source}")
+    print(f"pinned:   {llama.PINNED_BUILD}")
+
+    if build not in ("", llama.PINNED_BUILD):
+        # Worth saying, not worth failing over. A measurement taken against one
+        # build does not transfer to another, which is the whole reason the pin
+        # exists — but someone running a build they chose deliberately does not
+        # need to be argued with about it.
+        print(
+            f"\nNote: this is {build}, not the pinned {llama.PINNED_BUILD}. "
+            f"Numbers measured against one build do not carry to another; "
+            f"`forge llama install` fetches the pinned one alongside it."
+        )
+    return 0
+
+
+def _llama_install(args: argparse.Namespace) -> int:
+    tag = args.build or llama.PINNED_BUILD
+    target = llama.detect(args.backend or "")
+
+    try:
+        assets = llama.resolve(tag, target)
+    except llama.LlamaError as exc:
+        print(f"error: {exc}")
+        return 1
+
+    total = sum(a.size for a in assets) / 1e6
+    print(f"build:    {tag}")
+    print(f"machine:  {target.describe()}")
+    for asset in assets:
+        print(f"  {asset.name:<48} {asset.size / 1e6:7.1f} MB")
+    print(f"  {'':<48} {total:7.1f} MB total, SHA-256 verified before unpacking")
+
+    if args.dry_run:
+        print(f"\nWould install into {llama.install_root() / tag}")
+        return 0
+
+    print(f"\nfetching into {llama.install_root() / tag} …")
+    try:
+        binary, target = llama.install(
+            tag, backend=args.backend or "", force=args.force
+        )
+    except llama.LlamaError as exc:
+        print(f"error: {exc}")
+        return 1
+
+    print(f"installed {llama.build_of(binary) or tag}: {binary}")
+    print(
+        "\nForge uses this over anything on PATH. Serve a project's models with:\n"
+        f'  "{binary}" --models-preset .hybridforge/models/llamacpp.ini --models-max 1'
+    )
+    return 0
+
+
 def cmd_models(args: argparse.Namespace) -> int:
     config = _load(args.root)
     if not _report_preset(config, wrote_config=False):
@@ -203,10 +298,48 @@ def cmd_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def _report_llama_build(config: Config) -> None:
+    """Which llama.cpp is behind the local models, when there are any.
+
+    Reported here because a probe cannot see it. Every local model in this
+    config is served by one binary, and which build that is decides both the
+    throughput and whether a number measured last week still applies — the same
+    checkpoint measured 16 tok/s on a Vulkan build and 353 on CUDA. `forge
+    doctor` reports the endpoint answering; this reports what is answering.
+    """
+    from .providers import LlamaCppProvider
+
+    local = [
+        name for name in config.models
+        if str(config.model_block(name).get("kind", LlamaCppProvider.kind)).lower()
+        in ("llamacpp", "llama.cpp", "llama-cpp", "llama-server", "llama", "local")
+    ]
+    if not local:
+        return
+
+    binary, source = llama.resolve_server()
+    if binary is None:
+        print(
+            f"  llama.cpp: not found on this machine. "
+            f"`forge llama install` fetches {llama.PINNED_BUILD}.\n"
+        )
+        return
+
+    build = llama.build_of(binary) or "unknown build"
+    print(f"  llama.cpp: {build}, {source}")
+    if build not in ("", llama.PINNED_BUILD):
+        print(
+            f"      forge is pinned to {llama.PINNED_BUILD}. Not a fault — but a "
+            f"figure measured on one build does not carry to another."
+        )
+    print()
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     config = _load(args.root)
     print(f"project: {config.root}")
     print(f"roles:   {json.dumps(config.roles)}\n")
+    _report_llama_build(config)
 
     failures = 0
     for name in sorted(config.models):
@@ -2059,6 +2192,43 @@ def build_parser() -> argparse.ArgumentParser:
         "models", help="write the llama.cpp preset for the configured local models"
     )
     p.set_defaults(func=cmd_models)
+
+    p = sub.add_parser(
+        "llama", help="fetch or inspect the llama.cpp build the local models run on"
+    )
+    p.add_argument(
+        "llama_command",
+        nargs="?",
+        default="status",
+        choices=("status", "install", "list"),
+        help="status (default): what this machine has and what it should have. "
+             "install: fetch the pinned build. list: what is already fetched",
+    )
+    p.add_argument(
+        "--build",
+        default="",
+        metavar="TAG",
+        help=f"a llama.cpp release tag such as b10687. Defaults to the build "
+             f"forge is tested against ({llama.PINNED_BUILD}) — pinned rather "
+             f"than latest because several are published a day, and a number "
+             f"measured on one build does not carry to another",
+    )
+    p.add_argument(
+        "--backend",
+        default="",
+        metavar="NAME",
+        help="override backend detection: cuda-13.3, cuda-12.4, vulkan, cpu, "
+             "metal, rocm-7.14, sycl. Detection reads the GPU's compute "
+             "capability; an explicit answer from someone who has measured "
+             "their own box wins",
+    )
+    p.add_argument("--force", action="store_true", help="re-download over an existing install")
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print what would be downloaded, with sizes, and stop",
+    )
+    p.set_defaults(func=cmd_llama)
 
     p = sub.add_parser("ui", help="serve the dashboard without running the loop")
     p.add_argument("--open", action="store_true", help="open the dashboard in a browser")

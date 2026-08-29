@@ -160,13 +160,22 @@ all.
 ### 1.1 Prerequisites
 
 `llama-server` is the inference server, and it is the only local backend forge
-speaks to. Either build it or take a release binary; the CUDA build matters
-more than the version does.
+speaks to. Install the daemon first (Part 2) and let it fetch one:
 
 ```bash
-# A release build, CUDA — pick the one matching your driver
-curl -fsSLO https://github.com/ggml-org/llama.cpp/releases/latest/download/llama-<platform>-cuda.zip
+forge llama install
 ```
+
+That reads the GPU's compute capability, picks the matching build, verifies the
+download against the SHA-256 GitHub published for it, and unpacks it — including
+the separate `cudart-*` archive a Windows CUDA build needs and fails without.
+Builds are pinned rather than tracked, because llama.cpp publishes several a day
+and a throughput measured on one does not carry to another. See
+[LLAMA-PACKAGING.md](LLAMA-PACKAGING.md).
+
+To do it by hand instead, take a release binary from
+[the releases page](https://github.com/ggml-org/llama.cpp/releases) and put
+`llama-server` on PATH; forge uses that when it has fetched nothing.
 
 **Take CUDA over Vulkan if you have the choice.** Measured on a 5090 with a 30B
 A3B MoE at Q4_K_M: 16 tok/s on the Vulkan build, 353 tok/s on CUDA. That is not

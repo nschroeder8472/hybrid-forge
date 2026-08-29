@@ -69,20 +69,27 @@ why it is worth hosting yourself.
 
 ### Install llama.cpp
 
-`llama-server` is the only local backend forge speaks to. Take a release binary
-or build it; what matters more than the version is which backend it was built
-with.
+`llama-server` is the only local backend forge speaks to. Let forge fetch it:
 
 ```bash
-# Release binaries, one per platform and backend:
-# https://github.com/ggml-org/llama.cpp/releases
+forge llama install
 ```
 
-**Take the CUDA build if you have an NVIDIA card.** Measured on a 5090 with a
-30B A3B MoE at Q4_K_M: 16 tok/s on the Vulkan build against 353 tok/s on CUDA.
-That is not tuning, it is whether an overnight run finishes. Blackwell (5090 and
-friends) needs CUDA 12.8 or newer. On an Apple Silicon Mac, take the Metal
-build — it is the default.
+That picks the build for your machine, downloads it, checks it against the
+SHA-256 GitHub published for it, and unpacks it where forge will find it.
+`forge llama` on its own says what it would pick and what you already have.
+
+**Which build matters more than which version.** Measured on a 5090 with a 30B
+A3B MoE at Q4_K_M: 16 tok/s on the Vulkan build against 353 tok/s on CUDA. That
+is not tuning, it is whether an overnight run finishes — and nothing reports the
+slow path, which is why forge chooses rather than leaving it to a paragraph.
+Detection reads your GPU's compute capability; `--backend` overrides it.
+
+To install it yourself instead, take a release binary from
+[the releases page](https://github.com/ggml-org/llama.cpp/releases) and put
+`llama-server` on PATH — forge uses that when it has fetched nothing. On
+Windows the CUDA builds need the matching `cudart-*` archive unpacked beside
+them, or the server exits on a missing DLL without mentioning CUDA.
 
 The server speaks an OpenAI-compatible API, which is what forge sends. Your
 endpoint will be `http://127.0.0.1:8080/v1`.

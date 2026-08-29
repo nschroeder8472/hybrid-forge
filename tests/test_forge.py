@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import hashlib
 import io
 import itertools
 import json
@@ -22,11 +23,12 @@ import threading
 import time
 import unittest
 import unittest.mock
+import zipfile
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from types import SimpleNamespace
 
-from forge import cli, evidence, imports, presets, ratify, replay, respec, toolchain
+from forge import cli, evidence, imports, llama, presets, ratify, replay, respec, toolchain
 from forge.artifacts import Artifacts
 from forge.budget import BudgetGate, ContextOverflow, RateLimitPolicy
 from forge.config import (
@@ -20600,3 +20602,388 @@ class TestTheCloudAdapterNoLongerGuessesAWindow(unittest.TestCase):
 
     def test_the_default_endpoint_is_openais_and_not_a_local_port(self):
         self.assertEqual(self._provider().base_url, "https://api.openai.com/v1")
+
+
+
+class TestTheBackendIsPickedRatherThanLandedOn(unittest.TestCase):
+    """A Vulkan build is not an error, it is twenty hours.
+
+    Measured on one 5090 with a 30B A3B MoE at Q4_K_M: 16 tok/s on the Vulkan
+    build against 353 tok/s on CUDA. Nothing reports the slow path — the loop
+    runs, the tickets pass, the run takes all night and then some. Choosing for
+    the operator is the only place that difference can be caught.
+    """
+
+    def _target(self, *, plat, machine, capability, backend=""):
+        with unittest.mock.patch.object(llama.sys, "platform", plat), \
+                unittest.mock.patch.object(llama.platform, "machine", lambda: machine), \
+                unittest.mock.patch.object(llama, "compute_capability", lambda: capability):
+            return llama.detect(backend)
+
+    def test_blackwell_gets_a_cuda_new_enough_for_it(self):
+        # Compute capability 12.0 needs CUDA 12.8+. Of the two published
+        # Windows builds only 13.3 qualifies, and picking 12.4 fails at load
+        # with a missing kernel rather than at install with a reason.
+        target = self._target(plat="win32", machine="AMD64", capability=12.0)
+
+        self.assertEqual(target.backend, "cuda-13.3")
+
+    def test_an_older_nvidia_card_takes_the_newest_build_too(self):
+        # Nothing requires the older toolkit; it is kept for a driver too old
+        # for 13.x, which is a choice `--backend` exists to make.
+        target = self._target(plat="win32", machine="AMD64", capability=8.9)
+
+        self.assertTrue(target.backend.startswith("cuda-"))
+
+    def test_no_nvidia_gpu_means_cpu_rather_than_a_cuda_build_that_cannot_load(self):
+        target = self._target(plat="win32", machine="AMD64", capability=None)
+
+        self.assertEqual(target.backend, "cpu")
+
+    def test_a_mac_is_metal_and_is_not_asked_about_it(self):
+        # Every published macOS build carries Metal, so there is no second
+        # option and no question to put to anyone.
+        target = self._target(plat="darwin", machine="arm64", capability=None)
+
+        self.assertEqual(target.backend, "metal")
+        self.assertEqual(target.arch, "arm64")
+
+    def test_linux_with_an_nvidia_card_gets_vulkan_because_there_is_no_cuda_archive(self):
+        # The project publishes ROCm, SYCL, Vulkan and CPU for Linux, and no
+        # CUDA. Naming a build that does not exist would fail at resolve with a
+        # list of assets rather than here with a reason.
+        target = self._target(plat="linux", machine="x86_64", capability=8.9)
+
+        self.assertEqual(target.backend, "vulkan")
+
+    def test_an_explicit_backend_beats_detection(self):
+        # Detection cannot see a passthrough GPU or a driver about to be
+        # replaced. Someone who measured their own box is right.
+        target = self._target(
+            plat="win32", machine="AMD64", capability=12.0, backend="vulkan"
+        )
+
+        self.assertEqual(target.backend, "vulkan")
+
+    def test_an_architecture_with_no_build_says_so_rather_than_guessing(self):
+        with self.assertRaises(llama.LlamaError) as caught:
+            self._target(plat="linux", machine="riscv64", capability=None)
+
+        self.assertIn("riscv64", str(caught.exception))
+        self.assertIn("PATH", str(caught.exception))
+
+
+class TestTheAssetNameIsTheConventionAndItsOmissions(unittest.TestCase):
+    """The names encode what is in each build, including by leaving parts out.
+
+    A macOS build has no backend segment because Metal is in all of them; a
+    plain `ubuntu-x64` is the CPU build and there is no `-cpu-` spelling for
+    it. Getting either wrong produces a 404 on a name that looks right.
+    """
+
+    @staticmethod
+    def _t(os_, arch, backend):
+        return llama.Target(os=os_, arch=arch, backend=backend)
+
+    def test_windows_cuda(self):
+        self.assertEqual(
+            llama.asset_name("b10687", self._t("win", "x64", "cuda-13.3")),
+            "llama-b10687-bin-win-cuda-13.3-x64.zip",
+        )
+
+    def test_macos_carries_no_backend_segment(self):
+        self.assertEqual(
+            llama.asset_name("b10687", self._t("macos", "arm64", "metal")),
+            "llama-b10687-bin-macos-arm64.tar.gz",
+        )
+
+    def test_a_plain_ubuntu_build_is_the_cpu_one(self):
+        self.assertEqual(
+            llama.asset_name("b10687", self._t("ubuntu", "x64", "cpu")),
+            "llama-b10687-bin-ubuntu-x64.tar.gz",
+        )
+
+    def test_ubuntu_vulkan_does_carry_its_segment(self):
+        self.assertEqual(
+            llama.asset_name("b10687", self._t("ubuntu", "x64", "vulkan")),
+            "llama-b10687-bin-ubuntu-vulkan-x64.tar.gz",
+        )
+
+    def test_windows_cuda_needs_a_second_archive_and_nothing_else_does(self):
+        # Without the runtime, llama-server.exe exits on a missing cudart DLL
+        # and says nothing about CUDA — a long walk from the symptom.
+        self.assertEqual(
+            llama.runtime_asset_name("b10687", self._t("win", "x64", "cuda-13.3")),
+            "cudart-llama-bin-win-cuda-13.3-x64.zip",
+        )
+        for target in (
+            self._t("win", "x64", "vulkan"),
+            self._t("win", "x64", "cpu"),
+            self._t("ubuntu", "x64", "vulkan"),
+            self._t("macos", "arm64", "metal"),
+        ):
+            with self.subTest(target=target.describe()):
+                self.assertEqual(llama.runtime_asset_name("b10687", target), "")
+
+
+class TestAnUnverifiedBinaryIsNotInstalled(unittest.TestCase):
+    """This downloads an executable and puts it where a later command runs it.
+
+    TLS says the bytes came from GitHub. The published SHA-256 says they are
+    the bytes GitHub described. Both are cheap, and the second is the one that
+    survives a proxy, a mirror, or a half-written file.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.payload = b"#!/bin/sh\necho llama\n" * 64
+        self.digest = hashlib.sha256(self.payload).hexdigest()
+
+    def _asset(self, digest=None):
+        return llama.Asset(
+            name="llama-b1-bin-ubuntu-x64.tar.gz",
+            url="https://example.invalid/a",
+            size=len(self.payload),
+            digest="sha256:" + (self.digest if digest is None else digest),
+        )
+
+    @contextlib.contextmanager
+    def _serving(self, body):
+        class Response(io.BytesIO):
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                self_inner.close()
+                return False
+
+        with unittest.mock.patch.object(
+            llama.urllib.request, "urlopen", lambda *a, **k: Response(body)
+        ):
+            yield
+
+    def test_a_download_matching_its_digest_is_kept(self):
+        with self._serving(self.payload):
+            path = llama._download(self._asset(), self.root)
+
+        self.assertTrue(path.is_file())
+        self.assertEqual(path.read_bytes(), self.payload)
+
+    def test_a_mismatch_refuses_and_deletes_rather_than_quarantining(self):
+        # Leaving it invites someone to unpack it by hand to see what went
+        # wrong, which is the one thing that must not happen to an archive of
+        # executables that arrived substituted.
+        with self._serving(b"something else entirely"):
+            with self.assertRaises(llama.LlamaError) as caught:
+                llama._download(self._asset(), self.root)
+
+        self.assertIn("does not match the SHA-256", str(caught.exception))
+        self.assertEqual(list(self.root.glob("*")), [])
+
+    def test_an_asset_the_api_published_no_digest_for_is_refused(self):
+        asset = llama.Asset(name="x.tar.gz", url="https://example.invalid/a",
+                            size=1, digest="")
+
+        with self.assertRaises(llama.LlamaError) as caught:
+            llama._download(asset, self.root)
+
+        self.assertIn("cannot be verified", str(caught.exception))
+
+
+class TestAnArchiveDoesNotGetToWriteWhereverItLikes(unittest.TestCase):
+    """Checked before extraction, because after is too late.
+
+    By the time a traversal is visible on disk it has already overwritten
+    whatever it was aimed at.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+
+    def test_a_member_climbing_out_is_refused(self):
+        with self.assertRaises(llama.LlamaError) as caught:
+            llama._safe_members(["build/bin/llama-server", "../../evil.sh"], self.root)
+
+        self.assertIn("outside the install directory", str(caught.exception))
+
+    def test_an_absolute_member_is_refused(self):
+        for name in ("/etc/cron.d/evil", "C:\\Windows\\System32\\evil.dll"):
+            with self.subTest(name=name):
+                with self.assertRaises(llama.LlamaError):
+                    llama._safe_members([name], self.root)
+
+    def test_ordinary_members_pass(self):
+        llama._safe_members(
+            ["llama-server", "build/bin/llama-cli", "./ggml.dll"], self.root
+        )
+
+    def test_a_real_zip_round_trips(self):
+        archive = self.root / "b.zip"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("llama-server", "#!/bin/sh\n")
+        destination = self.root / "out"
+
+        llama._extract(archive, destination)
+
+        self.assertTrue((destination / "llama-server").is_file())
+
+    def test_a_zip_that_climbs_out_is_refused_before_anything_lands(self):
+        archive = self.root / "evil.zip"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("../escaped", "no")
+        destination = self.root / "out"
+
+        with self.assertRaises(llama.LlamaError):
+            llama._extract(archive, destination)
+
+        self.assertFalse((self.root / "escaped").exists())
+
+
+class TestWhichServerRuns(unittest.TestCase):
+    """A pinned build beats one on PATH, and PATH beats nothing.
+
+    Pinned because llama.cpp published five tagged builds inside four hours on
+    the day this was written: tracking `latest` would mean two machines set up
+    an hour apart run different inference code, and every number in this
+    repository was measured on one of them.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+
+    def _install(self, tag, name="llama-server"):
+        directory = self.root / tag
+        directory.mkdir(parents=True)
+        binary = directory / (name + (".exe" if sys.platform == "win32" else ""))
+        binary.write_text("#!/bin/sh\n", encoding="utf-8")
+        return binary
+
+    def test_a_fetched_build_is_preferred_over_path(self):
+        expected = self._install(llama.PINNED_BUILD)
+        with unittest.mock.patch.object(llama, "install_root", lambda base=None: self.root), \
+                unittest.mock.patch.object(llama.shutil, "which", lambda _: "/usr/bin/llama-server"):
+            binary, source = llama.resolve_server(llama.PINNED_BUILD)
+
+        self.assertEqual(binary, expected)
+        self.assertIn(llama.PINNED_BUILD, source)
+
+    def test_path_is_a_fallback_and_not_an_error(self):
+        # Someone who built from source for a backend nobody publishes has done
+        # the right thing and should not be told to undo it.
+        with unittest.mock.patch.object(llama, "install_root", lambda base=None: self.root), \
+                unittest.mock.patch.object(llama.shutil, "which", lambda _: "/usr/bin/llama-server"):
+            binary, source = llama.resolve_server(llama.PINNED_BUILD)
+
+        self.assertEqual(binary, Path("/usr/bin/llama-server"))
+        self.assertIn("PATH", source)
+
+    def test_nothing_anywhere_is_reported_rather_than_raised(self):
+        with unittest.mock.patch.object(llama, "install_root", lambda base=None: self.root), \
+                unittest.mock.patch.object(llama.shutil, "which", lambda _: None):
+            binary, source = llama.resolve_server(llama.PINNED_BUILD)
+
+        self.assertIsNone(binary)
+        self.assertEqual(source, "not found")
+
+    def test_a_build_nested_where_the_archive_put_it_is_still_found(self):
+        # The layout has moved between releases — sometimes top level,
+        # sometimes under build/bin. Searching is cheaper than tracking it.
+        directory = self.root / "b1" / "build" / "bin"
+        directory.mkdir(parents=True)
+        name = "llama-server.exe" if sys.platform == "win32" else "llama-server"
+        (directory / name).write_text("x", encoding="utf-8")
+
+        self.assertEqual(llama.server_binary(self.root / "b1"), directory / name)
+
+    def test_installed_lists_only_directories_holding_a_server(self):
+        self._install("b10687")
+        (self.root / "b-empty").mkdir()
+
+        with unittest.mock.patch.object(llama, "install_root", lambda base=None: self.root):
+            self.assertEqual(sorted(llama.installed()), ["b10687"])
+
+
+class TestTheBuildNumberIsNotTheVersionNumber(unittest.TestCase):
+    """`llama-server --version` prints both, and one of them is a trap.
+
+        version: 0.3.0-dev (build 10666, commit 4e97ac86e)
+
+    Reading the first integer after `version:` yields `0` from the semantic
+    version — a plausible-looking answer that would report every build as `b0`
+    and make the pin check meaningless.
+    """
+
+    def _reports(self, text):
+        result = SimpleNamespace(stdout="", stderr=text, returncode=0)
+        with unittest.mock.patch.object(llama.subprocess, "run", lambda *a, **k: result):
+            return llama.build_of(Path("llama-server"))
+
+    def test_the_build_number_is_read_and_not_the_semver(self):
+        self.assertEqual(
+            self._reports("version: 0.3.0-dev (build 10666, commit 4e97ac86e)\n"),
+            "b10666",
+        )
+
+    def test_a_binary_that_will_not_say_reports_nothing_rather_than_guessing(self):
+        self.assertEqual(self._reports("some other banner\n"), "")
+
+    def test_a_binary_that_cannot_be_run_is_not_an_exception(self):
+        with unittest.mock.patch.object(
+            llama.subprocess, "run", unittest.mock.Mock(side_effect=OSError("nope"))
+        ):
+            self.assertEqual(llama.build_of(Path("llama-server")), "")
+
+
+class TestResolvingAgainstARelease(unittest.TestCase):
+    """What the release actually publishes, against what was asked for."""
+
+    RELEASE = {
+        "tag_name": "b10687",
+        "assets": [
+            {"name": "llama-b10687-bin-win-cuda-13.3-x64.zip",
+             "browser_download_url": "https://example.invalid/1",
+             "size": 146_500_000, "digest": "sha256:aa"},
+            {"name": "cudart-llama-bin-win-cuda-13.3-x64.zip",
+             "browser_download_url": "https://example.invalid/2",
+             "size": 391_000_000, "digest": "sha256:bb"},
+            {"name": "llama-b10687-bin-ubuntu-x64.tar.gz",
+             "browser_download_url": "https://example.invalid/3",
+             "size": 16_400_000, "digest": "sha256:cc"},
+        ],
+    }
+
+    @contextlib.contextmanager
+    def _release(self, data=None):
+        with unittest.mock.patch.object(
+            llama, "release", lambda tag, **k: self.RELEASE if data is None else data
+        ):
+            yield
+
+    def test_windows_cuda_resolves_both_archives_server_first(self):
+        target = llama.Target(os="win", arch="x64", backend="cuda-13.3")
+        with self._release():
+            assets = llama.resolve("b10687", target)
+
+        self.assertEqual(
+            [a.name for a in assets],
+            ["llama-b10687-bin-win-cuda-13.3-x64.zip",
+             "cudart-llama-bin-win-cuda-13.3-x64.zip"],
+        )
+        self.assertEqual(assets[0].sha256, "aa")
+
+    def test_a_target_the_release_does_not_publish_lists_what_it_does(self):
+        target = llama.Target(os="win", arch="arm64", backend="rocm-7.14")
+        with self._release():
+            with self.assertRaises(llama.LlamaError) as caught:
+                llama.resolve("b10687", target)
+
+        message = str(caught.exception)
+        self.assertIn("llama-b10687-bin-win-rocm-7.14-arm64.zip", message)
+        self.assertIn("llama-b10687-bin-ubuntu-x64.tar.gz", message)
+
+    def test_a_single_archive_target_resolves_to_one(self):
+        target = llama.Target(os="ubuntu", arch="x64", backend="cpu")
+        with self._release():
+            assets = llama.resolve("b10687", target)
+
+        self.assertEqual(len(assets), 1)

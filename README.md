@@ -63,6 +63,13 @@ budget a thinking model is spending its whole answer on, the context window out
 of the argv rather than out of a guess. `forge models` writes the preset from
 your config, so the numbers in the two files cannot drift apart.
 
+It also means forge can install the backend rather than describe it. `forge llama
+install` fetches a pinned llama.cpp build, picks CUDA over Vulkan by reading the
+GPU's compute capability, and verifies the download against the SHA-256 GitHub
+published for it before unpacking. The same checkpoint measured 16 tok/s on a
+Vulkan build and 353 on CUDA, and nothing reports the slow path — see
+[docs/LLAMA-PACKAGING.md](docs/LLAMA-PACKAGING.md).
+
 Adding a backend is one module and one registry line. Nothing in the loop, the
 budget gate, or the dashboard knows which kind it is talking to.
 
