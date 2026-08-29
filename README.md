@@ -39,11 +39,13 @@ greenfield repo and an existing one: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md
 ## Bring your own models
 
 Four roles — `planner`, `executor`, `tester`, `reviewer` — and any model can play
-any of them. Five adapters cover the field:
+any of them. Seven adapters cover the field:
 
 | kind | reaches |
 |---|---|
-| `openai` | Ollama, vLLM, LM Studio, llama.cpp server, LiteLLM, OpenRouter, Together, DeepSeek, OpenAI |
+| `openai` | Ollama, vLLM, LM Studio, a single-model llama.cpp server, LiteLLM, OpenRouter, Together, DeepSeek, OpenAI |
+| `llamacpp` | `llama-server` in router mode, swapping checkpoints on one endpoint as the loop alternates roles |
+| `freetoken` | a FreeToken daemon, which serves one checkpoint at a time and answers to any name it is sent |
 | `anthropic` | Anthropic Messages API |
 | `gemini` | Google Gemini |
 | `command` | any local binary that reads a prompt and writes a completion |

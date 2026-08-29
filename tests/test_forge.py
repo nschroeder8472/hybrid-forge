@@ -20037,3 +20037,419 @@ class TestTheTicketFileRecordsTheArgument(unittest.TestCase):
 
         self.assertEqual(back.context, "Keep the paths bare.")
         self.assertEqual(back.criteria, ["it parses"])
+
+
+class TestLlamaCppRouterSwapsCheckpoints(unittest.TestCase):
+    """`llama-server --models-dir` routes by model id and 400s an id it lacks.
+
+    That is the whole difference from FreeToken, whose engine answers to any
+    name and echoes it back. Here forge's record of which model wrote what is
+    true for free, and what is left to get right is the swap itself: a load is
+    not instant, a load that dies looks like nothing at all, and `--models-max`
+    keeps the previous role's checkpoint sitting on the VRAM this one needs.
+    """
+
+    def _provider(self, model="nemo-a", **extra):
+        return build_provider("role", {
+            "kind": "llamacpp", "baseUrl": "http://127.0.0.1:8080/v1",
+            "model": model, **extra,
+        })
+
+    @staticmethod
+    def _entry(status, args=()):
+        return {"status": {"value": status, "args": list(args)}}
+
+    def _wire(self, provider, catalog, *, comes_up="loaded"):
+        """Stand in for the router. Records every load and unload asked for."""
+        asked: list[tuple[str, str]] = []
+        state = dict(catalog)
+
+        def load(model):
+            asked.append(("load", model))
+            entry = dict(state[model])
+            entry["status"] = {**entry["status"], "value": comes_up}
+            state[model] = entry
+
+        def unload(model):
+            asked.append(("unload", model))
+            entry = dict(state[model])
+            entry["status"] = {**entry["status"], "value": "unloaded"}
+            state[model] = entry
+
+        provider._load = load
+        provider._unload = unload
+        provider.catalog = lambda refresh=False: state
+        return asked, state
+
+    def test_a_resident_checkpoint_is_not_loaded_again(self):
+        provider = self._provider()
+        asked, _ = self._wire(provider, {"nemo-a": self._entry("loaded")})
+
+        provider._ensure_loaded()
+
+        self.assertEqual(asked, [])
+
+    def test_an_unloaded_checkpoint_is_loaded(self):
+        provider = self._provider()
+        asked, state = self._wire(provider, {"nemo-a": self._entry("unloaded")})
+
+        provider._ensure_loaded()
+
+        self.assertEqual(asked, [("load", "nemo-a")])
+        self.assertEqual(state["nemo-a"]["status"]["value"], "loaded")
+
+    def test_a_load_already_in_flight_is_waited_for_rather_than_asked_for_twice(self):
+        # The router spawns the child asynchronously, so a role's poll can
+        # arrive while the same checkpoint is already mid-load.
+        provider = self._provider()
+        asked: list[tuple[str, str]] = []
+        provider._load = lambda model: asked.append(("load", model))
+        provider._unload = lambda model: asked.append(("unload", model))
+
+        polls = [{"nemo-a": self._entry("loading")},
+                 {"nemo-a": self._entry("loaded")}]
+        provider.catalog = lambda refresh=False: polls.pop(0) if len(polls) > 1 else polls[0]
+
+        provider._ensure_loaded()
+
+        self.assertEqual(asked, [])
+
+    def test_exclusive_evicts_every_other_resident_checkpoint(self):
+        # --models-max defaults to 4. On a GPU with room for one, the load that
+        # fails is this one and the reason is the previous role's model.
+        provider = self._provider("nemo-b", exclusive=True)
+        asked, state = self._wire(provider, {
+            "nemo-a": self._entry("loaded"),
+            "nemo-b": self._entry("unloaded"),
+            "nemo-c": self._entry("loading"),
+        })
+
+        provider._ensure_loaded()
+
+        self.assertEqual(asked[:2], [("unload", "nemo-a"), ("unload", "nemo-c")])
+        self.assertEqual(asked[2], ("load", "nemo-b"))
+        self.assertEqual(state["nemo-a"]["status"]["value"], "unloaded")
+
+    def test_without_exclusive_the_router_keeps_what_it_has(self):
+        provider = self._provider("nemo-b")
+        asked, _ = self._wire(provider, {
+            "nemo-a": self._entry("loaded"),
+            "nemo-b": self._entry("unloaded"),
+        })
+
+        provider._ensure_loaded()
+
+        self.assertEqual(asked, [("load", "nemo-b")])
+
+    def test_exclusive_still_evicts_when_this_model_is_already_resident(self):
+        provider = self._provider("nemo-b", exclusive=True)
+        asked, _ = self._wire(provider, {
+            "nemo-a": self._entry("loaded"),
+            "nemo-b": self._entry("loaded"),
+        })
+
+        provider._ensure_loaded()
+
+        self.assertEqual(asked, [("unload", "nemo-a")])
+
+    def test_an_unknown_id_names_what_the_router_actually_serves(self):
+        # A models-dir entry is named after its directory, so the name an
+        # operator invents is almost never the name that exists.
+        provider = self._provider("qwen3.8")
+        self._wire(provider, {
+            "nemotron-3-nano-omni-30b-a3b-reasoning-gguf": self._entry("unloaded"),
+        })
+
+        with self.assertRaises(ProviderError) as caught:
+            provider._ensure_loaded()
+
+        message = str(caught.exception)
+        self.assertIn("has no model 'qwen3.8'", message)
+        self.assertIn("nemotron-3-nano-omni-30b-a3b-reasoning-gguf", message)
+
+    def test_a_child_that_dies_is_reported_as_a_dead_child(self):
+        # The router publishes no exit reason: a child that fails to allocate
+        # simply reverts to unloaded. Read naively that is "still loading",
+        # and the run polls until the deadline for a process that is gone.
+        provider = self._provider(loadSeconds=1)
+        provider._load = lambda model: None
+        provider._unload = lambda model: None
+        provider.catalog = lambda refresh=False: {"nemo-a": self._entry("unloaded")}
+
+        with self.assertRaises(ProviderUnreachable) as caught:
+            provider._ensure_loaded()
+
+        self.assertIn("child server exited", str(caught.exception))
+        self.assertIn("VRAM", str(caught.exception))
+
+    def test_a_load_that_never_finishes_names_the_deadline(self):
+        provider = self._provider(loadSeconds=0)
+        self._wire(provider, {"nemo-a": self._entry("unloaded")},
+                   comes_up="loading")
+
+        with self.assertRaises(ProviderUnreachable) as caught:
+            provider._ensure_loaded()
+
+        self.assertIn("did not load 'nemo-a' within 0s", str(caught.exception))
+
+    def test_the_context_window_comes_from_the_preset_the_router_will_spawn(self):
+        # The router's own /props answers n_ctx 0 -- it holds no model -- and a
+        # child's port is ephemeral, so the published argv is the only place a
+        # per-model window is visible without loading it.
+        provider = self._provider()
+        self._wire(provider, {
+            "nemo-a": self._entry("unloaded", ["--ctx-size", "32768"]),
+        })
+
+        self.assertEqual(provider.capabilities().context_window, 32768)
+
+    def test_the_short_spelling_of_the_context_flag_is_read_too(self):
+        provider = self._provider()
+        self._wire(provider, {"nemo-a": self._entry("unloaded", ["-c", "16384"])})
+
+        self.assertEqual(provider.capabilities().context_window, 16384)
+
+    def test_configuration_wins_over_the_preset(self):
+        provider = self._provider(contextWindow=8000)
+        self._wire(provider, {
+            "nemo-a": self._entry("unloaded", ["--ctx-size", "32768"]),
+        })
+
+        self.assertEqual(provider.capabilities().context_window, 8000)
+
+    def test_a_preset_pinning_nothing_falls_back_rather_than_guessing_the_trained_max(self):
+        # Reading the trained maximum out of the GGUF and believing it is the
+        # failure the budget gate exists to prevent: the server allocates its
+        # own default and truncates the overflow from the front, taking the
+        # system prompt and the spec with it.
+        provider = self._provider()
+        self._wire(provider, {"nemo-a": self._entry("unloaded", ["--model", "x"])})
+
+        self.assertEqual(provider.capabilities().context_window, 8192)
+
+    def test_a_window_wider_than_the_preset_is_reported_before_a_run_spends_on_it(self):
+        provider = self._provider(contextWindow=131072, exclusive=True)
+        self._wire(provider, {
+            "nemo-a": self._entry("unloaded", ["--ctx-size", "32768"]),
+        })
+        provider._props = lambda: {"role": "router", "max_instances": 1}
+
+        notes = " ".join(provider.diagnostics())
+
+        self.assertIn("contextWindow is 131,072", notes)
+        self.assertIn("-c 32,768", notes)
+        self.assertIn("truncated from the front", notes)
+
+    def test_a_single_model_server_is_told_it_cannot_swap(self):
+        provider = self._provider()
+        provider._props = lambda: {"role": "chat", "max_instances": 0}
+
+        notes = " ".join(provider.diagnostics())
+
+        self.assertIn("rather than running in router mode", notes)
+        self.assertIn("openai", notes)
+
+    def test_a_projector_nothing_uses_is_reported_as_the_vram_it_is(self):
+        provider = self._provider(contextWindow=4096, exclusive=True)
+        self._wire(provider, {
+            "nemo-a": self._entry("unloaded", ["--ctx-size", "32768", "--mmproj", "p"]),
+        })
+        provider._props = lambda: {"role": "router", "max_instances": 1}
+
+        self.assertIn("--mmproj", " ".join(provider.diagnostics()))
+
+    def test_residency_is_reported_when_nothing_is_evicting(self):
+        provider = self._provider(contextWindow=4096)
+        self._wire(provider, {
+            "nemo-a": self._entry("unloaded", ["--ctx-size", "32768"]),
+            "nemo-b": self._entry("loaded", ["--ctx-size", "32768"]),
+        })
+        provider._props = lambda: {"role": "router", "max_instances": 4}
+
+        notes = " ".join(provider.diagnostics())
+
+        self.assertIn("keeps up to 4 models resident", notes)
+        self.assertIn("nemo-b", notes)
+
+    def test_unloading_something_already_gone_is_not_an_error(self):
+        # Between reading the catalogue and acting on it another role may have
+        # evicted the same model; the router answers 400 "model is not running".
+        provider = self._provider()
+        import forge.providers.llamacpp as mod
+
+        def refuse(url, payload, *, headers, timeout):
+            raise ProviderBadResponse(url + " returned 400: model is not running")
+
+        original = mod.post_json
+        mod.post_json = refuse
+        try:
+            provider._unload("nemo-b")
+        finally:
+            mod.post_json = original
+
+    def test_a_real_refusal_to_unload_still_raises(self):
+        provider = self._provider()
+        import forge.providers.llamacpp as mod
+
+        def refuse(url, payload, *, headers, timeout):
+            raise ProviderBadResponse(url + " returned 400: malformed request")
+
+        original = mod.post_json
+        mod.post_json = refuse
+        try:
+            with self.assertRaises(ProviderBadResponse):
+                provider._unload("nemo-b")
+        finally:
+            mod.post_json = original
+
+    def test_the_kind_is_registered_under_the_names_people_type(self):
+        self.assertIn("llamacpp", available_kinds())
+        for spelling in ("llama.cpp", "llama-cpp", "llama-server", "llama"):
+            self.assertEqual(
+                build_provider("r", {"kind": spelling, "model": "m"}).kind, "llamacpp"
+            )
+
+    def test_the_default_port_is_the_routers_and_not_ollamas(self):
+        # The OpenAI base defaults to 11434, which belongs to a different
+        # server entirely; a block naming no baseUrl would silently inherit it.
+        provider = build_provider("r", {"kind": "llamacpp", "model": "m"})
+
+        self.assertEqual(provider.base_url, "http://127.0.0.1:8080/v1")
+        self.assertEqual(provider._router_url(), "http://127.0.0.1:8080")
+
+    def test_a_given_base_url_is_left_alone(self):
+        provider = build_provider(
+            "r", {"kind": "llamacpp", "model": "m", "baseUrl": "http://box:9000/v1"}
+        )
+
+        self.assertEqual(provider._router_url(), "http://box:9000")
+
+
+class TestLlamaCppContextDiscoveryDoesNotOutliveAnOutage(unittest.TestCase):
+    """A window that collapsed to a default must not be remembered.
+
+    `capabilities()` is asked by the budget gate before every call and caches
+    what it found, which is right for a fact about the preset and wrong for a
+    fact about the network. Cached, a router that was briefly down leaves the
+    rest of the run planning against 8192 and reporting every ticket as too
+    large for a model that is fine.
+    """
+
+    def _provider(self, **extra):
+        return build_provider("role", {
+            "kind": "llamacpp", "baseUrl": "http://127.0.0.1:8080/v1",
+            "model": "nemo-a", **extra,
+        })
+
+    def test_a_fallback_taken_during_an_outage_is_not_remembered(self):
+        provider = self._provider()
+        state = {"up": False}
+
+        def catalog(refresh=False):
+            if not state["up"]:
+                raise ProviderUnreachable("router is down")
+            return {"nemo-a": {"status": {"value": "unloaded",
+                                          "args": ["--ctx-size", "131072"]}}}
+
+        provider.catalog = catalog
+
+        self.assertEqual(provider.capabilities().context_window, 8192)
+
+        state["up"] = True
+
+        self.assertEqual(provider.capabilities().context_window, 131072)
+
+    def test_a_preset_that_pins_nothing_is_remembered(self):
+        # The router answered; that the preset pins no window is a fact about
+        # the preset and will not change under us.
+        provider = self._provider()
+        calls = []
+
+        def catalog(refresh=False):
+            calls.append(1)
+            return {"nemo-a": {"status": {"value": "unloaded", "args": []}}}
+
+        provider.catalog = catalog
+
+        self.assertEqual(provider.capabilities().context_window, 8192)
+        self.assertEqual(provider.capabilities().context_window, 8192)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_configured_window_never_asks_the_router_at_all(self):
+        provider = self._provider(contextWindow=131072)
+
+        def catalog(refresh=False):
+            raise AssertionError("config already answered this")
+
+        provider.catalog = catalog
+
+        self.assertEqual(provider.capabilities().context_window, 131072)
+
+
+class TestLlamaCppReportsAProjectorNothingUses(unittest.TestCase):
+    """A text-only role can end up holding vision weights two different ways.
+
+    A `--models-dir` entry beside an `mmproj-*.gguf` is spawned with an
+    explicit `--mmproj`, which the catalogue publishes. An `hf-repo` entry
+    resolves one *inside* the child whenever the repo ships it, so the argv
+    says nothing at all and the only trace is a line in the router's log:
+
+        loaded multimodal model, '…\\mmproj-BF16.gguf'
+
+    Both spend VRAM on a modality no role here sends, and on a card sized for
+    one checkpoint that is the difference between a swap and an
+    `ErrorOutOfDeviceMemory`.
+    """
+
+    def _provider(self, args, **extra):
+        provider = build_provider("role", {
+            "kind": "llamacpp", "baseUrl": "http://127.0.0.1:8080/v1",
+            "model": "nemo-a", "contextWindow": 32768,
+            "maxOutputTokens": 4096, "exclusive": True, **extra,
+        })
+        provider.catalog = lambda refresh=False: {
+            "nemo-a": {"status": {"value": "unloaded", "args": list(args)}}
+        }
+        provider._props = lambda: {"role": "router", "max_instances": 1}
+        return provider
+
+    def test_an_explicit_projector_is_reported(self):
+        provider = self._provider(["--ctx-size", "32768", "--mmproj", "p.gguf"])
+
+        notes = " ".join(provider.diagnostics())
+
+        self.assertIn("--mmproj", notes)
+        self.assertIn("no-mmproj = true", notes)
+
+    def test_a_hugging_face_pull_is_reported_even_though_the_argv_is_silent(self):
+        provider = self._provider(
+            ["--ctx-size", "32768", "--hf-repo", "unsloth/Qwen3.8-27B-GGUF:Q4_K_M"]
+        )
+
+        notes = " ".join(provider.diagnostics())
+
+        self.assertIn("downloads and loads a multimodal projector", notes)
+
+    def test_turning_it_off_settles_the_question(self):
+        provider = self._provider([
+            "--ctx-size", "32768", "--hf-repo", "r", "--no-mmproj",
+        ])
+
+        self.assertEqual(provider.diagnostics(), [])
+
+    def test_the_spelling_a_preset_actually_emits_counts_too(self):
+        # `no-mmproj = true` in a preset reaches the child as
+        # --no-mmproj-auto, not as the --no-mmproj alias the help advertises.
+        # Matching only the advertised one reports a projector on a child that
+        # has none, which teaches the operator to ignore the note.
+        provider = self._provider([
+            "--ctx-size", "32768", "--jinja", "--no-mmproj-auto",
+            "--hf-repo", "unsloth/Qwen3.8-27B-GGUF:Q4_K_M",
+        ])
+
+        self.assertEqual(provider.diagnostics(), [])
+
+    def test_a_plain_local_checkpoint_is_not_accused_of_anything(self):
+        provider = self._provider(["--ctx-size", "32768", "--model", "x.gguf"])
+
+        self.assertEqual(provider.diagnostics(), [])

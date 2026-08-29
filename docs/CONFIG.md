@@ -77,6 +77,7 @@ reviewer between two backends by editing one line in `roles`.
 | `kind` | Talks to | Aliases you can also type |
 |---|---|---|
 | `openai` | anything speaking the OpenAI chat-completions shape | `openai-compatible`, `ollama`, `vllm`, `lmstudio`, `openrouter`, `litellm` |
+| `llamacpp` | `llama-server` in **router** mode, swapping checkpoints on demand | `llama.cpp`, `llama-cpp`, `llama-server`, `llama` |
 | `anthropic` | the Anthropic Messages API | `claude` |
 | `gemini` | Google's Generative Language API | `google` |
 | `claude-cli` | a local `claude` binary in `-p` mode | `claude-code` |
@@ -226,6 +227,147 @@ over the gear.
 | `extraBody` | `{}` | Fields merged into the request body, for backend-specific knobs (vLLM routing, Ollama `options`, OpenRouter preferences). |
 | `supportsTemperature` | `true` | Set false for endpoints that reject the field outright. |
 | `topP`, `topK`, `minP`, `presencePenalty`, `frequencyPenalty` | unset | Sent only when set, so a model's own shipped recipe still applies. **`topK` and `minP` are accepted and silently discarded by Ollama's `/v1` shim** — put them in a Modelfile instead (`forge models` writes one). |
+
+### `kind: "llamacpp"`
+
+For `llama-server` started in **router** mode — `--models-dir` or
+`--models-preset`. The router holds a catalogue, spawns a child server per
+model on an ephemeral port, and proxies each request to whichever model it
+names. One endpoint, several checkpoints, loaded on demand.
+
+A single-model `llama-server` is `kind: "openai"` and always was. Use this one
+only when the server can swap; pointed at a single-model server it says so
+rather than failing later.
+
+| Key | Default | Notes |
+|---|---|---|
+| `baseUrl` | `http://127.0.0.1:8080/v1` | Include the `/v1`. The router's `/models/load`, `/models/unload` and `/props` sit one level up, the way Ollama's native API does. |
+| `model` | `""` | The router's **id** for the checkpoint, which is not a path. See below. |
+| `loadSeconds` | `300` | How long to wait for a checkpoint to become servable. |
+| `exclusive` | `false` | Unload every other resident checkpoint before loading this one. |
+
+Everything under [`kind: "openai"`](#kind-openai) applies too — `extraBody`,
+the sampling knobs, `headers`. Unlike Ollama, `topK` and `minP` do reach the
+model here.
+
+**The id is the directory, not the file.** A `--models-dir` entry is named
+after the directory holding the `.gguf`, so a checkpoint at
+`C:\AIModels\nemotron-3-nano-omni-30b-a3b-reasoning-gguf\…Q4_K_M.gguf` is
+called `nemotron-3-nano-omni-30b-a3b-reasoning-gguf` and nothing else. The
+router answers `400 model 'x' not found` for anything else, which is a good
+failure — `forge doctor` turns it into a better one by listing what the router
+actually serves:
+
+```
+  plan: FAIL name=plan kind=llamacpp model=qwen3.8 error=ProviderError: the
+    llama.cpp router at http://127.0.0.1:8080 has no model 'qwen3.8'; it serves
+    nemotron-3-nano-omni-30b-a3b-reasoning-gguf.
+```
+
+That refusal is also why this adapter is small. [FreeToken](#kind-freetoken)
+exists because its engine answers to *any* model name and echoes it back, so a
+config naming three models gets one model and three labels. The router routes
+by id, so forge's record of which model wrote what is true for free.
+
+**A load is not instant and is not the call's fault.** With
+`--models-autoload` the first request after a swap simply blocks while a 30B
+checkpoint loads, so a load that never finishes is reported as the *completion*
+timing out — naming an endpoint that was healthy throughout. So the load is
+asked for explicitly, waited for against `loadSeconds`, and a checkpoint still
+not `loaded` at the deadline says which one and for how long. A child that dies
+instead of binding reverts to `unloaded` with no reason published, and is
+reported as a dead child rather than polled until the deadline.
+
+**`exclusive` — one checkpoint at a time.** `--models-max` defaults to 4, which
+is right on a box with the VRAM for it and fatal on one without: the router
+keeps the previous role's checkpoint resident and the next role's load fails
+with
+
+```
+ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory
+```
+
+from a child process, in the router's log, while `/v1/models` shows only that
+the model went back to `unloaded`. `exclusive` unloads everything else first,
+trading a reload per role alternation — measured at 10-20s for a 30B A3B MoE at
+Q4_K_M — for a ceiling of one checkpoint. Starting the router with
+`--models-max 1` does the same thing globally; `forge doctor` reports the
+residency either way.
+
+**The context window comes from the preset, and it has to.** The router's own
+`/props` answers `n_ctx: 0` — it holds no model — and a child's port is
+ephemeral, so the argv the catalogue publishes is the only place a per-model
+window is visible without loading it. `contextWindow` in config wins; absent
+one, the preset's `-c` is read; absent both it falls back to 8192 rather than
+reading the trained maximum out of the GGUF, because that number describes the
+model and not the window the server allocated. Believing it is how the budget
+gate approves a prompt the server then truncates *from the front*, dropping the
+system prompt and the spec — and what comes back reads as a weak model rather
+than a truncated request. `forge doctor` reports the mismatch:
+
+```
+  plan: ok name=plan kind=llamacpp model=nemo-a reply='OK'
+      contextWindow is 131,072 but the router starts 'nemo-a' with -c 32,768.
+```
+
+**Set `tokensPerSecond`.** A 30B A3B MoE at Q4_K_M measured 16 tok/s on a
+consumer GPU. At the 30 tok/s default the derived timeout is `120 + 32768/30 =
+1,212s` for a budget that actually needs about 2,150s, so a large
+`maxOutputTokens` is never reachable and the failure arrives wearing the name
+of a network fault.
+
+A preset file is worth writing rather than relying on `--models-dir`, because a
+generated entry pins no `-c` and does load a multimodal projector beside a
+text-only checkpoint — VRAM no role here uses, on a card that may be sized for
+exactly one model. There are two ways to acquire one and only the first is
+visible: a models-dir entry beside an `mmproj-*.gguf` is spawned with an
+explicit `--mmproj`, while an `hf-repo` entry resolves one *inside* the child
+whenever the repo publishes it, so the argv says nothing and the only trace is
+a line in the router's log. `no-mmproj = true` settles both, and `forge doctor`
+reports either.
+
+The format is INI, one section per id, keys spelled like the long flags without
+their dashes:
+
+```ini
+[nemotron-3-nano]
+model = C:\AIModels\nemotron-3-nano-omni-30b-a3b-reasoning-gguf\Nemotron-3-Nano-Omni-30B-A3B-Reasoning-Q4_K_M.gguf
+ctx-size = 131072
+jinja = true
+no-mmproj = true
+
+[qwen3.8]
+hf-repo = unsloth/Qwen3.8-27B-GGUF:Q4_K_M
+ctx-size = 131072
+jinja = true
+no-mmproj = true
+```
+
+```
+llama-server --models-preset models.ini --models-max 1 --host 127.0.0.1 --port 8080
+```
+
+```json
+"plan": {
+  "kind": "llamacpp",
+  "model": "nemotron-3-nano",
+  "contextWindow": 131072,
+  "maxOutputTokens": 32768,
+  "tokensPerSecond": 16,
+  "exclusive": true
+},
+"code": {
+  "kind": "llamacpp",
+  "model": "qwen3.8",
+  "contextWindow": 131072,
+  "maxOutputTokens": 32768,
+  "tokensPerSecond": 16,
+  "exclusive": true
+}
+```
+
+Two entries, one endpoint, one GPU: the router swaps between them as the loop
+alternates roles.
 
 ### `kind: "anthropic"`
 
