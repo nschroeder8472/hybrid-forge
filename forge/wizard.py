@@ -348,8 +348,13 @@ def run(root: Path, profile: Profile, prompter: Prompter) -> tuple[Config, Profi
 
 def _ask_executor(answers: Answers, profile: Profile, prompter: Prompter) -> None:
     heading(1, TOTAL_STEPS, "Executor — the model that writes the code")
-    say("Any OpenAI-compatible server: Ollama, vLLM, LM Studio, llama.cpp, LiteLLM,")
-    say("OpenRouter, DeepSeek, or OpenAI itself.")
+    say("A local model, served by llama.cpp's router:")
+    say("")
+    say('  llama-server --models-preset <preset> --models-max 1')
+    say("")
+    say("The model name below is the router's id for a checkpoint, which is the")
+    say("section name in the preset. `forge models` writes that preset from this")
+    say("config once you are through here.")
 
     previous = profile.models.get("local", {})
     block: dict[str, Any] = {}
@@ -359,17 +364,20 @@ def _ask_executor(answers: Answers, profile: Profile, prompter: Prompter) -> Non
     # retry buries the error message they are trying to read.
     for attempt in range(MAX_RETRIES):
         base_url = prompter.ask(
-            "\nBase URL", previous.get("baseUrl", "http://localhost:11434/v1")
+            "\nRouter URL", previous.get("baseUrl", "http://127.0.0.1:8080/v1")
         )
-        model = prompter.ask("Model name", previous.get("model", "qwen3.6:35b-a3b"))
-        key_env = prompter.ask(
-            "Env var holding the API key, if this endpoint needs one",
-            previous.get("apiKeyEnv", ""),
+        model = prompter.ask(
+            "Model id (the preset's section name)",
+            previous.get("model", "qwen3.8"),
+        )
+        model_path = prompter.ask(
+            "Path to its .gguf, if you want `forge models` to write the preset",
+            previous.get("modelPath", ""),
         )
 
-        block = {"kind": "openai", "baseUrl": base_url, "model": model}
-        if key_env:
-            block["apiKeyEnv"] = key_env
+        block = {"kind": "llamacpp", "baseUrl": base_url, "model": model}
+        if model_path:
+            block["modelPath"] = model_path
         if previous.get("contextWindow"):
             block["contextWindow"] = previous["contextWindow"]
 

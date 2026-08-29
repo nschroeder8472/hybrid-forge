@@ -116,7 +116,7 @@ is a language with a runner, and `python tools/check_IMG-001.py` is that runner.
 ## Problem 1 — `Message.content` is a `str`
 
 A reviewer that cannot see the image is not a reviewer. `Message.content` is
-typed `str` and every one of the five adapters formats it as one.
+typed `str` and every adapter formats it as one.
 
 The change is to make content a sequence of parts:
 
@@ -151,16 +151,20 @@ pixels. The resolution: the *provider* reports the size it requested, the
 `ImagePart` with no dimensions is priced at the provider's worst case.
 
 **A provider must declare whether it can see.** `Capabilities` gains
-`supports_images: bool`, defaulting to `False`. `command`/`subprocess_cli` reads
-stdin and cannot. `claude-cli` defaults to no tools, so it cannot open a file
-path either — a prompt that names `assets/hero.png` to a tool-less CLI is a
-reviewer being asked to rule on a filename. Seating a provider without
-`supports_images` as the reviewer of an image ticket is refused at
-`config.validate()`, not discovered at review time.
+`supports_images: bool`, defaulting to `False`. It is per *checkpoint* on
+`llamacpp`, not per adapter: a GGUF with a projector beside it can, one without
+cannot, and forge turns the projector off by default (`mmproj-auto = false`)
+precisely because it costs VRAM no text-only role uses. An image ticket has to
+set `multimodal: true` on the model that reviews it and regenerate the preset.
+`claude-cli` defaults to no tools, so it cannot open a file path either — a
+prompt that names `assets/hero.png` to a tool-less CLI is a reviewer being asked
+to rule on a filename. Seating a provider without `supports_images` as the
+reviewer of an image ticket is refused at `config.validate()`, not discovered at
+review time.
 
 That is the roadmap's deferred **per-role provider guarantees** entry becoming
 load-bearing. A role declaring what it needs stops being a nicety the moment one
-role needs a capability four of five adapters lack.
+role needs a capability most of the adapters lack.
 
 **Artifacts must not inline megabytes.** `Artifacts.write` records step detail as
 readable text. An `ImagePart` is recorded as a path into the run's artifact

@@ -26,7 +26,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from types import SimpleNamespace
 
-from forge import cli, evidence, imports, modelfiles, ratify, replay, respec, toolchain
+from forge import cli, evidence, imports, presets, ratify, replay, respec, toolchain
 from forge.artifacts import Artifacts
 from forge.budget import BudgetGate, ContextOverflow, RateLimitPolicy
 from forge.config import (
@@ -126,7 +126,6 @@ from forge.providers.base import (
     MIN_TIMEOUT_SECONDS,
     TIMEOUT_OVERHEAD_SECONDS,
 )
-from forge.providers.freetoken import _drain_failed as freetoken_drain_failed
 from forge.providers.base import (
     Capabilities,
     Completion,
@@ -155,6 +154,32 @@ from forge.state import (
 )
 from forge.ui import server as ui_server
 from forge.ui.server import exposure_warning, is_exposed
+
+
+def _failing_shell(output: str):
+    """A `_shell` stub that fails every configured command with `output`.
+
+    Unconfigured steps still pass, as the real one does — otherwise the ticket
+    fails on `lint` before reaching the step under test.
+    """
+
+    def shell(_run_id, name, command, _ticket="", **_kwargs):
+        if not command.strip():
+            return StepResult(ok=True, detail=f"no {name} command configured; skipped")
+        return StepResult(ok=False, detail=output)
+
+    return shell
+
+
+def _replies(*texts: str):
+    """A `_call` stub that returns each reply in turn, repeating the last."""
+    remaining = list(texts)
+
+    def call(*_args, **_kwargs):
+        text = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        return Completion(text=text, usage=Usage(), finish_reason="stop")
+
+    return call
 
 
 class TestPatchParsing(unittest.TestCase):
@@ -3333,11 +3358,6 @@ class TestProviderWorkingDirectory(unittest.TestCase):
             {"kind": "claude-cli", "model": "opus", "cwd": "/elsewhere"},
         )
         self.assertEqual(config.model_block("m")["cwd"], "/elsewhere")
-
-    def test_the_command_adapter_gets_it_too(self):
-        root = Path(tempfile.mkdtemp())
-        config = self._config(root, {"kind": "command", "command": ["echo", "hi"]})
-        self.assertEqual(config.provider_for("executor").cwd, str(root))
 
     def test_model_block_does_not_mutate_the_stored_config(self):
         config = self._config(Path(tempfile.mkdtemp()), {"kind": "claude-cli", "model": "opus"})
@@ -14652,108 +14672,6 @@ class TestTheLoopProbesBeforeItSpends(unittest.TestCase):
         self.assertEqual(orch._preflight(run_id), [])
 
 
-class TestGeneratedModelfiles(unittest.TestCase):
-    """The settings a Modelfile carries are exactly the ones nothing else can
-    reach, so hand-writing them is where the drift lives — one setup carried
-    `num_ctx 32768` across three models trained for eight times that, and
-    nothing reported it."""
-
-    SHOW_ALIAS = {
-        "parameters": 'top_k                 40\ntemperature           0.7\nstop  "<|im_end|>"\n',
-        "details": {"parent_model": "devstral:24b"},
-        "model_info": {"llama.context_length": 131072},
-    }
-    SHOW_BASE = {
-        "parameters": "",
-        "details": {"parent_model": ""},
-        "model_info": {"llama.context_length": 131072},
-    }
-
-    def _config(self, model, contextWindow=None, kind="openai"):
-        root = Path(tempfile.mkdtemp())
-        (root / ".hybridforge").mkdir()
-        block = {"kind": kind, "baseUrl": "http://127.0.0.1:11434/v1", "model": model}
-        if contextWindow:
-            block["contextWindow"] = contextWindow
-        (root / ".hybridforge" / "config.json").write_text(json.dumps({
-            "models": {"local": block},
-            "roles": {r: "local" for r in ("planner", "executor", "tester", "reviewer")},
-        }), encoding="utf-8")
-        return Config.load(root)
-
-    def _plan(self, config, show):
-        mod = sys.modules["forge.providers.openai_compat"]
-        with unittest.mock.patch.object(mod, "post_json", lambda *a, **k: show), \
-             unittest.mock.patch.object(mod, "get_json", lambda *a, **k: {"models": []}):
-            return modelfiles.plan(config)
-
-    def test_a_tuned_alias_is_rebuilt_under_its_own_name(self):
-        entries = self._plan(self._config("forge-alt"), self.SHOW_ALIAS)
-
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0].create_as, "forge-alt")
-        self.assertFalse(entries[0].rename)
-
-    def test_the_modelfile_is_from_the_real_base_not_the_alias(self):
-        """`FROM forge-alt` on a file used to rebuild `forge-alt` is circular
-        and loses the weights it was derived from."""
-        entries = self._plan(self._config("forge-alt"), self.SHOW_ALIAS)
-
-        self.assertTrue(entries[0].text.startswith("FROM devstral:24b\n"))
-
-    def test_a_base_model_gets_a_new_name_rather_than_being_overwritten(self):
-        """Building under the base's own name replaces the weights the file is
-        FROM — the one outcome this must never produce."""
-        entries = self._plan(self._config("devstral:24b"), self.SHOW_BASE)
-
-        self.assertEqual(entries[0].create_as, "forge-local")
-        self.assertTrue(entries[0].rename)
-        self.assertTrue(entries[0].text.startswith("FROM devstral:24b\n"))
-
-    def test_the_base_models_own_sampling_recipe_is_preserved(self):
-        entries = self._plan(self._config("forge-alt"), self.SHOW_ALIAS)
-
-        self.assertIn("PARAMETER top_k 40", entries[0].text)
-
-    def test_defaults_fill_in_when_the_base_ships_nothing(self):
-        entries = self._plan(self._config("devstral:24b"), self.SHOW_BASE)
-
-        self.assertIn("PARAMETER top_k 20", entries[0].text)
-        self.assertIn("PARAMETER min_p 0", entries[0].text)
-
-    def test_a_configured_window_wins_over_the_trained_maximum(self):
-        entries = self._plan(self._config("forge-alt", contextWindow=65536), self.SHOW_ALIAS)
-
-        self.assertIn("PARAMETER num_ctx 65536", entries[0].text)
-        self.assertIn("trained for 131,072", entries[0].text)
-
-    def test_a_full_window_carries_no_smaller_note(self):
-        entries = self._plan(self._config("forge-alt", contextWindow=131072), self.SHOW_ALIAS)
-
-        self.assertIn("PARAMETER num_ctx 131072", entries[0].text)
-        self.assertNotIn("trained for", entries[0].text)
-
-    def test_non_ollama_endpoints_are_skipped(self):
-        """A Modelfile means nothing to vLLM or OpenRouter, and writing one
-        would imply otherwise."""
-        config = self._config("gpt-4o", kind="anthropic")
-
-        self.assertEqual(modelfiles.plan(config), [])
-
-    def test_writing_puts_them_under_the_project_config_dir(self):
-        config = self._config("forge-alt")
-        mod = sys.modules["forge.providers.openai_compat"]
-        with unittest.mock.patch.object(mod, "post_json", lambda *a, **k: self.SHOW_ALIAS), \
-             unittest.mock.patch.object(mod, "get_json", lambda *a, **k: {"models": []}):
-            written = modelfiles.write(config)
-
-        self.assertEqual(len(written), 1)
-        entry, path = written[0]
-        self.assertEqual(path.name, "Modelfile.local")
-        self.assertEqual(path.parent, config.config_dir / "models")
-        self.assertIn("ollama create forge-alt -f", entry.command)
-
-
 class TestSamplingIsConfigurablePerModel(unittest.TestCase):
     """A model ships a sampling recipe its authors chose, and the loop's own
     per-role temperature overrides only that one knob. The rest are settable
@@ -14816,218 +14734,6 @@ class TestSamplingIsConfigurablePerModel(unittest.TestCase):
         """The escape hatch stays an escape hatch."""
         sent = self._payload({"topP": 0.8, "extraBody": {"top_p": 0.5}})
         self.assertEqual(sent["top_p"], 0.5)
-
-
-class TestOllamaModelNamesCarryAnImplicitTag(unittest.TestCase):
-    """`/api/ps` reports `forge-exec:latest`; config writes `forge-exec`,
-    because that is how every `ollama run` example spells it. Comparing them
-    exactly matched nothing, so the served window was always discarded and the
-    budget gate planned against the architectural maximum instead — 262,144
-    for a server holding 32,768, with the overflow truncated off the front of
-    the prompt where the system message and the spec live."""
-
-    LOADED = {
-        "models": [
-            {"name": "forge-exec:latest", "model": "forge-exec:latest",
-             "context_length": 32768, "size": 8, "size_vram": 8}
-        ]
-    }
-    TRAINED = {"model_info": {"qwen35moe.context_length": 262144}}
-
-    def _provider(self, model: str):
-        provider = OpenAICompatProvider(
-            "local", {"baseUrl": "http://x:11434/v1", "model": model}
-        )
-        mod = sys.modules["forge.providers.openai_compat"]
-        self.enterContext(
-            unittest.mock.patch.object(mod, "get_json", lambda *a, **k: self.LOADED)
-        )
-        self.enterContext(
-            unittest.mock.patch.object(mod, "post_json", lambda *a, **k: self.TRAINED)
-        )
-        return provider
-
-    def test_an_untagged_config_name_matches_the_tagged_report(self):
-        provider = self._provider("forge-exec")
-
-        self.assertTrue(provider._ollama_loaded())
-        self.assertEqual(provider._discover_context_window(), 32768)
-
-    def test_a_tagged_config_name_still_matches(self):
-        provider = self._provider("forge-exec:latest")
-
-        self.assertEqual(provider._discover_context_window(), 32768)
-
-    def test_a_different_model_does_not_match(self):
-        provider = self._provider("forge-alt")
-
-        self.assertEqual(provider._ollama_loaded(), {})
-        self.assertEqual(provider._discover_context_window(), 262144)
-
-    def test_a_non_latest_tag_is_not_confused_with_latest(self):
-        """`forge-exec:v2` and `forge-exec:latest` are different models."""
-        provider = self._provider("forge-exec:v2")
-
-        self.assertEqual(provider._ollama_loaded(), {})
-
-    def test_the_diagnostic_about_a_smaller_window_can_now_fire(self):
-        """It is gated on knowing the served size, so the name bug silenced the
-        one warning that would have reported the name bug."""
-        provider = self._provider("forge-exec")
-        provider._caps = None
-        notes = provider.diagnostics()
-
-        self.assertTrue(any("32,768" in note for note in notes), notes)
-
-    def test_tag_normalisation_leaves_a_digest_reference_alone(self):
-        from forge.providers.openai_compat import _tagged
-
-        self.assertEqual(_tagged("forge-exec"), "forge-exec:latest")
-        self.assertEqual(_tagged("forge-exec:latest"), "forge-exec:latest")
-        self.assertEqual(_tagged("forge-exec:v2"), "forge-exec:v2")
-        self.assertEqual(_tagged("m@sha256:abc"), "m@sha256:abc")
-
-
-class TestServedContextBeatsTrainedContext(unittest.TestCase):
-    """`/api/show` reports what the model was trained for; `/api/ps` reports
-    what Ollama actually loaded. On a real box those read 131072 and 32768.
-    Planning against the larger one hands the budget gate a ceiling four times
-    too high, and the server then truncates from the front of the prompt —
-    dropping the system message and the spec."""
-
-    TRAINED = {"model_info": {"gptoss.context_length": 131072}}
-
-    def _provider(self, loaded: dict | None = None, **config):
-        provider = OpenAICompatProvider(
-            "local", {"baseUrl": "http://x:11434/v1", "model": "m", **config}
-        )
-        models = [loaded] if loaded else []
-        provider_mod = sys.modules["forge.providers.openai_compat"]
-        return provider, provider_mod, {"models": models}
-
-    def _patched(self, provider_mod, ps_payload):
-        return (
-            unittest.mock.patch.object(provider_mod, "get_json", lambda *a, **k: ps_payload),
-            unittest.mock.patch.object(provider_mod, "post_json", lambda *a, **k: self.TRAINED),
-        )
-
-    def test_the_served_window_wins(self):
-        loaded = {"name": "m", "context_length": 32768, "size": 8, "size_vram": 8}
-        provider, mod, ps = self._provider(loaded)
-        get, post = self._patched(mod, ps)
-        with get, post:
-            self.assertEqual(provider.capabilities().context_window, 32768)
-
-    def test_the_trained_window_is_the_fallback_when_nothing_is_loaded(self):
-        provider, mod, ps = self._provider(None)
-        get, post = self._patched(mod, ps)
-        with get, post:
-            self.assertEqual(provider.capabilities().context_window, 131072)
-
-    def test_config_still_beats_both(self):
-        loaded = {"name": "m", "context_length": 32768, "size": 8, "size_vram": 8}
-        provider, mod, ps = self._provider(loaded, contextWindow=16384)
-        get, post = self._patched(mod, ps)
-        with get, post:
-            self.assertEqual(provider.capabilities().context_window, 16384)
-
-    def test_a_window_wider_than_the_server_is_warned_about(self):
-        loaded = {"name": "m", "context_length": 32768, "size": 8, "size_vram": 8}
-        provider, mod, ps = self._provider(loaded, contextWindow=131072, maxOutputTokens=4096)
-        get, post = self._patched(mod, ps)
-        with get, post:
-            notes = " ".join(provider.diagnostics())
-        self.assertIn("silently truncated", notes)
-        self.assertIn("32,768", notes)
-
-    def test_an_output_reserve_that_eats_the_window_is_warned_about(self):
-        loaded = {"name": "m", "context_length": 32768, "size": 8, "size_vram": 8}
-        provider, mod, ps = self._provider(loaded, contextWindow=32768, maxOutputTokens=32768)
-        get, post = self._patched(mod, ps)
-        with get, post:
-            notes = " ".join(provider.diagnostics())
-        self.assertIn("maxOutputTokens", notes)
-        self.assertIn("Every ticket overflows", notes)
-
-    def test_the_library_default_ratio_does_not_warn_about_itself(self):
-        # 4096 of 8192 is the Capabilities default. A check that fires on it
-        # trains the reader to skip the whole section.
-        loaded = {"name": "m", "context_length": 8192, "size": 8, "size_vram": 8}
-        provider, mod, ps = self._provider(loaded, contextWindow=8192)
-        get, post = self._patched(mod, ps)
-        with get, post:
-            notes = " ".join(provider.diagnostics())
-        self.assertNotIn("maxOutputTokens", notes)
-
-    def test_a_sane_configuration_warns_about_nothing_important(self):
-        loaded = {"name": "m", "context_length": 32768, "size": 8, "size_vram": 8}
-        provider, mod, ps = self._provider(loaded, contextWindow=32768, maxOutputTokens=8192)
-        get, post = self._patched(mod, ps)
-        with get, post:
-            notes = provider.diagnostics()
-        self.assertFalse([n for n in notes if not n.startswith("note:")])
-
-    def test_partial_vram_residency_is_reported(self):
-        loaded = {"name": "m", "context_length": 32768, "size": 100, "size_vram": 40}
-        provider, mod, ps = self._provider(loaded, contextWindow=32768, maxOutputTokens=8192)
-        get, post = self._patched(mod, ps)
-        with get, post:
-            notes = " ".join(provider.diagnostics())
-        self.assertIn("40% of", notes)
-        self.assertIn("runs on CPU", notes)
-
-    def test_a_non_ollama_endpoint_asks_nothing_and_warns_nothing(self):
-        provider = OpenAICompatProvider(
-            "remote",
-            {"baseUrl": "https://api.example.com", "model": "m", "contextWindow": 8192},
-        )
-        mod = sys.modules["forge.providers.openai_compat"]
-
-        def explode(*_a, **_k):
-            raise AssertionError("must not probe a non-Ollama endpoint")
-
-        with unittest.mock.patch.object(mod, "get_json", explode), \
-             unittest.mock.patch.object(mod, "post_json", explode):
-            self.assertEqual(provider.diagnostics(), [])
-
-    def test_a_probe_failure_never_breaks_doctor(self):
-        provider = OpenAICompatProvider(
-            "local", {"baseUrl": "http://x:11434/v1", "model": "m", "contextWindow": 8192}
-        )
-        mod = sys.modules["forge.providers.openai_compat"]
-
-        def explode(*_a, **_k):
-            raise OSError("connection refused")
-
-        with unittest.mock.patch.object(mod, "get_json", explode), \
-             unittest.mock.patch.object(mod, "post_json", explode):
-            self.assertEqual(provider.diagnostics(), [])
-
-
-def _failing_shell(output: str):
-    """A `_shell` stub that fails every configured command with `output`.
-
-    Unconfigured steps still pass, as the real one does — otherwise the ticket
-    fails on `lint` before reaching the step under test.
-    """
-
-    def shell(_run_id, name, command, _ticket="", **_kwargs):
-        if not command.strip():
-            return StepResult(ok=True, detail=f"no {name} command configured; skipped")
-        return StepResult(ok=False, detail=output)
-
-    return shell
-
-
-def _replies(*texts: str):
-    """A `_call` stub that returns each reply in turn, repeating the last."""
-    remaining = list(texts)
-
-    def call(*_args, **_kwargs):
-        text = remaining.pop(0) if len(remaining) > 1 else remaining[0]
-        return Completion(text=text, usage=Usage(), finish_reason="stop")
-
-    return call
 
 
 class TestThinkingModelsThatNeverAnswer(unittest.TestCase):
@@ -18627,441 +18333,6 @@ class TestWhatTheFormatterCouldNotReadReachesTheNextAttempt(unittest.TestCase):
         self.assertIn("could not read", found[0])
 
 
-class TestFreeTokenLoadsTheModelItWasAskedFor(unittest.TestCase):
-    """FreeToken serves one checkpoint and answers to any name.
-
-        model="Qwen3.8-27B-NVFP4"      -> 200, served-as=Qwen3.8-27B-NVFP4
-        model="Gemma-4-26B-A4B-NVFP4"  -> 200, served-as=Gemma-4-26B-A4B-NVFP4
-        model="totally-made-up"        -> 200, served-as=totally-made-up
-
-    All three answered by the one loaded engine, which echoed the name back.
-    Pointed at it, the plain `openai` kind turns a config naming three models
-    into one model and three labels, with every artifact recording the label —
-    and no error anywhere. So this provider asks the daemon what is loaded,
-    switches when it is wrong, and verifies what came up."""
-
-    QWEN = r"C:\Users\nschr\.freetoken\models\Qwen3.8-27B-NVFP4"
-    GEMMA = r"C:\Users\nschr\.freetoken\models\Gemma-4-26B-A4B-NVFP4"
-
-    def _provider(self, name, path, **extra):
-        return build_provider("role", {
-            "kind": "freetoken", "daemonUrl": "http://127.0.0.1:1900", "port": 1919,
-            "model": name, "modelPath": path, "contextWindow": 8192, **extra,
-        })
-
-    def _wire(self, provider, loaded, comes_up=None, exit_code=None):
-        """Stand in for the daemon and the serve. Records what was asked."""
-        asked: list[str] = []
-        state = {"loaded": loaded}
-
-        def status():
-            running = bool(state["loaded"]) and exit_code is None
-            return {"running": running, "model": state["loaded"] or "",
-                    "lastExitCode": exit_code, "lastExitReason": "exited"}
-
-        def switch(_body):
-            asked.append("switch")
-            state["loaded"] = comes_up if comes_up is not None else _body["model"]
-
-        provider._status = status
-        provider._switch_wire = switch
-        provider._serving = lambda: provider._loaded_name(status())
-        original = provider._switch
-
-        def _switch():
-            switch({"model": provider.model_path})
-            if exit_code is not None or comes_up == "":
-                return original()
-            return original() if False else None
-
-        provider._switch = _switch
-        return asked, state
-
-    def test_a_model_already_loaded_is_not_reloaded(self):
-        provider = self._provider("Qwen3.8-27B-NVFP4", self.QWEN)
-        asked, _ = self._wire(provider, self.QWEN)
-
-        provider._ensure_loaded()
-
-        self.assertEqual(asked, [])
-
-    def test_a_different_model_is_switched_in(self):
-        provider = self._provider("Gemma-4-26B-A4B-NVFP4", self.GEMMA)
-        asked, state = self._wire(provider, self.QWEN)
-
-        provider._ensure_loaded()
-
-        self.assertEqual(asked, ["switch"])
-        self.assertEqual(state["loaded"], self.GEMMA)
-
-    def test_a_path_is_compared_against_the_name_the_api_reports(self):
-        # `/engine/status` reports the path it was handed and `/v1/models`
-        # reports the basename of it, so one has to be reduced or every call
-        # looks like a miss and reloads 19 GiB.
-        provider = self._provider("Qwen3.8-27B-NVFP4", self.QWEN)
-
-        self.assertEqual(
-            provider._loaded_name({"model": self.QWEN}), "Qwen3.8-27B-NVFP4"
-        )
-        self.assertEqual(
-            provider._loaded_name({"model": "a/b/Gemma-4-26B-A4B-NVFP4"}),
-            "Gemma-4-26B-A4B-NVFP4",
-        )
-        self.assertEqual(provider._loaded_name({}), "")
-
-    def test_nothing_loaded_still_switches(self):
-        provider = self._provider("Qwen3.8-27B-NVFP4", self.QWEN)
-        asked, _ = self._wire(provider, "")
-
-        provider._ensure_loaded()
-
-        self.assertEqual(asked, ["switch"])
-
-    def test_the_port_decides_the_base_url(self):
-        provider = self._provider("Qwen3.8-27B-NVFP4", self.QWEN)
-
-        self.assertEqual(provider.base_url, "http://127.0.0.1:1919/v1")
-
-    def test_a_base_url_is_left_alone_when_given(self):
-        provider = self._provider(
-            "Qwen3.8-27B-NVFP4", self.QWEN, baseUrl="http://box:9000/v1"
-        )
-
-        self.assertEqual(provider.base_url, "http://box:9000/v1")
-
-    def test_the_path_defaults_to_the_model_name(self):
-        provider = build_provider("role", {
-            "kind": "freetoken", "model": "Qwen3.8-27B-NVFP4", "contextWindow": 8192,
-        })
-
-        self.assertEqual(provider.model_path, "Qwen3.8-27B-NVFP4")
-        self.assertEqual(provider.port, 1919)
-
-    def test_engine_arguments_reach_the_daemon(self):
-        # `--moe-backend offload`, `--memory-ratio`: per model, because the two
-        # halves of a co-resident pair are never given the same budget.
-        sent: list[dict] = []
-        provider = self._provider(
-            "Gemma-4-26B-A4B-NVFP4", self.GEMMA,
-            engineArgs=["--moe-backend", "offload"],
-        )
-        provider._serving = lambda: "Gemma-4-26B-A4B-NVFP4"
-
-        import forge.providers.freetoken as ft
-        original = ft.post_json
-        ft.post_json = lambda url, body, **kw: sent.append(body) or {}
-        try:
-            provider._switch()
-        finally:
-            ft.post_json = original
-
-        self.assertEqual(sent[0]["args"], ["--moe-backend", "offload"])
-        self.assertEqual(sent[0]["model"], self.GEMMA)
-
-    def test_the_wrong_model_coming_up_is_refused_not_used(self):
-        # The failure this provider exists to prevent: answering from one
-        # checkpoint under another's name, which the endpoint does happily.
-        provider = self._provider("Gemma-4-26B-A4B-NVFP4", self.GEMMA)
-        provider._serving = lambda: "Qwen3.8-27B-NVFP4"
-        provider._status = lambda: {"running": True, "model": self.QWEN,
-                                    "lastExitCode": None}
-
-        import forge.providers.freetoken as ft
-        original = ft.post_json
-        ft.post_json = lambda url, body, **kw: {}
-        try:
-            with self.assertRaises(ProviderError) as caught:
-                provider._switch()
-        finally:
-            ft.post_json = original
-
-        self.assertIn("Qwen3.8-27B-NVFP4", str(caught.exception))
-        self.assertIn("echoes whatever model name", str(caught.exception))
-
-    def test_an_engine_that_exited_is_reported_with_the_likely_cause(self):
-        # A bare name is handed to `AutoConfig.from_pretrained`, looked up on
-        # HuggingFace, and the engine exits 1 before binding a port — while
-        # `/engine/status` still says `running: true` for a moment.
-        provider = self._provider("Qwen3.8-27B-NVFP4", "Qwen3.8-27B-NVFP4")
-        provider._serving = lambda: ""
-        provider._status = lambda: {"running": False, "model": "",
-                                    "lastExitCode": 1, "lastExitReason": "exited"}
-
-        import forge.providers.freetoken as ft
-        original = ft.post_json
-        ft.post_json = lambda url, body, **kw: {}
-        try:
-            with self.assertRaises(ProviderUnreachable) as caught:
-                provider._switch()
-        finally:
-            ft.post_json = original
-
-        self.assertIn("modelPath", str(caught.exception))
-
-    def test_the_registry_knows_the_kind_and_its_alias(self):
-        self.assertIn("freetoken", available_kinds())
-        self.assertEqual(
-            build_provider("r", {"kind": "ft", "model": "m"}).kind, "freetoken"
-        )
-
-
-class TestTheEngineIsShapedTheWayTheRoleAsksFor(unittest.TestCase):
-    """A serve started by `/engine/switch` comes up at the engine's default
-    cache sizing, and anything applied by hand belongs to the process it was
-    applied to. So a run that swaps models lands on defaults every swap.
-
-    Measured on one checkpoint: 115,729 KV tokens by default against 759,808
-    applied from the desktop app. On the small one the reviewer reasoned past a
-    65,536-token budget twice without ever answering; on the large one the same
-    prompt finished in 7,533 tokens.
-
-    Nothing here knows anything about a particular model. Which pools exist,
-    what they may be set to, and what the reasoning gears are called all come
-    from `/v1/cache/status`, so a checkpoint with a mamba pool and no window
-    pool configures exactly as well as one with the reverse."""
-
-    GEOMETRY = {
-        "num_pages": 115729, "page_size": 1,
-        "num_swa_pages": 32819, "swa_page_size": 1,
-        "moe_cache_size": 3840, "num_mamba_slots": 0,
-        "limits": {
-            "kv_tokens": {"min": 1, "max": 1063841},
-            "moe_experts": {"min": 128, "max": 3840},
-            "mamba_slots": {"min": 0, "max": 0},
-            "swa_tokens": {"min": 8777, "max": 106384},
-        },
-        "reasoning": {
-            "gears": ["off", "on"], "default": "off",
-            "kwargs": {
-                "off": {"enable_thinking": False, "thinking_mode": "disabled"},
-                "on": {"enable_thinking": True, "thinking_mode": "enabled"},
-            },
-        },
-    }
-
-    def _provider(self, **extra):
-        return build_provider("role", {
-            "kind": "freetoken", "port": 1919, "model": "M", "modelPath": r"C:\m",
-            "contextWindow": 262144, "maxOutputTokens": 65536, **extra,
-        })
-
-    def _wire(self, provider, geometry=None, posts=None):
-        """Answer /v1/cache/status, and record what a rebuild would send."""
-        import forge.providers.freetoken as ft
-        state = {"geometry": dict(geometry or self.GEOMETRY)}
-        original_get, original_post = ft.get_json, ft.post_json
-
-        def get(url, **kwargs):
-            if "cache/status" in url:
-                return {"geometry": state["geometry"]}
-            raise AssertionError(url)
-
-        def post(url, body, **kwargs):
-            if posts is not None:
-                posts.append(body)
-            # A real rebuild is reflected in the geometry read back after it.
-            for field in ("num_pages", "num_swa_pages", "moe_cache_size"):
-                if field in body:
-                    state["geometry"][field] = body[field]
-            return {"status": "ok"}
-
-        ft.get_json, ft.post_json = get, post
-        self.addCleanup(lambda: setattr(ft, "get_json", original_get))
-        self.addCleanup(lambda: setattr(ft, "post_json", original_post))
-        return state
-
-    def test_tokens_become_pages_and_slots_stay_slots(self):
-        provider = self._provider(cache={"kv": 759808, "swa": 23146, "moe": 256})
-        self._wire(provider)
-        self.assertEqual(
-            provider._targets(provider.geometry()),
-            {"num_pages": 759808, "num_swa_pages": 23146, "moe_cache_size": 256},
-        )
-
-    def test_a_page_larger_than_one_token_is_honoured(self):
-        # Never assume 1. It is 1 on radix-SWA and is not on every backend, and
-        # a page size read as 1 when it is 16 asks for a sixteenth of the cache.
-        geometry = {**self.GEOMETRY, "page_size": 16}
-        provider = self._provider(cache={"kv": 1000})
-        self._wire(provider, geometry)
-        # 1000 tokens is 62.5 pages, and a partial page is still allocated.
-        self.assertEqual(provider._targets(provider.geometry())["num_pages"], 63)
-
-    def test_a_pool_this_model_does_not_have_is_refused(self):
-        provider = self._provider(cache={"mamba": 8})
-        self._wire(provider)
-        with self.assertRaises(ProviderError) as caught:
-            provider._targets(provider.geometry())
-        self.assertIn("no 'mamba' cache pool", str(caught.exception))
-
-    def test_a_size_outside_the_limits_is_refused_not_clamped(self):
-        # Clamping would leave the run believing it asked for something it did
-        # not get, which is the whole class of bug this exists to end.
-        provider = self._provider(cache={"swa": 100})
-        self._wire(provider)
-        with self.assertRaises(ProviderError) as caught:
-            provider._targets(provider.geometry())
-        self.assertIn("8,777-106,384", str(caught.exception))
-
-    def test_an_unknown_pool_name_says_what_it_understands(self):
-        provider = self._provider(cache={"gpu": 1})
-        self._wire(provider)
-        with self.assertRaises(ProviderError) as caught:
-            provider._targets(provider.geometry())
-        self.assertIn("kv, mamba, moe, swa", str(caught.exception))
-
-    def test_a_switch_shapes_the_new_serve(self):
-        posts: list[dict] = []
-        provider = self._provider(cache={"kv": 759808, "swa": 23146})
-        self._wire(provider, posts=posts)
-        provider._apply_cache()
-        self.assertEqual(len(posts), 1)
-        self.assertEqual(posts[0]["num_pages"], 759808)
-        self.assertEqual(posts[0]["num_swa_pages"], 23146)
-
-    def test_a_serve_already_shaped_that_way_is_left_alone(self):
-        # A rebuild stops serving while it runs, and switching back to a model
-        # this provider already shaped is the common case.
-        posts: list[dict] = []
-        provider = self._provider(cache={"kv": 115729, "swa": 32819})
-        self._wire(provider, posts=posts)
-        provider._apply_cache()
-        self.assertEqual(posts, [])
-
-    def test_a_refused_rebuild_is_not_reported_as_success(self):
-        # The endpoint answers per pool, and one that will not fit the VRAM
-        # budget is refused on its own - leaving a geometry nobody chose.
-        import forge.providers.freetoken as ft
-        provider = self._provider(cache={"kv": 759808})
-        original_get, original_post = ft.get_json, ft.post_json
-        ft.get_json = lambda url, **kw: {"geometry": self.GEOMETRY}
-        ft.post_json = lambda url, body, **kw: {"status": "rejected"}
-        self.addCleanup(lambda: setattr(ft, "get_json", original_get))
-        self.addCleanup(lambda: setattr(ft, "post_json", original_post))
-        with self.assertRaises(ProviderUnreachable) as caught:
-            provider._apply_cache()
-        self.assertIn("refused", str(caught.exception))
-
-    def test_no_cache_configured_touches_nothing(self):
-        posts: list[dict] = []
-        provider = self._provider()
-        self._wire(provider, posts=posts)
-        provider._apply_cache()
-        self.assertEqual(posts, [])
-
-    # -- reasoning gears ------------------------------------------------
-
-    def test_a_gear_resolves_to_the_engines_own_fields(self):
-        provider = self._provider(reasoning="on")
-        self._wire(provider)
-        self.assertEqual(
-            provider._reasoning_body(),
-            {"chat_template_kwargs":
-                {"enable_thinking": True, "thinking_mode": "enabled"}},
-        )
-
-    def test_the_gear_travels_as_template_kwargs_not_request_fields(self):
-        """Where these go decides whether they do anything, and the wrong
-        place fails silently.
-
-        Measured against one engine, same prompt, only the nesting moved:
-
-            nothing sent               4 tokens,   0 chars of reasoning
-            chat_template_kwargs on  216 tokens, 436 chars
-            top-level                  4 tokens,   0 chars
-
-        Sent flat they are dropped without a word and the engine falls back to
-        its default gear, which on that checkpoint is `off` — so a reviewer
-        configured to think returns an instant ACCEPT and reads like a model
-        that simply will not reason. They are the checkpoint's jinja template
-        variables, not request fields, and nesting is what makes them arrive.
-        """
-        provider = self._provider(reasoning="on")
-        self._wire(provider)
-        provider._ensure_loaded = lambda: None
-
-        import forge.providers.openai_compat as oc
-        sent: list[dict] = []
-        original = oc.post_json
-
-        def post(url, body, **kwargs):
-            sent.append(body)
-            return {"choices": [{"message": {"content": "ok"},
-                                 "finish_reason": "stop"}]}
-
-        oc.post_json = post
-        self.addCleanup(lambda: setattr(oc, "post_json", original))
-        provider.complete([Message(role="user", content="hi")], max_tokens=16)
-
-        self.assertEqual(
-            sent[0]["chat_template_kwargs"],
-            {"enable_thinking": True, "thinking_mode": "enabled"},
-        )
-        # Flat copies would be inert, and their presence would suggest the
-        # gear had been delivered when it had not.
-        self.assertNotIn("enable_thinking", sent[0])
-        self.assertNotIn("thinking_mode", sent[0])
-
-    def test_a_gear_the_model_lacks_is_refused_with_what_it_has(self):
-        # The failure this replaces was silent: the engine logged that
-        # `reasoning_effort medium` was not supported, used the template
-        # default, and answered - so two roles spent a whole run believing
-        # they had asked for something.
-        provider = self._provider(reasoning="medium")
-        self._wire(provider)
-        with self.assertRaises(ProviderError) as caught:
-            provider._reasoning_body()
-        message = str(caught.exception)
-        self.assertIn("no 'medium' reasoning gear", message)
-        self.assertIn("off, on", message)
-
-    def test_an_operators_own_body_still_wins(self):
-        provider = self._provider(
-            reasoning="on",
-            extraBody={"chat_template_kwargs": {"thinking_mode": "custom"}},
-        )
-        self._wire(provider)
-        provider._ensure_loaded = lambda: None
-        import forge.providers.openai_compat as oc
-        sent: list[dict] = []
-        original = oc.post_json
-
-        def post(url, body, **kwargs):
-            sent.append(body)
-            return {"choices": [{"message": {"content": "ok"},
-                                 "finish_reason": "stop"}]}
-
-        oc.post_json = post
-        self.addCleanup(lambda: setattr(oc, "post_json", original))
-        provider.complete([Message(role="user", content="hi")], max_tokens=16)
-        # Merged one level in, not overlaid: setting one template variable
-        # must not drop the others the gear selects.
-        self.assertEqual(
-            sent[0]["chat_template_kwargs"],
-            {"enable_thinking": True, "thinking_mode": "custom"},
-        )
-
-    def test_an_older_serve_without_geometry_passes_the_name_through(self):
-        import forge.providers.freetoken as ft
-        provider = self._provider(reasoning="low")
-        original = ft.get_json
-
-        def get(url, **kwargs):
-            raise OSError("no such endpoint")
-
-        ft.get_json = get
-        self.addCleanup(lambda: setattr(ft, "get_json", original))
-        self.assertEqual(provider._reasoning_body(), {"reasoning_effort": "low"})
-
-    def test_doctor_prints_the_pools_and_gears_a_byom_user_cannot_guess(self):
-        provider = self._provider()
-        self._wire(provider)
-        notes = " | ".join(provider.diagnostics())
-        self.assertIn("cache pools available", notes)
-        self.assertIn("swa 8,777-106,384", notes)
-        self.assertIn("reasoning gears: off, on", notes)
-
-
 class TestATimeoutCoversTheBudgetItWasGiven(unittest.TestCase):
     """A timeout shorter than the budget makes the budget unreachable.
 
@@ -19176,104 +18447,6 @@ class TestATimeoutCoversTheBudgetItWasGiven(unittest.TestCase):
             [Message(role="user", content="hi")], max_tokens=65536, timeout=60
         )
         self.assertEqual(seen, [60])
-
-
-class TestASwitchIsForcedWhenTheOldEngineWillNotDrain(unittest.TestCase):
-    """The daemon drains the running serve before replacing it, and a serve
-    that is mid-generation will not drain:
-
-        503 {"error": "prepare-stop returned HTTP 503",
-             "code": "accounting_prepare_failed", "enginePreserved": true}
-
-    That is the ordinary case, not an exotic one — the engine being replaced
-    was answering a moment ago, and a model that reasons past its output budget
-    goes on answering for a long time after. One run lost ten builds and two
-    records to it, every one reported as the build step failing."""
-
-    BUSY = ('http://127.0.0.1:1900/engine/switch returned 503: '
-            '{"error":"prepare-stop returned HTTP 503",'
-            '"code":"accounting_prepare_failed","enginePreserved":true}')
-
-    def _provider(self):
-        return build_provider("role", {
-            "kind": "freetoken", "port": 1919, "model": "Gemma-4-26B-A4B-NVFP4",
-            "modelPath": r"C:\models\Gemma-4-26B-A4B-NVFP4", "contextWindow": 8192,
-        })
-
-    def _posts(self, provider, fail_first):
-        """Record every switch body; optionally 503 the un-forced one."""
-        sent: list[dict] = []
-        import forge.providers.freetoken as ft
-        original = ft.post_json
-
-        def post(url, body, **kwargs):
-            sent.append(body)
-            if fail_first and not body.get("force"):
-                raise ProviderUnreachable(self.BUSY)
-            return {}
-
-        ft.post_json = post
-        self.addCleanup(lambda: setattr(ft, "post_json", original))
-        provider._serving = lambda: provider.model
-        return sent
-
-    def test_a_busy_engine_is_retried_with_force(self):
-        provider = self._provider()
-        sent = self._posts(provider, fail_first=True)
-
-        provider._switch()
-
-        self.assertEqual(len(sent), 2)
-        self.assertNotIn("force", sent[0])
-        self.assertIs(sent[1]["force"], True)
-
-    def test_a_switch_that_works_is_not_forced(self):
-        provider = self._provider()
-        sent = self._posts(provider, fail_first=False)
-
-        provider._switch()
-
-        self.assertEqual(len(sent), 1)
-        self.assertNotIn("force", sent[0])
-
-    def test_engine_arguments_survive_the_forced_retry(self):
-        provider = build_provider("role", {
-            "kind": "freetoken", "port": 1919, "model": "Gemma-4-26B-A4B-NVFP4",
-            "modelPath": r"C:\models\Gemma-4-26B-A4B-NVFP4", "contextWindow": 8192,
-            "engineArgs": ["--max-running-requests", "1"],
-        })
-        sent = self._posts(provider, fail_first=True)
-
-        provider._switch()
-
-        self.assertEqual(sent[1]["args"], ["--max-running-requests", "1"])
-
-    def test_a_daemon_that_is_not_there_is_not_forced(self):
-        # Forcing helps only when the drain failed and the engine was
-        # preserved. A daemon that cannot be reached at all is a different
-        # fault, and retrying it as a force would report the wrong cause.
-        provider = self._provider()
-        tried: list[dict] = []
-        import forge.providers.freetoken as ft
-        original = ft.post_json
-
-        def post(url, body, **kwargs):
-            tried.append(body)
-            raise ProviderUnreachable("could not reach http://127.0.0.1:1900: refused")
-
-        ft.post_json = post
-        self.addCleanup(lambda: setattr(ft, "post_json", original))
-
-        with self.assertRaises(ProviderUnreachable):
-            provider._switch()
-        self.assertEqual(len(tried), 1)
-
-    def test_the_marker_is_read_off_the_real_error(self):
-        self.assertTrue(freetoken_drain_failed(self.BUSY))
-        self.assertFalse(freetoken_drain_failed("engine exited (exited)"))
-        self.assertFalse(
-            freetoken_drain_failed("could not reach 127.0.0.1:1900: refused")
-        )
 
 
 class TestAFormatChainSurvivesValidation(unittest.TestCase):
@@ -21140,3 +20313,290 @@ class TestAnEvictionIsWaitedForBeforeTheSlotIsClaimed(unittest.TestCase):
             provider._ensure_loaded()
 
         self.assertEqual(asked, [("unload", "nemo-a")])
+
+
+
+class TestThePresetIsWrittenFromTheConfigThatPlansAgainstIt(unittest.TestCase):
+    """`ctx-size` and `contextWindow` are the same number in two files.
+
+    Forge proves a prompt fits against config and the server truncates against
+    the preset, so when they disagree the gate approves a prompt the server
+    then cuts *from the front* — the system message and the spec. What comes
+    back reads as a weak model rather than a truncated request.
+
+    Keeping them in step by hand is where that lives, which is why this is
+    generated. The Ollama Modelfiles this replaced existed for the same reason
+    and had the same failure: one setup carried `num_ctx 32768` across three
+    models trained for eight times that, and nothing reported it.
+    """
+
+    def _config(self, models):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        return Config(
+            root=root,
+            models=models,
+            roles={r: sorted(models)[0] for r in ROLES},
+        )
+
+    @staticmethod
+    def _sections(text):
+        """Parse the generated INI back into {section: {key: value}}."""
+        import configparser
+
+        parser = configparser.ConfigParser()
+        parser.read_string(text)
+        return {s: dict(parser[s]) for s in parser.sections()}
+
+    def test_a_local_model_becomes_a_section_named_by_its_router_id(self):
+        config = self._config({"plan": {
+            "kind": "llamacpp", "model": "qwen3.8",
+            "modelPath": r"C:\models\Qwen3.8.gguf", "contextWindow": 65536,
+        }})
+
+        sections = self._sections(presets.render(presets.plan(config)))
+
+        self.assertEqual(list(sections), ["qwen3.8"])
+        self.assertEqual(sections["qwen3.8"]["model"], r"C:\models\Qwen3.8.gguf")
+        self.assertEqual(sections["qwen3.8"]["ctx-size"], "65536")
+
+    def test_the_window_written_is_the_one_the_budget_gate_plans_against(self):
+        config = self._config({"plan": {
+            "kind": "llamacpp", "model": "m", "modelPath": "/m.gguf",
+            "contextWindow": 32768,
+        }})
+
+        sections = self._sections(presets.render(presets.plan(config)))
+        window = config.provider_for("planner").config["contextWindow"]
+
+        self.assertEqual(sections["m"]["ctx-size"], str(window))
+
+    def test_two_roles_on_one_checkpoint_are_one_child_server(self):
+        # The ordinary case, not a mistake: a planner and an executor sharing a
+        # model differ in output budget, which is a per-request number.
+        config = self._config({
+            "plan": {"kind": "llamacpp", "model": "qwen", "modelPath": "/q.gguf",
+                     "contextWindow": 65536, "maxOutputTokens": 16384},
+            "code": {"kind": "llamacpp", "model": "qwen", "modelPath": "/q.gguf",
+                     "contextWindow": 65536, "maxOutputTokens": 8192},
+        })
+
+        entries = presets.plan(config)
+
+        self.assertEqual([e.model_id for e in entries], ["qwen"])
+
+    def test_two_roles_disagreeing_on_the_window_get_the_larger(self):
+        # One child server, so one -c. A role planning against 32,768 is fine
+        # on a server that allocated 65,536; the reverse truncates the prompt
+        # from the front. Order of keys in config.json must not decide which.
+        wide_first = self._config({
+            "a": {"kind": "llamacpp", "model": "q", "modelPath": "/q.gguf",
+                  "contextWindow": 65536},
+            "b": {"kind": "llamacpp", "model": "q", "modelPath": "/q.gguf",
+                  "contextWindow": 32768},
+        })
+        narrow_first = self._config({
+            "a": {"kind": "llamacpp", "model": "q", "modelPath": "/q.gguf",
+                  "contextWindow": 32768},
+            "b": {"kind": "llamacpp", "model": "q", "modelPath": "/q.gguf",
+                  "contextWindow": 65536},
+        })
+
+        for config in (wide_first, narrow_first):
+            sections = self._sections(presets.render(presets.plan(config)))
+            self.assertEqual(sections["q"]["ctx-size"], "65536")
+
+    def test_a_flag_only_one_role_sets_still_reaches_the_section(self):
+        config = self._config({
+            "a": {"kind": "llamacpp", "model": "q", "modelPath": "/q.gguf"},
+            "b": {"kind": "llamacpp", "model": "q", "modelPath": "/q.gguf",
+                  "reasoningBudget": 2048},
+        })
+
+        sections = self._sections(presets.render(presets.plan(config)))
+
+        self.assertEqual(sections["q"]["reasoning-budget"], "2048")
+
+    def test_a_cloud_model_is_left_out(self):
+        # A preset means nothing to an endpoint forge does not start.
+        config = self._config({
+            "local": {"kind": "llamacpp", "model": "m", "modelPath": "/m.gguf"},
+            "api": {"kind": "anthropic", "model": "claude-opus-5"},
+            "hosted": {"kind": "openai", "model": "gpt-5"},
+        })
+
+        entries = presets.plan(config)
+
+        self.assertEqual([e.model_id for e in entries], ["m"])
+
+    def test_a_local_model_with_no_gguf_path_is_skipped_rather_than_guessed(self):
+        # The file is not derivable from a router id, and a section pointing at
+        # the wrong one fails at load with a message about the file rather than
+        # about the config that named it.
+        config = self._config({"plan": {"kind": "llamacpp", "model": "qwen3.8"}})
+
+        self.assertEqual(presets.plan(config), [])
+        self.assertIsNone(presets.write(config))
+
+    def test_the_reasoning_budget_reaches_the_preset(self):
+        # Measured: a 30B A3B MoE with no budget spent all 32,768 of its output
+        # tokens on hidden reasoning and never began its answer, on every call.
+        config = self._config({"plan": {
+            "kind": "llamacpp", "model": "nemo", "modelPath": "/n.gguf",
+            "reasoningBudget": 2048,
+        }})
+
+        sections = self._sections(presets.render(presets.plan(config)))
+
+        self.assertEqual(sections["nemo"]["reasoning-budget"], "2048")
+
+    def test_the_projector_is_off_unless_the_model_is_multimodal(self):
+        # Loaded automatically beside a .gguf that has one, and costing VRAM no
+        # text-only role will use.
+        off = self._config({"plan": {
+            "kind": "llamacpp", "model": "m", "modelPath": "/m.gguf"}})
+        on = self._config({"plan": {
+            "kind": "llamacpp", "model": "m", "modelPath": "/m.gguf",
+            "multimodal": True}})
+
+        self.assertEqual(
+            self._sections(presets.render(presets.plan(off)))["m"]["mmproj-auto"],
+            "false",
+        )
+        self.assertNotIn(
+            "mmproj-auto",
+            self._sections(presets.render(presets.plan(on)))["m"],
+        )
+
+    def test_an_unlisted_flag_can_still_be_set(self):
+        config = self._config({"plan": {
+            "kind": "llamacpp", "model": "m", "modelPath": "/m.gguf",
+            "presetFlags": {"rope-scaling": "yarn", "threads": 16},
+        }})
+
+        sections = self._sections(presets.render(presets.plan(config)))
+
+        self.assertEqual(sections["m"]["rope-scaling"], "yarn")
+        self.assertEqual(sections["m"]["threads"], "16")
+
+    def test_booleans_are_written_the_way_llama_cpp_reads_them(self):
+        config = self._config({"plan": {
+            "kind": "llamacpp", "model": "m", "modelPath": "/m.gguf",
+            "flashAttention": True,
+        }})
+
+        text = presets.render(presets.plan(config))
+
+        self.assertIn("flash-attn = true", text)
+        self.assertIn("jinja = true", text)
+
+    def test_the_file_lands_where_the_router_is_told_to_look(self):
+        config = self._config({"plan": {
+            "kind": "llamacpp", "model": "m", "modelPath": "/m.gguf",
+            "contextWindow": 8192,
+        }})
+
+        path = presets.write(config)
+
+        self.assertEqual(path.name, presets.PRESET_NAME)
+        self.assertEqual(path.parent.name, presets.MODELS_DIR)
+        self.assertIn("[m]", path.read_text(encoding="utf-8"))
+
+    def test_the_header_says_how_to_serve_it(self):
+        # The file is written; the server is not started. It owns the GPU and
+        # outlives any one forge command.
+        text = presets.render(presets.plan(self._config({"plan": {
+            "kind": "llamacpp", "model": "m", "modelPath": "/m.gguf"}})))
+
+        self.assertIn("--models-preset", text)
+        self.assertIn("llama-server", text)
+
+    def test_a_config_with_nothing_local_writes_no_file(self):
+        config = self._config({"api": {"kind": "anthropic", "model": "opus"}})
+
+        self.assertIsNone(presets.write(config))
+        self.assertFalse((config.config_dir / presets.MODELS_DIR).exists())
+
+
+class TestABackendForgeNoLongerCarriesSaysSo(unittest.TestCase):
+    """"Unknown kind" would send its author hunting for a typo.
+
+    A config saying `"kind": "ollama"` is not misspelled — it is a config
+    written when that was a backend. The four local adapters forge used to
+    carry each had their own way of being asked what they were serving and
+    their own silent failure, which is why there is one now; the config that
+    predates the narrowing deserves the migration rather than the spellcheck.
+    """
+
+    def _kind(self, kind):
+        with self.assertRaises(ValueError) as caught:
+            build_provider("plan", {"kind": kind, "model": "m"})
+        return str(caught.exception)
+
+    def test_a_retired_local_backend_names_its_replacement(self):
+        for kind in ("ollama", "vllm", "lmstudio", "freetoken", "command"):
+            with self.subTest(kind=kind):
+                message = self._kind(kind)
+                self.assertIn("llamacpp", message)
+                self.assertNotIn("available kinds", message)
+
+    def test_an_alias_of_a_retired_backend_gets_the_same_answer(self):
+        self.assertEqual(self._kind("ft"), self._kind("freetoken"))
+        self.assertEqual(self._kind("subprocess"), self._kind("command"))
+
+    def test_a_genuine_typo_still_gets_the_list(self):
+        message = self._kind("openia")
+
+        self.assertIn("available kinds", message)
+        self.assertIn("llamacpp", message)
+
+    def test_the_local_backend_is_what_an_omitted_kind_means(self):
+        # Every cloud kind needs a credential named beside it, so none of them
+        # is reachable by leaving `kind` out.
+        self.assertEqual(build_provider("plan", {"model": "m"}).kind, "llamacpp")
+
+    def test_the_registry_is_the_five_that_are_left(self):
+        self.assertEqual(
+            available_kinds(),
+            ["anthropic", "claude-cli", "gemini", "llamacpp", "openai"],
+        )
+
+
+class TestTheCloudAdapterNoLongerGuessesAWindow(unittest.TestCase):
+    """It used to ask Ollama. There is no Ollama to ask.
+
+    Discovery existed to reconcile two disagreeing answers — `/api/ps` for what
+    was loaded against `/api/show` for what the model could do, 32,768 against
+    131,072 on a real box. A hosted endpoint publishes neither, so a number
+    that arrived by discovery would now be a guess wearing a measurement's
+    clothes. `forge doctor` asks for the real one instead.
+    """
+
+    def _provider(self, **extra):
+        return build_provider("api", {
+            "kind": "openai", "model": "gpt-5",
+            "apiKey": "k", **extra,
+        })
+
+    def test_an_unset_window_is_the_documented_default(self):
+        from forge.providers.openai_compat import DEFAULT_CONTEXT_WINDOW
+
+        self.assertEqual(
+            self._provider().capabilities().context_window, DEFAULT_CONTEXT_WINDOW
+        )
+
+    def test_doctor_asks_for_the_number_rather_than_inventing_one(self):
+        notes = " ".join(self._provider().diagnostics())
+
+        self.assertIn("contextWindow is not set", notes)
+
+    def test_a_configured_window_is_taken_and_not_queried(self):
+        provider = self._provider(contextWindow=200000)
+
+        self.assertEqual(provider.capabilities().context_window, 200000)
+        self.assertNotIn(
+            "contextWindow is not set", " ".join(provider.diagnostics())
+        )
+
+    def test_the_default_endpoint_is_openais_and_not_a_local_port(self):
+        self.assertEqual(self._provider().base_url, "https://api.openai.com/v1")

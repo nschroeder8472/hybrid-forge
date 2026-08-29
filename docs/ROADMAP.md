@@ -181,7 +181,7 @@ Three things make it more than a `kind` string, and the spec is mostly about
 them.
 
 - **A reviewer that cannot see the image is not a reviewer.** `Message.content`
-  is a `str` and all five adapters format it as one. Multimodal messages are
+  is a `str` and every adapter formats it as one. Multimodal messages are
   phase 1, and they ship useful on their own — a reviewer handed a screenshot on
   an ordinary code ticket needs the same change, with no image generation in the
   picture.
@@ -222,8 +222,10 @@ Found while reviewing the loop, judged not worth building yet.
   version would let a role *declare* what it needs — "this role reads text and
   returns text" — and refuse a provider that cannot promise it, rather than
   relying on a default. The image spec above makes this load-bearing: a reviewer
-  that has to *see* needs a capability four of the five adapters cannot offer,
-  and discovering that at review time costs the ticket.
+  that has to *see* needs a capability most adapters cannot offer — and on
+  `llamacpp` it is not even a property of the adapter but of the checkpoint,
+  since forge turns the projector off by default. Discovering that at review
+  time costs the ticket.
 - **Cross-ticket oscillation detection.** The executor now sees its last two
   failures, which is enough to spot an A-then-B-then-A cycle if it reads them.
   Detecting the cycle mechanically — comparing failure signatures across

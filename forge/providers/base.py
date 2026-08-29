@@ -1,9 +1,11 @@
 """Provider abstraction: one interface, any model the user brings.
 
-Every model the pipeline talks to — local Ollama, a vLLM box, the Anthropic API,
-Gemini, a bare llama.cpp binary, or the Claude Code CLI itself — is reached
-through a `Provider`. Adding a new backend means adding one module here and
-registering it; nothing in the loop, the budget gate, or the UI changes.
+Every model the pipeline talks to — a local checkpoint on llama.cpp's router,
+the Anthropic API, Gemini, OpenAI, or the Claude Code CLI itself — is reached
+through a `Provider`. Local means llama.cpp and only llama.cpp, so what a
+diagnostic can say about a local model is specific rather than the intersection
+of four backends; cloud stays plural. Adding one is a module here and a line in
+the registry; nothing in the loop, the budget gate, or the UI changes.
 
 Two things every provider must report honestly, because the loop depends on
 them:

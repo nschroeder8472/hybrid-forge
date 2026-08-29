@@ -17,11 +17,13 @@ HuggingFace repo, or the alias the operator has in their head is refused —
 failure, and this provider turns it into a better one by listing what the
 router does have, at `forge doctor` time rather than mid-run.
 
-That refusal is also why this module is small. FreeToken exists because its
-engine answers to *any* model name and echoes it back, so a config naming three
-models gets one model and three labels. The router routes by id and 400s an id
-it does not have, so forge's record of which model wrote what is true for free.
-What is left is worth having anyway:
+That refusal is also why this module is small, and part of why it is the only
+local backend forge carries. The one it replaced answered to *any* model name
+and echoed it back, so a config naming three checkpoints got one checkpoint and
+three labels — and every artifact, usage row and cost figure attributed work to
+a model that had not written it. The router routes by id and 400s an id it does
+not have, so forge's record of which model wrote what is true for free. What is
+left is worth having anyway:
 
 **A load is not instant and is not the call's fault.** Loading a 30B checkpoint
 takes tens of seconds. With `--models-autoload` the first request after a swap
@@ -108,9 +110,9 @@ class LlamaCppProvider(OpenAICompatProvider):
     def __init__(self, name: str, config: dict[str, Any]):
         super().__init__(name, config)
         # `baseUrl` carries the `/v1` the completions live under; the router's
-        # management endpoints sit one level up, the way Ollama's native API
-        # does. The OpenAI base has already defaulted this to Ollama's 11434,
-        # which belongs to a different server entirely.
+        # management endpoints — /models/load, /models/unload, /props — sit one
+        # level up from it. The inherited default is OpenAI's own endpoint,
+        # which is a cloud address and belongs to a different adapter.
         if not config.get("baseUrl"):
             self.base_url = "http://127.0.0.1:8080/v1"
         self.load_seconds = int(config.get("loadSeconds", DEFAULT_LOAD_SECONDS))

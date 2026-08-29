@@ -35,8 +35,16 @@ stored in the profile.
 **Ask what the user actually has**, do not assume the sample. The realistic
 shapes:
 
-- a local server (Ollama / vLLM / LM Studio / llama.cpp / LiteLLM) at some
-  host:port — adapter `openai`, `baseUrl` ending in `/v1`;
+- a local model — adapter `llamacpp`, pointed at a `llama-server` running in
+  router mode (`--models-preset`), `baseUrl` ending in `/v1`. This is the only
+  local backend; Ollama, vLLM, LM Studio and the `command` escape hatch were
+  all removed, and a config naming one is refused with what to use instead.
+  `model` is the router's **id** for a checkpoint — a section name in the
+  preset — not a path and not a file name. Ask for the `.gguf` path too and
+  put it in `modelPath`: that is what lets `forge models` write the preset, so
+  `ctx-size` and `contextWindow` come from one source instead of two;
+- a hosted OpenAI-compatible endpoint (OpenAI, OpenRouter, LiteLLM, Together,
+  DeepSeek) — adapter `openai`, `baseUrl` ending in `/v1`, key by env var;
 - an existing Claude subscription — adapter `claude-cli`, no key, requires
   `claude` on PATH;
 - an API key — adapter `anthropic` or `gemini`, keyed by the *name* of an
@@ -45,8 +53,10 @@ shapes:
 **Probe every endpoint while the user is still here.** A wrong URL costs one
 retyped line now and an entire overnight run later.
 
-- HTTP adapters: `GET {baseUrl}/models` — it also tells you the exact model tag
-  the server serves, which is the field people most often get wrong.
+- HTTP adapters: `GET {baseUrl}/models` — it also tells you the exact model id
+  the server serves, which is the field people most often get wrong. For
+  `llamacpp` the reply lists every preset section with its load status, and
+  the ids there are the only values `model` may take.
 - `claude-cli`: check `claude` resolves on PATH.
 - key-based adapters: check the named environment variable is set. Never read,
   echo, or write the key itself — only the variable name goes in config.

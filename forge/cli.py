@@ -13,7 +13,7 @@
     forge criteria [ID --accept N] adopt a criterion respec proposed and lost
     forge replay [--changed]       re-read past output with today's parsers
     forge prune [--keep N]         delete the artifact trees of old runs
-    forge models                   write Modelfiles pinning what config cannot
+    forge models                   write the llama.cpp preset the local models serve from
     forge pause | resume | stop    control a running loop
     forge ui [--host H] [--port N] serve the dashboard on its own
 
@@ -35,7 +35,7 @@ import webbrowser
 from collections import Counter
 from pathlib import Path
 
-from . import evidence, modelfiles, replay, respec, toolchain, wizard
+from . import evidence, presets, replay, respec, toolchain, wizard
 from .artifacts import ARTIFACTS_DIR, GITIGNORE_LINES
 from .config import (
     ANY_LANGUAGE,
@@ -141,7 +141,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             # init that already succeeded — the repo config is the deliverable.
             print(f"(could not save machine profile: {exc})")
 
-    _report_modelfiles(config, wrote_config=True)
+    _report_preset(config, wrote_config=True)
 
     print("\nNext:")
     if args.defaults:
@@ -155,57 +155,50 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def _report_modelfiles(config: Config, *, wrote_config: bool) -> int:
-    """Write a Modelfile per Ollama-backed model and say what to do with them.
+def _report_preset(config: Config, *, wrote_config: bool) -> int:
+    """Write the llama.cpp preset for the local models and say how to serve it.
 
-    Generated rather than remembered. The settings that belong in a Modelfile
-    are exactly the ones nothing else can reach — `num_ctx`, which a global
-    `OLLAMA_CONTEXT_LENGTH` silently overrides, and `top_k`/`min_p`, which the
-    OpenAI-compatible endpoint accepts and discards. Hand-written they drift:
-    one setup carried `num_ctx 32768` across three models trained for eight
-    times that, and nothing reported it.
+    Generated rather than remembered, because the numbers in it have to agree
+    with `config.json` and keeping two files in step by hand is where the
+    silent failures live. `ctx-size` here and `contextWindow` there are the
+    pair that matters: forge plans a prompt against config and the server
+    truncates against the preset, and what a too-large window loses is the
+    front of the prompt — the system message and the spec.
 
-    The files are written; `ollama create` is not run. Building a model takes
-    minutes and rewrites something outside this repository, which is a
-    decision for whoever is reading the output.
+    The file is written; `llama-server` is not started. It owns the GPU and
+    outlives any one forge command, so starting it is a decision for whoever is
+    reading this.
     """
     try:
-        written = modelfiles.write(config)
+        path = presets.write(config)
     except Exception as exc:  # noqa: BLE001 - never fail an init over this
-        print(f"\n(could not generate Modelfiles: {exc})")
+        print(f"\n(could not generate the llama.cpp preset: {exc})")
         return 0
-    if not written:
+    if path is None:
         return 0
 
+    entries = presets.plan(config)
     where = "Also wrote" if wrote_config else "Wrote"
-    print(f"\n{where} {len(written)} Modelfile(s) in {config.config_dir / modelfiles.MODELS_DIR}:")
-    for entry, path in written:
-        print(f'  {entry.alias:<12} {entry.command} "{path}"')
+    print(f"\n{where} a llama.cpp preset with {len(entries)} model(s): {path}")
+    for entry in entries:
+        print(f"  {entry.alias:<12} {entry.model_id:<24} {entry.path}")
 
+    print("\nServe it with:")
+    print(f'  llama-server --models-preset "{path}" --models-max 1')
     print(
-        "\nThese pin what config.json cannot: num_ctx, which a global\n"
-        "OLLAMA_CONTEXT_LENGTH would override, and top_k/min_p, which Ollama's\n"
-        "OpenAI endpoint accepts and ignores. Review them, then run the commands\n"
-        "above. Nothing is built for you."
+        "\n--models-max 1 keeps one checkpoint resident at a time. Raise it only\n"
+        "if every model in the preset fits in VRAM together; the role that finds\n"
+        "out otherwise is the one whose child server exits during a run."
     )
-
-    # A block naming a base model directly cannot be rebuilt under that name:
-    # the Modelfile is FROM those weights, and building over them replaces the
-    # thing it derives from.
-    renamed = [entry for entry, _ in written if entry.rename]
-    if renamed:
-        print("\nThese build under a new name, so config has to point at it too:")
-        for entry in renamed:
-            print(f"  models.{entry.alias}.model:  {entry.base}  ->  {entry.create_as}")
-    return len(written)
+    return len(entries)
 
 
 def cmd_models(args: argparse.Namespace) -> int:
     config = _load(args.root)
-    if not _report_modelfiles(config, wrote_config=False):
+    if not _report_preset(config, wrote_config=False):
         print(
-            "No Ollama-backed models in this config, so there is nothing to pin. "
-            "A Modelfile means nothing to vLLM, OpenRouter or OpenAI."
+            "No llama.cpp models in this config, so there is no preset to write. "
+            "Cloud endpoints are configured entirely in config.json."
         )
     return 0
 
@@ -2063,7 +2056,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.set_defaults(func=cmd_control, command=name)
 
     p = sub.add_parser(
-        "models", help="write Ollama Modelfiles for the configured models"
+        "models", help="write the llama.cpp preset for the configured local models"
     )
     p.set_defaults(func=cmd_models)
 

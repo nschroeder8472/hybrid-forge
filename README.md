@@ -39,17 +39,29 @@ greenfield repo and an existing one: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md
 ## Bring your own models
 
 Four roles — `planner`, `executor`, `tester`, `reviewer` — and any model can play
-any of them. Seven adapters cover the field:
+any of them. Local models are llama.cpp; cloud is whichever vendor you have:
 
 | kind | reaches |
 |---|---|
-| `openai` | Ollama, vLLM, LM Studio, a single-model llama.cpp server, LiteLLM, OpenRouter, Together, DeepSeek, OpenAI |
-| `llamacpp` | `llama-server` in router mode, swapping checkpoints on one endpoint as the loop alternates roles |
-| `freetoken` | a FreeToken daemon, which serves one checkpoint at a time and answers to any name it is sent |
+| `llamacpp` | **the local backend.** `llama-server` in router mode, swapping checkpoints on one endpoint as the loop alternates roles |
+| `openai` | OpenAI, and the gateways that speak its wire — OpenRouter, LiteLLM, Together, DeepSeek |
 | `anthropic` | Anthropic Messages API |
 | `gemini` | Google Gemini |
-| `command` | any local binary that reads a prompt and writes a completion |
 | `claude-cli` | headless `claude -p`, so planning and review run on an existing Claude subscription rather than an API key |
+
+One local backend is deliberate. Forge used to carry four — Ollama and friends
+through `openai`, FreeToken, and a `command` escape hatch — and each had its own
+way of being asked what it was serving, its own way of being told to load
+something else, and its own silent failure. An Ollama name that never matched
+because config omitted `:latest`; an engine that answered to any model id and
+echoed it back. Every one of them cost a run before it was found, and carrying
+them meant diagnostics could only say what all four had in common.
+
+With one, they can name the thing in front of you: the preset a checkpoint is
+spawned from, the `--models-max` slot another model is holding, the reasoning
+budget a thinking model is spending its whole answer on, the context window out
+of the argv rather than out of a guess. `forge models` writes the preset from
+your config, so the numbers in the two files cannot drift apart.
 
 Adding a backend is one module and one registry line. Nothing in the loop, the
 budget gate, or the dashboard knows which kind it is talking to.
@@ -98,7 +110,7 @@ So the split is by weight, not by role:
 
 | Machine | Runs |
 |---|---|
-| GPU host | Ollama serving the executor model; MemPalace |
+| GPU host | `llama-server` in router mode, serving the local models; MemPalace |
 | Your workstation | the repo, the daemon, Claude Code, the toolchain |
 
 Model calls and memory reads cross the network; files, git, and builds stay
@@ -232,7 +244,7 @@ With no terminal attached — piped, redirected, or run from a script — it tak
 every default and says so rather than blocking on stdin nobody is watching.
 
 First time through, [docs/QUICKSTART.md](docs/QUICKSTART.md) walks the whole
-setup — Ollama and which model to run, MemPalace, the daemon, and a narrated
+setup — llama.cpp and which models to run, MemPalace, the daemon, and a narrated
 first `forge init`. [docs/SETUP.md](docs/SETUP.md) is the reference behind it:
 every option, every alternative, and the full security discussion. The daemon is
 stdlib-only Python 3.10+ — a failed `pip install` is a bad way to discover that

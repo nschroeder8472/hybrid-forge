@@ -1,7 +1,7 @@
 # Hybrid Forge — setup
 
 End-to-end setup for the plan-and-execute pipeline: Claude plans and reviews,
-a locally hosted Qwen3.6-35B-A3B executes, MemPalace carries project decisions
+a locally hosted model on llama.cpp executes, MemPalace carries project decisions
 across sessions.
 
 If this is your first time, [QUICKSTART.md](QUICKSTART.md) walks the same
@@ -46,7 +46,7 @@ So split by weight, not by role:
 
 | Machine | Runs | Why |
 |---|---|---|
-| **GPU host** (the 5090) | Ollama + MemPalace, in Docker | Needs the GPU and holds the palace |
+| **GPU host** (the 5090) | `llama-server` + MemPalace, in Docker | Needs the GPU and holds the palace |
 | **Workstation** (your Mac) | repo, daemon, Claude Code, toolchain | Needs the files |
 
 Only model calls and memory reads cross the network. Files, git, and builds stay
@@ -60,8 +60,8 @@ exactly right. On the Mac, everything is local except two URLs:
 ```json
 {
   "models": {
-    "local":  { "kind": "openai", "baseUrl": "http://forge-host:11434/v1",
-                "model": "qwen3.6:35b-a3b", "contextWindow": 32768 },
+    "local":  { "kind": "llamacpp", "baseUrl": "http://forge-host:8080/v1",
+                "model": "qwen3.8", "contextWindow": 65536 },
     "claude": { "kind": "claude-cli", "model": "opus" }
   },
   "roles": { "planner": "claude", "executor": "local",
@@ -159,10 +159,19 @@ all.
 
 ### 1.1 Prerequisites
 
+`llama-server` is the inference server, and it is the only local backend forge
+speaks to. Either build it or take a release binary; the CUDA build matters
+more than the version does.
+
 ```bash
-# Ollama — the inference server
-curl -fsSL https://ollama.com/install.sh | sh
+# A release build, CUDA — pick the one matching your driver
+curl -fsSLO https://github.com/ggml-org/llama.cpp/releases/latest/download/llama-<platform>-cuda.zip
 ```
+
+**Take CUDA over Vulkan if you have the choice.** Measured on a 5090 with a 30B
+A3B MoE at Q4_K_M: 16 tok/s on the Vulkan build, 353 tok/s on CUDA. That is not
+a tuning difference, it is the difference between a run that finishes overnight
+and one that does not. Blackwell (sm_120) needs CUDA 12.8 or newer.
 
 You also need a network path from your workstation to this host. Anything that
 gives the two machines a stable address for each other works — a LAN, a VPN, an
@@ -171,38 +180,58 @@ overlay network, an SSH tunnel. Pick one now and note the address, because
 the resulting address is reachable by your workstation and *not* by anything
 else: neither service below has authentication.
 
-Confirm the GPU is visible to Ollama:
+Confirm the GPU is visible:
 
 ```bash
 nvidia-smi
-ollama --version
+llama-server --version
 ```
 
-### 1.2 Pull the executor model
+### 1.2 Get the executor model
+
+`llama-server` serves GGUF files directly — there is no separate pull step and
+no model store. Download the quantization you want and note the path:
 
 ```bash
-ollama pull qwen3.6:35b-a3b
+# e.g. from a HuggingFace GGUF repo
+curl -fsSLO https://huggingface.co/<repo>/resolve/main/Qwen3.8-27B-UD-Q4_K_M.gguf
 ```
 
-At Q4 this lands comfortably inside 32GB with room for a working context. If you
-want more headroom for long specs, or more quality, benchmark Q4 against Q6 on
-your own code before committing — published benchmark deltas will not tell you
-how it does on your Rust or Swift.
+At Q4 a 27-30B lands comfortably inside 32GB with room for a working context.
+If you want more headroom for long specs, or more quality, benchmark Q4 against
+Q6 on your own code before committing — published benchmark deltas will not tell
+you how it does on your Rust or Swift.
 
-Verify it loads and answers:
+Note the KV cache is not free and scales with `ctx-size`. Measured at
+`--ctx-size 131072`: a 15.3 GiB Qwen at Q4 occupied 24.6 GiB resident, so 9.3 GiB
+of that was cache. Setting a window you will not use costs VRAM you could have
+spent on weights.
 
-```bash
-ollama run qwen3.6:35b-a3b "Reply with exactly: OK"
-nvidia-smi   # confirm VRAM occupancy looks sane
+### 1.3 Serve the models in router mode
+
+**Router mode is what lets forge swap checkpoints.** `--models-preset` reads an
+INI where each section is a model id; the router spawns one child server per
+model on an ephemeral port and proxies `/v1/chat/completions` by that id. The
+loop alternates roles, so this is how a planner on one checkpoint and an
+executor on another share one GPU and one endpoint.
+
+Forge writes that preset for you — see [§3.1](#31-declaring-models-and-roles)
+and `forge models`. It looks like this:
+
+```ini
+[qwen3.8]
+model = /models/Qwen3.8-27B-UD-Q4_K_M.gguf
+jinja = true
+ctx-size = 65536
+reasoning-budget = 2048
+mmproj-auto = false
 ```
 
-### 1.3 Bind the inference server to one interface
-
-**Ollama ships with no authentication.** Binding it to `0.0.0.0` publishes an
-endpoint that will happily execute inference for anything that can reach the
-port — every network this host is attached to, including whatever your router
-is doing. Bind it to a single address instead, and make it the narrowest one
-that your workstation can still reach.
+**`llama-server` ships with no authentication.** Binding it to `0.0.0.0`
+publishes an endpoint that will happily execute inference for anything that can
+reach the port — every network this host is attached to, including whatever your
+router is doing. Bind it to a single address instead, and make it the narrowest
+one that your workstation can still reach.
 
 List the candidates and pick one:
 
@@ -212,24 +241,26 @@ ip -4 -o addr show scope global      # interface name and address, one per line
 
 ```bash
 BIND_ADDR=<the address you picked>
-sudo mkdir -p /etc/systemd/system/ollama.service.d
-sudo tee /etc/systemd/system/ollama.service.d/override.conf <<EOF
-[Service]
-Environment="OLLAMA_HOST=${BIND_ADDR}:11434"
-Environment="OLLAMA_KEEP_ALIVE=30m"
-EOF
-sudo systemctl daemon-reload && sudo systemctl restart ollama
+llama-server \
+  --host "${BIND_ADDR}" --port 8080 \
+  --models-preset /path/to/llamacpp.ini \
+  --models-max 1
 ```
 
-`OLLAMA_KEEP_ALIVE=30m` keeps weights resident between tickets. Without it you
-pay a cold load on every delegation, which is the single biggest source of
-"why is this so slow" in this setup.
+**`--models-max 1` unless every model in the preset fits in VRAM together.**
+The default is 4, which is right on a box with the room and fatal on one
+without: the router keeps the previous role's checkpoint resident and the next
+role's child server exits trying to allocate. Forge's `exclusive` setting does
+the same thing per model; either is enough, both is fine.
+
+Run it under whatever keeps services up on this host — a systemd unit, a
+scheduled task, `tmux`. It owns the GPU and should outlive any one forge run.
 
 Verify from the host, then from your workstation:
 
 ```bash
-curl http://${BIND_ADDR}:11434/v1/models       # on host
-curl http://<host-address>:11434/v1/models     # on the workstation
+curl http://${BIND_ADDR}:8080/v1/models       # on host
+curl http://<host-address>:8080/v1/models     # on the workstation
 ```
 
 Both checks matter, and the second is the one that counts — an endpoint
@@ -237,6 +268,13 @@ answering on the machine it runs on proves nothing about reachability. If it
 fails, the problem is the bind address, a firewall rule, or your VPN's access
 controls. Fix it here before going further; everything downstream assumes this
 works.
+
+The reply lists every model id in the preset with its status. Those ids are
+exactly what `model` in `config.json` must name:
+
+```json
+{"data": [{"id": "qwen3.8", "status": {"value": "unloaded"}}]}
+```
 
 If your network gives the host a stable name, prefer the name over the literal
 address in client config — a machine that changes address then costs you one
@@ -299,7 +337,7 @@ The endpoint is `/mcp`, which is the transport the daemon speaks:
 "memory": { "url": "http://forge-host:8765/mcp" }
 ```
 
-Unlike Ollama, this listener authenticates. A non-loopback bind auto-generates
+Unlike `llama-server`, this listener authenticates. A non-loopback bind auto-generates
 a bearer token and stores it `0600` under `~/.mempalace/server/`; `--token`
 sets one explicitly. Give it to the daemon by naming the environment variable
 that holds it — never by pasting it into `config.json`, which this project
@@ -323,7 +361,7 @@ worth knowing:
   proxy that terminates auth. Traffic is plaintext without `--tls-cert` /
   `--tls-key`.
 
-Same bind rule as Ollama: the narrowest interface that your daemon still
+Same bind rule as `llama-server`: the narrowest interface your daemon still
 reaches, never `0.0.0.0` out of convenience.
 
 The palace database stays on one machine, permanently. One authoritative copy.
@@ -368,47 +406,60 @@ docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
 ```bash
 cp .env.example .env
 ip -4 -o addr show scope global   # pick one; put it in BIND_ADDR
+# MODELS_DIR: where your .gguf files are
+# PRESET_DIR: the .hybridforge/models/ of the project, holding llamacpp.ini
 docker compose up -d
-docker compose exec ollama ollama pull qwen3.6:35b-a3b
+curl "http://${BIND_ADDR}:8080/v1/models"
 ```
 
-The first pull writes into the `ollama-models` volume and persists from then on.
+There is no pull step — `llama-server` serves `.gguf` files off the mounted
+directory. Put the files in `MODELS_DIR` yourself and let `forge models` write
+the preset that names them.
+
+**The paths in the preset are container paths.** `MODELS_DIR` mounts at
+`/models`, so `modelPath` in `config.json` should read `/models/<file>.gguf`
+rather than the host path. A section pointing at a path that does not exist
+inside the container fails at load with a message about the file.
 
 ### Teardown semantics
 
 ```bash
 docker compose down          # destroys containers, keeps volumes — what you want
-docker compose down -v       # ALSO destroys the volumes: 20GB re-pull, palace gone
+docker compose down -v       # ALSO destroys the volumes: the palace is gone
 ```
 
-The compute layer is disposable; the state is not. `-v` is the footgun.
+The compute layer is disposable; the state is not. `-v` is the footgun. Weights
+are a bind mount rather than a volume here, so they survive either way — the
+thing `-v` takes is the palace.
 
 ### Two things that behave differently under containers
 
 **Host networking is doing real work here.** A container on the default bridge
 network has its own network namespace and cannot see the host's interfaces, so
-`OLLAMA_HOST` pointed at a host address would fail to bind — this bites hardest
-with VPN and overlay interfaces, which exist only on the host.
-`network_mode: host` makes the container's bind address the host's bind
-address, which is why the security posture from 1.3 carries over unchanged.
-Note that `ports:` is ignored in this mode — `BIND_ADDR` is what controls
-exposure, so a wrong value there is not contained by Docker.
+`--host` pointed at a host address would fail to bind — this bites hardest with
+VPN and overlay interfaces, which exist only on the host. `network_mode: host`
+makes the container's bind address the host's bind address, which is why the
+security posture from 1.3 carries over unchanged. Note that `ports:` is ignored
+in this mode — `BIND_ADDR` is what controls exposure, so a wrong value there is
+not contained by Docker.
 
-**Restarts evict VRAM.** `OLLAMA_KEEP_ALIVE` only helps within a container's
-lifetime. If your habit is spinning the stack up and down around each coding
-session, you pay a cold load on the first delegation every time. Leaving the
-containers running and restarting only on config changes gets you the disposable
-runtime without that cost.
+**Restarts evict VRAM, and a changed preset needs one.** The router reads the
+preset at startup, so `forge models` writing a new one does nothing until the
+container restarts. Swaps *within* a run are cheap — measured at 6-10s for a
+15-23 GiB checkpoint with a warm page cache — but a restart re-reads from disk
+cold. Leaving the container up and restarting only on preset changes gets you
+the disposable runtime without paying that on every session.
 
 ### Windows caveat
 
-If the 5090 sits in a Windows workstation, run Ollama natively and containerize
-only MemPalace. Docker Desktop routes through WSL2, where GPU passthrough works
-but adds a filesystem translation layer that is genuinely slow for large
-sequential reads — exactly the access pattern of loading 20GB of weights — and is
-more fragile across driver updates.
+If the 5090 sits in a Windows workstation, run `llama-server` natively and
+containerize only MemPalace. Docker Desktop routes through WSL2, where GPU
+passthrough works but adds a filesystem translation layer that is genuinely slow
+for large sequential reads — exactly the access pattern of loading 20GB of
+weights — and is more fragile across driver updates.
 
 ---
+
 
 ## Part 2 — Client setup (each machine you code from)
 
@@ -582,8 +633,8 @@ does what). Any declared model can play any role:
 {
   "room": "image-marquee",
   "models": {
-    "local":  { "kind": "openai", "baseUrl": "http://forge-host:11434/v1",
-                "model": "qwen3.6:35b-a3b", "contextWindow": 32768 },
+    "local":  { "kind": "llamacpp", "baseUrl": "http://forge-host:8080/v1",
+                "model": "qwen3.8", "contextWindow": 65536 },
     "claude": { "kind": "claude-cli", "model": "opus" }
   },
   "roles": {
@@ -627,18 +678,19 @@ worse than having no memory at all.
 
 ### Context window and output reserve
 
-`contextWindow` and `maxOutputTokens` are per model, and config always wins over
-discovery. Two things about them are worth getting right before the first run,
-because neither fails a health probe.
+`contextWindow` and `maxOutputTokens` are per model, and config always wins.
+Two things about them are worth getting right before the first run, because
+neither fails a health probe.
 
 **Set `contextWindow` to what your server is serving, not what the model can
-do.** These are different numbers and they routinely disagree. Ollama reports
-the architectural maximum through `/api/show` and the loaded `num_ctx` through
-`/api/ps`; on one box those read 131072 and 32768. Forge asks `/api/ps` first
-for exactly this reason. Believing the larger figure defeats the budget gate —
-it approves a 90k prompt for a 32k server, which truncates from the *front*,
-taking the system prompt and the spec with it. What comes back then reads as a
-weak model rather than a truncated request.
+do.** These are different numbers and they routinely disagree: a checkpoint
+trained for 262,144 serves whatever `--ctx-size` its child server was spawned
+with. Forge reads that argv back out of the router's catalogue rather than
+reading the trained maximum out of the GGUF, for exactly this reason. Believing
+the larger figure defeats the budget gate — it approves a 90k prompt for a 32k
+server, which truncates from the *front*, taking the system prompt and the spec
+with it. What comes back then reads as a weak model rather than a truncated
+request.
 
 ### Sampling
 
@@ -665,22 +717,28 @@ across 36 attempts, and the automatic retry cycle stops precisely when it
 detects that nothing is varying. Models that ship a recommended sampling
 recipe — most current open-weights families do — are usually better run near
 it. `qwen3-coder` ships `temperature 0.7, top_p 0.8`; `gpt-oss` ships
-`temperature 1.0`. Check with `ollama show <model>` before overriding.
+`temperature 1.0`. The model card is where these are published; `forge doctor`
+does not invent one for you.
 
 Keep the reviewer tighter than the rest. Its verdict has to parse, and a
 verdict that does not is treated as a rejection.
 
-**State it rather than discovering it.** `/api/ps` reports nothing until a
-model is resident, so the first probe of a run can read the architectural
-maximum and cache it for the whole run — a race whose outcome depends on
-whether something happened to load the model first. Setting `contextWindow`
-explicitly per model removes it.
+A bare `"temperature": 0.6` overrides *every* call, including the ones the loop
+asks determinism for — sign-off votes and sampling comparisons stop being
+reproducible. `{"default": 0.6, "deterministic": 0.0}` follows the recipe and
+lets a requested 0.0 through, which is what you almost always want.
 
-Raise the server instead if you want the rest of the window:
-`OLLAMA_CONTEXT_LENGTH=131072`, or `num_ctx` in the Modelfile. A larger
-`num_ctx` allocates a larger KV cache, so check it still fits in VRAM — `forge
-doctor` warns when a model is only partly resident, which costs several times
-the speed rather than failing outright.
+**State the window rather than leaving it to be read.** Forge can read
+`--ctx-size` back from the router, but only for a model the router already knows
+about, and not at all while the router is down — in which case it falls back to
+8192 and the budget gate reports 1-3k-token tickets as too large. Setting
+`contextWindow` explicitly per model removes that failure mode entirely.
+
+Raise `ctx-size` in the preset if you want the rest of the window. A larger
+window allocates a larger KV cache — measured at `--ctx-size 131072`, a 15.3 GiB
+Qwen at Q4 occupied 24.6 GiB resident — so check it still fits alongside the
+weights. `cache-type-k`/`cache-type-v` at `q8_0` roughly halve the cache if it
+does not.
 
 **`maxOutputTokens` comes straight off the prompt budget.** `input_budget =
 contextWindow − maxOutputTokens − margin`, so reserving the whole window for
@@ -696,107 +754,128 @@ it drops below a third of the window.
 
 ### Where each setting has to live
 
-Ollama takes the same setting from three places, and they do not agree. Which
-one wins is not obvious, and getting it wrong is silent:
+Two files, and the split is not arbitrary: a setting that decides how the child
+server is *spawned* cannot be sent per request, and a setting that varies per
+role cannot live in the preset.
 
-| Setting | Modelfile | `config.json` | `OLLAMA_CONTEXT_LENGTH` | Ollama app settings |
-|---|---|---|---|---|
-| `num_ctx` | **wins** | — | applies when no Modelfile pins it | overridden by the env var |
-| `temperature` | ignored by forge | **wins** | — | — |
-| `top_p` | ignored by forge | **wins** | — | — |
-| `top_k` | **only place it works** | sent, discarded | — | — |
-| `min_p` | **only place it works** | sent, discarded | — | — |
-| models directory | — | — | `OLLAMA_MODELS` | used when the env var is unset |
+| Setting | preset (`.ini`) | `config.json` | Why |
+|---|---|---|---|
+| `ctx-size` / `contextWindow` | **allocates the KV cache** | **what the gate plans against** | Both. They must agree — see below. |
+| `reasoning-budget` | **wins** | written from `reasoningBudget` | Decided when the server starts. |
+| `n-gpu-layers`, `flash-attn`, `cache-type-k/v` | **only place they work** | written from config | Spawn-time. |
+| `temperature` | ignored by forge | **wins** | Forge sends one per role on every call. |
+| `top_p`, `top_k`, `min_p` | ignored by forge | **wins** | Sent per request, and unlike the OpenAI-shim path forge used to carry, they genuinely arrive. |
+| `maxOutputTokens` | — | **only here** | Per request, and per role: a planner emitting a backlog needs more than an executor emitting one file. |
 
 Three consequences worth stating plainly.
 
-**`top_k` and `min_p` do not reach the model through the OpenAI endpoint.**
-Measured against Ollama 0.32: `top_p 0.01` collapses six samples to one, while
-`top_k 1` leaves all six distinct. The shim accepts both and applies only the
-OpenAI-standard ones. Set them in the Modelfile; `forge doctor` warns if it
-finds them in config against an Ollama endpoint.
+**`ctx-size` and `contextWindow` are one number in two files.** Forge proves a
+prompt fits against config; the server truncates against the preset. When the
+config number is larger, the gate approves a prompt the server then cuts *from
+the front* — the system message and the spec — and what comes back reads as a
+weak model rather than a truncated request. `forge doctor` compares them and
+says so:
 
-**A Modelfile `PARAMETER temperature` is inert for forge**, which sends an
-explicit temperature on every request — 0.0 for the reviewer and planner, 0.1
-for the tester, 0.2 for the executor. It only applies when something other
-than forge calls the model.
+```
+  plan: ok name=plan kind=llamacpp model=nemo-a reply='OK'
+      contextWindow is 131,072 but the router starts 'nemo-a' with -c 32,768.
+```
 
-**`OLLAMA_CONTEXT_LENGTH` is one number for every model.** A per-model pin in
-a Modelfile is the only way to give a 24B reviewer and a 35B executor different
-windows, and the global silently overrides the desktop app's own setting. If
-you pin per model, unset the global — otherwise you are maintaining two
-sources of truth for one value and only one of them is in effect.
+Write both from one source with `forge models` and they cannot drift.
 
-The models directory has the same shape. The desktop app stores its own path
-in `%LOCALAPPDATA%\Ollama\db.sqlite`, and `OLLAMA_MODELS` overrides it. When
-they disagree, whichever launched the server decides — a tray-launched server
-and a hand-started `ollama serve` can read different directories, and the
-symptom is every model vanishing at once. Make them agree.
+**A thinking model with no `reasoning-budget` spends its whole answer
+thinking.** Measured on a 30B A3B MoE: every one of 32,768 output tokens went
+to hidden reasoning and the reply came back empty, on every call, until the
+budget was set. On another run 81 of 86 calls hit the budget exactly — 6,144
+tokens of reasoning in front of a 450-token answer, which was 62% of the run's
+wall clock. It is the first thing to tune and the last thing anyone thinks to
+look at.
 
-### Generating the Modelfiles
+**`--models-max` is a global the preset cannot override.** It caps how many
+child servers stay resident at once. Set it to 1 unless every checkpoint in the
+preset fits in VRAM together; `exclusive: true` per model does the same job from
+the other side. The role that discovers you got this wrong is the one whose
+child server exits mid-run.
 
-`forge models` writes one per Ollama-backed model into
-`.hybridforge/models/`, using each model's real numbers rather than a
-remembered default:
+### Generating the preset
+
+`forge models` writes `.hybridforge/models/llamacpp.ini` from the local models
+in `config.json`, so the numbers in the two files come from one source:
 
 ```
 $ forge models
-Wrote 4 Modelfile(s) in .hybridforge/models:
-  local-code   ollama create forge-code -f ".../Modelfile.local-code"
-  ...
+Wrote a llama.cpp preset with 2 model(s): .hybridforge/models/llamacpp.ini
+  plan         nemotron-3-nano          C:\AIModels\Nemotron-3-Nano-...Q4_K_M.gguf
+  code         qwen3.8                  C:\AIModels\Qwen3.8-27B-UD-Q4_K_M.gguf
+
+Serve it with:
+  llama-server --models-preset ".hybridforge/models/llamacpp.ini" --models-max 1
 ```
 
-It reads the trained maximum from `/api/show`, keeps the base model's own
-sampling recipe where it ships one, and pins `contextWindow` when config
-states it. `forge init` runs it too, so a new project starts with the right
-file instead of a copied one.
+`forge init` runs it too, so a new project starts with the right file rather
+than a copied one.
 
-The files are written; `ollama create` is not run. Building takes minutes and
-changes something outside the repository.
+A model needs `modelPath` to appear — the `.gguf` is not derivable from a
+router id, and a section pointing at the wrong file fails at load with a message
+about the file rather than about the config that named it. Cloud models are
+skipped: a preset means nothing to an endpoint forge does not start.
 
-One detail it handles that is easy to get wrong by hand: when config names a
-base model directly, the generated file is `FROM` those weights, and building
-it under the same name would *replace the model it derives from*. In that case
-a new name is proposed and the output says which config key to update.
+Two roles naming the same `model` collapse into one section, because they are
+one child server. A planner and an executor sharing a checkpoint and differing
+only in `maxOutputTokens` is the ordinary case — that number is per request and
+stays in `config.json`.
+
+The file is written; `llama-server` is not started or restarted. It owns the GPU
+and outlives any one forge command, so picking up a changed preset is a restart
+you choose.
 
 ### Thinking models answer last
 
 A thinking model writes its reasoning before a single character of its answer,
 and over the OpenAI-compatible shape that reasoning does not arrive in
-`content`. Ollama returns it as `reasoning`, vLLM and DeepSeek as
-`reasoning_content` — none of which are in the spec, and all of which still
-count against `maxOutputTokens`. Run out of budget mid-thought and the reply is
-an *empty string* with `finish_reason: length`, which reads downstream as
-"planner did not return usable JSON:" followed by nothing at all.
+`content` — llama.cpp and DeepSeek return it as `reasoning_content`, others as
+`reasoning`, none of which are in the spec, and all of which still count against
+`maxOutputTokens`. Run out of budget mid-thought and the reply is an *empty
+string* with `finish_reason: length`, which reads downstream as "planner did not
+return usable JSON:" followed by nothing at all.
 
-This bites hardest where replies are longest — respec and whole-file builds —
-so a model can pass `forge doctor`, plan a backlog, and still fail every ticket.
-Forge now names this case instead of passing the empty string on, but the fix is
-config. Either give the thinking room:
+This bites hardest where replies are longest — respec and whole-file builds — so
+a model can pass `forge doctor`, plan a backlog, and still fail every ticket.
+Forge names the case rather than passing the empty string on, and retries once
+with `reasoning_effort: none` so the call is not simply lost. The fix is still
+config.
+
+**On llama.cpp, cap the thinking in the preset.** `reasoning-budget` is a hard
+ceiling on reasoning tokens, after which the model must begin its answer:
 
 ```json
-"local": { "kind": "openai", "baseUrl": "http://127.0.0.1:11434/v1",
-           "model": "qwen3.6:35b-a3b", "contextWindow": 32768,
-           "maxOutputTokens": 16384 }
+"local": { "kind": "llamacpp", "baseUrl": "http://127.0.0.1:8080/v1",
+           "model": "qwen3.8", "contextWindow": 65536,
+           "maxOutputTokens": 8192, "reasoningBudget": 2048 }
 ```
 
-or turn thinking off and reclaim the budget for the answer:
+`forge models` writes that into the preset as `reasoning-budget = 2048`. Without
+it, a 30B A3B MoE measured here spent all 32,768 of its output budget reasoning
+and returned empty content on *every* call.
+
+**Then check it is not merely capped but sensible.** On a later run with the
+budget set to 6,144, 81 of 86 executor calls came back at 6,000+ completion
+tokens — the model was spending the entire budget every time, in front of a
+median 450-token answer. That was 62% of the run's wall clock. A budget that is
+always hit is a budget that is too large, not a budget that is working.
+
+Turning thinking off entirely reclaims the budget for the answer:
 
 ```json
-"local": { "kind": "openai", "baseUrl": "http://127.0.0.1:11434/v1",
-           "model": "qwen3.6:35b-a3b", "contextWindow": 32768,
+"local": { "kind": "llamacpp", "baseUrl": "http://127.0.0.1:8080/v1",
+           "model": "qwen3.8", "contextWindow": 65536,
            "maxOutputTokens": 8192,
            "extraBody": { "reasoning_effort": "none" } }
 ```
 
-`extraBody` is merged into the request body verbatim, so it also carries vLLM's
-`top_k` and OpenRouter's routing preferences. Note that `reasoning_effort` is
-the only thinking switch Ollama's `/v1` endpoint honors — `think: false` and
-`chat_template_kwargs.enable_thinking` are accepted and silently ignored, and
-the model keeps thinking.
-
-Check which you have before guessing: `ollama show <model>` lists `thinking`
-under capabilities.
+`extraBody` is merged into the request body verbatim, so it also carries a
+gateway's own knobs. On a cloud endpoint it is the only lever — there is no
+preset to write.
 
 **`baselineVerify`** (default `true`) runs your verify commands once before each
 ticket, so a failure that was already in the tree is not blamed on whichever
@@ -1312,11 +1391,14 @@ on triage staying honest. If you find tickets touching auth or concurrency
 getting routed to the executor because "it's mostly mechanical," tighten
 `neverDelegate` rather than relying on judgment in the moment.
 
-**Cold-start latency is the usual complaint.** If delegation feels slow, check
-`OLLAMA_KEEP_ALIVE` and whether another process evicted the weights from VRAM.
+**Swap latency is rarely the complaint it looks like.** Alternating roles across
+two checkpoints costs a reload each time, but measured with a warm page cache
+that is 6-10s for a 15-23 GiB model — 54 swaps came to 3.5% of a 3.5-hour run.
+If delegation feels slow, look at generation instead: reasoning tokens were 62%
+of that same run's wall clock. See §"Thinking models answer last".
 
 **Keep the security posture.** Three unauthenticated surfaces exist here and
-none of them will ever ask who is calling: Ollama executes inference for
+none of them will ever ask who is calling: `llama-server` executes inference for
 anyone who can reach it, MemPalace serves your project's decisions to anyone
 who can reach it, and the dashboard's stop button ends a run for anyone who can
 reach it. All three are bound narrowly for that reason — the dashboard to
@@ -1331,7 +1413,7 @@ dashboard is bound off loopback; treat it as a reminder, not a permission slip.
 
 | Symptom | Where to look |
 |---|---|
-| `EXECUTOR_UNREACHABLE` | Network path from the daemon's machine to the host, then `OLLAMA_HOST` bind address, then firewall rules |
+| `EXECUTOR_UNREACHABLE` | Network path from the daemon's machine to the host, then `llama-server --host`, then firewall rules |
 | `forge doctor` reports FAIL | The error names the kind — auth, unreachable, or bad response |
 | MCP server missing from `/mcp` | `claude --debug`; restart Claude Code after config changes |
 | MemPalace connects on host but not Mac | Stdio has no address. Either run it on the daemon's machine with `memory.command`, or put an MCP proxy in front (§1.4) |
@@ -1347,12 +1429,12 @@ dashboard is bound off loopback; treat it as a reminder, not a permission slip.
 | "could not build the planner model" during detection | Detection runs on the planner role, which is configured one question earlier. A failed probe there leaves nothing to ask |
 | `memory: FAIL` in doctor | Under `command`, the report carries the server's own stderr — read that first; a wrong subcommand shows up as an immediate exit. Under `url`, wrong address or no proxy running |
 | Memory connects but retrieves nothing | Wrong tool auto-selected, or wrong `room`. Doctor prints the chosen tool and every available name; set `memory.searchTool` |
-| Every model vanishes at once (`/api/tags` empty) | The server is reading a different models directory than the one holding them. `OLLAMA_MODELS` and the desktop app's own setting disagree; whichever launched the server won. See §"Where each setting has to live" |
+| `/v1/models` lists nothing, or not what you expect | The router is reading a different preset than the one `forge models` wrote, or the paths in it do not resolve on the server's side of a bind mount. The id forge sends must be a section name in the preset the router was started with |
 | `prompt_budget` is negative | Not a ticket that is too large, whatever the blocked note says: `maxOutputTokens` exceeds the window. Either the window collapsed to a default because discovery failed, or the two were set independently |
-| `topK` / `minP` in config appear to do nothing | They do nothing. Ollama's OpenAI endpoint accepts and discards them — put them in the Modelfile, and run `forge models` to generate one |
+| A model answers but the reply is empty, `finish_reason: length` | A thinking model spent its whole output budget reasoning. Set `reasoningBudget` and re-run `forge models`, then restart the router so it re-reads the preset |
 | Every retry produces byte-identical output | Temperature is too low for retries to explore. See §Sampling |
 | Every ticket blocks on context overflow | The model's window is too small for these tickets. Split them, or raise `contextWindow` if it was set too low by hand |
-| "planner did not return usable JSON:" with nothing after the colon | A thinking model spent its whole output budget reasoning and returned empty `content`. Raise `maxOutputTokens` or set `"extraBody": {"reasoning_effort": "none"}` — see §"Thinking models answer last" |
+| "planner did not return usable JSON:" with nothing after the colon | A thinking model spent its whole output budget reasoning and returned empty `content`. Set `reasoningBudget`, raise `maxOutputTokens`, or set `"extraBody": {"reasoning_effort": "none"}` — see §"Thinking models answer last" |
 | Builds truncate mid-file, `finish_reason: length` | `maxOutputTokens` too small for a whole-file reply. It defaults to 4096, which a thinking model half-spends before writing any code |
-| Slow first token every ticket | `OLLAMA_KEEP_ALIVE`, VRAM eviction by another process |
+| Slow first token every ticket | A checkpoint swap on a cold page cache, or another process holding VRAM. `nvidia-smi` while the run is going says which |
 | The run keeps re-running the same backlog | `loop.retryCycles` is set (or `forge go --retries -1` is in the command). `forge stop`, then read the respec revisions before setting it going again |
