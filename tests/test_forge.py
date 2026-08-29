@@ -20453,3 +20453,120 @@ class TestLlamaCppReportsAProjectorNothingUses(unittest.TestCase):
         provider = self._provider(["--ctx-size", "32768", "--model", "x.gguf"])
 
         self.assertEqual(provider.diagnostics(), [])
+
+
+class TestRatifyOrderIsTheOperatorsToChoose(unittest.TestCase):
+    """Which order the roles vote in, and why it is not cosmetic.
+
+    Two things ride on it. Votes accumulate as they are cast and every role is
+    shown the ones before it, so the first votes blind and the last answers
+    three arguments — moving the reviewer turns its vote from a rebuttal into
+    an opening position. And on a backend serving one checkpoint at a time,
+    two roles sharing a model are free when adjacent and cost a reload when
+    not: measured at 20-35s a swap, the default order against a two-model
+    config pays two a pass where a grouped order pays one, and leaves the
+    right checkpoint resident for the build that follows.
+    """
+
+    BASE = {
+        "models": {"a": {"kind": "openai", "model": "m"}},
+        "roles": {"planner": "a", "executor": "a", "tester": "a", "reviewer": "a"},
+        "commands": {"test": "pytest"},
+    }
+
+    def _config(self, loop):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps({**self.BASE, "loop": loop}), encoding="utf-8"
+        )
+        return Config.load(root)
+
+    def test_the_default_is_the_order_roles_have_always_voted_in(self):
+        self.assertEqual(
+            self._config({}).loop.ratify_order,
+            ("planner", "executor", "tester", "reviewer"),
+        )
+
+    def test_an_empty_value_falls_back_rather_than_emptying_the_pass(self):
+        # `"ratifyOrder": []` reads as "no opinion", not "nobody votes".
+        # Honouring it literally would skip sign-off while reporting it ran.
+        self.assertEqual(
+            self._config({"ratifyOrder": []}).loop.ratify_order,
+            ("planner", "executor", "tester", "reviewer"),
+        )
+
+    def test_roles_can_be_grouped_by_the_model_behind_them(self):
+        order = self._config(
+            {"ratifyOrder": ["planner", "reviewer", "executor", "tester"]}
+        ).loop.ratify_order
+
+        self.assertEqual(order, ("planner", "reviewer", "executor", "tester"))
+
+    def test_omitting_a_role_is_refused_because_it_moves_the_majority(self):
+        # Sign-off resolves over the votes cast. Three voters instead of four
+        # is a different gate, and nothing in the run would say so.
+        with self.assertRaises(ConfigError) as caught:
+            self._config({"ratifyOrder": ["planner", "reviewer", "executor"]})
+
+        message = str(caught.exception)
+        self.assertIn("omits 'tester'", message)
+        self.assertIn("ratifyPasses", message)
+
+    def test_repeating_a_role_is_refused_because_it_doubles_its_vote(self):
+        with self.assertRaises(ConfigError) as caught:
+            self._config(
+                {"ratifyOrder": ["planner", "planner", "executor", "tester", "reviewer"]}
+            )
+
+        self.assertIn("more than once", str(caught.exception))
+
+    def test_a_name_that_is_not_a_role_names_the_ones_that_are(self):
+        with self.assertRaises(ConfigError) as caught:
+            self._config(
+                {"ratifyOrder": ["planner", "reviewer", "executor", "architect"]}
+            )
+
+        message = str(caught.exception)
+        self.assertIn("'architect'", message)
+        self.assertIn("planner, executor, tester, reviewer", message)
+
+    def test_it_survives_a_save_and_reload(self):
+        config = self._config(
+            {"ratifyOrder": ["planner", "reviewer", "executor", "tester"]}
+        )
+
+        config.write()
+
+        self.assertEqual(
+            Config.load(config.root).loop.ratify_order,
+            ("planner", "reviewer", "executor", "tester"),
+        )
+
+    def test_the_order_is_what_ratify_actually_votes_in(self):
+        # The seam was already there: ratify() takes the sequence and iterates
+        # it. This is the test that the call site stopped hardcoding the
+        # module-level constant.
+        asked = []
+
+        def fake_vote(store, run_id, ticket, role, **kwargs):
+            asked.append(role)
+            return ratify.Vote(role, True)
+
+        original_vote, original_settle = ratify._vote, ratify._settle
+        ratify._vote = fake_vote
+        ratify._settle = lambda store, run_id, ticket, result: result
+        try:
+            ratify.ratify(
+                None,
+                1,
+                Ticket(ticket_id="T-1", title="t", spec="s"),
+                call=lambda role, messages, budget: None,
+                budget_for=lambda role: 512,
+                roles=("planner", "reviewer", "executor", "tester"),
+                passes=1,
+            )
+        finally:
+            ratify._vote, ratify._settle = original_vote, original_settle
+
+        self.assertEqual(asked, ["planner", "reviewer", "executor", "tester"])

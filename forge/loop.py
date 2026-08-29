@@ -3268,7 +3268,7 @@ class Orchestrator:
             ticket,
             call=call,
             budget_for=self._output_budget,
-            roles=ROLES,
+            roles=self.config.loop.ratify_order,
             passes=passes,
             sources=sources,
             retrieved=retrieved,
