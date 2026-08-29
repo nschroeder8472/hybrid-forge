@@ -811,6 +811,30 @@ class LoopSettings:
     # See docs/RATIFY.md, including the rule it knowingly bends: a reviewer
     # that helped write the contract is not independent of it.
     ratify_passes: int = 2
+    # The order the roles vote in, within a pass. A permutation of `ROLES` —
+    # every role votes exactly once, because the majority is counted over all
+    # four and dropping one would change the arithmetic silently.
+    #
+    # Order is not cosmetic, and it buys two different things.
+    #
+    # It decides what each role reads. Votes accumulate as they are cast and
+    # every role is shown the ones before it, so the first votes blind and the
+    # last answers three arguments. Putting the reviewer early makes it an
+    # opening position; putting it last makes it a rebuttal.
+    #
+    # It also decides how often the models change. On a backend that serves one
+    # checkpoint at a time — `llamacpp` with `exclusive`, or `freetoken` — two
+    # roles sharing a model are free if they are adjacent and cost a reload if
+    # they are not. Measured on one box: a swap is 20-35s, so the default order
+    # against a two-model config costs two swaps a pass where an order grouped
+    # by model costs one, and leaves the right checkpoint resident for the
+    # build that follows.
+    #
+    # Worth keeping in proportion. On that same box a single executor vote ran
+    # 19,926 output tokens, about 241s, which is seven times what the swaps it
+    # saves are worth. Reorder because it is free, not because it is the fix
+    # for a slow ratify pass — that is `ratifyPasses` and the output budget.
+    ratify_order: tuple[str, ...] = ROLES
 
 
 @dataclass
@@ -1007,6 +1031,7 @@ class Config:
             toolchain_context=bool(loop.get("toolchainContext", True)),
             bug_hypotheses=int(loop.get("bugHypotheses", 3)),
             ratify_passes=int(loop.get("ratifyPasses", 2)),
+            ratify_order=tuple(loop.get("ratifyOrder", ROLES) or ROLES),
         )
 
         ui = data.get("ui", {}) or {}
@@ -1079,6 +1104,35 @@ class Config:
                 f"loop.ratifyPasses is {self.loop.ratify_passes}; expected 0 "
                 f"(no sign-off pass) or the number of passes the roles get to "
                 f"agree on a ticket before it is built."
+            )
+        # A permutation, checked rather than tolerated. Sign-off resolves over
+        # the votes actually cast, so an order that omits a role quietly
+        # changes what a majority is, and one that repeats a role gives it two
+        # votes. Both read as a stricter or laxer gate that nobody chose, and
+        # neither announces itself anywhere in the run.
+        order = self.loop.ratify_order
+        unknown = [role for role in order if role not in ROLES]
+        if unknown:
+            raise ConfigError(
+                f"loop.ratifyOrder names {', '.join(repr(r) for r in unknown)}, "
+                f"which {'are' if len(unknown) > 1 else 'is'} not a role; "
+                f"expected some ordering of {', '.join(ROLES)}."
+            )
+        if len(set(order)) != len(order):
+            twice = sorted({role for role in order if order.count(role) > 1})
+            raise ConfigError(
+                f"loop.ratifyOrder lists {', '.join(repr(r) for r in twice)} "
+                f"more than once. Every role votes exactly once per pass, so a "
+                f"repeat would hand it two votes toward the majority."
+            )
+        if set(order) != set(ROLES):
+            missing = [role for role in ROLES if role not in order]
+            raise ConfigError(
+                f"loop.ratifyOrder omits {', '.join(repr(r) for r in missing)}. "
+                f"It sets the order the roles vote in, not which of them vote — "
+                f"sign-off is counted over all {len(ROLES)}, so leaving one out "
+                f"would change what a majority is. Use loop.ratifyPasses 0 to "
+                f"turn sign-off off entirely."
             )
         for role in ROLES:
             name = self.roles.get(role)
@@ -1401,6 +1455,7 @@ class Config:
                 "toolchainContext": self.loop.toolchain_context,
                 "bugHypotheses": self.loop.bug_hypotheses,
                 "ratifyPasses": self.loop.ratify_passes,
+                "ratifyOrder": list(self.loop.ratify_order),
             },
             "ui": {"host": self.ui.host, "port": self.ui.port, "enabled": self.ui.enabled},
         }

@@ -94,7 +94,8 @@
     "flatCycles": 0,
     "reviewWhenStuck": 2,
     "freezeTests": true,
-    "ratifyPasses": 2
+    "ratifyPasses": 2,
+    "ratifyOrder": ["planner", "executor", "tester", "reviewer"]
   },
   "ui": {
     "host": "127.0.0.1",

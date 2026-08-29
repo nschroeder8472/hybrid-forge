@@ -234,6 +234,17 @@ def _vote(
     return Vote(role, signed=signed, blocking=blocking, suggestions=suggestions)
 
 
+def _normalise_criterion(text: str) -> str:
+    """A criterion reduced to what makes two of them the same claim.
+
+    Backticks, case and trailing punctuation move on every rewrite and mean
+    nothing; this is only ever used to say which criteria in a longer list are
+    new, so it errs towards calling a rewording new rather than missing an
+    addition.
+    """
+    return " ".join(str(text).replace("`", "").split()).rstrip(".").lower()
+
+
 def _apply(
     store: Store,
     run_id: int,
@@ -241,6 +252,7 @@ def _apply(
     revision: dict,
     *,
     root: Path | None,
+    criteria_locked: bool = True,
 ) -> list[str]:
     """Apply a planner revision to the ticket, under the guards that still hold.
 
@@ -249,10 +261,46 @@ def _apply(
     the pass is to settle a contract before it is expensive to change. Every
     *other* guard respec enforces still applies here, and for the same reasons:
     the prompt forbidding something is not an access control.
+
+    Moving them is not the same as *adding* them, and the difference is the
+    ratchet. Rewording a criterion nobody can assert is the work this pass
+    exists to do. Inventing a new one is raising the bar the ticket is judged
+    against, and the planner has no way to compute a value it makes up: asked
+    to settle a ticket carrying four measured hash vectors, one planner added
+    four more of its own, got three right by luck and the fourth wrong —
+    `postVariant(3130775471, 0, 0, 10) returns 2`, where the hash it had just
+    agreed to ends in 7. Nothing downstream could tell that criterion from the
+    measured ones. It cost five attempts, parked the ticket, and skipped the
+    two that depended on it.
+
+    So a revision that ends with more criteria than it started with is refused
+    whole. Refused rather than trimmed, because there is no way to tell which
+    of fourteen replaced which of ten, and keeping the ten a human wrote is the
+    safe direction. `loop.respecCriteria` unlocks it for an operator who wants
+    the additions.
     """
     revision.pop("needs", None)
     revision.pop("rationale", None)
     revision.pop("responses", None)
+
+    proposed = revision.get("criteria")
+    if criteria_locked and isinstance(proposed, list) and len(proposed) > len(ticket.criteria):
+        known = {_normalise_criterion(text) for text in ticket.criteria}
+        added = [text for text in proposed if _normalise_criterion(text) not in known]
+        revision.pop("criteria")
+        store.log(
+            run_id,
+            f"{ticket.ticket_id}: ratify grew the acceptance criteria from "
+            f"{len(ticket.criteria)} to {len(proposed)}; the revision was "
+            f"refused. Rewording a criterion is this pass's job; adding one "
+            f"raises the bar the ticket is judged against, and a value the "
+            f"planner invented is indistinguishable from a measured one. Set "
+            f"loop.respecCriteria to allow it:\n"
+            + "\n".join(f"  + {text}" for text in added[:5]),
+            level="warn",
+            kind="ticket",
+            data={"added": added},
+        )
 
     for field_name, phrase in _refuse_protocol_edits(ticket, revision, ()):
         store.log(
@@ -406,6 +454,7 @@ def _revise(
     sources: dict[str, str] | None,
     digest: str,
     root: Path | None,
+    criteria_locked: bool = True,
 ) -> tuple[list[str], list[str]]:
     """One planner revision. Returns `(changed fields, responses)`.
 
@@ -436,7 +485,9 @@ def _revise(
         return [], []
 
     responses = [str(r) for r in revision.get("responses", [])]
-    changed = _apply(store, run_id, ticket, revision, root=root)
+    changed = _apply(
+        store, run_id, ticket, revision, root=root, criteria_locked=criteria_locked
+    )
     if changed:
         store.update_ticket(run_id, ticket)
         store.log(
@@ -479,6 +530,7 @@ def ratify(
     retrieved: str = "",
     digest: str = "",
     root: Path | None = None,
+    criteria_locked: bool = True,
 ) -> Ratification:
     """Put one ticket to every role until it is agreed, or the passes run out.
 
@@ -529,6 +581,7 @@ def ratify(
             sources=sources,
             digest=digest,
             root=root,
+            criteria_locked=criteria_locked,
         )
         _attach_responses(notes, responses)
         for name in changed:

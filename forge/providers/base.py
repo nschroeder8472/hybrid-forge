@@ -307,9 +307,35 @@ class Provider(ABC):
         override. Config wins, so `"temperature": 0.6` on a model block lets a
         model be run the way its authors intended without the loop having to
         know which family it belongs to.
+
+        Winning everywhere is the problem. The loop does not ask for one
+        temperature: it asks 0.0 where it needs the same answer twice — the
+        sign-off votes, the verdict parse, the respec — and 0.1 or 0.2 where it
+        wants the model to reach. A scalar overrides both, so following a
+        vendor's recipe silently costs reproducible ratification, and the same
+        backlog run twice parks different tickets. Measured: two runs of one
+        nine-ticket spec under identical configuration, and two tickets swapped
+        verdicts.
+
+        So the requested value is read as the intent it is. A map says what to
+        do with each:
+
+            "temperature": 0.6                             # as before
+            "temperature": {"default": 0.6, "deterministic": 0.0}
+
+        `deterministic` is used when the loop asked for exactly zero, `default`
+        for everything else. Either key may be omitted, and an omitted one
+        leaves the loop's own number alone — which makes `{"default": 0.6}` the
+        honest spelling of "follow the recipe, but let determinism through".
         """
         configured = self.config.get("temperature")
-        return requested if configured is None else float(configured)
+        if configured is None:
+            return requested
+        if isinstance(configured, dict):
+            key = "deterministic" if requested == 0.0 else "default"
+            chosen = configured.get(key)
+            return requested if chosen is None else float(chosen)
+        return float(configured)
 
     @abstractmethod
     def capabilities(self) -> Capabilities:

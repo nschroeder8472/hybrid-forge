@@ -357,6 +357,35 @@ naming none of them, and every ticket in the backlog had `reference_files: []`.
 The implementation shipped four of the eighteen characters, treated the exit
 marker as a pushable block, and invented every message.
 
+**A dependency's output is a reference for the ticket that depends on it.**
+The mirror of the rule above, and it fails for the opposite reason: not a path
+that does not resolve, but one that *will* resolve by the time the ticket runs
+and is therefore never handed over at all. `reading_scope` keeps only files
+that exist and expands siblings only into directories that exist, and it runs
+once, at ingest — before a single ticket has produced anything. So a dependent
+is scoped against a tree that does not yet contain what it depends on.
+
+One backlog paid for that twice. PF-003 declared `needs: ["PF-002"]`, and PF-002
+wrote the `LevelModel` type PF-003 exists to serialize:
+
+```
+PF-003  needs      : ["PF-002"]
+        reference  : scripts/loaders/level_loader.gd, tools/path_forge/tests/smoke.test.ts
+```
+
+Four objections across two runs named it — the reviewer and the executor in one,
+the executor and the tester in the other. Every one was correct and none was
+actionable, and the ticket parked without an attempt. Ratification was working;
+the loop had no remedy to offer it.
+
+`_inherit_dependency_reads` recomputes the read scope when a ticket is picked
+up, seeded with the `allowed_files` of everything in `needs`. Per ticket rather
+than at ingest, because that is the first moment those files are on disk.
+`allowed_files` is already exempt from the existence filter — "most of it does
+not exist until the ticket runs" — and its readers inherit that exemption here.
+A dependency that never ran contributes nothing, because `reading_scope` still
+drops what it cannot open.
+
 `cmd_ingest` now puts the source document first in every ticket's
 `reference_files` when the backlog was **planned** from one — first because
 `reading_scope` takes `reference` in order and caps the rest at twelve. A

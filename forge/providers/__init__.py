@@ -27,6 +27,7 @@ from .base import (
 from .claude_cli import ClaudeCLIProvider
 from .freetoken import FreeTokenProvider
 from .gemini import GeminiProvider
+from .llamacpp import LlamaCppProvider
 from .openai_compat import OpenAICompatProvider
 from .subprocess_cli import SubprocessProvider
 
@@ -37,6 +38,7 @@ _REGISTRY: dict[str, type[Provider]] = {
     SubprocessProvider.kind: SubprocessProvider,
     ClaudeCLIProvider.kind: ClaudeCLIProvider,
     FreeTokenProvider.kind: FreeTokenProvider,
+    LlamaCppProvider.kind: LlamaCppProvider,
 }
 
 # Aliases for the names people actually type in config.
@@ -53,6 +55,12 @@ _ALIASES = {
     "subprocess": "command",
     "claude-code": "claude-cli",
     "ft": "freetoken",
+    # The router, not a single-model `llama-server` — that one is plain
+    # `openai`, and `llamacpp`'s diagnostics says so when it is pointed at one.
+    "llama.cpp": "llamacpp",
+    "llama-cpp": "llamacpp",
+    "llama-server": "llamacpp",
+    "llama": "llamacpp",
 }
 
 

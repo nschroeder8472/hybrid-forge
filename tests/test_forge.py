@@ -20037,3 +20037,1106 @@ class TestTheTicketFileRecordsTheArgument(unittest.TestCase):
 
         self.assertEqual(back.context, "Keep the paths bare.")
         self.assertEqual(back.criteria, ["it parses"])
+
+
+class TestLlamaCppRouterSwapsCheckpoints(unittest.TestCase):
+    """`llama-server --models-dir` routes by model id and 400s an id it lacks.
+
+    That is the whole difference from FreeToken, whose engine answers to any
+    name and echoes it back. Here forge's record of which model wrote what is
+    true for free, and what is left to get right is the swap itself: a load is
+    not instant, a load that dies looks like nothing at all, and `--models-max`
+    keeps the previous role's checkpoint sitting on the VRAM this one needs.
+    """
+
+    def _provider(self, model="nemo-a", **extra):
+        return build_provider("role", {
+            "kind": "llamacpp", "baseUrl": "http://127.0.0.1:8080/v1",
+            "model": model, **extra,
+        })
+
+    @staticmethod
+    def _entry(status, args=()):
+        return {"status": {"value": status, "args": list(args)}}
+
+    def _wire(self, provider, catalog, *, comes_up="loaded"):
+        """Stand in for the router. Records every load and unload asked for."""
+        asked: list[tuple[str, str]] = []
+        state = dict(catalog)
+
+        def load(model):
+            asked.append(("load", model))
+            entry = dict(state[model])
+            entry["status"] = {**entry["status"], "value": comes_up}
+            state[model] = entry
+
+        def unload(model):
+            asked.append(("unload", model))
+            entry = dict(state[model])
+            entry["status"] = {**entry["status"], "value": "unloaded"}
+            state[model] = entry
+
+        provider._load = load
+        provider._unload = unload
+        provider.catalog = lambda refresh=False: state
+        return asked, state
+
+    def test_a_resident_checkpoint_is_not_loaded_again(self):
+        provider = self._provider()
+        asked, _ = self._wire(provider, {"nemo-a": self._entry("loaded")})
+
+        provider._ensure_loaded()
+
+        self.assertEqual(asked, [])
+
+    def test_an_unloaded_checkpoint_is_loaded(self):
+        provider = self._provider()
+        asked, state = self._wire(provider, {"nemo-a": self._entry("unloaded")})
+
+        provider._ensure_loaded()
+
+        self.assertEqual(asked, [("load", "nemo-a")])
+        self.assertEqual(state["nemo-a"]["status"]["value"], "loaded")
+
+    def test_a_load_already_in_flight_is_waited_for_rather_than_asked_for_twice(self):
+        # The router spawns the child asynchronously, so a role's poll can
+        # arrive while the same checkpoint is already mid-load.
+        provider = self._provider()
+        asked: list[tuple[str, str]] = []
+        provider._load = lambda model: asked.append(("load", model))
+        provider._unload = lambda model: asked.append(("unload", model))
+
+        polls = [{"nemo-a": self._entry("loading")},
+                 {"nemo-a": self._entry("loaded")}]
+        provider.catalog = lambda refresh=False: polls.pop(0) if len(polls) > 1 else polls[0]
+
+        provider._ensure_loaded()
+
+        self.assertEqual(asked, [])
+
+    def test_exclusive_evicts_every_other_resident_checkpoint(self):
+        # --models-max defaults to 4. On a GPU with room for one, the load that
+        # fails is this one and the reason is the previous role's model.
+        provider = self._provider("nemo-b", exclusive=True)
+        asked, state = self._wire(provider, {
+            "nemo-a": self._entry("loaded"),
+            "nemo-b": self._entry("unloaded"),
+            "nemo-c": self._entry("loading"),
+        })
+
+        provider._ensure_loaded()
+
+        self.assertEqual(asked[:2], [("unload", "nemo-a"), ("unload", "nemo-c")])
+        self.assertEqual(asked[2], ("load", "nemo-b"))
+        self.assertEqual(state["nemo-a"]["status"]["value"], "unloaded")
+
+    def test_without_exclusive_the_router_keeps_what_it_has(self):
+        provider = self._provider("nemo-b")
+        asked, _ = self._wire(provider, {
+            "nemo-a": self._entry("loaded"),
+            "nemo-b": self._entry("unloaded"),
+        })
+
+        provider._ensure_loaded()
+
+        self.assertEqual(asked, [("load", "nemo-b")])
+
+    def test_exclusive_still_evicts_when_this_model_is_already_resident(self):
+        provider = self._provider("nemo-b", exclusive=True)
+        asked, _ = self._wire(provider, {
+            "nemo-a": self._entry("loaded"),
+            "nemo-b": self._entry("loaded"),
+        })
+
+        provider._ensure_loaded()
+
+        self.assertEqual(asked, [("unload", "nemo-a")])
+
+    def test_an_unknown_id_names_what_the_router_actually_serves(self):
+        # A models-dir entry is named after its directory, so the name an
+        # operator invents is almost never the name that exists.
+        provider = self._provider("qwen3.8")
+        self._wire(provider, {
+            "nemotron-3-nano-omni-30b-a3b-reasoning-gguf": self._entry("unloaded"),
+        })
+
+        with self.assertRaises(ProviderError) as caught:
+            provider._ensure_loaded()
+
+        message = str(caught.exception)
+        self.assertIn("has no model 'qwen3.8'", message)
+        self.assertIn("nemotron-3-nano-omni-30b-a3b-reasoning-gguf", message)
+
+    def test_a_child_that_dies_is_reported_as_a_dead_child(self):
+        # The router publishes no exit reason: a child that fails to allocate
+        # simply reverts to unloaded. Read naively that is "still loading",
+        # and the run polls until the deadline for a process that is gone.
+        provider = self._provider(loadSeconds=1)
+        provider._load = lambda model: None
+        provider._unload = lambda model: None
+        provider.catalog = lambda refresh=False: {"nemo-a": self._entry("unloaded")}
+
+        with self.assertRaises(ProviderUnreachable) as caught:
+            provider._ensure_loaded()
+
+        self.assertIn("child server exited", str(caught.exception))
+        self.assertIn("VRAM", str(caught.exception))
+
+    def test_a_load_that_never_finishes_names_the_deadline(self):
+        provider = self._provider(loadSeconds=0)
+        self._wire(provider, {"nemo-a": self._entry("unloaded")},
+                   comes_up="loading")
+
+        with self.assertRaises(ProviderUnreachable) as caught:
+            provider._ensure_loaded()
+
+        self.assertIn("did not load 'nemo-a' within 0s", str(caught.exception))
+
+    def test_the_context_window_comes_from_the_preset_the_router_will_spawn(self):
+        # The router's own /props answers n_ctx 0 -- it holds no model -- and a
+        # child's port is ephemeral, so the published argv is the only place a
+        # per-model window is visible without loading it.
+        provider = self._provider()
+        self._wire(provider, {
+            "nemo-a": self._entry("unloaded", ["--ctx-size", "32768"]),
+        })
+
+        self.assertEqual(provider.capabilities().context_window, 32768)
+
+    def test_the_short_spelling_of_the_context_flag_is_read_too(self):
+        provider = self._provider()
+        self._wire(provider, {"nemo-a": self._entry("unloaded", ["-c", "16384"])})
+
+        self.assertEqual(provider.capabilities().context_window, 16384)
+
+    def test_configuration_wins_over_the_preset(self):
+        provider = self._provider(contextWindow=8000)
+        self._wire(provider, {
+            "nemo-a": self._entry("unloaded", ["--ctx-size", "32768"]),
+        })
+
+        self.assertEqual(provider.capabilities().context_window, 8000)
+
+    def test_a_preset_pinning_nothing_falls_back_rather_than_guessing_the_trained_max(self):
+        # Reading the trained maximum out of the GGUF and believing it is the
+        # failure the budget gate exists to prevent: the server allocates its
+        # own default and truncates the overflow from the front, taking the
+        # system prompt and the spec with it.
+        provider = self._provider()
+        self._wire(provider, {"nemo-a": self._entry("unloaded", ["--model", "x"])})
+
+        self.assertEqual(provider.capabilities().context_window, 8192)
+
+    def test_a_window_wider_than_the_preset_is_reported_before_a_run_spends_on_it(self):
+        provider = self._provider(contextWindow=131072, exclusive=True)
+        self._wire(provider, {
+            "nemo-a": self._entry("unloaded", ["--ctx-size", "32768"]),
+        })
+        provider._props = lambda: {"role": "router", "max_instances": 1}
+
+        notes = " ".join(provider.diagnostics())
+
+        self.assertIn("contextWindow is 131,072", notes)
+        self.assertIn("-c 32,768", notes)
+        self.assertIn("truncated from the front", notes)
+
+    def test_a_single_model_server_is_told_it_cannot_swap(self):
+        provider = self._provider()
+        provider._props = lambda: {"role": "chat", "max_instances": 0}
+
+        notes = " ".join(provider.diagnostics())
+
+        self.assertIn("rather than running in router mode", notes)
+        self.assertIn("openai", notes)
+
+    def test_a_projector_nothing_uses_is_reported_as_the_vram_it_is(self):
+        provider = self._provider(contextWindow=4096, exclusive=True)
+        self._wire(provider, {
+            "nemo-a": self._entry("unloaded", ["--ctx-size", "32768", "--mmproj", "p"]),
+        })
+        provider._props = lambda: {"role": "router", "max_instances": 1}
+
+        self.assertIn("--mmproj", " ".join(provider.diagnostics()))
+
+    def test_residency_is_reported_when_nothing_is_evicting(self):
+        provider = self._provider(contextWindow=4096)
+        self._wire(provider, {
+            "nemo-a": self._entry("unloaded", ["--ctx-size", "32768"]),
+            "nemo-b": self._entry("loaded", ["--ctx-size", "32768"]),
+        })
+        provider._props = lambda: {"role": "router", "max_instances": 4}
+
+        notes = " ".join(provider.diagnostics())
+
+        self.assertIn("keeps up to 4 models resident", notes)
+        self.assertIn("nemo-b", notes)
+
+    def test_unloading_something_already_gone_is_not_an_error(self):
+        # Between reading the catalogue and acting on it another role may have
+        # evicted the same model; the router answers 400 "model is not running".
+        provider = self._provider()
+        import forge.providers.llamacpp as mod
+
+        def refuse(url, payload, *, headers, timeout):
+            raise ProviderBadResponse(url + " returned 400: model is not running")
+
+        original = mod.post_json
+        mod.post_json = refuse
+        try:
+            provider._unload("nemo-b")
+        finally:
+            mod.post_json = original
+
+    def test_a_real_refusal_to_unload_still_raises(self):
+        provider = self._provider()
+        import forge.providers.llamacpp as mod
+
+        def refuse(url, payload, *, headers, timeout):
+            raise ProviderBadResponse(url + " returned 400: malformed request")
+
+        original = mod.post_json
+        mod.post_json = refuse
+        try:
+            with self.assertRaises(ProviderBadResponse):
+                provider._unload("nemo-b")
+        finally:
+            mod.post_json = original
+
+    def test_the_kind_is_registered_under_the_names_people_type(self):
+        self.assertIn("llamacpp", available_kinds())
+        for spelling in ("llama.cpp", "llama-cpp", "llama-server", "llama"):
+            self.assertEqual(
+                build_provider("r", {"kind": spelling, "model": "m"}).kind, "llamacpp"
+            )
+
+    def test_the_default_port_is_the_routers_and_not_ollamas(self):
+        # The OpenAI base defaults to 11434, which belongs to a different
+        # server entirely; a block naming no baseUrl would silently inherit it.
+        provider = build_provider("r", {"kind": "llamacpp", "model": "m"})
+
+        self.assertEqual(provider.base_url, "http://127.0.0.1:8080/v1")
+        self.assertEqual(provider._router_url(), "http://127.0.0.1:8080")
+
+    def test_a_given_base_url_is_left_alone(self):
+        provider = build_provider(
+            "r", {"kind": "llamacpp", "model": "m", "baseUrl": "http://box:9000/v1"}
+        )
+
+        self.assertEqual(provider._router_url(), "http://box:9000")
+
+
+class TestLlamaCppContextDiscoveryDoesNotOutliveAnOutage(unittest.TestCase):
+    """A window that collapsed to a default must not be remembered.
+
+    `capabilities()` is asked by the budget gate before every call and caches
+    what it found, which is right for a fact about the preset and wrong for a
+    fact about the network. Cached, a router that was briefly down leaves the
+    rest of the run planning against 8192 and reporting every ticket as too
+    large for a model that is fine.
+    """
+
+    def _provider(self, **extra):
+        return build_provider("role", {
+            "kind": "llamacpp", "baseUrl": "http://127.0.0.1:8080/v1",
+            "model": "nemo-a", **extra,
+        })
+
+    def test_a_fallback_taken_during_an_outage_is_not_remembered(self):
+        provider = self._provider()
+        state = {"up": False}
+
+        def catalog(refresh=False):
+            if not state["up"]:
+                raise ProviderUnreachable("router is down")
+            return {"nemo-a": {"status": {"value": "unloaded",
+                                          "args": ["--ctx-size", "131072"]}}}
+
+        provider.catalog = catalog
+
+        self.assertEqual(provider.capabilities().context_window, 8192)
+
+        state["up"] = True
+
+        self.assertEqual(provider.capabilities().context_window, 131072)
+
+    def test_a_preset_that_pins_nothing_is_remembered(self):
+        # The router answered; that the preset pins no window is a fact about
+        # the preset and will not change under us.
+        provider = self._provider()
+        calls = []
+
+        def catalog(refresh=False):
+            calls.append(1)
+            return {"nemo-a": {"status": {"value": "unloaded", "args": []}}}
+
+        provider.catalog = catalog
+
+        self.assertEqual(provider.capabilities().context_window, 8192)
+        self.assertEqual(provider.capabilities().context_window, 8192)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_configured_window_never_asks_the_router_at_all(self):
+        provider = self._provider(contextWindow=131072)
+
+        def catalog(refresh=False):
+            raise AssertionError("config already answered this")
+
+        provider.catalog = catalog
+
+        self.assertEqual(provider.capabilities().context_window, 131072)
+
+
+class TestLlamaCppReportsAProjectorNothingUses(unittest.TestCase):
+    """A text-only role can end up holding vision weights two different ways.
+
+    A `--models-dir` entry beside an `mmproj-*.gguf` is spawned with an
+    explicit `--mmproj`, which the catalogue publishes. An `hf-repo` entry
+    resolves one *inside* the child whenever the repo ships it, so the argv
+    says nothing at all and the only trace is a line in the router's log:
+
+        loaded multimodal model, '…\\mmproj-BF16.gguf'
+
+    Both spend VRAM on a modality no role here sends, and on a card sized for
+    one checkpoint that is the difference between a swap and an
+    `ErrorOutOfDeviceMemory`.
+    """
+
+    def _provider(self, args, **extra):
+        provider = build_provider("role", {
+            "kind": "llamacpp", "baseUrl": "http://127.0.0.1:8080/v1",
+            "model": "nemo-a", "contextWindow": 32768,
+            "maxOutputTokens": 4096, "exclusive": True, **extra,
+        })
+        provider.catalog = lambda refresh=False: {
+            "nemo-a": {"status": {"value": "unloaded", "args": list(args)}}
+        }
+        provider._props = lambda: {"role": "router", "max_instances": 1}
+        return provider
+
+    def test_an_explicit_projector_is_reported(self):
+        provider = self._provider(["--ctx-size", "32768", "--mmproj", "p.gguf"])
+
+        notes = " ".join(provider.diagnostics())
+
+        self.assertIn("--mmproj", notes)
+        self.assertIn("no-mmproj = true", notes)
+
+    def test_a_hugging_face_pull_is_reported_even_though_the_argv_is_silent(self):
+        provider = self._provider(
+            ["--ctx-size", "32768", "--hf-repo", "unsloth/Qwen3.8-27B-GGUF:Q4_K_M"]
+        )
+
+        notes = " ".join(provider.diagnostics())
+
+        self.assertIn("downloads and loads a multimodal projector", notes)
+
+    def test_turning_it_off_settles_the_question(self):
+        provider = self._provider([
+            "--ctx-size", "32768", "--hf-repo", "r", "--no-mmproj",
+        ])
+
+        self.assertEqual(provider.diagnostics(), [])
+
+    def test_the_spelling_a_preset_actually_emits_counts_too(self):
+        # `no-mmproj = true` in a preset reaches the child as
+        # --no-mmproj-auto, not as the --no-mmproj alias the help advertises.
+        # Matching only the advertised one reports a projector on a child that
+        # has none, which teaches the operator to ignore the note.
+        provider = self._provider([
+            "--ctx-size", "32768", "--jinja", "--no-mmproj-auto",
+            "--hf-repo", "unsloth/Qwen3.8-27B-GGUF:Q4_K_M",
+        ])
+
+        self.assertEqual(provider.diagnostics(), [])
+
+    def test_a_plain_local_checkpoint_is_not_accused_of_anything(self):
+        provider = self._provider(["--ctx-size", "32768", "--model", "x.gguf"])
+
+        self.assertEqual(provider.diagnostics(), [])
+
+
+class TestRatifyOrderIsTheOperatorsToChoose(unittest.TestCase):
+    """Which order the roles vote in, and why it is not cosmetic.
+
+    Two things ride on it. Votes accumulate as they are cast and every role is
+    shown the ones before it, so the first votes blind and the last answers
+    three arguments — moving the reviewer turns its vote from a rebuttal into
+    an opening position. And on a backend serving one checkpoint at a time,
+    two roles sharing a model are free when adjacent and cost a reload when
+    not: measured at 20-35s a swap, the default order against a two-model
+    config pays two a pass where a grouped order pays one, and leaves the
+    right checkpoint resident for the build that follows.
+    """
+
+    BASE = {
+        "models": {"a": {"kind": "openai", "model": "m"}},
+        "roles": {"planner": "a", "executor": "a", "tester": "a", "reviewer": "a"},
+        "commands": {"test": "pytest"},
+    }
+
+    def _config(self, loop):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps({**self.BASE, "loop": loop}), encoding="utf-8"
+        )
+        return Config.load(root)
+
+    def test_the_default_is_the_order_roles_have_always_voted_in(self):
+        self.assertEqual(
+            self._config({}).loop.ratify_order,
+            ("planner", "executor", "tester", "reviewer"),
+        )
+
+    def test_an_empty_value_falls_back_rather_than_emptying_the_pass(self):
+        # `"ratifyOrder": []` reads as "no opinion", not "nobody votes".
+        # Honouring it literally would skip sign-off while reporting it ran.
+        self.assertEqual(
+            self._config({"ratifyOrder": []}).loop.ratify_order,
+            ("planner", "executor", "tester", "reviewer"),
+        )
+
+    def test_roles_can_be_grouped_by_the_model_behind_them(self):
+        order = self._config(
+            {"ratifyOrder": ["planner", "reviewer", "executor", "tester"]}
+        ).loop.ratify_order
+
+        self.assertEqual(order, ("planner", "reviewer", "executor", "tester"))
+
+    def test_omitting_a_role_is_refused_because_it_moves_the_majority(self):
+        # Sign-off resolves over the votes cast. Three voters instead of four
+        # is a different gate, and nothing in the run would say so.
+        with self.assertRaises(ConfigError) as caught:
+            self._config({"ratifyOrder": ["planner", "reviewer", "executor"]})
+
+        message = str(caught.exception)
+        self.assertIn("omits 'tester'", message)
+        self.assertIn("ratifyPasses", message)
+
+    def test_repeating_a_role_is_refused_because_it_doubles_its_vote(self):
+        with self.assertRaises(ConfigError) as caught:
+            self._config(
+                {"ratifyOrder": ["planner", "planner", "executor", "tester", "reviewer"]}
+            )
+
+        self.assertIn("more than once", str(caught.exception))
+
+    def test_a_name_that_is_not_a_role_names_the_ones_that_are(self):
+        with self.assertRaises(ConfigError) as caught:
+            self._config(
+                {"ratifyOrder": ["planner", "reviewer", "executor", "architect"]}
+            )
+
+        message = str(caught.exception)
+        self.assertIn("'architect'", message)
+        self.assertIn("planner, executor, tester, reviewer", message)
+
+    def test_it_survives_a_save_and_reload(self):
+        config = self._config(
+            {"ratifyOrder": ["planner", "reviewer", "executor", "tester"]}
+        )
+
+        config.write()
+
+        self.assertEqual(
+            Config.load(config.root).loop.ratify_order,
+            ("planner", "reviewer", "executor", "tester"),
+        )
+
+    def test_the_order_is_what_ratify_actually_votes_in(self):
+        # The seam was already there: ratify() takes the sequence and iterates
+        # it. This is the test that the call site stopped hardcoding the
+        # module-level constant.
+        asked = []
+
+        def fake_vote(store, run_id, ticket, role, **kwargs):
+            asked.append(role)
+            return ratify.Vote(role, True)
+
+        original_vote, original_settle = ratify._vote, ratify._settle
+        ratify._vote = fake_vote
+        ratify._settle = lambda store, run_id, ticket, result: result
+        try:
+            ratify.ratify(
+                None,
+                1,
+                Ticket(ticket_id="T-1", title="t", spec="s"),
+                call=lambda role, messages, budget: None,
+                budget_for=lambda role: 512,
+                roles=("planner", "reviewer", "executor", "tester"),
+                passes=1,
+            )
+        finally:
+            ratify._vote, ratify._settle = original_vote, original_settle
+
+        self.assertEqual(asked, ["planner", "reviewer", "executor", "tester"])
+
+
+class TestATicketCanReadWhatItsDependenciesWrote(unittest.TestCase):
+    """A dependency's output was invisible to its dependent by construction.
+
+    `reading_scope` keeps only paths that resolve and expands siblings only
+    where the directory exists, and it is computed once at ingest — before any
+    ticket has run. So at the moment a dependent's read scope is worked out,
+    the files it depends on do not exist, and nothing recomputed it when they
+    did.
+
+    Measured on one backlog: PF-003 declared `needs: ["PF-002"]` and was handed
+    a GDScript loader and a smoke test, while PF-002 wrote the `LevelModel`
+    type PF-003 exists to serialize. Four objections across two runs said so —
+    all correct, none actionable — and the ticket parked without an attempt.
+    """
+
+    def _loop(self, root):
+        loop = Orchestrator.__new__(Orchestrator)
+        loop.config = Config.load(root)
+        return loop
+
+    def _root(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"a": {"kind": "openai", "model": "m"}},
+                    "roles": {
+                        "planner": "a",
+                        "executor": "a",
+                        "tester": "a",
+                        "reviewer": "a",
+                    },
+                    "commands": {"test": "pytest"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return root
+
+    @staticmethod
+    def _write(root, path, text="x = 1\n"):
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    def _run(self, root, dependency, dependent):
+        """Wire a two-ticket store and put `dependent` through the inheritance."""
+        import types as _types
+
+        logged = []
+        updated = []
+        loop = self._loop(root)
+        loop.store = _types.SimpleNamespace(
+            list_tickets=lambda run_id: [dependency, dependent],
+            update_ticket=lambda run_id, ticket: updated.append(ticket.ticket_id),
+            log=lambda run_id, message, **kw: logged.append(message),
+        )
+        loop._inherit_dependency_reads(1, dependent)
+        return logged, updated
+
+    def test_a_dependencys_files_become_readable_once_they_exist(self):
+        root = self._root()
+        self._write(root, "src/level/types.ts")
+        self._write(root, "src/level/parse.ts")
+
+        parser = Ticket(
+            ticket_id="PF-002",
+            allowed_files=["src/level/types.ts", "src/level/parse.ts"],
+        )
+        serializer = Ticket(
+            ticket_id="PF-003",
+            allowed_files=["src/level/serialize.ts"],
+            needs=["PF-002"],
+        )
+
+        logged, updated = self._run(root, parser, serializer)
+
+        self.assertIn("src/level/types.ts", serializer.reference_files)
+        self.assertIn("src/level/parse.ts", serializer.reference_files)
+        self.assertEqual(updated, ["PF-003"])
+        self.assertIn("PF-002", logged[0])
+
+    def test_a_ticket_with_no_dependencies_is_left_alone(self):
+        root = self._root()
+        self._write(root, "src/level/types.ts")
+        alone = Ticket(ticket_id="PF-002", allowed_files=["src/level/types.ts"])
+
+        logged, updated = self._run(root, alone, alone)
+
+        self.assertEqual(updated, [])
+        self.assertEqual(logged, [])
+
+    def test_a_dependency_that_wrote_nothing_yet_contributes_nothing(self):
+        # `reading_scope` drops what it cannot open, so a dependency that never
+        # ran cannot smuggle a phantom path into a prompt — which is invariant
+        # 10's rule, and the reason this is safe to run before the build.
+        root = self._root()
+        parser = Ticket(ticket_id="PF-002", allowed_files=["src/level/types.ts"])
+        serializer = Ticket(
+            ticket_id="PF-003",
+            allowed_files=["src/level/serialize.ts"],
+            needs=["PF-002"],
+        )
+
+        logged, updated = self._run(root, parser, serializer)
+
+        self.assertEqual(serializer.reference_files, [])
+        self.assertEqual(updated, [])
+        self.assertEqual(logged, [])
+
+    def test_the_tickets_own_declared_references_are_not_displaced(self):
+        # `reading_scope` takes `reference` in order and caps the rest, so a
+        # path a human chose has to stay ahead of anything derived.
+        root = self._root()
+        self._write(root, "scripts/level_loader.gd")
+        self._write(root, "src/level/types.ts")
+        parser = Ticket(ticket_id="PF-002", allowed_files=["src/level/types.ts"])
+        serializer = Ticket(
+            ticket_id="PF-003",
+            allowed_files=["src/level/serialize.ts"],
+            reference_files=["scripts/level_loader.gd"],
+            needs=["PF-002"],
+        )
+
+        self._run(root, parser, serializer)
+
+        self.assertEqual(serializer.reference_files[0], "scripts/level_loader.gd")
+        self.assertIn("src/level/types.ts", serializer.reference_files)
+
+    def test_a_dependency_named_but_absent_from_the_run_is_not_an_error(self):
+        root = self._root()
+        self._write(root, "src/level/types.ts")
+        serializer = Ticket(
+            ticket_id="PF-003",
+            allowed_files=["src/level/serialize.ts"],
+            needs=["PF-999"],
+        )
+
+        logged, updated = self._run(root, serializer, serializer)
+
+        self.assertEqual(updated, [])
+        self.assertEqual(logged, [])
+
+
+class TestRatifyMayRewordCriteriaButNotInventThem(unittest.TestCase):
+    """Moving a criterion is this pass's job; adding one is raising the bar.
+
+    A planner asked to settle a ticket carrying four measured hash vectors
+    added four more of its own. Three were right by luck. The fourth —
+    `postVariant(3130775471, 0, 0, 10) returns 2`, where the hash it had just
+    agreed to ends in 7 — was arithmetic nobody had done. Nothing downstream
+    could tell it from a measured value: it cost five attempts, parked the
+    ticket, and skipped the two that depended on it.
+    """
+
+    @staticmethod
+    def _ticket():
+        return Ticket(
+            ticket_id="PF-007",
+            title="hash",
+            spec="port the hasher",
+            criteria=[
+                "`hashVector3i(0, 0, 0)` returns 1691721052.",
+                "`postVariant(3130775471, 0, 0, 3)` returns 0.",
+            ],
+        )
+
+    @staticmethod
+    def _store():
+        import types as _types
+
+        logged = []
+        return _types.SimpleNamespace(
+            log=lambda run_id, message, **kw: logged.append(message),
+            list_tickets=lambda run_id: [],
+            update_ticket=lambda run_id, ticket: None,
+        ), logged
+
+    def test_an_added_criterion_is_refused_and_named(self):
+        ticket = self._ticket()
+        store, logged = self._store()
+        revision = {
+            "criteria": [
+                "hashVector3i(0, 0, 0) returns 1691721052.",
+                "postVariant(3130775471, 0, 0, 3) returns 0.",
+                "postVariant(3130775471, 0, 0, 10) returns 2.",
+            ]
+        }
+
+        ratify._apply(store, 1, ticket, revision, root=None)
+
+        self.assertEqual(len(ticket.criteria), 2)
+        self.assertIn("postVariant(3130775471, 0, 0, 10)", " ".join(logged))
+        self.assertIn("respecCriteria", " ".join(logged))
+
+    def test_rewording_the_same_number_of_criteria_still_works(self):
+        # The refusal is on growth, not on change. Making an unassertable
+        # criterion assertable is the whole point of the pass.
+        ticket = self._ticket()
+        store, logged = self._store()
+        revision = {
+            "criteria": [
+                "hashVector3i(0, 0, 0) returns exactly 1691721052 as an unsigned value.",
+                "postVariant(3130775471, 0, 0, 3) returns 0.",
+            ]
+        }
+
+        ratify._apply(store, 1, ticket, revision, root=None)
+
+        self.assertIn("unsigned", ticket.criteria[0])
+        self.assertEqual(logged, [])
+
+    def test_removing_a_criterion_is_not_growth(self):
+        ticket = self._ticket()
+        store, logged = self._store()
+
+        ratify._apply(
+            store, 1, ticket, {"criteria": ["hashVector3i(0, 0, 0) returns 1691721052."]},
+            root=None,
+        )
+
+        self.assertEqual(len(ticket.criteria), 1)
+
+    def test_an_operator_can_unlock_additions(self):
+        ticket = self._ticket()
+        store, logged = self._store()
+        revision = {
+            "criteria": [
+                "hashVector3i(0, 0, 0) returns 1691721052.",
+                "postVariant(3130775471, 0, 0, 3) returns 0.",
+                "postVariant(3130775471, 0, 0, 10) returns 2.",
+            ]
+        }
+
+        ratify._apply(store, 1, ticket, revision, root=None, criteria_locked=False)
+
+        self.assertEqual(len(ticket.criteria), 3)
+
+    def test_backticks_and_case_do_not_make_a_rewrite_look_new(self):
+        self.assertEqual(
+            ratify._normalise_criterion("`hashVector3i(0, 0, 0)` returns 1691721052."),
+            ratify._normalise_criterion("hashVector3i(0, 0, 0)  returns 1691721052"),
+        )
+
+
+class TestAConfiguredTemperatureNeedNotOverrideDeterminism(unittest.TestCase):
+    """The loop asks 0.0 where it needs the same answer twice.
+
+    A scalar `temperature` overrides that as readily as it overrides the 0.2 a
+    build asks for, so following a vendor's sampling recipe silently costs
+    reproducible sign-off. Measured: the same nine-ticket backlog run twice
+    under identical configuration, two tickets swapping verdicts.
+    """
+
+    @staticmethod
+    def _at(configured, requested):
+        block = {"kind": "openai", "model": "m"}
+        if configured is not None:
+            block["temperature"] = configured
+        return build_provider("role", block).temperature(requested)
+
+    def test_a_scalar_still_wins_everywhere(self):
+        self.assertEqual(self._at(0.6, 0.0), 0.6)
+        self.assertEqual(self._at(0.6, 0.2), 0.6)
+
+    def test_a_map_lets_a_requested_zero_through(self):
+        configured = {"default": 0.6, "deterministic": 0.0}
+
+        self.assertEqual(self._at(configured, 0.0), 0.0)
+        self.assertEqual(self._at(configured, 0.2), 0.6)
+
+    def test_an_omitted_key_leaves_the_loops_own_number_alone(self):
+        # `{"default": 0.6}` is the honest spelling of "follow the recipe, but
+        # let determinism through".
+        self.assertEqual(self._at({"default": 0.6}, 0.0), 0.0)
+        self.assertEqual(self._at({"default": 0.6}, 0.2), 0.6)
+        self.assertEqual(self._at({"deterministic": 0.0}, 0.2), 0.2)
+
+    def test_nothing_configured_is_unchanged(self):
+        self.assertEqual(self._at(None, 0.0), 0.0)
+        self.assertEqual(self._at(None, 0.2), 0.2)
+
+
+class TestTheSignOffPassDoesNotAskForAReview(unittest.TestCase):
+    """Ratification runs before anything is built, and the prompt has to say so
+    in the place the model is actually reading.
+
+    The system message always said it. The reviewer's *question* undercut it:
+    "rule on this ticket from a diff and these criteria alone… name any
+    criterion you could not check by reading the change" reads, to a smaller
+    model, as though a diff existed and had been withheld. One 30B reviewer
+    answered exactly that way —
+
+        Round-trip test implementation missing, so cannot verify discovery of
+        exactly 63 files.
+        serializeLevel implementation not present, cannot verify trailing LF…
+
+    — and attached suggestions that restated the ticket's own spec back as
+    instructions, which the same system message forbids. Three of the four
+    objections that parked a never-attempted ticket were of that shape.
+    """
+
+    def _system(self, role):
+        from forge.prompts import ratify_prompt
+
+        ticket = Ticket(
+            ticket_id="PF-003",
+            title="serialize a level",
+            spec="emit one character per tile",
+            criteria=["round-trips every level file"],
+        )
+        return ratify_prompt(ticket, role)[0].content
+
+    def test_the_reviewer_is_asked_about_a_diff_that_does_not_exist_yet(self):
+        from forge.prompts import RATIFY_QUESTIONS
+
+        question = RATIFY_QUESTIONS["reviewer"]
+
+        self.assertIn("Once this ticket has been built", question)
+        # The old phrasing, which read as a diff withheld rather than a diff
+        # not yet written.
+        self.assertNotIn("from a diff and these criteria alone", question)
+
+    def test_every_role_is_told_the_absence_of_code_is_the_premise(self):
+        for role in ("planner", "executor", "tester", "reviewer"):
+            with self.subTest(role=role):
+                system = self._system(role)
+                self.assertIn("Do not object that the work has not been done yet", system)
+                self.assertIn("premise of this pass", system)
+
+    def test_the_reviewer_still_gets_its_own_question_and_not_anothers(self):
+        from forge.prompts import RATIFY_QUESTIONS
+
+        # The question is the whole difference between four sign-offs and four
+        # opinions, so the guard must not have flattened them into one.
+        reviewer = self._system("reviewer")
+        tester = self._system("tester")
+
+        self.assertIn(RATIFY_QUESTIONS["reviewer"], reviewer)
+        self.assertNotIn(RATIFY_QUESTIONS["tester"], reviewer)
+        self.assertIn(RATIFY_QUESTIONS["tester"], tester)
+
+
+
+class TestAnEvictionIsWaitedForBeforeTheSlotIsClaimed(unittest.TestCase):
+    """`/models/unload` answers before the checkpoint has gone.
+
+    The router accepts the unload as soon as it has asked the child server to
+    exit; the `--models-max` slot is not free until the child has actually
+    gone. Ask for the next checkpoint inside that window and the router
+    refuses:
+
+        500 {"error":{"code":500,"message":"model limit reached, try again
+        later","type":"server_error"}}
+
+    On this backend a 500 is a `ProviderUnreachable`, so that refusal reaches
+    the loop as a model that cannot be talked to. Measured cost when it landed
+    on a live run: four roles unreachable for sign-off, then five delegation
+    attempts spent and the ticket given up on, all inside two seconds --
+
+        18:26:42  PF-007: no role could be reached for sign-off; continuing
+                  without ratification.
+        18:26:45  attempt 1 failed ... attempt 5 failed
+        18:26:46  PF-007: gave up after 5 attempts.
+
+    -- against 54 alternations in the run before it that crossed the same
+    window and never noticed. A race this narrow does not announce itself; it
+    spends a ticket.
+    """
+
+    def _provider(self, model="nemo-b", **extra):
+        from forge.providers import build_provider
+
+        return build_provider("role", {
+            "kind": "llamacpp", "baseUrl": "http://127.0.0.1:8080/v1",
+            "model": model, "exclusive": True, **extra,
+        })
+
+    @staticmethod
+    def _entry(status):
+        return {"status": {"value": status, "args": []}}
+
+    @staticmethod
+    def _limit_reached():
+        from forge.providers.base import ProviderUnreachable
+
+        return ProviderUnreachable(
+            'http://127.0.0.1:8080/models/load returned 500: '
+            '{"error":{"code":500,"message":"model limit reached, try again '
+            'later","type":"server_error"}}'
+        )
+
+    @contextlib.contextmanager
+    def _no_waiting(self, slot_seconds=60.0):
+        """Run the polls without paying for them."""
+        from forge.providers import llamacpp
+
+        with unittest.mock.patch.object(llamacpp.time, "sleep"), \
+                unittest.mock.patch.object(llamacpp, "_SLOT_SECONDS", slot_seconds):
+            yield
+
+    def _wire(self, provider, catalog, *, lingers=0):
+        """A router whose unload takes `lingers` polls to actually land."""
+        asked: list[tuple[str, str]] = []
+        state = dict(catalog)
+        remaining = {}
+
+        def load(model):
+            asked.append(("load", model))
+            if any(m != model and self._status(state, m) == "loaded" for m in state):
+                raise self._limit_reached()
+            state[model] = self._entry("loaded")
+
+        def unload(model):
+            asked.append(("unload", model))
+            remaining[model] = lingers
+            if not lingers:
+                state[model] = self._entry("unloaded")
+
+        def catalog_of(refresh=False):
+            for model, left in list(remaining.items()):
+                if left <= 0:
+                    state[model] = self._entry("unloaded")
+                    remaining.pop(model)
+                else:
+                    remaining[model] = left - 1
+            return dict(state)
+
+        provider._load = load
+        provider._unload = unload
+        provider.catalog = catalog_of
+        return asked, state
+
+    @staticmethod
+    def _status(state, model):
+        return (state[model].get("status") or {}).get("value")
+
+    def test_the_load_is_not_asked_for_until_the_eviction_lands(self):
+        provider = self._provider()
+        asked, state = self._wire(provider, {
+            "nemo-a": self._entry("loaded"),
+            "nemo-b": self._entry("unloaded"),
+        }, lingers=3)
+
+        with self._no_waiting():
+            provider._ensure_loaded()
+
+        self.assertEqual(asked, [("unload", "nemo-a"), ("load", "nemo-b")])
+        self.assertEqual(self._status(state, "nemo-b"), "loaded")
+
+    def test_a_refusal_inside_the_window_is_waited_out_rather_than_raised(self):
+        # The wait above closes the window the provider opens itself. This
+        # closes the one it cannot see: the router's slot accounting can lag
+        # its own status field, and something else may hold a slot entirely.
+        from forge.providers import llamacpp
+
+        provider = self._provider()
+        provider._unload = lambda model: None
+        provider.catalog = lambda refresh=False: {"nemo-b": self._entry("unloaded")}
+
+        refusals = [self._limit_reached(), self._limit_reached(), None]
+        posted: list[str] = []
+
+        def post_json(url, payload, **kwargs):
+            posted.append(url)
+            outcome = refusals.pop(0)
+            if outcome is not None:
+                raise outcome
+            return {}
+
+        with self._no_waiting(), \
+                unittest.mock.patch.object(llamacpp, "post_json", post_json):
+            provider._load("nemo-b")
+
+        self.assertEqual(len(posted), 3)
+
+    def test_a_refusal_that_never_clears_names_what_is_holding_the_slot(self):
+        from forge.providers import llamacpp
+        from forge.providers.base import ProviderUnreachable
+
+        provider = self._provider()
+
+        def post_json(url, payload, **kwargs):
+            raise self._limit_reached()
+
+        with self._no_waiting(slot_seconds=0.0), \
+                unittest.mock.patch.object(llamacpp, "post_json", post_json):
+            with self.assertRaises(ProviderUnreachable) as caught:
+                provider._load("nemo-b")
+
+        message = str(caught.exception)
+        self.assertIn("no slot for 'nemo-b'", message)
+        self.assertIn("--models-max", message)
+
+    def test_a_refusal_that_is_not_about_slots_is_raised_at_once(self):
+        # Waiting out a 400 would turn a config error into a minute of
+        # silence, and the id in it is the commonest mistake on this backend.
+        from forge.providers import llamacpp
+        from forge.providers.base import ProviderError
+
+        provider = self._provider()
+        attempts: list[str] = []
+
+        def post_json(url, payload, **kwargs):
+            attempts.append(url)
+            raise ProviderError("returned 400: model 'nemo-b' not found")
+
+        with self._no_waiting(), \
+                unittest.mock.patch.object(llamacpp, "post_json", post_json):
+            with self.assertRaises(ProviderError):
+                provider._load("nemo-b")
+
+        self.assertEqual(len(attempts), 1)
+
+    def test_an_eviction_that_never_lands_is_reported_against_the_model(self):
+        from forge.providers.base import ProviderUnreachable
+
+        provider = self._provider()
+        self._wire(provider, {
+            "nemo-a": self._entry("loaded"),
+            "nemo-b": self._entry("unloaded"),
+        }, lingers=10_000)
+
+        with self._no_waiting(slot_seconds=0.0):
+            with self.assertRaises(ProviderUnreachable) as caught:
+                provider._ensure_loaded()
+
+        message = str(caught.exception)
+        self.assertIn("still had 'nemo-a' resident", message)
+        self.assertIn("no slot for 'nemo-b'", message)
+
+    def test_several_evictions_are_asked_for_before_any_is_waited_on(self):
+        # Serialising ask-then-wait would pay the eviction latency once per
+        # checkpoint, on every role alternation.
+        provider = self._provider()
+        asked, _ = self._wire(provider, {
+            "nemo-a": self._entry("loaded"),
+            "nemo-b": self._entry("unloaded"),
+            "nemo-c": self._entry("loading"),
+        }, lingers=2)
+
+        with self._no_waiting():
+            provider._ensure_loaded()
+
+        self.assertEqual(asked, [
+            ("unload", "nemo-a"), ("unload", "nemo-c"), ("load", "nemo-b"),
+        ])
+
+    def test_this_models_own_status_is_re_read_after_the_eviction(self):
+        # The eviction wait polls the catalogue for as long as it takes, so a
+        # status read before it is stale by the time it is acted on -- and
+        # `--models-autoload` can have this checkpoint resident by then.
+        provider = self._provider()
+        asked: list[tuple[str, str]] = []
+        provider._load = lambda model: asked.append(("load", model))
+        provider._unload = lambda model: asked.append(("unload", model))
+
+        polls = [
+            {"nemo-a": self._entry("loaded"), "nemo-b": self._entry("unloaded")},
+            {"nemo-a": self._entry("unloaded"), "nemo-b": self._entry("loaded")},
+        ]
+        provider.catalog = lambda refresh=False: polls.pop(0) if len(polls) > 1 else polls[0]
+
+        with self._no_waiting():
+            provider._ensure_loaded()
+
+        self.assertEqual(asked, [("unload", "nemo-a")])

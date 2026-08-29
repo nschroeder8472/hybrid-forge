@@ -3268,8 +3268,9 @@ class Orchestrator:
             ticket,
             call=call,
             budget_for=self._output_budget,
-            roles=ROLES,
+            roles=self.config.loop.ratify_order,
             passes=passes,
+            criteria_locked=not self.config.loop.respec_criteria,
             sources=sources,
             retrieved=retrieved,
             digest=digest,
@@ -3327,6 +3328,84 @@ class Orchestrator:
         )
         return True
 
+    def _inherit_dependency_reads(self, run_id: int, ticket: Ticket) -> None:
+        """Let a ticket read what the tickets it depends on wrote.
+
+        `reading_scope` keeps only paths that resolve, and expands siblings
+        only where the directory already exists. Both are right, and both are
+        computed once — at ingest, before a single ticket has run. So a
+        dependency's output is invisible to its dependent by construction: at
+        the moment the scope is worked out, the file does not exist yet, and
+        nothing recomputes it when the dependency finishes.
+
+        Measured cost of that on one backlog: PF-003 declared `needs:
+        ["PF-002"]` and was handed `[level_loader.gd, smoke.test.ts]`, while
+        PF-002 wrote the `LevelModel` type PF-003 exists to serialize. Four
+        separate objections across two runs said so — the reviewer and the
+        executor in one, the executor and the tester in the other, all of them
+        correct, none of them actionable. The ticket parked without an attempt.
+
+        This is invariant 10 read the other way round. That one says a path
+        handed to a role must resolve *now*; the case it does not cover is a
+        path that resolves by the time the ticket runs and is therefore never
+        handed over at all. `allowed_files` is already exempt from the
+        existence filter because "most of it does not exist until the ticket
+        runs" — its readers inherit that exemption here.
+
+        Run per ticket rather than at ingest, because that is the first moment
+        the dependency's files are on disk. A dependency that never ran, or
+        wrote nothing, contributes nothing: `reading_scope` drops what it
+        cannot open, so this cannot smuggle a phantom path into a prompt.
+        """
+        if not ticket.needs:
+            return
+        produced: list[str] = []
+        for other in self.store.list_tickets(run_id):
+            if other.ticket_id in ticket.needs:
+                produced.extend(other.allowed_files)
+        if not produced:
+            return
+
+        before = list(ticket.reference_files)
+        # Through `extra`, which is the slot for paths the caller already has
+        # reason to believe are relevant — ahead of same-directory siblings and
+        # behind the ticket's own declared references, which a human chose.
+        ticket.reference_files = evidence.reading_scope(
+            self.config.root,
+            ticket.allowed_files,
+            ticket.reference_files,
+            extra=produced,
+        )
+        gained = [path for path in ticket.reference_files if path not in before]
+        if not gained:
+            return
+        self.store.update_ticket(run_id, ticket)
+
+        # Attributed honestly. Recomputing the scope also re-runs the
+        # same-directory sibling expansion, and a directory the dependencies
+        # have since filled holds files none of them wrote — reporting those as
+        # coming from a dependency would be a claim about provenance that is
+        # simply false, in the log a human reads to work out where a prompt's
+        # contents came from.
+        owned = {normalize_path(path) for path in produced}
+        from_needs = [p for p in gained if normalize_path(p) in owned]
+        alongside = len(gained) - len(from_needs)
+        if not from_needs:
+            return
+        extra_note = (
+            f", and {alongside} more now sitting in the same directories"
+            if alongside
+            else ""
+        )
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: reads {', '.join(from_needs)} from "
+            f"{', '.join(sorted(ticket.needs))}{extra_note}. None of it existed "
+            f"when the backlog was ingested, which is where the read scope was "
+            f"last worked out.",
+            kind="ticket",
+        )
+
     def _work_ticket(self, run_id: int, ticket: Ticket) -> None:
         # Triage is a hard gate, not a preference. A claude-only ticket is one
         # the plan judged unsafe to hand to the executor, and the loop is not
@@ -3345,6 +3424,11 @@ class Orchestrator:
 
         if not self._scope_gate(run_id, ticket):
             return
+
+        # What this ticket's dependencies wrote, added to what it may read.
+        # Before ratification, because the first role asked whether it can do
+        # its part is entitled to see the types it has to stay consistent with.
+        self._inherit_dependency_reads(run_id, ticket)
 
         # Before the baseline, the snapshot, and any code: every role is asked
         # whether it can do its part of this ticket as written. Off unless

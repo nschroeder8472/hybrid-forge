@@ -77,6 +77,7 @@ reviewer between two backends by editing one line in `roles`.
 | `kind` | Talks to | Aliases you can also type |
 |---|---|---|
 | `openai` | anything speaking the OpenAI chat-completions shape | `openai-compatible`, `ollama`, `vllm`, `lmstudio`, `openrouter`, `litellm` |
+| `llamacpp` | `llama-server` in **router** mode, swapping checkpoints on demand | `llama.cpp`, `llama-cpp`, `llama-server`, `llama` |
 | `anthropic` | the Anthropic Messages API | `claude` |
 | `gemini` | Google's Generative Language API | `google` |
 | `claude-cli` | a local `claude` binary in `-p` mode | `claude-code` |
@@ -91,7 +92,7 @@ Default `openai`. An unknown kind fails at startup naming the ones that exist.
 | `model` | `""` | The model id sent to the backend. Required by `openai`, `anthropic` and `gemini`; optional for `claude-cli` (empty = whatever the CLI defaults to) and `command`. |
 | `contextWindow` | see below | Total prompt+output budget in tokens. The budget gate reserves output from it and refuses — or trims — a prompt that will not fit. |
 | `maxOutputTokens` | see below | Ceiling on one reply. Too low is not a silent failure: a truncated planner reply is reported as running out of output room, not as bad JSON. |
-| `temperature` | unset | Overrides the temperature the loop asks for. Set it when a model ships a sampling recipe you are meant to follow — several reasoning models degenerate into repetition above their recommended value. |
+| `temperature` | unset | Overrides the temperature the loop asks for. Set it when a model ships a sampling recipe you are meant to follow — several reasoning models degenerate into repetition above their recommended value. A number overrides *every* call; an object `{"default": 0.6, "deterministic": 0.0}` overrides only the ones the loop did not ask determinism for. See below. |
 | `tokensPerSecond` | `30` | What this endpoint generates at. Only used to work out how long to wait for a call — see below. The default is a floor, not a guess at your hardware. |
 | `timeoutSeconds` | derived | Hard ceiling on one call, in seconds. Overrides the derivation below. `forge doctor` warns when it is too short to generate `maxOutputTokens`. |
 | `rateLimit` | none | See [`rateLimit`](#ratelimit) below. |
@@ -136,6 +137,27 @@ Prefer `tokensPerSecond` over `timeoutSeconds`. An absolute ceiling has to be
 re-tuned by hand every time the budget moves, and forgetting to is exactly how
 the budget stops being reachable again. Use `timeoutSeconds` when you would
 genuinely rather abandon a call than wait for it.
+
+**A configured temperature need not override determinism.** The loop does not
+ask for one temperature. It asks **0.0** where it needs the same answer twice —
+the sign-off votes, the verdict parse, the respec — and 0.1 or 0.2 where it
+wants the model to reach. A scalar `temperature` overrides both, so following a
+vendor's sampling recipe silently costs reproducible ratification. Measured: one
+nine-ticket backlog run twice under identical configuration, two tickets
+swapping verdicts, because every ratify vote ran at 0.6 where the loop had asked
+for 0.
+
+An object splits the two:
+
+```json
+"plan": { "temperature": { "default": 0.6, "deterministic": 0.0 } }
+```
+
+`deterministic` applies when the loop asked for exactly zero, `default` to
+everything else. Either key may be omitted and an omitted one leaves the loop's
+own number alone, which makes `{"default": 0.6}` the honest spelling of *follow
+the recipe, but let determinism through*. A bare number still overrides
+everything, so nothing that worked before changes.
 
 ### `kind: "freetoken"`
 
@@ -226,6 +248,163 @@ over the gear.
 | `extraBody` | `{}` | Fields merged into the request body, for backend-specific knobs (vLLM routing, Ollama `options`, OpenRouter preferences). |
 | `supportsTemperature` | `true` | Set false for endpoints that reject the field outright. |
 | `topP`, `topK`, `minP`, `presencePenalty`, `frequencyPenalty` | unset | Sent only when set, so a model's own shipped recipe still applies. **`topK` and `minP` are accepted and silently discarded by Ollama's `/v1` shim** — put them in a Modelfile instead (`forge models` writes one). |
+
+### `kind: "llamacpp"`
+
+For `llama-server` started in **router** mode — `--models-dir` or
+`--models-preset`. The router holds a catalogue, spawns a child server per
+model on an ephemeral port, and proxies each request to whichever model it
+names. One endpoint, several checkpoints, loaded on demand.
+
+A single-model `llama-server` is `kind: "openai"` and always was. Use this one
+only when the server can swap; pointed at a single-model server it says so
+rather than failing later.
+
+| Key | Default | Notes |
+|---|---|---|
+| `baseUrl` | `http://127.0.0.1:8080/v1` | Include the `/v1`. The router's `/models/load`, `/models/unload` and `/props` sit one level up, the way Ollama's native API does. |
+| `model` | `""` | The router's **id** for the checkpoint, which is not a path. See below. |
+| `loadSeconds` | `300` | How long to wait for a checkpoint to become servable. |
+| `exclusive` | `false` | Unload every other resident checkpoint before loading this one. |
+
+Everything under [`kind: "openai"`](#kind-openai) applies too — `extraBody`,
+the sampling knobs, `headers`. Unlike Ollama, `topK` and `minP` do reach the
+model here.
+
+**The id is the directory, not the file.** A `--models-dir` entry is named
+after the directory holding the `.gguf`, so a checkpoint at
+`C:\AIModels\nemotron-3-nano-omni-30b-a3b-reasoning-gguf\…Q4_K_M.gguf` is
+called `nemotron-3-nano-omni-30b-a3b-reasoning-gguf` and nothing else. The
+router answers `400 model 'x' not found` for anything else, which is a good
+failure — `forge doctor` turns it into a better one by listing what the router
+actually serves:
+
+```
+  plan: FAIL name=plan kind=llamacpp model=qwen3.8 error=ProviderError: the
+    llama.cpp router at http://127.0.0.1:8080 has no model 'qwen3.8'; it serves
+    nemotron-3-nano-omni-30b-a3b-reasoning-gguf.
+```
+
+That refusal is also why this adapter is small. [FreeToken](#kind-freetoken)
+exists because its engine answers to *any* model name and echoes it back, so a
+config naming three models gets one model and three labels. The router routes
+by id, so forge's record of which model wrote what is true for free.
+
+**A load is not instant and is not the call's fault.** With
+`--models-autoload` the first request after a swap simply blocks while a 30B
+checkpoint loads, so a load that never finishes is reported as the *completion*
+timing out — naming an endpoint that was healthy throughout. So the load is
+asked for explicitly, waited for against `loadSeconds`, and a checkpoint still
+not `loaded` at the deadline says which one and for how long. A child that dies
+instead of binding reverts to `unloaded` with no reason published, and is
+reported as a dead child rather than polled until the deadline.
+
+**`exclusive` — one checkpoint at a time.** `--models-max` defaults to 4, which
+is right on a box with the VRAM for it and fatal on one without: the router
+keeps the previous role's checkpoint resident and the next role's load fails
+with
+
+```
+ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory
+```
+
+from a child process, in the router's log, while `/v1/models` shows only that
+the model went back to `unloaded`. `exclusive` unloads everything else first,
+trading a reload per role alternation — measured at 10-20s for a 30B A3B MoE at
+Q4_K_M — for a ceiling of one checkpoint. Starting the router with
+`--models-max 1` does the same thing globally; `forge doctor` reports the
+residency either way.
+
+The eviction is waited out before the next load is asked for, because
+`/models/unload` answers when the child server has been *asked* to exit rather
+than when it has, and the slot is only free once it has. A load that lands in
+that window is refused with
+
+```
+500 {"error":{"code":500,"message":"model limit reached, try again later"}}
+```
+
+which reaches the loop as a model that cannot be talked to: roles drop out of
+sign-off and delegation attempts are spent without a model ever being asked
+anything. Forge waits for the catalogue to show the evicted checkpoint gone,
+then retries a refusal that arrives anyway for up to 60s. Nothing to configure;
+the only case that survives it is a slot genuinely held by another client, and
+that is named in the error.
+
+**The context window comes from the preset, and it has to.** The router's own
+`/props` answers `n_ctx: 0` — it holds no model — and a child's port is
+ephemeral, so the argv the catalogue publishes is the only place a per-model
+window is visible without loading it. `contextWindow` in config wins; absent
+one, the preset's `-c` is read; absent both it falls back to 8192 rather than
+reading the trained maximum out of the GGUF, because that number describes the
+model and not the window the server allocated. Believing it is how the budget
+gate approves a prompt the server then truncates *from the front*, dropping the
+system prompt and the spec — and what comes back reads as a weak model rather
+than a truncated request. `forge doctor` reports the mismatch:
+
+```
+  plan: ok name=plan kind=llamacpp model=nemo-a reply='OK'
+      contextWindow is 131,072 but the router starts 'nemo-a' with -c 32,768.
+```
+
+**Set `tokensPerSecond`.** A 30B A3B MoE at Q4_K_M measured 16 tok/s on a
+consumer GPU. At the 30 tok/s default the derived timeout is `120 + 32768/30 =
+1,212s` for a budget that actually needs about 2,150s, so a large
+`maxOutputTokens` is never reachable and the failure arrives wearing the name
+of a network fault.
+
+A preset file is worth writing rather than relying on `--models-dir`, because a
+generated entry pins no `-c` and does load a multimodal projector beside a
+text-only checkpoint — VRAM no role here uses, on a card that may be sized for
+exactly one model. There are two ways to acquire one and only the first is
+visible: a models-dir entry beside an `mmproj-*.gguf` is spawned with an
+explicit `--mmproj`, while an `hf-repo` entry resolves one *inside* the child
+whenever the repo publishes it, so the argv says nothing and the only trace is
+a line in the router's log. `no-mmproj = true` settles both, and `forge doctor`
+reports either.
+
+The format is INI, one section per id, keys spelled like the long flags without
+their dashes:
+
+```ini
+[nemotron-3-nano]
+model = C:\AIModels\nemotron-3-nano-omni-30b-a3b-reasoning-gguf\Nemotron-3-Nano-Omni-30B-A3B-Reasoning-Q4_K_M.gguf
+ctx-size = 131072
+jinja = true
+no-mmproj = true
+
+[qwen3.8]
+hf-repo = unsloth/Qwen3.8-27B-GGUF:Q4_K_M
+ctx-size = 131072
+jinja = true
+no-mmproj = true
+```
+
+```
+llama-server --models-preset models.ini --models-max 1 --host 127.0.0.1 --port 8080
+```
+
+```json
+"plan": {
+  "kind": "llamacpp",
+  "model": "nemotron-3-nano",
+  "contextWindow": 131072,
+  "maxOutputTokens": 32768,
+  "tokensPerSecond": 16,
+  "exclusive": true
+},
+"code": {
+  "kind": "llamacpp",
+  "model": "qwen3.8",
+  "contextWindow": 131072,
+  "maxOutputTokens": 32768,
+  "tokensPerSecond": 16,
+  "exclusive": true
+}
+```
+
+Two entries, one endpoint, one GPU: the router swaps between them as the loop
+alternates roles.
 
 ### `kind: "anthropic"`
 
@@ -596,7 +775,7 @@ run some context, never the run.
 | `stopOnBlocked` | `false` | Stop the whole run when a ticket blocks, instead of moving on. On means a blocker gets attention; off means the backlog keeps making progress elsewhere. |
 | `retryCycles` | `0` | Whole-backlog retry cycles after a run ends anything but done. `0` hands back to a human, `-1` keeps going until the backlog is clean or you stop it. Anything below `-1` is a typo and is rejected. |
 | `respecOnRetry` | `true` | Have the planner rewrite each requeued ticket from why it failed before the next cycle. A cycle that re-runs the spec which already failed is a slower version of the same failure. |
-| `respecCriteria` | `false` | Let a respec rewrite the acceptance criteria too. Off: the party being judged does not write the standard it is judged against. Left on, one ticket's criteria drifted until they asserted the opposite of what its author wrote. |
+| `respecCriteria` | `false` | Let a respec rewrite the acceptance criteria too, and let ratification *add* them. Off: the party being judged does not write the standard it is judged against. Left on, one ticket's criteria drifted until they asserted the opposite of what its author wrote — and a ratify pass grew a ten-criterion ticket to fourteen, inventing a hash value it had no way to compute. |
 | `reopenStaleDependents` | `true` | Re-open a ticket that passed on top of a dependency a respec has since rewritten — its `done` was earned against a contract that no longer exists. Can re-open a lot of a backlog after one respec; turn it off to be warned instead. |
 | `preflight` | `true` | Probe every model before the first ticket, so a dead endpoint fails in seconds rather than one ticket at a time. |
 | `preflightCanary` | `true` | Prove, rather than infer, that each build's test command actually reads each language **this backlog is about to write**. Writes an unparseable file where that language's tests live, runs the command over it, and requires the command to go red **and** to name the file — then deletes it. Coverage used to be read off the *text* of a command against a table of known runners, and a runner the table has never heard of answers "covered" for everything: one gdUnit4 launcher reported itself as the test command for 4,000 lines of TypeScript and exited 0 fifteen times. A build that fails this blocks the run before anything is delegated. Scoped to the languages the tickets declare they will write, not to every language in the tree — a Godot repository with one Python helper script beside its `project.godot` has `.py` present, nothing that runs it, and no ticket that cares. Costs one command per language per build, once per run. Turn off for a suite slow enough that paying it at startup is worse than finding out later; `forge toolchain --language X --skip` is the narrower way to excuse one language, and says so on the record. |
@@ -615,6 +794,7 @@ run some context, never the run.
 | `reviewWhenStuck` | `2` | Consecutive flat cycles before the loop escalates. Two rungs, one per cycle after it: at `n` the reviewer is asked against the red tree whether the ticket is winnable at all — normally unreachable for a ticket that never verifies — and at `n + 1` the planner is asked the inverted question and may reply `impossible`, which parks the ticket for a reason rather than for a count. `0` never escalates. See [CONVERGENCE](CONVERGENCE.md). |
 | `freezeTests` | `true` | Keep a ticket's tests while the criteria they encode are unchanged, instead of re-deriving them on every attempt. The tests are a function of the criteria, so an unchanged fingerprint — criteria, spec, scope, test command — produces the same file at the price of the loop's most expensive role, and gives the executor a target that stops moving under it. Rewritten when any of those changes, when the file is not on disk, or when the last failure was in the test file itself. See [CONVERGENCE](CONVERGENCE.md). |
 | `ratifyPasses` | `2` | Sign-off passes over a ticket before its first attempt. Every role is asked whether it can do its part as written, the planner rewrites the ticket from what they say, and the pass repeats. A ticket ships when everyone signs off, when a majority does, or when the planner and one other do; below that it parks with the objections recorded. Costs `roles × passes` calls per ticket before any code exists, one of them on the reviewer. See [RATIFY.md](RATIFY.md). |
+| `ratifyOrder` | all four, in the order above | The order the roles vote in, within a pass. A permutation of the four — it sets the order they vote, not which of them vote, and an order omitting one is refused because sign-off is counted over all four. Two things ride on it. Votes accumulate as they are cast and every role sees the ones before it, so the first votes blind and the last answers three arguments. And on a backend serving one checkpoint at a time (`llamacpp` with `exclusive`, or `freetoken`), two roles sharing a model are free when adjacent and cost a reload when not — see below. |
 
 ---
 

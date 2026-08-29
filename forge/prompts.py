@@ -2711,6 +2711,12 @@ or for stylistic reasons. Do not restate the ticket back. Do not propose work
 the ticket does not ask for — a ticket that does less than you would like is
 not a defect, and scope you add here is scope somebody has to verify.
 
+Do not object that the work has not been done yet. There is no implementation,
+no diff and no test run to look at, and there is not meant to be — that is the
+premise of this pass, not something missing from it. "I cannot verify this
+because the code is not here" is true of every ticket that reaches you, and it
+answers a question nobody asked.
+
 Reply in exactly this format and nothing else:
 
 SIGNOFF: yes
@@ -2742,9 +2748,17 @@ RATIFY_QUESTIONS = {
         "before the change and passes after it? Name any criterion you could "
         "not express as an assertion."
     ),
+    # Written in the future tense on purpose. "Rule on this from a diff" reads
+    # to a smaller model as though a diff had been supplied and withheld, and
+    # it answers by listing what the missing implementation prevents it from
+    # checking — three such objections parked one ticket that had never been
+    # attempted, and the suggestions attached to them restated the ticket's own
+    # spec back as instructions.
     "reviewer": (
-        "Could you rule on this ticket from a diff and these criteria alone? "
-        "Name any criterion you could not check by reading the change."
+        "Once this ticket has been built, could you rule on the diff from "
+        "these criteria alone? Name any criterion you could not settle by "
+        "reading a change — one needing the code run, a value nobody has "
+        "measured, or a judgement the criteria do not pin down."
     ),
 }
 
