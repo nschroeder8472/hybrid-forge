@@ -25,6 +25,7 @@ import json
 import re
 from pathlib import Path
 
+from . import routes
 from .patch import normalize_path
 from .providers import Message, Provider
 from .state import TICKET_FEATURE, Ticket
@@ -63,7 +64,11 @@ _RATIFICATION = re.compile(r"^#{1,4}\s*Ratification.*$", re.MULTILINE | re.IGNOR
 # does not have to say "feature" on every section.
 _KIND = re.compile(r"^\*\*Kind:\*\*\s*(?P<kind>bug|feature)", re.MULTILINE | re.IGNORECASE)
 
-_ROUTE = re.compile(r"^\*\*Route:\*\*\s*(?P<route>delegate|claude-only)", re.MULTILINE | re.IGNORECASE)
+# Anything after the marker is captured, not just the values this version
+# knows. `routes.normalise` settles it — and a route nobody can parse
+# withholds the ticket rather than falling back to `delegate`, because a
+# gate that fails open is worse than one that fails loudly.
+_ROUTE = re.compile(r"^\*\*Route:\*\*\s*(?P<route>.+)$", re.MULTILINE | re.IGNORECASE)
 
 # "**Needs:** TT-003, TT-004" — the tickets that must land before this one.
 _NEEDS = re.compile(r"^\*\*Needs:\*\*\s*(?P<needs>.+)$", re.MULTILINE | re.IGNORECASE)
@@ -491,7 +496,13 @@ def parse_plan(text: str) -> list[Ticket]:
             boundaries.append(closing.start())
 
         route_match = _ROUTE.search(body)
-        route = (route_match.group("route").lower() if route_match else "delegate")
+        # The warning is not raised here: `parse_plan` returns tickets and
+        # nothing else, and the fact worth reporting survives in the value
+        # — a route that normalised to `unspecified` is exactly the set
+        # worth naming, and `withheld_without_reason` recovers it.
+        route, _ = routes.normalise(
+            route_match.group("route") if route_match else ""
+        )
 
         needs_match = _NEEDS.search(body)
         needs = _ids(needs_match.group("needs")) if needs_match else []
@@ -572,7 +583,7 @@ def tickets_from_json(text: str) -> list[Ticket]:
             Ticket(
                 ticket_id=str(item.get("id") or f"T-{position + 1:03d}"),
                 title=str(item.get("title", "")),
-                route=str(item.get("route", "delegate")).lower(),
+                route=routes.normalise(str(item.get("route", "")))[0],
                 position=position,
                 spec=str(item.get("spec", "")),
                 allowed_files=[str(p) for p in item.get("allowed_files", [])],

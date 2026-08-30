@@ -731,6 +731,57 @@ def _one_subject_at_a_time(entries: Sequence[dict], limit: int) -> list[dict]:
     return kept
 
 
+ADVICE_HEADING = "## What a person said about this ticket"
+
+
+def advice_message(ticket: Ticket, limit: int = 8) -> Message | None:
+    """Notes a human wrote against this ticket, newest last.
+
+    The loop has seven ways to hand a ticket back and, until this, no way to be
+    handed anything in return. Every exit wrote a sentence to a person who
+    could not write one back.
+
+    Framed the way `learned` is framed, with one difference stated in as many
+    words: this was written by a person about this ticket, and it outranks what
+    earlier attempts concluded. `learned` is what the loop worked out from its
+    own failures; a note is what somebody who can read the repository decided.
+    Where they disagree, the loop is the one that has been wrong before.
+
+    Never concatenated into a system message, and rendered under its own
+    heading like every other history block. Text that entered the harness from
+    outside must not be able to imitate the harness — the same reason
+    `strip_prompt_echo` exists.
+
+    Not shown to the reviewer. What the reviewer is shown is the bar, and the
+    bar moves through criteria or it does not move; a person who wants it moved
+    adds a criterion, which `forge criteria --add` lets them do.
+    """
+    entries = [note for note in (ticket.human_note or []) if note.get("text")]
+    if not entries:
+        return None
+    # Newest last, so the most recent thing a person said is the last thing
+    # read before the ticket itself.
+    shown = entries[-limit:]
+    dropped = len(entries) - len(shown)
+    lines = [f"- {note['text'].strip()}" for note in shown]
+    older = (
+        f"\n\n({dropped} earlier note(s) not shown.)" if dropped else ""
+    )
+    return Message(
+        role="user",
+        content=f"""{ADVICE_HEADING}
+Written by a person about this ticket, after seeing where it got stuck. This
+outranks anything earlier attempts concluded: those are the loop's own guesses
+from its own failures, and this is somebody who can read the repository.
+
+It is not an acceptance criterion. What you are judged against is the criteria
+below and nothing else — if a note asks for something the criteria do not, the
+criteria are what the reviewer will read.
+
+{chr(10).join(lines)}{older}""",
+    )
+
+
 def learned_message(ticket: Ticket, limit: int = 12) -> Message | None:
     """What earlier attempts worked out about this repository.
 
@@ -821,6 +872,13 @@ def build_prompt(
     established = learned_message(ticket, learned_limit)
     if established is not None:
         messages.append(established)
+
+    # After the loop's own conclusions, because where the two disagree
+    # the person is the one who has not already been wrong about this
+    # ticket, and the last thing read before the ticket should be theirs.
+    advice = advice_message(ticket)
+    if advice is not None:
+        messages.append(advice)
 
     settled = ratification_message(ticket)
     if settled is not None:
@@ -1144,6 +1202,13 @@ report — not something to correct on the way to the comparison.
     established = learned_message(ticket, learned_limit)
     if established is not None:
         messages.append(established)
+
+    # After the loop's own conclusions, because where the two disagree
+    # the person is the one who has not already been wrong about this
+    # ticket, and the last thing read before the ticket should be theirs.
+    advice = advice_message(ticket)
+    if advice is not None:
+        messages.append(advice)
     # What the roles settled before any code existed. The tester is the role
     # most likely to have asked for a criterion to be made measurable, and it
     # should see whether it got it rather than rediscovering the same problem
@@ -2551,6 +2616,27 @@ and costs nothing further. It is the right answer, not a failure to answer:
 No xorshift32 with the shifts this spec defines produces that sequence — \
 seed 1 yields [2, ...]. Either the constant or the criterion is wrong, and \
 nothing in the failures says which."}}
+"""
+
+    notes = [n for n in (ticket.human_note or []) if n.get("text")]
+    if notes:
+        # A fifth evidence block into a shape already built to carry four, and
+        # the only one whose author can see the repository. It goes before the
+        # stuck block deliberately: if a person has already said why the ticket
+        # is stuck, that should be read before the loop's own account of it.
+        written = "\n".join(f"- {n['text'].strip()}" for n in notes[-8:])
+        body += f"""
+## What a person said about this ticket
+Written by a human after seeing where it got stuck, and the only evidence here
+whose author could read the repository. Where it disagrees with the failures
+below, they are what the loop observed and this is what somebody made of it.
+
+{written}
+
+A person may state an acceptance criterion and you may not — that rule is about
+provenance, not position, and they are not the party being judged. If a note
+asks for one, it is theirs to add with `forge criteria --add`; putting it in
+your revision is still you raising the bar.
 """
 
     if stuck:

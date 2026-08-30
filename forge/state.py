@@ -138,6 +138,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     ratify_notes      TEXT NOT NULL DEFAULT '[]',
     ratify_fingerprint TEXT NOT NULL DEFAULT '',
     ratify_overrun    TEXT NOT NULL DEFAULT '',
+    human_note        TEXT NOT NULL DEFAULT '[]',
     ratified_spec     TEXT NOT NULL DEFAULT '',
     ratified_criteria TEXT NOT NULL DEFAULT '[]',
     updated_at    REAL NOT NULL,
@@ -220,7 +221,15 @@ TICKET_RUNNING = "running"
 TICKET_DONE = "done"
 TICKET_BLOCKED = "blocked"
 TICKET_FAILED = "failed"
+# Two unrelated things used to share `skipped`: *a person must write this* and
+# *this is waiting on PF-002*. They were distinguishable only by reading the
+# prose in `blocked_note`, which is why the dashboard showed them identically
+# and `forge retry --all` treated them as one class.
+#
+# `skipped` keeps the dependency case, which is transient and clears itself when
+# the dependency lands. `withheld` is the one that needs a person.
 TICKET_SKIPPED = "skipped"
+TICKET_WITHHELD = "withheld"
 
 
 @dataclass
@@ -368,6 +377,17 @@ class Ticket:
     # `update_ticket`: a field any caller can shorten is not append-only.
     # See docs/CONVERGENCE.md.
     learned: list[dict] = field(default_factory=list)
+    # What a person wrote about this ticket, oldest first, as
+    # `[{"text", "at"}]`. Written only by `Store.advise` — never by
+    # `update_ticket`, for the reason `learned` and `original_spec` are not
+    # named there either: a field any caller can shorten is not append-only,
+    # and a note a respec cycle can quietly drop is a note the human finds
+    # missing three cycles later with nothing recording it was ever there.
+    #
+    # Not deduplicated, unlike `learned`. A person repeating themselves is
+    # saying it is still true, and collapsing two identical notes written a
+    # day apart discards the fact that the first one was not acted on.
+    human_note: list[dict] = field(default_factory=list)
     # The failure classes this ticket's *last completed cycle* produced, and
     # the step it had reached when that cycle ended. Together they are how a
     # cycle is compared to the one before it: everything after `cycle_mark` is
@@ -501,6 +521,7 @@ class Ticket:
             "ratify_notes": json.dumps(self.ratify_notes),
             "ratify_fingerprint": self.ratify_fingerprint,
             "ratify_overrun": self.ratify_overrun,
+            "human_note": json.dumps(self.human_note),
             "impossible_fingerprint": self.impossible_fingerprint,
             "ratified_spec": self.ratified_spec,
             "ratified_criteria": json.dumps(self.ratified_criteria),
@@ -539,6 +560,7 @@ class Ticket:
             ratified_spec=row["ratified_spec"],
             ratified_criteria=json.loads(row["ratified_criteria"]),
             learned=json.loads(row["learned"] or "[]"),
+            human_note=json.loads(row["human_note"] or "[]"),
             cycle_classes=json.loads(row["cycle_classes"] or "[]"),
             cycle_mark=row["cycle_mark"] or 0,
             tests_fingerprint=row["tests_fingerprint"] or "",
@@ -622,6 +644,7 @@ class Store:
         ("tickets", "ratified_criteria", "TEXT NOT NULL DEFAULT '[]'"),
         ("steps", "classes", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "learned", "TEXT NOT NULL DEFAULT '[]'"),
+        ("tickets", "human_note", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "cycle_classes", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "cycle_mark", "INTEGER NOT NULL DEFAULT 0"),
         ("tickets", "flat_cycles", "INTEGER NOT NULL DEFAULT 0"),
@@ -884,6 +907,74 @@ class Store:
                 "WHERE run_id = :run_id AND ticket_id = :ticket_id",
                 {**ticket.as_row(), "run_id": run_id, "now": time.time()},
             )
+
+    def advise(self, run_id: int, ticket: Ticket, text: str) -> dict:
+        """Record what a person said about this ticket. Append-only.
+
+        The loop has seven ways to hand a ticket back and no way to be handed
+        anything in return: every exit writes prose into `blocked_note` and
+        ends there. This is the return path, and it is deliberately the
+        smallest thing that could be one — a note the planner reads on the next
+        respec and the executor reads on the next attempt.
+
+        **Nothing waits for it.** The loop is unattended by design, and a gate
+        it waits on puts a person back in the critical path of a system built
+        not to have one — where the failure mode is silent, because a run
+        blocked on a human looks exactly like a run that is thinking. A note is
+        picked up if it is there. A ticket that never receives one behaves
+        exactly as it does today.
+
+        Written here rather than through `update_ticket`, which does not name
+        the column, for the reason that method does not name `learned` or
+        `original_spec`: a field any caller can shorten is not append-only.
+
+        Not deduplicated, unlike `learned`. A person repeating themselves is
+        saying it is still true, and collapsing two identical notes written a
+        day apart discards the fact that the first one was not acted on.
+
+        Returns the entry as recorded, so a caller can report the timestamp it
+        actually got rather than the one it assumed.
+        """
+        body = (text or "").strip()
+        if not body:
+            raise ValueError("a note needs text")
+
+        entry = {"text": body, "at": time.time()}
+        merged = [*ticket.human_note, entry]
+        with self._write() as connection:
+            connection.execute(
+                "UPDATE tickets SET human_note = :human_note, updated_at = :now "
+                "WHERE run_id = :run_id AND ticket_id = :ticket_id",
+                {
+                    "human_note": json.dumps(merged),
+                    "run_id": run_id,
+                    "ticket_id": ticket.ticket_id,
+                    "now": time.time(),
+                },
+            )
+        ticket.human_note = merged
+        return entry
+
+    def set_route(self, run_id: int, ticket: Ticket, route: str) -> None:
+        """Change a ticket's route. The only writer of it after ingest.
+
+        Nothing else in the codebase writes `route` — every other reference is
+        a read — which is why a ticket withheld from the executor has had no
+        way back into a run even after a person answered the objection it was
+        withheld over.
+        """
+        with self._write() as connection:
+            connection.execute(
+                "UPDATE tickets SET route = :route, updated_at = :now "
+                "WHERE run_id = :run_id AND ticket_id = :ticket_id",
+                {
+                    "route": route,
+                    "run_id": run_id,
+                    "ticket_id": ticket.ticket_id,
+                    "now": time.time(),
+                },
+            )
+        ticket.route = route
 
     def learn(self, run_id: int, ticket: Ticket, entries: Sequence[str]) -> list[str]:
         """Add what this cycle established to the ticket, keeping what was there.
@@ -1268,7 +1359,7 @@ class Store:
         return [row["detail"] for row in reversed(rows)]
 
     # Statuses a retry reopens by default: work that stopped without landing.
-    RETRYABLE = (TICKET_FAILED, TICKET_BLOCKED, TICKET_SKIPPED)
+    RETRYABLE = (TICKET_FAILED, TICKET_BLOCKED, TICKET_SKIPPED, TICKET_WITHHELD)
 
     def reset_tickets(
         self,

@@ -44,6 +44,7 @@ from . import toolchain
 from . import ratify as ratification
 from . import respec
 from . import evidence
+from . import routes
 from .artifacts import ABANDONED_DIR, Artifacts, safe_name
 from .budget import BudgetGate, Wait
 from .config import ANY_LANGUAGE, REPO_ROOT, ROLES, Config, ConfigError, Workspace
@@ -133,6 +134,7 @@ from .state import (
     TICKET_PENDING,
     TICKET_RUNNING,
     TICKET_SKIPPED,
+    TICKET_WITHHELD,
     Store,
     Ticket,
 )
@@ -1272,7 +1274,7 @@ class Orchestrator:
 
     # A ticket that will not run again in this cycle. Red left behind by one of
     # these is red nothing in the backlog is still working on.
-    _GAVE_UP = frozenset({TICKET_FAILED, TICKET_BLOCKED, TICKET_SKIPPED})
+    _GAVE_UP = frozenset({TICKET_FAILED, TICKET_BLOCKED, TICKET_SKIPPED, TICKET_WITHHELD})
 
     def _unverifiable(
         self, run_id: int, ticket: Ticket, excused: Sequence[str], output: str
@@ -1794,6 +1796,8 @@ class Orchestrator:
             missing = self.store.unmet_needs(run_id, ticket)
             if not missing:
                 continue
+            # Keeps `skipped`: this one is transient and clears itself
+            # when the dependency lands. Nobody has to do anything.
             ticket.status = TICKET_SKIPPED
             ticket.blocked_note = f"dependency not met: {', '.join(missing)}"
             self.store.update_ticket(run_id, ticket)
@@ -3442,18 +3446,31 @@ class Orchestrator:
         )
 
     def _work_ticket(self, run_id: int, ticket: Ticket) -> None:
-        # Triage is a hard gate, not a preference. A claude-only ticket is one
-        # the plan judged unsafe to hand to the executor, and the loop is not
+        # Triage is a hard gate, not a preference. A withheld ticket is one the
+        # plan judged unsafe to hand to the executor, and the loop is not
         # entitled to overrule that because the backlog would otherwise stall.
-        if ticket.route != "delegate":
-            ticket.status = TICKET_SKIPPED
-            ticket.blocked_note = "routed claude-only; implement this one directly"
+        #
+        # `withheld` rather than `skipped`, because the two things that status
+        # used to mean want opposite responses: a dependency park clears itself
+        # when the dependency lands, and this one clears when a person acts.
+        # `forge release` and `forge discharge` are those actions.
+        if routes.is_withheld(ticket.route):
+            reason = routes.reason_of(ticket.route)
+            ticket.status = TICKET_WITHHELD
+            ticket.blocked_note = (
+                f"withheld from the executor ({reason}); implement this one "
+                f"directly, then `forge discharge {ticket.ticket_id}`. If the "
+                f"objection no longer applies, `forge release "
+                f"{ticket.ticket_id} --note \"why\"`."
+            )
             self.store.update_ticket(run_id, ticket)
             self.store.log(
                 run_id,
-                f"{ticket.ticket_id}: claude-only, left for a human.",
+                f"{ticket.ticket_id}: {routes.describe(ticket.route)} — "
+                f"left for a human.",
                 level="warn",
                 kind="ticket",
+                data={"route": ticket.route, "reason": reason},
             )
             return
 
