@@ -20987,3 +20987,333 @@ class TestResolvingAgainstARelease(unittest.TestCase):
             assets = llama.resolve("b10687", target)
 
         self.assertEqual(len(assets), 1)
+
+
+
+class TestATicketCanReadTheFilesItsOwnSpecNames(unittest.TestCase):
+    """A ticket's read scope is computed from what it may *write*.
+
+    The two are not the same set, and the gap parks tickets. PF-009 of a
+    nine-ticket run told `_initialize` to load `worlds/dragon_forest/world.json`
+    and four levels by id; none of the five was in its scope, and the executor
+    signed off `no` on exactly that:
+
+        The ticket does not provide the exact hardcoded level texts for
+        `game_001`, `game_007`, `game_043`, and `_demo/level_006`, so the
+        dumper cannot be written without opening unlisted level files.
+
+    The objection was correct. What followed was not: the planner revised the
+    *spec* to say the texts must be embedded as string literals, which made the
+    ticket genuinely impossible, and two later passes objected to the clause
+    that revision had introduced. Nineteen calls, a hundred and eleven minutes,
+    no attempt ever made — and every one of those files was in the repository
+    the whole time.
+    """
+
+    def _root(self, files):
+        root = Path(tempfile.mkdtemp())
+        for path in files:
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("x\n", encoding="utf-8")
+        return root
+
+    def test_an_explicit_path_in_the_spec_is_found(self):
+        root = self._root(["worlds/dragon_forest/world.json"])
+
+        found = evidence.named_paths(
+            root, "`_initialize` loads `worlds/dragon_forest/world.json`, reads density."
+        )
+
+        self.assertEqual(found, ["worlds/dragon_forest/world.json"])
+
+    def test_a_bare_level_id_resolves_when_exactly_one_file_carries_it(self):
+        root = self._root([
+            "worlds/dragon_forest/levels/game_001.txt",
+            "worlds/dragon_forest/levels/game_007.txt",
+        ])
+
+        found = evidence.named_paths(root, "It then loads each of game_001 and game_007.")
+
+        self.assertEqual(sorted(found), [
+            "worlds/dragon_forest/levels/game_001.txt",
+            "worlds/dragon_forest/levels/game_007.txt",
+        ])
+
+    def test_an_ambiguous_name_points_at_nothing_rather_than_at_one_of_them(self):
+        # A stem matching six files identifies none of them, and guessing would
+        # put a file in a prompt that the ticket never mentioned.
+        root = self._root(["a/config_01.json", "b/config_01.json"])
+
+        self.assertEqual(evidence.named_paths(root, "reads config_01"), [])
+
+    def test_an_ordinary_word_is_not_treated_as_a_filename(self):
+        # `capture` is the function this ticket is about. Resolving it to a file
+        # that happens to be called capture.gd would be worse than useless.
+        root = self._root(["scripts/capture.gd"])
+
+        self.assertEqual(evidence.named_paths(root, "a pure static helper named capture"), [])
+
+    def test_a_named_path_that_does_not_exist_is_not_offered(self):
+        # Invariant 10: a path handed to a role must resolve now. A spec naming
+        # its own output file names something that does not exist yet.
+        root = self._root(["scripts/real.gd"])
+
+        found = evidence.named_paths(
+            root, "writes to `tools/path_forge/fixtures/game_001.json` and reads `scripts/real.gd`"
+        )
+
+        self.assertEqual(found, ["scripts/real.gd"])
+
+    def test_build_and_vendor_directories_are_not_searched(self):
+        # Matching a vendored copy is worse than matching nothing: it is the
+        # wrong file, and it reads as the right one.
+        root = self._root(["node_modules/pkg/level_001.txt", "addons/x/level_001.txt"])
+
+        self.assertEqual(evidence.named_paths(root, "loads level_001"), [])
+
+    def test_a_repeated_word_does_not_exhaust_the_lookup_allowance(self):
+        # Counted after de-duplication. Counting before it let one word repeated
+        # thirty times spend the whole allowance, and the level ids named in the
+        # spec's last paragraph were never looked up at all.
+        root = self._root(["levels/game_043.txt"])
+        spec = ("capture " * 200) + " and finally game_043."
+
+        self.assertEqual(evidence.named_paths(root, spec), ["levels/game_043.txt"])
+
+    def test_the_loop_puts_them_in_the_reading_scope(self):
+        root = self._root([
+            "worlds/dragon_forest/world.json",
+            "worlds/dragon_forest/levels/game_001.txt",
+        ])
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(json.dumps({
+            "models": {"a": {"kind": "openai", "model": "m"}},
+            "roles": {r: "a" for r in ROLES},
+            "commands": {"test": "pytest"},
+        }), encoding="utf-8")
+
+        import types as _types
+        logged, updated = [], []
+        loop = Orchestrator.__new__(Orchestrator)
+        loop.config = Config.load(root)
+        loop.store = _types.SimpleNamespace(
+            list_tickets=lambda run_id: [],
+            update_ticket=lambda run_id, t: updated.append(t.ticket_id),
+            log=lambda run_id, message, **kw: logged.append(message),
+        )
+        ticket = Ticket(
+            ticket_id="PF-009",
+            spec="loads `worlds/dragon_forest/world.json` then game_001.",
+            allowed_files=["tools/dump_decor_fixtures.gd"],
+        )
+
+        loop._inherit_dependency_reads(1, ticket)
+
+        self.assertIn("worlds/dragon_forest/world.json", ticket.reference_files)
+        self.assertIn("worlds/dragon_forest/levels/game_001.txt", ticket.reference_files)
+        self.assertEqual(updated, ["PF-009"])
+        self.assertIn("its own spec names", logged[0])
+
+    def test_a_ticket_naming_nothing_that_exists_is_left_alone(self):
+        root = self._root(["scripts/real.gd"])
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(json.dumps({
+            "models": {"a": {"kind": "openai", "model": "m"}},
+            "roles": {r: "a" for r in ROLES},
+            "commands": {"test": "pytest"},
+        }), encoding="utf-8")
+
+        import types as _types
+        updated = []
+        loop = Orchestrator.__new__(Orchestrator)
+        loop.config = Config.load(root)
+        loop.store = _types.SimpleNamespace(
+            list_tickets=lambda run_id: [],
+            update_ticket=lambda run_id, t: updated.append(t.ticket_id),
+            log=lambda run_id, message, **kw: None,
+        )
+        ticket = Ticket(ticket_id="PF-001", spec="write a thing", allowed_files=["a.py"])
+
+        loop._inherit_dependency_reads(1, ticket)
+
+        self.assertEqual(updated, [])
+
+
+class TestARevisionThatBalloonsIsNotARevision(unittest.TestCase):
+    """Asked to rewrite a ticket, one planner began quoting the repository.
+
+    Measured on PF-009: the reply's `spec` field ran to 83,180 characters
+    against a 3,863-character original — 22x — and ended mid-source of
+    `tests/core/test_move_resolver.gd`, one of the ticket's own reference files.
+    The output budget cut it off at 32,768 tokens.
+
+    No ceiling on `maxOutputTokens` makes that the right answer, so the length
+    is judged against the thing being revised rather than against the budget.
+    """
+
+    def _store(self):
+        import types as _types
+
+        logged = []
+        return _types.SimpleNamespace(
+            log=lambda run_id, message, **kw: logged.append(message),
+            update_ticket=lambda run_id, t: None,
+            list_tickets=lambda run_id: [],
+        ), logged
+
+    @staticmethod
+    def _ticket(spec):
+        return Ticket(ticket_id="PF-009", spec=spec, original_spec=spec,
+                      criteria=["it works"])
+
+    def test_a_spec_many_times_its_original_is_refused_whole(self):
+        ticket = self._ticket("Add a dumper that captures decoration." * 4)
+        store, logged = self._store()
+
+        ratify._apply(store, 1, ticket, {"spec": "x " * 40_000}, root=None)
+
+        self.assertEqual(ticket.spec, ticket.original_spec)
+        self.assertIn("the length of the one it was revising", " ".join(logged))
+
+    def test_an_ordinary_expansion_is_left_alone(self):
+        # Ratification legitimately expands a terse plan into something four
+        # roles can work from. Across the measured run the largest growth on a
+        # ticket that went on to pass was 1.42x.
+        original = "Port the parser."
+        ticket = self._ticket(original)
+        store, logged = self._store()
+
+        ratify._apply(store, 1, ticket, {"spec": original * 3}, root=None)
+
+        self.assertEqual(ticket.spec, original * 3)
+        self.assertEqual(logged, [])
+
+    def test_a_shorter_spec_is_not_a_runaway(self):
+        ticket = self._ticket("Port the parser, carefully, with attention.")
+        store, logged = self._store()
+
+        ratify._apply(store, 1, ticket, {"spec": "Port the parser."}, root=None)
+
+        self.assertEqual(ticket.spec, "Port the parser.")
+
+    def test_the_measure_is_the_plans_text_and_not_the_last_revision(self):
+        # Two passes each growing 3x would slip past a check against the
+        # previous one, and the plan is the fixed point everywhere else.
+        ticket = self._ticket("Port the parser.")
+        ticket.spec = "Port the parser." * 3
+        store, logged = self._store()
+
+        ratify._apply(store, 1, ticket, {"spec": "Port the parser." * 9}, root=None)
+
+        self.assertIn("the length of the one it was revising", " ".join(logged))
+
+
+class TestAPromptThatOverranIsNotSentAgain(unittest.TestCase):
+    """The reply was deterministic in the only sense that matters.
+
+    Measured on PF-009, two retry cycles apart: `prompt_tokens` 20,665 both
+    times, `completion_tokens` 32,768 both times, `finish_reason: length` both
+    times. The second call bought nothing and cost ninety seconds of a model
+    that had already answered — and the whole ten-call ratification round it sat
+    in was byte-identical to the one before it.
+    """
+
+    def _store(self):
+        import types as _types
+
+        logged = []
+        return _types.SimpleNamespace(
+            log=lambda run_id, message, **kw: logged.append(message),
+            update_ticket=lambda run_id, t: None,
+            list_tickets=lambda run_id: [],
+        ), logged
+
+    @staticmethod
+    def _notes():
+        return [{"role": "executor", "blocking": ["cannot see the level texts"],
+                 "signed": False, "suggestions": [], "response": ""}]
+
+    def test_an_overrun_is_remembered_against_the_prompt_that_caused_it(self):
+        ticket = Ticket(ticket_id="PF-009", spec="dump the fixtures",
+                        criteria=["it works"])
+        store, _ = self._store()
+        calls = []
+
+        def call(role, prompt, budget):
+            calls.append(role)
+            return Completion(text="", usage=Usage(), finish_reason="length")
+
+        ratify._revise(store, 1, ticket, self._notes(), call=call, budget=32768,
+                       sources=None, digest="", root=None)
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(ticket.ratify_overrun)
+
+    def test_the_same_prompt_is_not_sent_a_second_time(self):
+        ticket = Ticket(ticket_id="PF-009", spec="dump the fixtures",
+                        criteria=["it works"])
+        store, logged = self._store()
+        calls = []
+
+        def call(role, prompt, budget):
+            calls.append(role)
+            return Completion(text="", usage=Usage(), finish_reason="length")
+
+        for _ in range(3):
+            ratify._revise(store, 1, ticket, self._notes(), call=call,
+                           budget=32768, sources=None, digest="", root=None)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("already ran out of output room", " ".join(logged))
+
+    def test_a_ticket_whose_objections_changed_is_asked_again(self):
+        # The skip is keyed on the prompt, not on the ticket. New objections
+        # build a different prompt, which is a question that has not been put.
+        ticket = Ticket(ticket_id="PF-009", spec="dump the fixtures",
+                        criteria=["it works"])
+        store, _ = self._store()
+        calls = []
+
+        def call(role, prompt, budget):
+            calls.append(role)
+            return Completion(text="", usage=Usage(), finish_reason="length")
+
+        ratify._revise(store, 1, ticket, self._notes(), call=call, budget=32768,
+                       sources=None, digest="", root=None)
+        moved = [{"role": "tester", "blocking": ["a different objection entirely"],
+                  "signed": False, "suggestions": [], "response": ""}]
+        ratify._revise(store, 1, ticket, moved, call=call, budget=32768,
+                       sources=None, digest="", root=None)
+
+        self.assertEqual(len(calls), 2)
+
+    def test_a_revision_that_succeeds_leaves_no_mark(self):
+        ticket = Ticket(ticket_id="PF-009", spec="dump the fixtures",
+                        criteria=["it works"])
+        store, _ = self._store()
+
+        def call(role, prompt, budget):
+            return Completion(text='{"spec": "dump the fixtures, carefully"}',
+                              usage=Usage(), finish_reason="stop")
+
+        ratify._revise(store, 1, ticket, self._notes(), call=call, budget=32768,
+                       sources=None, digest="", root=None)
+
+        self.assertEqual(ticket.ratify_overrun, "")
+
+    def test_the_mark_survives_a_restart(self):
+        # Cycles are separated by a run that may have been stopped and resumed,
+        # so this has to be on the ticket rather than in the daemon.
+        root = Path(tempfile.mkdtemp())
+        store = Store(root / "run.db")
+        run_id = store.create_run("t", "spec.md")
+        ticket = Ticket(ticket_id="PF-009", spec="dump", criteria=["c"])
+        store.add_tickets(run_id, [ticket])
+        ticket.ratify_overrun = "abc123"
+        store.update_ticket(run_id, ticket)
+
+        reopened = Store(root / "run.db")
+        loaded = {t.ticket_id: t for t in reopened.list_tickets(run_id)}
+
+        self.assertEqual(loaded["PF-009"].ratify_overrun, "abc123")

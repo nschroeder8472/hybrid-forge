@@ -137,6 +137,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     ratify_passes     INTEGER NOT NULL DEFAULT 0,
     ratify_notes      TEXT NOT NULL DEFAULT '[]',
     ratify_fingerprint TEXT NOT NULL DEFAULT '',
+    ratify_overrun    TEXT NOT NULL DEFAULT '',
     ratified_spec     TEXT NOT NULL DEFAULT '',
     ratified_criteria TEXT NOT NULL DEFAULT '[]',
     updated_at    REAL NOT NULL,
@@ -316,6 +317,13 @@ class Ticket:
     # is put through ratification again rather than built to a version nobody
     # signed off on.
     ratify_fingerprint: str = ""
+    # The revision prompt that last ran the planner out of output room.
+    #
+    # A prompt that overran is not worth re-sending: the reply was as
+    # deterministic as it needs to be. Measured on one ticket, two cycles
+    # apart: prompt_tokens 20,665 both times, completion_tokens 32,768 both
+    # times, finish_reason `length` both times.
+    ratify_overrun: str = ""
     # The contract this ticket had when respec last reported it unsatisfiable.
     #
     # A retry cycle requeues blocked tickets, which is right: a human may have
@@ -492,6 +500,7 @@ class Ticket:
             "ratify_passes": self.ratify_passes,
             "ratify_notes": json.dumps(self.ratify_notes),
             "ratify_fingerprint": self.ratify_fingerprint,
+            "ratify_overrun": self.ratify_overrun,
             "impossible_fingerprint": self.impossible_fingerprint,
             "ratified_spec": self.ratified_spec,
             "ratified_criteria": json.dumps(self.ratified_criteria),
@@ -525,6 +534,7 @@ class Ticket:
             ratify_passes=row["ratify_passes"],
             ratify_notes=json.loads(row["ratify_notes"]),
             ratify_fingerprint=row["ratify_fingerprint"],
+            ratify_overrun=row["ratify_overrun"] or "",
             impossible_fingerprint=row["impossible_fingerprint"] or "",
             ratified_spec=row["ratified_spec"],
             ratified_criteria=json.loads(row["ratified_criteria"]),
@@ -607,6 +617,7 @@ class Store:
         ("tickets", "ratify_passes", "INTEGER NOT NULL DEFAULT 0"),
         ("tickets", "ratify_notes", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "ratify_fingerprint", "TEXT NOT NULL DEFAULT ''"),
+        ("tickets", "ratify_overrun", "TEXT NOT NULL DEFAULT ''"),
         ("tickets", "ratified_spec", "TEXT NOT NULL DEFAULT ''"),
         ("tickets", "ratified_criteria", "TEXT NOT NULL DEFAULT '[]'"),
         ("steps", "classes", "TEXT NOT NULL DEFAULT '[]'"),
@@ -868,6 +879,7 @@ class Store:
                 "baseline_tree = :baseline_tree, "
                 "charged_failures = :charged_failures, context = :context, "
                 "blocked_note = :blocked_note, "
+                "ratify_overrun = :ratify_overrun, "
                 "impossible_fingerprint = :impossible_fingerprint, updated_at = :now "
                 "WHERE run_id = :run_id AND ticket_id = :ticket_id",
                 {**ticket.as_row(), "run_id": run_id, "now": time.time()},
@@ -940,6 +952,7 @@ class Store:
                 "UPDATE tickets SET ratify_status = :ratify_status, "
                 "ratify_passes = :ratify_passes, ratify_notes = :ratify_notes, "
                 "ratify_fingerprint = :ratify_fingerprint, "
+                "ratify_overrun = :ratify_overrun, "
                 "ratified_spec = :ratified_spec, "
                 "ratified_criteria = :ratified_criteria, updated_at = :now "
                 "WHERE run_id = :run_id AND ticket_id = :ticket_id",

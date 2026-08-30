@@ -26,6 +26,8 @@ helped write the contract is not independent of it.
 
 from __future__ import annotations
 
+import hashlib
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
@@ -234,6 +236,26 @@ def _vote(
     return Vote(role, signed=signed, blocking=blocking, suggestions=suggestions)
 
 
+# How much longer than the spec it revises a proposed spec may be before it is
+# refused as a runaway. Generous: ratification legitimately expands a terse plan
+# into something four roles can work from, and the tickets that went on to pass
+# in the measured run grew by well under half. The case this stops grew 21x.
+_SPEC_RUNAWAY = 4.0
+
+
+def _prompt_digest(prompt) -> str:
+    """A stable fingerprint of a revision prompt, for "have we asked this?".
+
+    Over the messages' text, so a prompt rebuilt from the same ticket and the
+    same objections fingerprints the same across cycles and across a restart.
+    """
+    try:
+        body = chr(0).join(f"{m.role}:{m.content}" for m in prompt)
+    except (AttributeError, TypeError):
+        return ""
+    return hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()
+
+
 def _normalise_criterion(text: str) -> str:
     """A criterion reduced to what makes two of them the same claim.
 
@@ -321,6 +343,32 @@ def _apply(
             level="warn",
             kind="ticket",
         )
+
+    if "spec" in revision:
+        # A revision that balloons is not a revision. Asked to rewrite PF-009
+        # from four objections, one planner began copying the reference files
+        # into the `spec` field — the reply ended mid-source of
+        # `test_move_resolver.gd` — and ran to 83 KB against a 3.8 KB original
+        # before the output budget cut it off. A spec many times the length of
+        # the one it revises has stopped restating the ticket and started
+        # quoting the repository at it, and no ceiling on `maxOutputTokens`
+        # makes that the right answer.
+        anchor = (ticket.original_spec or ticket.spec or "").strip()
+        proposed_spec = (revision.get("spec") or "").strip()
+        if anchor and len(proposed_spec) > _SPEC_RUNAWAY * len(anchor):
+            revision.pop("spec")
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: ratify returned a spec "
+                f"{len(proposed_spec) / len(anchor):.0f}x the length of the one "
+                f"it was revising ({len(proposed_spec):,} chars against "
+                f"{len(anchor):,}); the spec revision was refused. A revision "
+                f"that long has stopped rewriting the ticket and started "
+                f"inlining the files it points at.",
+                level="warn",
+                kind="ticket",
+                data={"proposed": len(proposed_spec), "anchor": len(anchor)},
+            )
 
     if "spec" in revision:
         dropped = _dropped_decisions(ticket, revision["spec"], ())
@@ -461,14 +509,34 @@ def _revise(
     Best-effort, like respec: a planner that is unreachable or answers with
     nonsense costs a pass, never the ticket. The next pass re-reads the same
     ticket, which is a wasted round but not a wrong one.
+
+    Wasted once. A revision that overran the output budget is remembered by the
+    prompt that produced it, and an identical prompt is not sent again — the
+    reply was deterministic in the only sense that matters here. Measured on
+    PF-009 of a nine-ticket run: two calls, `prompt_tokens` 20,665 both times,
+    `completion_tokens` 32,768 both times, `finish_reason: length` both times.
+    The second bought nothing and cost ninety seconds of a model that had
+    already answered.
     """
-    try:
-        completion = call(
-            PLANNER,
-            ratify_revision_prompt(ticket, notes, sources=sources, learnings=digest),
-            budget,
+    prompt = ratify_revision_prompt(ticket, notes, sources=sources, learnings=digest)
+    fingerprint = _prompt_digest(prompt)
+    if fingerprint and fingerprint == ticket.ratify_overrun:
+        store.log(
+            run_id,
+            f"{ticket.ticket_id}: skipped the planner revision — this exact "
+            f"prompt already ran out of output room, and asking again would "
+            f"spend the budget to be told so twice. Raise maxOutputTokens for "
+            f"the planner, or narrow the ticket.",
+            level="warn",
+            kind="ticket",
         )
+        return [], []
+
+    try:
+        completion = call(PLANNER, prompt, budget)
         if completion.truncated:
+            ticket.ratify_overrun = fingerprint
+            store.update_ticket(run_id, ticket)
             raise ValueError(
                 f"planner ran out of output room after {budget:,} tokens; "
                 f"raise maxOutputTokens for the planner model"

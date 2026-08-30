@@ -562,3 +562,110 @@ def locate_named(root: Path, path: str, files: Sequence[str] | None = None) -> s
     pool = repo_files(root, limit=MAX_LOCATE) if files is None else files
     found = [candidate for candidate in pool if candidate.rsplit("/", 1)[-1] == name]
     return found[0] if len(found) == 1 else ""
+
+
+
+# A path-shaped run of characters: at least one slash, an extension, no spaces.
+# Deliberately narrow. Prose is full of things that look like identifiers and
+# almost nothing that looks like this.
+_PATH_TOKEN = re.compile(r"[A-Za-z0-9_./\\-]*[/\\][A-Za-z0-9_./\\-]*\.[A-Za-z0-9]{1,8}")
+
+# A bare name that could be a file's stem: carries a digit or an underscore, so
+# it is not an ordinary English word. `game_001` qualifies; `capture` does not.
+# Resolved only when exactly one file in the repository has that stem, because
+# a name matching six files points at none of them.
+_STEM_TOKEN = re.compile(r"\b(?=[a-z0-9_]*[0-9_])[a-z][a-z0-9_]{3,40}\b")
+
+# Directories a stem search never descends into. Matching a build artifact or a
+# vendored dependency is worse than matching nothing.
+_UNSEARCHED = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
+    "target", ".hybridforge", "addons", ".godot",
+}
+
+# How many *distinct* stems one ticket may look up. Counted after de-duplication
+# rather than before: a spec repeating `capture` thirty times would otherwise
+# spend the whole allowance on one word and never reach the level ids named in
+# its last paragraph, which is exactly the failure this function exists for.
+_MAX_STEM_LOOKUPS = 64
+
+
+def _repo_stems(root: Path) -> dict[str, list[str]]:
+    """Every file in the repository, by filename stem.
+
+    Walked once and handed back whole, because the alternative is a `rglob` per
+    token and a spec naming a dozen levels would walk the tree a dozen times.
+    """
+    found: dict[str, list[str]] = {}
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        parts = set(path.relative_to(root).parts[:-1])
+        if parts & _UNSEARCHED:
+            continue
+        found.setdefault(path.stem.lower(), []).append(
+            path.relative_to(root).as_posix()
+        )
+    return found
+
+
+def named_paths(root: Path, *texts: str) -> list[str]:
+    """Files the ticket's own words name, that exist, in the order named.
+
+    A ticket is written by someone who knows which files matter and says so —
+    and then the reading scope is computed from `allowed_files`, which is what
+    the ticket may *write*. The two are not the same set, and the gap is not
+    theoretical.
+
+    Measured on PF-009 of a nine-ticket run: the spec told `_initialize` to load
+    `worlds/dragon_forest/world.json` and four levels by id. Neither the JSON
+    nor any level file was in the reading scope, so the executor signed off
+    `no` — correctly — with
+
+        The ticket does not provide the exact hardcoded level texts for
+        `game_001`, `game_007`, `game_043`, and `_demo/level_006`, so the
+        dumper cannot be written without opening unlisted level files.
+
+    The planner then revised the *spec* to say the texts must be embedded as
+    string literals, which made the ticket genuinely impossible; two more
+    cycles objected to the clause the second one had introduced, and the
+    reviewer parked it as unwinnable. Nineteen calls, a hundred and eleven
+    minutes, and no attempt was ever made. `worlds/dragon_forest/levels/
+    game_001.txt` was in the repository the whole time.
+
+    Two spellings are recognised, because a spec uses both. An explicit path is
+    taken as written. A bare name is resolved only when it carries a digit or
+    an underscore — so `game_001` is a candidate and `capture` is not — and
+    only when exactly one file in the repository has that stem, because a name
+    matching six files points at none of them.
+    """
+    blob = "\n".join(t for t in texts if t)
+    if not blob.strip():
+        return []
+
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def take(candidate: str) -> None:
+        key = normalize_path(candidate)
+        if key in seen:
+            return
+        if not (root / candidate).is_file():
+            return
+        seen.add(key)
+        found.append(candidate)
+
+    for match in _PATH_TOKEN.finditer(blob):
+        take(match.group(0).replace("\\", "/").strip("./"))
+
+    stems = [m.group(0) for m in _STEM_TOKEN.finditer(blob.lower())]
+    if not stems:
+        return found
+
+    table = _repo_stems(root)
+    for stem in list(dict.fromkeys(stems))[:_MAX_STEM_LOOKUPS]:
+        matches = table.get(stem, ())
+        # Exactly one, or the name is ambiguous and points at nothing.
+        if len(matches) == 1:
+            take(matches[0])
+    return found

@@ -386,6 +386,31 @@ not exist until the ticket runs" — and its readers inherit that exemption here
 A dependency that never ran contributes nothing, because `reading_scope` still
 drops what it cannot open.
 
+**A file the ticket's own words name is a file the ticket may read.** The same
+gap without a dependency to open it: the read scope is derived from
+`allowed_files`, which is what a ticket may *write*, and a ticket routinely
+names files it must read and will never touch.
+
+PF-009 of the next run paid for that one. Its spec told `_initialize` to load
+`worlds/dragon_forest/world.json` and four levels by id; none of the five was in
+its scope, and the executor refused sign-off on exactly that — correctly. What
+followed is the part worth recording: the planner revised the **spec** to say
+the level texts must be embedded as string literals, which made the ticket
+genuinely impossible, and the two passes after it objected to the clause that
+revision had introduced. The reviewer parked it as unwinnable, citing a
+sentence no human wrote. Nineteen calls, a hundred and eleven minutes, no
+attempt ever made, and every one of those files was in the repository
+throughout.
+
+An objection about missing evidence must be answered by widening what a role
+can see, never by writing the gap into the contract. `evidence.named_paths`
+reads the ticket's spec and criteria for two spellings — an explicit path, and
+a bare name carrying a digit or underscore that exactly one file in the
+repository has as its stem — and feeds them through the same existence filter
+as everything else, so this cannot smuggle a path into a prompt either. It is
+still bounded by `MAX_READING`: PF-009's scope goes from 7 files to the cap of
+12, which is four of its five named files and all three it was refused over.
+
 `cmd_ingest` now puts the source document first in every ticket's
 `reference_files` when the backlog was **planned** from one — first because
 `reading_scope` takes `reference` in order and caps the rest at twelve. A
