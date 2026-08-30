@@ -88,6 +88,26 @@ trimmed: there is no reliable way to tell which of fourteen replaced which of
 ten, and keeping the ten a human wrote is the safe direction. `loop.respecCriteria`
 unlocks it.
 
+**The spec has no equivalent ratchet, and this is a known gap.** The next run
+showed why it is hard rather than merely undone. On PF-009 a revision added one
+clause — the level texts "must be embedded as string literals" — that made the
+ticket impossible and killed it over three cycles. Every guard here missed it,
+and the criteria ratchet held perfectly throughout: 11 criteria in, 11 out.
+
+The obvious fix does not survive contact with the evidence. Refusing a revision
+that introduces vocabulary the plan never used would have refused the revisions
+on PF-002 (40 new words), PF-005 (13) and PF-006 (44, including measured float
+constants) — all three of which went on to pass. There is no textual signal
+separating *invented an obligation* from *added the detail this pass exists to
+add*, and a guard that cannot tell them apart costs more tickets than it saves.
+
+What is enforced instead is the two failures that *are* separable: a revision
+many times the length of the spec it revises is refused as a runaway, and a
+revision prompt that ran out of output room is never sent a second time. The
+root cause is addressed a layer down — the objection PF-009's revision was
+answering was about evidence the role could not see, and a role that can see it
+does not raise it. See LOOP-INVARIANTS, "A file the ticket's own words names".
+
 This is the one place in the loop where the bar may move, and it is deliberate.
 Respec refuses new criteria because of *when* it runs: on a ticket that has
 just exhausted its attempts, where raising the bar cannot serve the purpose of

@@ -3357,13 +3357,29 @@ class Orchestrator:
         wrote nothing, contributes nothing: `reading_scope` drops what it
         cannot open, so this cannot smuggle a phantom path into a prompt.
         """
-        if not ticket.needs:
-            return
         produced: list[str] = []
-        for other in self.store.list_tickets(run_id):
-            if other.ticket_id in ticket.needs:
-                produced.extend(other.allowed_files)
-        if not produced:
+        if ticket.needs:
+            for other in self.store.list_tickets(run_id):
+                if other.ticket_id in ticket.needs:
+                    produced.extend(other.allowed_files)
+
+        # The other half of the same gap, and it does not need a dependency to
+        # open: a ticket names the files it is about, and the reading scope is
+        # computed from `allowed_files`, which is what it may *write*.
+        #
+        # PF-009 of a nine-ticket run told `_initialize` to load
+        # `worlds/dragon_forest/world.json` and four levels by id. None of the
+        # five was in its scope. The executor signed off `no` — correctly — on
+        # not being able to see them; the planner then revised the *spec* to
+        # say the level texts must be embedded as string literals, which made
+        # the ticket genuinely impossible, and two later passes objected to the
+        # clause that revision had introduced. Nineteen calls, a hundred and
+        # eleven minutes, no attempt ever made, and every one of those files was
+        # in the repository the whole time.
+        named = evidence.named_paths(
+            self.config.root, ticket.spec, "\n".join(ticket.criteria)
+        )
+        if not produced and not named:
             return
 
         before = list(ticket.reference_files)
@@ -3374,12 +3390,31 @@ class Orchestrator:
             self.config.root,
             ticket.allowed_files,
             ticket.reference_files,
-            extra=produced,
+            extra=[*produced, *named],
         )
         gained = [path for path in ticket.reference_files if path not in before]
         if not gained:
             return
         self.store.update_ticket(run_id, ticket)
+
+        owned_by_needs = {normalize_path(path) for path in produced}
+        spoken_for = {normalize_path(path) for path in named}
+        by_name = [
+            p for p in gained
+            if normalize_path(p) in spoken_for
+            and normalize_path(p) not in owned_by_needs
+        ]
+        if by_name:
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: reads {len(by_name)} file(s) its own spec "
+                f"names — " + ", ".join(by_name[:6]) + ". A ticket's scope is "
+                f"computed from what it may write; these are files it was told "
+                f"to read and could not.",
+                level="info",
+                kind="ticket",
+                data={"named": by_name},
+            )
 
         # Attributed honestly. Recomputing the scope also re-runs the
         # same-directory sibling expansion, and a directory the dependencies
