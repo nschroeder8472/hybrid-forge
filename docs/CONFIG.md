@@ -76,20 +76,39 @@ reviewer between two backends by editing one line in `roles`.
 
 | `kind` | Talks to | Aliases you can also type |
 |---|---|---|
-| `openai` | anything speaking the OpenAI chat-completions shape | `openai-compatible`, `ollama`, `vllm`, `lmstudio`, `openrouter`, `litellm` |
-| `llamacpp` | `llama-server` in **router** mode, swapping checkpoints on demand | `llama.cpp`, `llama-cpp`, `llama-server`, `llama` |
+| `llamacpp` | **local models.** `llama-server` in **router** mode, swapping checkpoints on demand | `llama.cpp`, `llama-cpp`, `llama-server`, `llama`, `local` |
+| `openai` | OpenAI, and gateways that speak its wire | `openai-compatible`, `openrouter`, `litellm`, `together`, `deepseek` |
 | `anthropic` | the Anthropic Messages API | `claude` |
 | `gemini` | Google's Generative Language API | `google` |
 | `claude-cli` | a local `claude` binary in `-p` mode | `claude-code` |
-| `command` | any CLI that takes a prompt and prints an answer | `cli`, `subprocess` |
 
-Default `openai`. An unknown kind fails at startup naming the ones that exist.
+Default `llamacpp`. Every cloud kind needs a credential named alongside it, so
+none of them is reached by leaving `kind` out. An unknown kind fails at startup
+naming the ones that exist.
+
+**Local means llama.cpp, and only llama.cpp.** `ollama`, `vllm`, `lmstudio`,
+`freetoken` and `command` were all backends here once, and a config still naming
+one is refused with what to do instead rather than with "unknown kind" — that
+error would send you hunting for a spelling mistake that is not there:
+
+```
+  model 'plan': Ollama is no longer a forge backend. Point `llama-server` at
+  the same GGUF and use `"kind": "llamacpp"` — forge writes the preset for you
+  with `forge init`, and gets the context window from the argv the router will
+  spawn rather than guessing between /api/ps and /api/show.
+```
+
+The narrowing is what lets the errors on this page be specific. Four local
+backends meant four ways of asking what was being served and four ways of being
+told to load something else, so a diagnostic could only say what all of them had
+in common. One means the checks can name a preset, a `--models-max` slot, a
+reasoning budget, or the argv a child server was spawned with.
 
 ### Keys every kind understands
 
 | Key | Default | What it does |
 |---|---|---|
-| `model` | `""` | The model id sent to the backend. Required by `openai`, `anthropic` and `gemini`; optional for `claude-cli` (empty = whatever the CLI defaults to) and `command`. |
+| `model` | `""` | The model id sent to the backend. For `llamacpp` it is the router's id for a checkpoint — the preset's section name. Required by `llamacpp`, `openai`, `anthropic` and `gemini`; optional for `claude-cli` (empty = whatever the CLI defaults to). |
 | `contextWindow` | see below | Total prompt+output budget in tokens. The budget gate reserves output from it and refuses — or trims — a prompt that will not fit. |
 | `maxOutputTokens` | see below | Ceiling on one reply. Too low is not a silent failure: a truncated planner reply is reported as running out of output room, not as bad JSON. |
 | `temperature` | unset | Overrides the temperature the loop asks for. Set it when a model ships a sampling recipe you are meant to follow — several reasoning models degenerate into repetition above their recommended value. A number overrides *every* call; an object `{"default": 0.6, "deterministic": 0.0}` overrides only the ones the loop did not ask determinism for. See below. |
@@ -98,12 +117,13 @@ Default `openai`. An unknown kind fails at startup naming the ones that exist.
 | `rateLimit` | none | See [`rateLimit`](#ratelimit) below. |
 | `cwd` | the project root | Working directory for adapters that shell out. Filled in automatically; override only to point a role at a different checkout. |
 
-**Context-window defaults differ by kind, and it matters.** `openai` asks the
-endpoint (Ollama's native API answers) and falls back to 8192 when nothing does;
-`claude-cli` assumes 200000/32000; `command` assumes 8192/4096; `gemini`
-defaults output to 8192. A window that collapsed to a default is the failure
-that reports six 1-3k-token tickets as "too large for this model" — if you see
-that, set `contextWindow` explicitly and run `forge doctor`.
+**Context-window defaults differ by kind, and it matters.** `llamacpp` reads
+the `--ctx-size` the router will spawn the child server with, which is the real
+number rather than an estimate of one; `openai` has nothing to ask and uses
+8192; `claude-cli` assumes 200000/32000; `gemini` defaults output to 8192. A
+window that collapsed to a default is the failure that reports six 1-3k-token
+tickets as "too large for this model" — if you see that, set `contextWindow`
+explicitly and run `forge doctor`.
 
 **How long a call is allowed to take is derived from its budget.** It used to
 be 600 seconds, hardcoded, with no way to change it — which quietly made a
@@ -159,95 +179,27 @@ own number alone, which makes `{"default": 0.6}` the honest spelling of *follow
 the recipe, but let determinism through*. A bare number still overrides
 everything, so nothing that worked before changes.
 
-### `kind: "freetoken"`
-
-| Key | Default | Notes |
-|---|---|---|
-| `modelPath` | `model` | Filesystem path to the checkpoint. The daemon hands this to `AutoConfig.from_pretrained`, so a bare name is looked up on HuggingFace and the engine exits before it binds a port. |
-| `port` | `1919` | Where the serve listens. `baseUrl` is the other spelling of the same thing. |
-| `daemonUrl` | `http://127.0.0.1:1900` | The control plane that owns the GPU. |
-| `engineArgs` | none | Extra launch flags for the serve. |
-| `switchSeconds` | `300` | How long to wait for a switched-to engine to answer. |
-| `cache` | none | Cache pool sizes for this role. See below. |
-| `rebuildSeconds` | `300` | How long a cache rebuild may take. Serving pauses while it runs. |
-| `reasoning` | none | Which reasoning gear to ask for, named the way this checkpoint names it. See below. |
-
-**`cache` — the knobs your model actually has.** FreeToken serves one model at
-a time, and a serve started by `/engine/switch` comes up at the engine's own
-default sizing. Anything applied by hand — the desktop app's Apply button, `ft
-ctl cache`, the shell's `/cache` — belongs to the process it was applied to and
-dies with it. A run that alternates roles replaces the serve on every swap, so
-without this block every call lands on defaults no matter what you set
-elsewhere.
-
-That is not a small difference. On one 26B checkpoint the default was 115,729
-KV tokens against 759,808 applied by hand; on the small one a reviewer reasoned
-past a 65,536-token budget twice without ever producing an answer, and on the
-large one the same prompt finished in 7,533 tokens.
-
-Counts are in **tokens** for `kv` and `swa`, **slots** for `moe` and `mamba` —
-the units the engine shows you. Name only the pools you care about; the rest
-are left alone.
-
-```json
-"reviewer": {
-  "kind": "freetoken",
-  "model": "Gemma-4-26B-A4B-NVFP4",
-  "modelPath": "C:\\models\\Gemma-4-26B-A4B-NVFP4",
-  "cache": { "kv": 759808, "swa": 23146, "moe": 256 },
-  "reasoning": "on"
-}
-```
-
-Per model block, so two roles on the same checkpoint can differ — a coder
-holding six reference files and a reviewer reading one diff do not want the
-same geometry, and they are separate blocks precisely so they need not.
-
-Nothing about this is per-model in forge. Which pools a checkpoint has, what
-each may be set to, and what its reasoning gears are called are read from
-`GET /v1/cache/status` on the running serve. A checkpoint with a mamba pool and
-no window pool configures exactly as well as one with the reverse, and a model
-released next year configures without forge learning its name. `forge doctor`
-prints what it found:
-
-```
-  reviewer: ok name=reviewer kind=freetoken model=Gemma-4-26B-A4B-NVFP4 reply='OK'
-      cache pools available: kv 1-1,063,841; moe 128-3,840; swa 8,777-106,384
-      reasoning gears: off, on (default 'off')
-```
-
-A size outside those limits is **refused, not clamped**, and a pool the model
-does not have is refused by name. Silently shrinking a budget to what fits
-leaves the run believing it asked for something it did not get, which is the
-failure this whole block exists to end.
-
-**`reasoning` — the gear, not a guess.** `extraBody.reasoning_effort` is the
-OpenAI spelling and it is a poor instrument here, because a checkpoint that
-does not grade its thinking accepts the field and ignores it. Measured on a
-26B model: the engine logged
-
-```
-reasoning_effort 'medium' is not supported by this checkpoint; using the template default
-```
-
-and answered anyway. Two roles spent an entire run believing they had asked for
-something. That checkpoint has two gears, `off` and `on`, and reports them —
-along with the request fields that select each. So name the gear and forge
-sends the engine's own fields for it; a gear the model does not have is refused
-up front, naming the ones it has. Anything you write in `extraBody` still wins
-over the gear.
-
 ### `kind: "openai"`
 
 | Key | Default | Notes |
 |---|---|---|
-| `baseUrl` | `http://localhost:11434/v1` | Include the `/v1`. Ollama's native API is discovered one level up from it. |
+This is the **cloud** adapter: OpenAI itself, and the gateways that speak its
+wire. It does not reach a local server any more — a GGUF belongs to
+[`llamacpp`](#kind-llamacpp).
+
+| Key | Default | Notes |
+|---|---|---|
+| `baseUrl` | `https://api.openai.com/v1` | Include the `/v1`. |
 | `apiKeyEnv` | unset | Name of the env var holding the key. Preferred. |
 | `apiKey` | `""` | Inline key. Works; makes the file unsafe to commit. |
 | `headers` | `{}` | Extra request headers, merged over the `Authorization` header. |
-| `extraBody` | `{}` | Fields merged into the request body, for backend-specific knobs (vLLM routing, Ollama `options`, OpenRouter preferences). |
+| `extraBody` | `{}` | Fields merged into the request body, for a gateway's own knobs (OpenRouter routing preferences and the like). |
 | `supportsTemperature` | `true` | Set false for endpoints that reject the field outright. |
-| `topP`, `topK`, `minP`, `presencePenalty`, `frequencyPenalty` | unset | Sent only when set, so a model's own shipped recipe still applies. **`topK` and `minP` are accepted and silently discarded by Ollama's `/v1` shim** — put them in a Modelfile instead (`forge models` writes one). |
+| `topP`, `topK`, `minP`, `presencePenalty`, `frequencyPenalty` | unset | Sent only when set, so a model's own shipped recipe still applies. |
+
+`contextWindow` is not discovered here and cannot be: a hosted endpoint does not
+publish the window it will serve. Left unset it is 8192 and `forge doctor` says
+so — set it from the model's documented window.
 
 ### `kind: "llamacpp"`
 
@@ -262,14 +214,37 @@ rather than failing later.
 
 | Key | Default | Notes |
 |---|---|---|
-| `baseUrl` | `http://127.0.0.1:8080/v1` | Include the `/v1`. The router's `/models/load`, `/models/unload` and `/props` sit one level up, the way Ollama's native API does. |
+| `baseUrl` | `http://127.0.0.1:8080/v1` | Include the `/v1`. The router's `/models/load`, `/models/unload` and `/props` sit one level up. |
 | `model` | `""` | The router's **id** for the checkpoint, which is not a path. See below. |
 | `loadSeconds` | `300` | How long to wait for a checkpoint to become servable. |
 | `exclusive` | `false` | Unload every other resident checkpoint before loading this one. |
 
 Everything under [`kind: "openai"`](#kind-openai) applies too — `extraBody`,
-the sampling knobs, `headers`. Unlike Ollama, `topK` and `minP` do reach the
-model here.
+the sampling knobs, `headers` — and unlike a hosted endpoint, `topK` and `minP`
+genuinely reach the model.
+
+**Keys `forge models` writes into the preset.** These configure the *server*
+rather than a request, so they cannot be sent per call — they decide how the
+child server is spawned. Setting them here means `forge models` can generate the
+preset instead of you maintaining it beside `config.json` and keeping the
+numbers in step by hand.
+
+| Key | Preset flag | Notes |
+|---|---|---|
+| `modelPath` | `model` | The `.gguf` on disk. Without it the model is left out of the generated preset — the file is not derivable from an id, and a section pointing at the wrong one fails at load with a message about the file rather than about the config that named it. |
+| `contextWindow` | `ctx-size` | The same number the budget gate plans against. Writing both from one source is the point. |
+| `reasoningBudget` | `reasoning-budget` | Tokens a thinking model may spend before it must begin answering. Unset, a 30B MoE measured here burned all 32,768 of its output budget reasoning and never started, on every call. |
+| `reasoningEffort` | `reasoning-effort` | The gear, where the checkpoint has them. |
+| `gpuLayers` | `n-gpu-layers` | |
+| `flashAttention` | `flash-attn` | |
+| `cacheTypeK`, `cacheTypeV` | `cache-type-k`, `cache-type-v` | KV quantization. `q8_0` on both roughly halves the cache, which is most of the VRAM at a large `ctx-size`. |
+| `parallel` | `parallel` | |
+| `mainGpu`, `splitMode` | `main-gpu`, `split-mode` | |
+| `multimodal` | `mmproj-auto` | Default false. A projector beside the `.gguf` is loaded automatically and costs VRAM no text-only role will use. |
+| `presetFlags` | — | An object merged in last, for any flag not listed above. |
+
+Two roles naming the same `model` are one child server and collapse into one
+section, which is the ordinary case rather than a mistake.
 
 **The id is the directory, not the file.** A `--models-dir` entry is named
 after the directory holding the `.gguf`, so a checkpoint at
@@ -285,10 +260,12 @@ actually serves:
     nemotron-3-nano-omni-30b-a3b-reasoning-gguf.
 ```
 
-That refusal is also why this adapter is small. [FreeToken](#kind-freetoken)
-exists because its engine answers to *any* model name and echoes it back, so a
-config naming three models gets one model and three labels. The router routes
-by id, so forge's record of which model wrote what is true for free.
+That refusal is also why this adapter is small, and part of why it is the only
+local one. The backend it replaced answered to *any* model name and echoed it
+back, so a config naming three checkpoints got one checkpoint and three labels —
+and every artifact, every usage row and every cost figure attributed work to a
+model that had not written it. The router routes by id and 400s an id it does
+not have, so forge's record of which model wrote what is true for free.
 
 **A load is not instant and is not the call's fault.** With
 `--models-autoload` the first request after a swap simply blocks while a 30B
@@ -445,15 +422,6 @@ measured reviewer call spent 208k cache-read tokens and $0.34 judging a diff the
 loop had already pasted into its prompt. It also voids a guarantee — the loop
 decides what each role may see and write, and a role with tools reads and writes
 whatever it likes.
-
-### `kind: "command"`
-
-| Key | Default | Notes |
-|---|---|---|
-| `command` | — | Required, non-empty argv array. |
-| `promptOn` | `stdin` | `stdin`, or `argv` to substitute `{prompt}` into the arguments. |
-| `model` | first argv element | Label used in the ledger. |
-| `contextWindow` / `maxOutputTokens` | `8192` / `4096` | Nothing to discover, so set these. |
 
 ### `rateLimit`
 
@@ -794,7 +762,7 @@ run some context, never the run.
 | `reviewWhenStuck` | `2` | Consecutive flat cycles before the loop escalates. Two rungs, one per cycle after it: at `n` the reviewer is asked against the red tree whether the ticket is winnable at all — normally unreachable for a ticket that never verifies — and at `n + 1` the planner is asked the inverted question and may reply `impossible`, which parks the ticket for a reason rather than for a count. `0` never escalates. See [CONVERGENCE](CONVERGENCE.md). |
 | `freezeTests` | `true` | Keep a ticket's tests while the criteria they encode are unchanged, instead of re-deriving them on every attempt. The tests are a function of the criteria, so an unchanged fingerprint — criteria, spec, scope, test command — produces the same file at the price of the loop's most expensive role, and gives the executor a target that stops moving under it. Rewritten when any of those changes, when the file is not on disk, or when the last failure was in the test file itself. See [CONVERGENCE](CONVERGENCE.md). |
 | `ratifyPasses` | `2` | Sign-off passes over a ticket before its first attempt. Every role is asked whether it can do its part as written, the planner rewrites the ticket from what they say, and the pass repeats. A ticket ships when everyone signs off, when a majority does, or when the planner and one other do; below that it parks with the objections recorded. Costs `roles × passes` calls per ticket before any code exists, one of them on the reviewer. See [RATIFY.md](RATIFY.md). |
-| `ratifyOrder` | all four, in the order above | The order the roles vote in, within a pass. A permutation of the four — it sets the order they vote, not which of them vote, and an order omitting one is refused because sign-off is counted over all four. Two things ride on it. Votes accumulate as they are cast and every role sees the ones before it, so the first votes blind and the last answers three arguments. And on a backend serving one checkpoint at a time (`llamacpp` with `exclusive`, or `freetoken`), two roles sharing a model are free when adjacent and cost a reload when not — see below. |
+| `ratifyOrder` | all four, in the order above | The order the roles vote in, within a pass. A permutation of the four — it sets the order they vote, not which of them vote, and an order omitting one is refused because sign-off is counted over all four. Two things ride on it. Votes accumulate as they are cast and every role sees the ones before it, so the first votes blind and the last answers three arguments. And on a backend serving one checkpoint at a time (`llamacpp` with `exclusive`, or a router started with `--models-max 1`), two roles sharing a model are free when adjacent and cost a reload when not — see below. |
 
 ---
 
@@ -826,10 +794,13 @@ discoverable without reading this page.
 {
   "models": {
     "local": {
-      "kind": "openai",
-      "baseUrl": "http://localhost:11434/v1",
-      "model": "qwen3.6:35b-a3b",
-      "maxOutputTokens": 8192
+      "kind": "llamacpp",
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "model": "qwen3.8",
+      "modelPath": "/models/Qwen3.8-27B-UD-Q4_K_M.gguf",
+      "contextWindow": 65536,
+      "maxOutputTokens": 8192,
+      "reasoningBudget": 2048
     }
   },
   "roles": {
@@ -850,34 +821,52 @@ One model reviewing its own executor's work is weaker than it looks — it is th
 same weights judging the answer they just produced. It is a fine place to start
 and the first thing to change.
 
+`forge models` turns the block above into the preset that serves it:
+
+```ini
+[qwen3.8]
+model = /models/Qwen3.8-27B-UD-Q4_K_M.gguf
+jinja = true
+ctx-size = 65536
+reasoning-budget = 2048
+mmproj-auto = false
+```
+
 ### Populated — local build, Claude review
 
 Shipped as [`templates/config.sample.json`](../templates/config.sample.json).
-Two entries point at the same Ollama endpoint with different output budgets,
-because the planner emits a whole backlog in one reply and the executor emits
-one file at a time. `api` is declared but unassigned: swapping the reviewer to
-it is a one-line edit in `roles`.
+Two entries name the same router id with different output budgets, because the
+planner emits a whole backlog in one reply and the executor emits one file at a
+time — one child server, two roles. `api` is declared but unassigned: swapping
+the reviewer to it is a one-line edit in `roles`.
 
 ```json
 {
   "room": "image-marquee",
   "models": {
     "local": {
-      "kind": "openai",
-      "baseUrl": "http://192.168.1.10:11434/v1",
-      "model": "qwen3.6:35b-a3b",
-      "contextWindow": 32768,
+      "kind": "llamacpp",
+      "baseUrl": "http://192.168.1.10:8080/v1",
+      "model": "qwen3.8",
+      "modelPath": "/models/Qwen3.8-27B-UD-Q4_K_M.gguf",
+      "exclusive": true,
+      "contextWindow": 65536,
       "maxOutputTokens": 8192,
-      "temperature": 0.6,
+      "reasoningBudget": 2048,
+      "tokensPerSecond": 80,
+      "temperature": { "default": 0.6, "deterministic": 0.0 },
       "topP": 0.95
     },
     "local-plan": {
-      "kind": "openai",
-      "baseUrl": "http://192.168.1.10:11434/v1",
-      "model": "qwen3.6:35b-a3b",
-      "contextWindow": 32768,
+      "kind": "llamacpp",
+      "baseUrl": "http://192.168.1.10:8080/v1",
+      "model": "qwen3.8",
+      "exclusive": true,
+      "contextWindow": 65536,
       "maxOutputTokens": 16384,
-      "temperature": 0.6
+      "reasoningBudget": 2048,
+      "tokensPerSecond": 80,
+      "temperature": { "default": 0.6, "deterministic": 0.0 }
     },
     "claude": {
       "kind": "claude-cli",

@@ -41,7 +41,7 @@ The model and the memory server can live anywhere you can reach:
 | Your situation | Do this |
 |---|---|
 | One machine with a decent GPU | Everything local. Simplest — start here |
-| Laptop for code, desktop with the GPU | Ollama and MemPalace on the desktop, repo and daemon on the laptop |
+| Laptop for code, desktop with the GPU | `llama-server` and MemPalace on the desktop, repo and daemon on the laptop |
 | No GPU at all | Use a hosted API for the executor, everything else local |
 
 This guide assumes one machine. Where a second machine changes something, it
@@ -67,41 +67,59 @@ files to disk.
 This is the model that writes code. It runs constantly during a run, which is
 why it is worth hosting yourself.
 
-### Install Ollama
+### Install llama.cpp
+
+`llama-server` is the only local backend forge speaks to. Let forge fetch it:
 
 ```bash
-curl -fsSL https://ollama.com/install.sh | sh      # macOS / Linux
+forge llama install
 ```
 
-On Windows, download the installer from [ollama.com](https://ollama.com).
+That picks the build for your machine, downloads it, checks it against the
+SHA-256 GitHub published for it, and unpacks it where forge will find it.
+`forge llama` on its own says what it would pick and what you already have.
 
-Ollama serves an OpenAI-compatible API on port `11434`, which is exactly what
-forge speaks. Your endpoint will be `http://localhost:11434/v1`.
+**Which build matters more than which version.** Measured on a 5090 with a 30B
+A3B MoE at Q4_K_M: 16 tok/s on the Vulkan build against 353 tok/s on CUDA. That
+is not tuning, it is whether an overnight run finishes — and nothing reports the
+slow path, which is why forge chooses rather than leaving it to a paragraph.
+Detection reads your GPU's compute capability; `--backend` overrides it.
+
+To install it yourself instead, take a release binary from
+[the releases page](https://github.com/ggml-org/llama.cpp/releases) and put
+`llama-server` on PATH — forge uses that when it has fetched nothing. On
+Windows the CUDA builds need the matching `cudart-*` archive unpacked beside
+them, or the server exits on a missing DLL without mentioning CUDA.
+
+The server speaks an OpenAI-compatible API, which is what forge sends. Your
+endpoint will be `http://127.0.0.1:8080/v1`.
 
 ### Pick a model
 
-The default this project was built around:
+`llama-server` serves `.gguf` files directly — there is no pull step and no
+model store. Download one and note the path:
 
 ```bash
-ollama pull qwen3.6:35b-a3b
+curl -fsSLO https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-UD-Q4_K_M.gguf
 ```
 
-It is a mixture-of-experts model — 35B parameters total but only about 3B
-active per token — so it is much faster than its size suggests and fits
-comfortably in 32GB of VRAM at Q4.
+A mixture-of-experts model is worth seeking out here: a 30B MoE with ~3B active
+per token runs several times faster than a dense model of the same size, and
+the executor is the role that runs constantly.
 
 If that does not fit your hardware, roughly:
 
 | VRAM | Try | Expect |
 |---|---|---|
-| 32 GB+ | `qwen3.6:35b-a3b` (the default) | Best results of anything you can host at home |
-| 24 GB | The same model at a lower quantization, or a ~30B coder model at Q4 | Works well; occasionally needs a second attempt on a ticket |
+| 32 GB+ | A 27-30B at Q4_K_M, MoE if you can get one | Best results of anything you can host at home |
+| 24 GB | The same at a lower quantization, or a ~14B coder model at Q4 | Works well; occasionally needs a second attempt on a ticket |
 | 16 GB | A 14B coder-tuned model at Q4 | Usable on well-specified tickets; split work into smaller pieces |
 | 8–12 GB | A 7B coder-tuned model at Q4 | It will write code, but expect more `BLOCKED:` tickets and more failed verify rounds |
 | No GPU | A hosted API — see below | Costs money per token, works anywhere |
 
-Browse current tags at [ollama.com/library](https://ollama.com/library); model
-names and quantization tags shift faster than any document can track.
+Leave room for the KV cache, which is not small and scales with the context
+window: measured at `--ctx-size 131072`, a 15.3 GiB Qwen at Q4 occupied 24.6 GiB
+resident. A window you will not use is VRAM you could have spent on weights.
 
 **What actually matters in this role** is not benchmark score. The executor is
 handed a spec, a list of files it is allowed to touch, and acceptance criteria,
@@ -109,33 +127,43 @@ and it has to return edits in a fixed format without wandering outside scope.
 Instruction-following and a long context window beat raw reasoning here. A model
 that is brilliant but ignores the output format is useless to the loop.
 
-### Keep the weights warm
+A thinking model needs one more thing: a `reasoningBudget`. Without a cap, one
+30B MoE measured here spent all 32,768 of its output tokens reasoning and
+returned an empty answer on *every* call. Set it and the same model answers in
+146. See [SETUP.md §"Thinking models answer last"](SETUP.md#thinking-models-answer-last).
+
+### Serve it in router mode
 
 ```bash
-export OLLAMA_KEEP_ALIVE=30m
+llama-server --models-preset .hybridforge/models/llamacpp.ini --models-max 1
 ```
 
-Without this, Ollama unloads the model between tickets and every single
-delegation pays a cold load from disk. It is the number-one cause of "why is
-this so slow".
+Router mode is what lets forge swap checkpoints: each section of the preset is a
+model id, and the router spawns one child server per id and proxies by name.
+Even with a single model it is the right shape, because adding a second one
+later is then a config edit rather than a second server.
 
-Make it permanent on Linux by setting it in the systemd unit — see
-[SETUP.md §1.3](SETUP.md#13-bind-the-inference-server-to-one-interface), which
-also covers binding Ollama to a specific network interface if your GPU is on a
-different machine.
+You do not have to write that preset. `forge init` and `forge models` generate
+it from `config.json`, which is the point — `ctx-size` there and `contextWindow`
+here are the same number, and keeping them in step by hand is where the silent
+failures live. Step 1 below is where you give forge the `.gguf` path it needs.
 
-> **Security note, if the GPU is on another machine:** Ollama has no
+`--models-max 1` keeps one checkpoint resident. Raise it only if every model in
+the preset fits in VRAM together.
+
+> **Security note, if the GPU is on another machine:** `llama-server` has no
 > authentication of any kind. Anything that can reach the port can run
-> inference on your hardware. Bind it to one specific private address — never
-> `0.0.0.0`.
+> inference on your hardware. Bind it to one specific private address with
+> `--host` — never `0.0.0.0`.
 
 ### Check it works
 
 ```bash
-ollama list
-ollama run qwen3.6:35b-a3b "Reply with exactly: OK"
-curl http://localhost:11434/v1/models
+curl http://127.0.0.1:8080/v1/models
 ```
+
+That lists every id in the preset with its status. Those ids are exactly what
+`model` in your config must name.
 
 ### No GPU? Use a hosted endpoint
 
@@ -241,7 +269,7 @@ for it verbatim in step 3.
 mempalace serve --host <private-address> --port 8765
 ```
 
-Unlike Ollama, this one authenticates: a non-loopback bind generates a bearer
+Unlike `llama-server`, this one authenticates: a non-loopback bind generates a bearer
 token and stores it under `~/.mempalace/server/`. Give that to forge by naming
 the environment variable holding it (`"tokenEnv": "MEMPALACE_TOKEN"`), never by
 pasting the token into your config file. Details in
@@ -334,19 +362,26 @@ Below is the whole flow, with what to type and why.
 Hybrid Forge setup — image-marquee
 
 1/5  Executor — the model that writes the code
-Any OpenAI-compatible server: Ollama, vLLM, LM Studio, llama.cpp, LiteLLM,
-OpenRouter, DeepSeek, or OpenAI itself.
+A local model, served by llama.cpp's router:
 
-Base URL [http://localhost:11434/v1]:
-Model name [qwen3.6:35b-a3b]:
-Env var holding the API key, if this endpoint needs one:
+  llama-server --models-preset <preset> --models-max 1
+
+The model name below is the router's id for a checkpoint, which is the
+section name in the preset. `forge models` writes that preset from this
+config once you are through here.
+
+Router URL [http://127.0.0.1:8080/v1]:
+Model id (the preset's section name) [qwen3.8]:
+Path to its .gguf, if you want `forge models` to write the preset:
 
 probing…
-  ok  answered — context 131.1k
+  ok  answered — context 65.5k
 ```
 
-Values in `[brackets]` are defaults — press Enter to accept. For local Ollama,
-all three defaults above are already right, so this step is three Enters.
+Values in `[brackets]` are defaults — press Enter to accept. For a router on
+this machine the first default is already right; the model id has to match a
+section in your preset, and the `.gguf` path is what lets forge write that
+preset for you.
 
 For a hosted endpoint, fill in its base URL and model name, and give the **name
 of the environment variable** holding your key (`OPENROUTER_API_KEY`), not the
@@ -357,9 +392,9 @@ token context window. Forge uses that number later to decide whether a ticket
 fits before sending it.
 
 If you get `FAIL`, it offers to let you retype. The most common causes are a
-missing `/v1` on the end of an Ollama URL, a model name that does not match
-`ollama list` exactly, or an API key variable you set in a different terminal
-window.
+missing `/v1` on the end of the router URL, a model id that is not a section
+name in the preset the router was started with, or a router that is not running
+yet. `curl http://127.0.0.1:8080/v1/models` lists the ids it will accept.
 
 ### Step 2 of 5 — the planner and reviewer
 
@@ -491,9 +526,10 @@ This will write /home/you/code/image-marquee/.hybridforge/config.json:
     "room": "image-marquee",
     "models": {
       "local": {
-        "kind": "openai",
-        "baseUrl": "http://localhost:11434/v1",
-        "model": "qwen3.6:35b-a3b"
+        "kind": "llamacpp",
+        "baseUrl": "http://127.0.0.1:8080/v1",
+        "model": "qwen3.8",
+        "modelPath": "/models/Qwen3.8-27B-UD-Q4_K_M.gguf"
       },
       "claude": {
         "kind": "claude-cli",
@@ -574,8 +610,8 @@ roles:   {"planner": "claude", "executor": "local", "tester": "local", "reviewer
 
   claude: ok name=claude kind=claude-cli model=opus reply='OK'
       context=200.0k max_output=64.0k
-  local: ok name=local kind=openai model=qwen3.6:35b-a3b reply='OK'
-      context=131.1k max_output=8.2k
+  local: ok name=local kind=llamacpp model=qwen3.8 reply='OK'
+      context=65.5k max_output=8.2k  resident=qwen3.8
   memory: ok memory transport=stdio target=mempalace-mcp room=image-marquee scope=[wing=image-marquee] read=palace_recall write=off available=palace_recall, palace_remember
   lint command: npm run lint
   typecheck command: npm run typecheck
@@ -724,7 +760,7 @@ that quietly does the wrong thing.
 | A ticket fails over and over | Almost always a wrong verify command, not a bad model. Read the failing step on the dashboard and run that command by hand |
 | "rejected out-of-scope edits" | Working as designed — the executor tried to touch a file its ticket does not cover |
 | Every ticket blocks on context | Tickets too large for the executor's window. Split them |
-| Slow first response every ticket | The model is being reloaded from disk. Set `OLLAMA_KEEP_ALIVE=30m` |
+| Slow first response every ticket | A checkpoint swap on a cold page cache. Warm swaps measured 6-10s; if it is much worse, the weights are being read from disk each time |
 
 ---
 

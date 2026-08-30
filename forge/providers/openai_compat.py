@@ -1,18 +1,20 @@
-"""OpenAI-compatible chat completions.
+"""OpenAI-compatible chat completions, for models forge does not host.
 
-One adapter, most of the ecosystem: Ollama, vLLM, LM Studio, llama.cpp's
-server, LiteLLM, OpenRouter, Together, DeepSeek, and OpenAI itself all speak
-this shape. Point `baseUrl` at whichever one you run.
+OpenAI itself and the gateways that speak its wire: OpenRouter, LiteLLM,
+Together, DeepSeek. Point `baseUrl` at whichever one you use, or leave it and
+get OpenAI.
 
-Context window discovery is best-effort. Ollama exposes it on its native port;
-most other servers do not expose it at all. Config always wins over discovery,
-and discovery only fills a gap.
+This is the *cloud* half of forge's model support. Local models are llama.cpp
+and nothing else, which is why the discovery this adapter used to carry is
+gone: it existed to reconcile Ollama's two disagreeing answers about what
+context window was actually loaded, and there is no longer an Ollama here to
+ask. A hosted endpoint publishes no such thing, so `contextWindow` is
+configuration, and a missing one is a documented default rather than a guess
+dressed up as a measurement.
 
-When Ollama is asked, it is asked what it is *serving* (`/api/ps`) before what
-the model *could* do (`/api/show`). Those disagree routinely — 32768 against
-131072 on a real box — and planning against the larger one hands the budget
-gate a ceiling four times too high, so it approves prompts the server then
-truncates from the front.
+`llamacpp` extends this class for the wire format, and only for that — it gets
+its window from the argv the router will spawn its child server with, which is
+a fact rather than a best effort.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from ._http import get_json, post_json
+from ._http import post_json
 from .base import (
     DERIVE_TIMEOUT,
     Capabilities,
@@ -32,16 +34,10 @@ from .base import (
     Usage,
 )
 
-
-def _tagged(name: str) -> str:
-    """An Ollama model name with its implicit `:latest` made explicit.
-
-    A digest reference (`model@sha256:…`) carries no tag and is left alone.
-    """
-    name = name.strip()
-    if not name or "@" in name or ":" in name:
-        return name
-    return f"{name}:latest"
+# What a hosted endpoint gets when nothing says otherwise. Every model worth
+# pointing forge at has more, so this is a floor that makes the budget gate
+# work rather than an estimate of anything — `forge doctor` says to set it.
+DEFAULT_CONTEXT_WINDOW = 8192
 
 
 class OpenAICompatProvider(Provider):
@@ -49,12 +45,14 @@ class OpenAICompatProvider(Provider):
 
     def __init__(self, name: str, config: dict[str, Any]):
         super().__init__(name, config)
-        self.base_url = str(config.get("baseUrl", "http://localhost:11434/v1")).rstrip("/")
+        self.base_url = str(
+            config.get("baseUrl", "https://api.openai.com/v1")
+        ).rstrip("/")
         key_env = config.get("apiKeyEnv")
         self.api_key = os.environ.get(key_env, "") if key_env else config.get("apiKey", "")
         self._caps: Capabilities | None = None
-        # Extra body fields for backends with useful non-standard knobs
-        # (vLLM's `top_k`, Ollama's `options`, OpenRouter's routing prefs).
+        # Extra body fields for endpoints with useful non-standard knobs
+        # (OpenRouter's routing preferences, a gateway's own extensions).
         self.extra_body: dict[str, Any] = config.get("extraBody", {}) or {}
         self.sampling = self._sampling_from(config)
 
@@ -68,11 +66,6 @@ class OpenAICompatProvider(Provider):
         ("presencePenalty", "presence_penalty", float),
         ("frequencyPenalty", "frequency_penalty", float),
     )
-
-    # Sent and silently discarded by Ollama's compatibility shim. vLLM, LM
-    # Studio and llama.cpp's server accept them, so they are worth sending —
-    # but on Ollama they belong in the Modelfile, and `diagnostics` says so.
-    _NOT_ON_OLLAMA = ("top_k", "min_p")
 
     @classmethod
     def _sampling_from(cls, config: dict[str, Any]) -> dict[str, Any]:
@@ -217,8 +210,7 @@ class OpenAICompatProvider(Provider):
                 f"on hidden reasoning and never began its answer, and asking it "
                 f"again with `reasoning_effort: none` did not help ({exc}). Raise "
                 "`maxOutputTokens` for this model, or turn thinking off with "
-                '`"extraBody": {"reasoning_effort": "none"}` — on Ollama, in the '
-                "Modelfile."
+                '`"extraBody": {"reasoning_effort": "none"}`.'
             ) from exc
 
         if not text.strip():
@@ -227,8 +219,7 @@ class OpenAICompatProvider(Provider):
                 "on hidden reasoning and never began its answer, and answered "
                 "with nothing when asked again without thinking. Raise "
                 "`maxOutputTokens` for this model, or turn thinking off with "
-                '`"extraBody": {"reasoning_effort": "none"}` — on Ollama, in the '
-                "Modelfile."
+                '`"extraBody": {"reasoning_effort": "none"}`.'
             )
         return data, (
             f"{self.model} spent its entire {max_tokens:,}-token output budget on "
@@ -239,6 +230,13 @@ class OpenAICompatProvider(Provider):
         )
 
     def capabilities(self) -> Capabilities:
+        """What this endpoint can do, from configuration.
+
+        No discovery. A hosted endpoint does not publish the window it will
+        serve, and the adapter that used to ask — Ollama's — is not a forge
+        backend any more. `contextWindow` is therefore the operator's number,
+        and `diagnostics` says so when it has been left at the default.
+        """
         if self._caps is not None:
             return self._caps
 
@@ -248,168 +246,21 @@ class OpenAICompatProvider(Provider):
             supports_temperature=bool(self.config.get("supportsTemperature", True)),
         )
         if not caps.context_window:
-            caps.context_window = self._discover_context_window() or 8192
+            caps.context_window = DEFAULT_CONTEXT_WINDOW
         self._caps = caps
         return caps
 
-    def _native_url(self) -> str | None:
-        """Ollama's native API root, if this endpoint looks like Ollama.
-
-        `/v1` is the compatibility prefix; the native API sits one level up.
-        Anything that is not Ollama simply fails the calls below, which is why
-        their failures are swallowed rather than raised.
-        """
-        if not self.base_url.endswith("/v1"):
-            return None
-        return self.base_url[: -len("/v1")]
-
-    def _ollama_context(self) -> dict[str, int]:
-        """What each Ollama source says this model's context is.
-
-        Two different numbers, and the difference is the whole point:
-
-        `served` is `num_ctx` of the instance actually loaded — the size of the
-        KV cache Ollama allocated, and the real ceiling on a request.
-
-        `trained` is the architectural maximum out of the GGUF metadata. It
-        describes the model, not the server, and Ollama will happily serve a
-        fraction of it: on one box `/api/show` reported 131072 while `/api/ps`
-        reported 32768, a 4x gap.
-
-        Believing `trained` defeats the budget gate. The gate exists to prove a
-        prompt fits before anything is spent, and it would have passed a 90k
-        prompt to a 32k server — where the front of it, meaning the system
-        prompt and the spec, is silently dropped. What comes back then looks
-        like a weak model rather than a truncated request.
-        """
-        native = self._native_url()
-        if native is None:
-            return {}
-
-        found: dict[str, int] = {}
-        entry = self._ollama_loaded()
-        if entry:
-            served = entry.get("context_length")
-            if isinstance(served, int) and served > 0:
-                found["served"] = served
-
-        info = self._ollama_show()
-        if not info:
-            return found
-        for key, value in (info.get("model_info") or {}).items():
-            if key.endswith(".context_length"):
-                try:
-                    found["trained"] = int(value)
-                except (TypeError, ValueError):
-                    pass
-                break
-        return found
-
-    @staticmethod
-    def _same_model(configured: str, reported: str | None) -> bool:
-        """Whether an `/api/ps` entry names the model this provider is configured for.
-
-        Ollama reports fully qualified names — `forge-exec:latest` — and config
-        almost always omits the tag, because that is how every `ollama run`
-        example writes it. Comparing the two exactly therefore never matches,
-        and the failure is silent in the worst possible way: the served window
-        is discarded, discovery falls back to the architectural maximum, and
-        the budget gate plans against 262,144 tokens for a server holding
-        32,768. What overflows is then truncated from the *front* — the system
-        prompt and the spec — so the model answers a question it was never
-        fully asked and reads as merely weak.
-        """
-        if not reported:
-            return False
-        return _tagged(configured) == _tagged(reported)
-
-    def _ollama_show(self) -> dict[str, Any]:
-        """`/api/show` for this model, or `{}` when it cannot be reached.
-
-        Carries the architectural window under `model_info` and the base
-        model's own `PARAMETER` lines under `parameters` — the recipe its
-        authors shipped, which a generated Modelfile should preserve rather
-        than replace with defaults.
-        """
-        native = self._native_url()
-        if native is None:
-            return {}
-        try:
-            info = post_json(
-                f"{native}/api/show",
-                {"model": self.model},
-                headers=self._headers(),
-                timeout=15,
-            )
-        except Exception:  # noqa: BLE001 - discovery is optional by design
-            return {}
-        return info if isinstance(info, dict) else {}
-
-    def _ollama_loaded(self) -> dict[str, Any]:
-        """This model's entry in `/api/ps`, or `{}` if it is not resident."""
-        native = self._native_url()
-        if native is None:
-            return {}
-        try:
-            data = get_json(f"{native}/api/ps", headers=self._headers(), timeout=10)
-        except Exception:  # noqa: BLE001
-            return {}
-        if not isinstance(data, dict):
-            return {}
-        for entry in data.get("models") or []:
-            if not isinstance(entry, dict):
-                continue
-            if self._same_model(self.model, entry.get("name")) or self._same_model(
-                self.model, entry.get("model")
-            ):
-                return entry
-        return {}
-
-    def _discover_context_window(self) -> int | None:
-        """The window to plan against: what is served, not what is possible.
-
-        Falls back to the architectural figure only when the model is not
-        loaded and there is nothing better to go on — a guess that is too large
-        is still better than the 8192 default for a model that can do far more,
-        and `forge doctor` says so out loud when the two disagree.
-        """
-        found = self._ollama_context()
-        return found.get("served") or found.get("trained") or None
-
     def diagnostics(self) -> list[str]:
         caps = self.capabilities()
-        found = self._ollama_context()
         warnings: list[str] = self.timeout_notes()
 
-        # Measured, not assumed: against Ollama 0.32, `top_p 0.01` collapses
-        # six samples to one and `top_k 1` leaves all six distinct. The shim
-        # accepts both and applies only the OpenAI-standard ones, so a knob set
-        # here in good faith does nothing and says nothing.
-        dropped = [k for k in self._NOT_ON_OLLAMA if k in self.sampling]
-        if dropped and self._native_url() and self._ollama_context():
+        if not int(self.config.get("contextWindow", 0) or 0):
             warnings.append(
-                f"{', '.join(dropped)} set, but Ollama's OpenAI endpoint ignores "
-                f"{'them' if len(dropped) > 1 else 'it'}. Put "
-                f"{'those' if len(dropped) > 1 else 'that'} in the Modelfile "
-                f"(`PARAMETER {dropped[0]} …`) instead, or they have no effect."
-            )
-
-        served = found.get("served")
-        if served and caps.context_window > served:
-            warnings.append(
-                f"context window is set to {caps.context_window:,} but the server "
-                f"is serving {served:,}. Prompts between the two will be accepted "
-                f"here and silently truncated there, dropping the start of the "
-                f"prompt — the system message and the spec. Set contextWindow to "
-                f"{served:,}, or raise num_ctx on the server."
-            )
-
-        trained = found.get("trained")
-        if served and trained and trained > served:
-            warnings.append(
-                f"note: this model was trained for {trained:,} but Ollama loaded "
-                f"it with num_ctx={served:,}. Raise OLLAMA_CONTEXT_LENGTH or the "
-                f"Modelfile to use the rest."
+                f"contextWindow is not set, so the budget gate is planning "
+                f"against {DEFAULT_CONTEXT_WINDOW:,} tokens. Nothing here can "
+                f"ask the endpoint what it will actually serve, and every "
+                f"model worth pointing forge at has more than this — set it "
+                f"from the model's documented window."
             )
 
         # Output reserve comes straight off the input budget, so what matters
@@ -429,22 +280,14 @@ class OpenAICompatProvider(Provider):
                     else ". A ticket with more than one reference file will not fit."
                 )
             )
-
-        entry = self._ollama_loaded()
-        total, in_vram = entry.get("size") or 0, entry.get("size_vram") or 0
-        if total and in_vram < total:
-            share = 100 * in_vram / total
-            warnings.append(
-                f"only {share:.0f}% of {total / 2**30:.1f} GiB is in VRAM; the rest "
-                f"runs on CPU. It will work, several times slower — a smaller "
-                f"quantization or a lower num_ctx would keep it resident."
-            )
         return warnings
 
 
 # Every server spells the field differently, and none of them are in the spec:
-# Ollama says `reasoning`, DeepSeek and vLLM say `reasoning_content`, and some
-# builds nest the text under a dict rather than returning it flat.
+# llama.cpp and DeepSeek say `reasoning_content`, others say `reasoning`, and
+# some builds nest the text under a dict rather than returning it flat. Kept in
+# the shared class because `llamacpp` needs it too — a thinking model that
+# never begins its answer is the failure this backend sees most.
 _REASONING_KEYS = ("reasoning", "reasoning_content")
 
 

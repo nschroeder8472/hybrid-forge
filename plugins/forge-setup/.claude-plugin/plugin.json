@@ -11,7 +11,7 @@
     "onboarding",
     "local-llm",
     "bring-your-own-model",
-    "ollama",
-    "vllm"
+    "llama.cpp",
+    "gguf"
   ]
 }

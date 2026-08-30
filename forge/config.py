@@ -9,8 +9,8 @@ second-guessing an OpenAI executor — with no code change.
 ```json
 {
   "models": {
-    "local":  {"kind": "openai",     "baseUrl": "http://forge:11434/v1",
-               "model": "qwen3.6:35b-a3b", "contextWindow": 32768},
+    "local":  {"kind": "llamacpp",   "baseUrl": "http://forge:8080/v1",
+               "model": "qwen3.8", "contextWindow": 65536},
     "claude": {"kind": "claude-cli", "model": "opus",
                "rateLimit": {"tokensPerWindow": 0, "costPerWindow": 0,
                              "windowSeconds": 18000}}
@@ -823,9 +823,10 @@ class LoopSettings:
     # opening position; putting it last makes it a rebuttal.
     #
     # It also decides how often the models change. On a backend that serves one
-    # checkpoint at a time — `llamacpp` with `exclusive`, or `freetoken` — two
-    # roles sharing a model are free if they are adjacent and cost a reload if
-    # they are not. Measured on one box: a swap is 20-35s, so the default order
+    # checkpoint at a time — `llamacpp` with `exclusive`, or the router started
+    # with `--models-max 1` — two roles sharing a model are free if they are
+    # adjacent and cost a reload if they are not. Measured on one box with a
+    # warm page cache, a swap is 6-10s, so the default order
     # against a two-model config costs two swaps a pass where an order grouped
     # by model costs one, and leaves the right checkpoint resident for the
     # build that follows.
@@ -1478,19 +1479,19 @@ class Config:
 
 
 def default_config(root: Path) -> Config:
-    """A starting config that runs entirely against a local Ollama.
+    """A starting config that runs entirely against a local llama.cpp router.
 
-    Deliberately single-model: it works the moment Ollama is up, and the user
-    can promote Claude into the planner and reviewer roles once they decide
-    what they want reviewing their diffs.
+    Deliberately single-model: it works the moment `llama-server` is up in
+    router mode, and the user can promote Claude into the planner and reviewer
+    roles once they decide what they want reviewing their diffs.
     """
     return Config(
         root=root,
         models={
             "local": {
-                "kind": "openai",
-                "baseUrl": "http://localhost:11434/v1",
-                "model": "qwen3.6:35b-a3b",
+                "kind": "llamacpp",
+                "baseUrl": "http://127.0.0.1:8080/v1",
+                "model": "qwen3.8",
                 "maxOutputTokens": 8192,
             }
         },

@@ -1,23 +1,37 @@
 services:
-  ollama:
-    image: ollama/ollama:latest
-    container_name: forge-ollama
+  llamacpp:
+    # The CUDA image. Vulkan will run, and on a 5090 with a 30B A3B MoE at
+    # Q4_K_M it measured 16 tok/s against 353 tok/s on CUDA — the difference
+    # between a run that finishes overnight and one that does not.
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: forge-llamacpp
     restart: unless-stopped
     # Host networking so the container can bind directly to a host interface.
-    # With this mode `ports:` is ignored — OLLAMA_HOST controls the bind address.
+    # With this mode `ports:` is ignored — --host controls the bind address.
     network_mode: host
-    environment:
-      # Bind to one specific interface. Ollama has no authentication; 0.0.0.0
-      # would publish an open inference endpoint to every network this host is
-      # attached to.
-      OLLAMA_HOST: "${BIND_ADDR}:11434"
-      # Keep weights resident between tickets. Without this every delegation
-      # after an idle gap pays a cold load of ~20GB from disk.
-      OLLAMA_KEEP_ALIVE: "${OLLAMA_KEEP_ALIVE:-30m}"
+    # Router mode. --models-preset reads the INI `forge models` writes: one
+    # section per model id, one child server spawned per section on an
+    # ephemeral port, proxied by id. That is what lets the loop alternate
+    # roles across checkpoints on a single endpoint.
+    #
+    # --models-max 1 keeps one checkpoint resident at a time. Raise it only if
+    # every model in the preset fits in VRAM together; the role that finds out
+    # otherwise is the one whose child server exits mid-run.
+    #
+    # Bind to one specific interface. llama-server has no authentication;
+    # 0.0.0.0 would publish an open inference endpoint to every network this
+    # host is attached to.
+    command: >
+      --host ${BIND_ADDR}
+      --port ${LLAMA_PORT:-8080}
+      --models-preset /presets/llamacpp.ini
+      --models-max ${LLAMA_MODELS_MAX:-1}
     volumes:
       # Weights live on the host filesystem, not in an image layer. Read
       # directly off NVMe, survive every teardown, and keep the image small.
-      - ollama-models:/root/.ollama
+      - "${MODELS_DIR}:/models:ro"
+      # The generated preset, from the project's .hybridforge/models/.
+      - "${PRESET_DIR}:/presets:ro"
     deploy:
       resources:
         reservations:
@@ -26,11 +40,14 @@ services:
               count: 1
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      # The router answers /health without holding a model, so this reports the
+      # router being up rather than any checkpoint being loaded — which is what
+      # you want, since forge loads them on demand.
+      test: ["CMD-SHELL", "curl -fsS http://${BIND_ADDR}:${LLAMA_PORT:-8080}/health >/dev/null || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 30s
 
   # MemPalace's default CMD is `mcp` — the MCP server over stdio, which is what
   # the daemon drives. That makes it a child process, not a service: a stdio
@@ -69,8 +86,6 @@ services:
       - mempalace-data:/data
 
 volumes:
-  ollama-models:
-    driver: local
   mempalace-data:
     # Named explicitly, against Compose's default of prefixing the project
     # directory. Two reasons, both about the palace outliving this checkout:
