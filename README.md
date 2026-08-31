@@ -9,6 +9,53 @@ The point is not to replace Claude with a local model. It is to spend expensive
 reasoning tokens on the parts that need reasoning, and let a cheaper model
 absorb the token-heavy bulk generation for the cost of electricity.
 
+## Measured throughput
+
+Four runs against one repository, on two local models sharing a single 32 GB
+card. Every figure is read from that project's `run.db`.
+
+| Run | Backlog | Tickets | Attempts | Model calls | Tokens | Wall clock |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | TypeScript port of a Godot level format | 9 | 18 | 169 | 3.00 M | 5 h 32 m |
+| 2 | Canvas view for that format | 5 | 10 | 86 | 2.27 M | 2 h 00 m |
+| 3 | Defects found reviewing run 2 | 3 | 3 | 54 | 1.13 M | 57 m |
+| 4 | The one ticket run 3 could not place | 1 | 1 | 13 | 0.33 M | 15 m |
+| | **Total** | **18** | **32** | **322** | **6.73 M** | **8 h 44 m** |
+
+8 of the 18 tickets passed on their first attempt. The longest uninterrupted
+run was 5 h 32 m.
+
+Delivered by those runs and present in the repository now:
+
+| | |
+|---:|---|
+| 34 | TypeScript files |
+| 1,236 | lines of source |
+| 2,213 | lines of tests |
+| 184 | tests passing |
+| 4 / 4 | verify commands exiting 0 (`lint`, `typecheck`, `typecheck:browser`, `test`) |
+
+1 of those 34 files was edited by hand, between run 2 and run 3: 5 tests removed
+from one file. They were there because run 2's spec put "the test command exits
+0" on every ticket — a criterion the harness already settles — and the tester
+encoded it the only way a criterion can be encoded, as tests that shell out to
+run the commands. Reviewing run 2 found it, the tests were removed, and the rule
+is now enforced where it was broken: the tester is told the harness runs those
+commands, and `/forge-spec-check` reports the criterion at authoring time. Runs
+3 and 4 were specified without it and needed no such edit.
+
+Run 4 is the same shape one step further. Run 3 left one ticket parked because
+its spec named no test file, so the tester's output landed outside the ticket's
+own scope where the executor could not repair it — and because its criteria
+asserted things about a DOM entry point that no test in the project can reach.
+Both are now reported before a run starts, by `forge ingest` and by
+`/forge-spec-check`. Respecified against what a test can actually assert, the
+same work landed in one attempt.
+
+Two earlier runs are excluded from the table. Both stopped for causes since
+fixed, so neither describes what the loop does now:
+[docs/CANVAS-POSTMORTEM.md](docs/CANVAS-POSTMORTEM.md).
+
 ## The loop is not a conversation
 
 The orchestrator is a Python daemon that owns the state machine and reads its
@@ -22,7 +69,7 @@ were holding the plan.
 ```
 forged (daemon)
  ├─ state: .hybridforge/run.db
- ├─ RATIFY   every role signs off on the ticket first (off by default)
+ ├─ RATIFY   every role signs off on the ticket before it is built
  ├─ BUILD    executor writes the implementation against the spec
  ├─ APPLY    edits land on disk; anything outside scope is rejected
  ├─ TESTS    tester encodes the ticket's criteria — never its own
@@ -69,6 +116,43 @@ GPU's compute capability, and verifies the download against the SHA-256 GitHub
 published for it before unpacking. The same checkpoint measured 16 tok/s on a
 Vulkan build and 353 on CUDA, and nothing reports the slow path — see
 [docs/LLAMA-PACKAGING.md](docs/LLAMA-PACKAGING.md).
+
+### Two models that work
+
+A pairing that has run this loop end to end, on a single 32 GB card. It is one
+machine and one project rather than a benchmark, so take it as a starting point
+that is known to work rather than as the answer:
+
+| Role | Checkpoint | Why this one |
+|---|---|---|
+| `planner`, `reviewer` | **Nemotron-3-Nano-Omni-30B-A3B-Reasoning**, Q4_K_M | An A3B MoE: 30B of weights, ~3B active, so it reads a long ticket and a long diff at around 150 tok/s. Planning and review are the roles that read the most and write the least, which is exactly what a sparse model is cheap at |
+| `executor`, `tester` | **Qwen3.8-27B**, UD-Q4_K_M | Dense, ~40 tok/s, and the executor emits whole files — the role where being right per token beats being fast per token. It is the half of the run worth spending the slower model on |
+
+Both at `ctx-size = 131072`, both `exclusive`, `--models-max 1`. They do not
+co-reside: about 25 GiB resident each against 32 GB of VRAM, so the router
+swaps checkpoints as the loop alternates roles, and that swap is why
+`loop.ratifyOrder` is worth grouping by model — see `/forge-setup`.
+
+One run, for scale: five tickets, all landing, 120 minutes, 86 model calls and
+2.27M tokens — 1.10M in and 415K out through the executor pair, 545K in and
+210K out through the planner pair. All of it local, on electricity.
+
+**Set `reasoningBudget` on both, before the first run.** Neither of these is
+usable without it. Unbounded, the Nemotron spent an entire 32,768-token output
+budget on hidden reasoning and never began its answer — forge notices, throws
+the call away and retries with thinking off, at a cost of roughly 93 seconds of
+wasted generation per planner and reviewer call. 8,192 for the Nemotron and
+6,144 for the Qwen leave both room to answer. The budget is one number per
+checkpoint, so size it against the *smaller* of the two output budgets the
+roles sharing it are given.
+
+Two smaller things that cost a run each if missed. Nemotron's "Omni" is
+multimodal, and a preset generated from `--models-dir` loads the vision
+projector beside a text-only checkpoint, spending VRAM no role here uses —
+`no-mmproj = true`. And the Qwen returns its `<think>` block inline in
+`content` rather than in `reasoning_content` depending on the chat template;
+forge strips it at the provider boundary, which is why it is worth knowing that
+a reply looking truncated in the logs may have been trimmed there.
 
 Adding a backend is one module and one registry line. Nothing in the loop, the
 budget gate, or the dashboard knows which kind it is talking to.
@@ -167,9 +251,11 @@ touches disk, and paths that escape the project root are refused outright.
 both the implementation and the test it is judged against will encode its bugs
 as passing tests.
 
-**Triage is not delegated.** A ticket routed `claude-only` is left for a human
-even if that stalls the backlog. Auth, concurrency, migrations, and public API
-surface stay with Claude.
+**Triage is not delegated.** A ticket routed `withheld:<reason>` is left for a
+human even if that stalls the backlog. The reason travels in the route —
+`withheld:security`, `withheld:concurrency`, `withheld:interface` — so a ticket
+parked in March still says in May what it was parked for. Auth, concurrency,
+migrations, and public API surface stay with a person.
 
 **A bug is never fixed on faith.** `forge bug` writes a test that asserts the
 correct behavior and requires it to *fail* before any fix is attempted. A fault
@@ -207,10 +293,23 @@ forge bug "<report>"        # reproduce a bug, then fix it
 forge toolchain             # what tests each language; set up what nothing does
 forge criteria [ID --accept N]
                             # adopt a criterion the loop proposed and refused
+forge advise <ID> "<note>"  # a note the planner and executor read next pass
+forge release <ID> "<why>"  # hand a withheld ticket back to the executor
+forge discharge <ID>        # mark a withheld ticket done — you wrote the code
+forge models                # write the llama.cpp preset from your config
+forge llama [status|install|list]
+                            # fetch or inspect the pinned llama.cpp build
+forge replay                # re-read a past run's output with today's parsers
+forge prune                 # delete the artifact trees of old runs
 forge pause | resume | stop # applied after the current step, never mid-patch
 forge ui                    # dashboard without running the loop
 forge ui --host IP --port N # bind it elsewhere, this run only (no auth!)
 ```
+
+`advise`, `release` and `discharge` are the return channel: a run that parks a
+ticket can be answered without restarting it, and a ticket you implemented by
+hand can be closed without pretending the loop did it. See
+[docs/HANDBACK.md](docs/HANDBACK.md).
 
 Two Claude Code plugins sit beside the CLI rather than wrapping it. **Forge
 Setup** (`/forge-setup`) handles the cold start — install check, endpoint
@@ -261,9 +360,14 @@ an overnight run never started.
 reproduce a fault before it is allowed to fix it, and what it refuses to do when
 it cannot.
 
+[docs/CANVAS-POSTMORTEM.md](docs/CANVAS-POSTMORTEM.md) is the shortest way to
+see what this loop's failures actually look like: a backlog that parked without
+writing a line because the parser dropped three fifths of its criteria, and the
+run after it that went green while deleting the project's dependencies.
+
 [docs/LOOP-INVARIANTS.md](docs/LOOP-INVARIANTS.md) is the one to read before
-adding a step, a role, or any check that attributes blame. Nine rules that hold
-across the whole harness — read scope versus write scope, why an anchor the loop
+adding a step, a role, or any check that attributes blame. Eighteen rules that
+hold across the whole harness — read scope versus write scope, why an anchor the loop
 wrote is not an anchor, why attribution must come from diagnostic blocks and
 never from raw output. Each was learned by breaking it.
 
@@ -285,7 +389,14 @@ forge/memory.py           MCP client for project memory (read + guarded write)
 forge/secrets.py          credential detection for anything about to be persisted
 forge/ingest.py           outside spec/plan -> backlog
 forge/patch.py            model output -> file writes, with scope enforcement
+forge/manifests.py        what a build manifest declared before a rewrite
 forge/prompts.py          per-role prompts (a contract the parsers depend on)
+forge/ratify.py           the pre-build sign-off pass
+forge/respec.py           revising a ticket from why it failed
+forge/routes.py           delegate vs withheld:<reason>, and what withheld means
+forge/evidence.py         which files a ticket may read
+forge/llama.py            fetching and verifying the pinned llama.cpp build
+forge/presets.py          config -> the llama.cpp router preset
 forge/wizard.py           interactive `forge init` — asks, probes, never hangs
 forge/toolchain.py        reads the repo's CI/docs to find its verify commands
 forge/profile.py          machine-level endpoints, reused by the next repo

@@ -19,6 +19,11 @@ that decides whether a language is covered fails **open**.
 
 The run failed for four independent reasons. Ordered by what unblocks what.
 
+A later run against the same repository is written up in
+[CANVAS-POSTMORTEM.md](CANVAS-POSTMORTEM.md): a different set of causes, and the
+first one where the loop damaged a correct spec rather than being handed a bad
+one.
+
 ---
 
 ## 1. The catch-all coverage rule is fail-open

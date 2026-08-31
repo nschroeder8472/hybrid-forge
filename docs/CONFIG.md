@@ -738,10 +738,10 @@ run some context, never the run.
 
 | Key | Default | What it changes |
 |---|---|---|
-| `maxAttempts` | `3` | Rework attempts per ticket before it parks as blocked. Past three the failure is usually a spec problem no amount of retrying fixes. |
+| `maxAttempts` | `5` | Rework attempts per ticket before it parks as blocked. Three absorbs a lint error and a shallow test failure; five also absorbs the one a local executor actually produces, which is a correct implementation arriving in a shape the parser cannot read — an attempt spent teaching the ticket nothing. Past five the failure is a spec problem no amount of retrying fixes, and `retryCycles` with a respec between cycles is the tool for that rather than more attempts against the same words. |
 | `autoCommit` | `false` | Commit each verified ticket. Off so the first unattended runs leave their work in the tree for you to read. |
 | `stopOnBlocked` | `false` | Stop the whole run when a ticket blocks, instead of moving on. On means a blocker gets attention; off means the backlog keeps making progress elsewhere. |
-| `retryCycles` | `0` | Whole-backlog retry cycles after a run ends anything but done. `0` hands back to a human, `-1` keeps going until the backlog is clean or you stop it. Anything below `-1` is a typo and is rejected. |
+| `retryCycles` | `-1` | Whole-backlog retry cycles after a run ends anything but done. `-1` keeps going until the backlog is clean or you stop it; `0` hands back to a human after the first pass. Anything below `-1` is a typo and is rejected.<br><br>`-1` is the default only because a cycle can now be *measured* rather than counted: `flatCycles` ends the retries when a cycle fails in exactly the way the one before it did, so an unattended run converges or stops on its own. Both have been observed — one backlog stopped itself after a single repeated cycle, and the next landed a ticket on the cycle after the one that gave up on it. **If you turn `flatCycles` off, set this back to `0` or a small number in the same edit**: without the detector this is the 18-hour run in [CONVERGENCE](CONVERGENCE.md). |
 | `respecOnRetry` | `true` | Have the planner rewrite each requeued ticket from why it failed before the next cycle. A cycle that re-runs the spec which already failed is a slower version of the same failure. |
 | `respecCriteria` | `false` | Let a respec rewrite the acceptance criteria too, and let ratification *add* them. Off: the party being judged does not write the standard it is judged against. Left on, one ticket's criteria drifted until they asserted the opposite of what its author wrote — and a ratify pass grew a ten-criterion ticket to fourteen, inventing a hash value it had no way to compute. |
 | `reopenStaleDependents` | `true` | Re-open a ticket that passed on top of a dependency a respec has since rewritten — its `done` was earned against a contract that no longer exists. Can re-open a lot of a backlog after one respec; turn it off to be warned instead. |
@@ -754,7 +754,7 @@ run some context, never the run.
 | `baselineVerify` | `true` | Run the verify commands once before each ticket, so breakage that was already there is not blamed on whichever ticket ran next. Turn off only when a full suite is slow enough that paying it per ticket costs more than the attempts it saves. |
 | `bugHypotheses` | `3` | How many explanations a `forge bug` ticket may go through before it parks. The first is the planner's reading of the report; each one after it is a re-diagnosis, asked for when the reproduction could not be written — a test that passes against the named code has *disproved* that reading, and disproof is evidence rather than a dead end. `1` parks on the first wrong guess. See [BUG-LOOP.md](BUG-LOOP.md). |
 | `executorTurns` | `4` | Replay this many prior attempts to the executor as real conversation turns — its own reply as an `assistant` message, the failure that followed as the next `user` one. `0` restores the flat single-message prompt, in which the executor reads its own previous work as somebody else's. See [SETUP](SETUP.md#thinking-models-answer-last) for the trade and [CONVERGENCE](CONVERGENCE.md) for what the flat shape cost on a long backlog. |
-| `innerTurns` | `0` (off) | How many times a compile failure may go straight back to the executor without spending an attempt. Between apply and the tests step the loop runs the `lint` and `typecheck` commands it was going to run at verify anyway; a failure there can only be the executor's own, so the reply goes back on the same conversation thread against the same contract, and the tester is not asked to write assertions for something that does not compile. Never `test` — a red suite may be the tester's assertion rather than the executor's code, and the executor cannot edit that file to find out. A turn is spent only while the error count is falling; when it stops, the attempt is charged and the ordinary path resumes. Off because it changes how attempts are counted, and every convergence rule in the loop is written against that number. Measured on one ticket: `typecheck` averaged 0.7s against the tester's 12.0s, and 58 of its 95 cycles wrote a test file for an implementation that then failed to compile. See [CONVERGENCE](CONVERGENCE.md). |
+| `innerTurns` | `3` | How many times a compile failure may go straight back to the executor without spending an attempt. Between apply and the tests step the loop runs the `lint` and `typecheck` commands it was going to run at verify anyway; a failure there can only be the executor's own, so the reply goes back on the same conversation thread against the same contract, and the tester is not asked to write assertions for something that does not compile. Never `test` — a red suite may be the tester's assertion rather than the executor's code, and the executor cannot edit that file to find out. A turn is spent only while the error count is falling; when it stops, the attempt is charged and the ordinary path resumes. It shipped off because it changes how attempts are counted, and every convergence rule in the loop is written against that number; the measurement is what moved it. On one ticket `typecheck` averaged 0.7s against the tester's 12.0s, and 58 of its 95 cycles wrote a test file for an implementation that then failed to compile. Set `0` to restore the older accounting. See [CONVERGENCE](CONVERGENCE.md). |
 | `toolchainContext` | `true` | Show the executor and tester the linter, compiler and test-runner settings that grade what they write — the real files at their real paths, resolved per language from the ticket's own scope and clipped. They are measured by `commands.lint` and `commands.typecheck` and were otherwise never shown what those enforce, so they inferred it from failures. Costs a few hundred characters a call, and the budget gate drops it first. See [CONVERGENCE](CONVERGENCE.md). |
 | `priorFailures` | `8` | Earlier failures carried into the executor's prompt alongside the newest one, deduplicated by failure *class* — `(step, error code, file)`, line numbers and quoted values masked — rather than by raw text. Keyed by text this window held one mistake repeated, not several distinct ones. See [CONVERGENCE](CONVERGENCE.md). |
 | `learnedLimit` | `12` | How many of a ticket's accumulated learnings reach a prompt, commonest first. A learning is a fact about *this repository* that an earlier attempt established — a compiler flag, an import convention — recorded by respec so the loop stops rediscovering it. It is not a bar: the reviewer is not shown it and no criterion is made from it. `0` renders none. See [CONVERGENCE](CONVERGENCE.md). |
@@ -921,10 +921,10 @@ the reviewer to it is a one-line edit in `roles`.
     "dryRun": true
   },
   "loop": {
-    "maxAttempts": 3,
+    "maxAttempts": 5,
     "autoCommit": false,
     "stopOnBlocked": false,
-    "retryCycles": 2,
+    "retryCycles": -1,
     "respecOnRetry": true,
     "respecCriteria": false,
     "reopenStaleDependents": true,
@@ -937,7 +937,7 @@ the reviewer to it is a one-line edit in `roles`.
     "baselineVerify": true,
     "bugHypotheses": 3,
     "executorTurns": 4,
-    "innerTurns": 0,
+    "innerTurns": 3,
     "toolchainContext": true,
     "priorFailures": 8,
     "learnedLimit": 12,

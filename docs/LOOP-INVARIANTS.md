@@ -756,6 +756,55 @@ kind cost fifteen tickets.
 
 ---
 
+## 18. A declaration deleted by a whole-file rewrite is invisible to verification
+
+The executor returns whole files. That is what makes its output parseable
+without a diff format, and it is also the one edit shape that can delete
+something by omission: a file reproduced from memory comes back missing
+whatever the model did not think to copy.
+
+Most of the time something downstream notices. The exception is a build
+manifest, and the reason is structural: **verification runs where the
+dependencies are already installed.** They have to be, or the commands could
+not run at all. So a `package.json` that lost its `devDependencies` passes
+lint, typecheck and the whole suite exactly as it did before.
+
+One run lost six of them out of a ticket that was adding two scripts. Every
+command exited 0, the reviewer read a diff that added what the ticket asked
+for, the ticket was recorded `done`, and on a clean checkout `npm ci` installed
+one package and every command in the project failed to start. Each of those
+tickets carried the criterion "lint, typecheck and test all exit 0" — true on
+the machine that verified it and false everywhere else.
+
+`forge/manifests.py` reads the manifest before `apply_edits` writes over it and
+compares what it declares afterwards. Before, not from git: a manifest an
+earlier attempt on the same ticket already rewrote has no clean version left to
+diff against.
+
+**Names, never versions.** A ticket that bumps or loosens a constraint is doing
+ordinary work. A ticket that drops the entry is not, and the difference is the
+whole check.
+
+**An unreadable manifest reports nothing.** A syntax error is a defect the
+language's own tooling describes far better than this can, and reading it as
+"declares nothing" would turn every such failure into a dropped-dependency
+complaint pointing at the wrong file. The same silence covers a TOML manifest
+on Python 3.10, which has no TOML reader in the standard library.
+
+**It fails the attempt rather than parking the ticket.** The fix is the
+smallest there is — the executor emits whole files and has to send the block
+back — and the guidance names the lost entries so it does not have to
+reconstruct them from the memory that lost them.
+
+The general rule this is one instance of: **a check that runs in an environment
+the deletion does not affect cannot see the deletion.** The same shape exists
+for anything else a whole-file rewrite can drop silently — a barrel module's
+re-exports, an ignore file's entries, a CI matrix leg. Only the manifest case is
+enforced, because only there is the invariant mechanical enough to compute
+without guessing.
+
+---
+
 ## What is bug-loop-specific and what is not
 
 | Mechanism | Scope |

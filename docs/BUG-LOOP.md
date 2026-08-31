@@ -320,9 +320,12 @@ how many runs were left untouched.
 wall-clock time, and a fresh clock per run would let three runs spend three
 times the cap.
 
-A bug whose scope touches a `neverDelegate` path is routed `claude-only` and
-left for a person, on the same reasoning that governs the build loop: a defect
-in code the project marked off-limits is exactly the kind that wants a human.
+A bug whose scope touches a `neverDelegate` path is routed
+`withheld:never-delegate` and left for a person, on the same reasoning that
+governs the build loop: a defect in code the project marked off-limits is
+exactly the kind that wants a human. That reason is the one the harness can
+prove — a glob matched — which is why it is spelled out rather than left as
+`unspecified`.
 
 ---
 

@@ -31,7 +31,7 @@ overlap this document heavily.
 | §7 Rule promotion | **The recurrence-gated form was built, measured against this run's own data, and reverted** — Feature 5. Its motivating case is now served by Feature 1 (toolchain context) and Feature 6 (conventions to memory from parked tickets). See §7. |
 | §8.1 Criteria drift audit | **Built, and stricter than specified.** `original_spec`, `original_criteria` and `original_context` are frozen at ticket creation; `Ticket.contract_criteria` is what a revision may not walk back; `loop.respecCriteria` defaults `false`. Completion is not verified against the frozen criteria — that half is still owed. |
 | §8.2 Signer participation | **The data exists, the counter does not.** `ratify_notes` records `{role, signed, blocking, suggestions}` per pass per ticket. Nothing aggregates it. |
-| §8.3 Sign-off efficacy | **Not built.** Ratification runs (`loop.ratifyPasses`, default 2) and nothing measures whether it caught anything. |
+| §8.3 Sign-off efficacy | **Not built.** Ratification runs (`loop.ratifyPasses`, default 2) and nothing measures whether it caught anything. One run has since been read by hand — 3 of 5 tickets changed by the pass before any code existed, and one role that had signed off on nothing across 16 earlier passes — but reading a run by hand is what this section exists to replace. See [RATIFY.md](RATIFY.md). |
 | §9 Plan-time prediction | **Not built. Its substrate now exists.** |
 | §10 Telemetry | **Mostly built.** `steps.classes`, `tickets.cycle_classes`, `cycle_mark`, `flat_cycles`, `tests_fingerprint`, `abandoned_values`, `impossible_fingerprint`, plus the `usage` table. |
 | §11 Thresholds | **Renamed.** See §11 for the mapping to real config keys. |
@@ -575,7 +575,7 @@ Existing keys this document depends on, at their shipped defaults:
 
 | Key | Default | The draft's name |
 | --- | --- | --- |
-| `loop.maxAttempts` | `3` | — |
+| `loop.maxAttempts` | `5` | — |
 | `loop.retryCycles` | `2` | — |
 | `loop.priorFailures` | `8` | part of the ledger |
 | `loop.learnedLimit` | `12` | part of the ledger |

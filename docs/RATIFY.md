@@ -163,12 +163,13 @@ revision should see the same.
 ## Cost
 
 Ratification is `roles × passes` model calls per ticket, plus up to
-`passes - 1` planner revisions. At the default four roles and two passes that
-is ten calls before a line is written, one of them on the reviewer — which is
-roughly 100% of the money on a hybrid run.
+`passes - 1` planner revisions. At the default four roles and two passes that is
+nine calls before a line is written — eight sign-offs and one revision — two of
+them on the reviewer, which is roughly 100% of the money on a hybrid run.
 
-That is why the default is `0`. The knob is the number of passes, and `0` means
-the feature is off entirely: no calls, no steps, no change to any existing run.
+The knob is the number of passes. `0` turns the feature off entirely: no calls,
+no steps, no change to any existing run. That is the setting for a backlog you
+have already vetted by hand.
 
 ---
 
@@ -187,11 +188,53 @@ told — is one the loop has actually produced, repeatedly. The failure it risks
 is a reviewer anchored on a contract it helped write. Both are real; only the
 first has been observed.
 
-**Still no evidence about ratification itself, and it is now on by default.**
-That tension is deliberate and worth stating plainly. Every claim above about
-what ratification improves is still derived from reading the loop rather than
-from watching it run; Section 9 of
+**One role signed off on nothing for sixteen passes, and nobody noticed.**
+Across the two Puzzle-Path runs of 2026-08-28/30 the reviewer blocked in 11 of
+16 sign-off passes and signed zero. Every objection was the same shape:
+
+> Cannot verify the numeric acceptance criteria without seeing the actual diff.
+
+`RATIFY_SIGNOFF_SYSTEM` bans that objection in a dedicated paragraph, and the
+model raised it anyway — because the question it was being asked invited it.
+`RATIFY_QUESTIONS["reviewer"]` said *"name any criterion you could not settle by
+reading a change — one needing the code run"*, and almost every backlog ends its
+criteria with "lint, typecheck and test all exit 0", which genuinely does need
+the code run. The reviewer answered correctly and was blocked from agreeing
+every time.
+
+The effect was not cosmetic. `resolve` counts votes, so a role that can never
+sign turns a four-way pass into a three-way one and moves `unanimous` out of
+reach permanently. PF-011 parked at 1 of 4 with the reviewer holding one of the
+three refusals.
+
+The question now states what the harness settles: verification runs before
+review and review only happens on a tree where it passed, so a criterion about a
+command exiting cleanly is already decided and the reviewer signs off on it. In
+the next run the reviewer signed 8 of 8.
+
+Two parser defects were fixed alongside it, both of which fed the sign-off pass
+text nobody wrote. A reply whose chain of thought arrived inline in `content` —
+llama.cpp does this depending on the chat template — was parsed as the answer,
+so an executor rehearsing the required format inside its own reasoning had the
+prompt's placeholders (`...`, `(one line each, or NONE)`) recorded as blocking
+objections. Reasoning is now stripped at the provider boundary, only the last
+`SIGNOFF:` in a reply is read, and repeated points are counted once.
+
+**The evidence about what ratification catches is still thin, and it is on by
+default.** That tension is deliberate and worth stating plainly. Most claims
+above about what ratification improves are still derived from reading the loop
+rather than from watching it run; Section 9 of
 [LOOP-INVARIANTS.md](LOOP-INVARIANTS.md) exists to distrust exactly that.
+
+What one run now shows: of five tickets, three were changed by the pass before
+any code existed. PF-012's executor named a fixture the ticket had to render and
+had not been given; PF-014's planner, executor and tester all refused a
+criterion calling a function with an argument shape the spec never defined;
+PF-015's executor and tester refused a spec that left the emitted command kinds
+open. All three went unanimous on the second pass and all five tickets landed.
+That is one uncontrolled run and it is not the comparison this section keeps
+asking for — but it is the first direct observation that the pass changes
+tickets rather than merely costing calls.
 
 What changed is not the evidence for this pass, it is the evidence for the
 problem. The Puzzle-Path run of 2026-08-22/23 handed the loop two tickets no
@@ -201,9 +244,9 @@ and with `ratifyPasses: 0` the loop had no moment at which anyone was asked
 whether the ticket was buildable. They cost 650 attempts, 16.6M tokens, and
 about 16 hours. See [CONVERGENCE.md](CONVERGENCE.md).
 
-Eight calls per ticket against that is a defensible default even without
-knowing how well the pass performs, because the alternative is not "cheaper",
-it is "no check at all". The evidence still owed is the one this section always
-asked for: the same backlog run twice, `ratifyPasses: 0` and `ratifyPasses: 2`,
-compared. Until that exists, treat the default as a judgement about the cost of
-the failure rather than a measurement of the fix.
+Nine calls per ticket against that is a defensible default even without knowing
+how well the pass performs, because the alternative is not "cheaper", it is "no
+check at all". The evidence still owed is the one this section always asked for:
+the same backlog run twice, `ratifyPasses: 0` and `ratifyPasses: 2`, compared.
+Until that exists, treat the default as a judgement about the cost of the
+failure rather than a measurement of the fix.

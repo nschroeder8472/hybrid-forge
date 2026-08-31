@@ -675,8 +675,21 @@ python plugins/forge-spec/scripts/check_spec.py plan.md
 ```
 
 It reports whether ingest would parse or re-plan the document, which tickets it
-found, and the authoring mistakes that otherwise pass silently — a criterion
-wrapped onto a second line loses everything after the first.
+found, and the authoring mistakes that otherwise pass silently. Worth knowing
+before you write the draft rather than after:
+
+- **Wrap a long criterion, but indent the continuation.** Two spaces, which is
+  what every markdown formatter produces, and the lines are read as one. A
+  continuation written flush left is dropped, and the criterion reaches the
+  tester as its first line only — precise-looking and missing its own point.
+  One spec wrapped at 95 columns lost 31 of its 51 criteria that way.
+- **Leave the project's own commands out of the criteria.** The harness runs
+  lint, typecheck and the suite before anything is judged, so "`npm test` exits
+  0" is settled by the run. Written down, it becomes a test that shells out to
+  run the command — one backlog got a suite that invoked itself.
+- **A heading the parser does not know folds its bullets into the section
+  above.** A `## Notes` list between `Allowed files` and `Acceptance criteria`
+  becomes allowed files. Put free prose after `Context`.
 
 ### Read the backlog before running it
 
@@ -685,9 +698,10 @@ cat .hybridforge/tickets/*.md
 ```
 
 Two minutes here is the cheapest quality control available. You are looking for
-a ticket marked `(claude-only)` that got routed to the executor instead, and for
-acceptance criteria that do not describe what you actually wanted. Edit the
-files directly — that is enormously cheaper than discovering it three hours in.
+a ticket that should have been `withheld:<reason>` and got routed to the
+executor instead, and for acceptance criteria that do not describe what you
+actually wanted. Edit the files directly — that is enormously cheaper than
+discovering it three hours in.
 
 ### Go
 
