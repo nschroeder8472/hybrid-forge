@@ -32,6 +32,7 @@ from .base import (
     ProviderBadResponse,
     ProviderError,
     Usage,
+    strip_reasoning,
 )
 
 # What a hosted endpoint gets when nothing says otherwise. Every model worth
@@ -122,7 +123,10 @@ class OpenAICompatProvider(Provider):
         try:
             choice = data["choices"][0]
             message = choice["message"]
-            text = message["content"] or ""
+            # Here rather than in each parser: a reply that carries its own
+            # chain of thought in `content` is one reply shape, and every
+            # caller downstream wants the answer out of it.
+            text = strip_reasoning(message["content"] or "")
         except (KeyError, IndexError, TypeError) as exc:
             raise ProviderBadResponse(f"unexpected response shape: {str(data)[:400]}") from exc
 
@@ -141,7 +145,7 @@ class OpenAICompatProvider(Provider):
                 )
                 choice = data["choices"][0]
                 message = choice.get("message") or {}
-                text = message.get("content") or ""
+                text = strip_reasoning(message.get("content") or "")
                 finish_reason = choice.get("finish_reason") or "stop"
 
         raw_usage = data.get("usage") or {}

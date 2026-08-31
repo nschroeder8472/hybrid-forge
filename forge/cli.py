@@ -52,7 +52,7 @@ from .config import (
     normalize_workspace_root,
 )
 from .ingest import ingest as ingest_document
-from .ingest import undeclared_order, write_tickets
+from .ingest import undeclared_order, untestable_scope, write_tickets
 from .loop import (
     CONTROL_KEY,
     CONTROL_PAUSE,
@@ -668,6 +668,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         )
 
     _warn_missing_manifests(config, tickets)
+    _warn_untestable_scope(tickets)
 
     # Said after `derive_needs` has run, so a shared writable file has already
     # been ordered and is not what this is about.
@@ -1564,6 +1565,19 @@ def _warn_missing_manifests(config: Config, tickets: list) -> list[str]:
     if gaps:
         print("  Add the build file as a ticket of its own, before the ones that need it.")
     return gaps
+
+
+def _warn_untestable_scope(tickets: list) -> list[str]:
+    """Say which tickets have nowhere in scope to put the tests they will get.
+
+    At ingest for the same reason as the manifest gaps: adding the path to
+    `Allowed files` costs a line now and costs the ticket later. See
+    `ingest.untestable_scope`.
+    """
+    problems = untestable_scope(tickets)
+    for problem in problems:
+        print(f"\nwarning: {problem}")
+    return problems
 
 
 def _warn_uncovered(config: Config, paths: list[str]) -> list[str]:

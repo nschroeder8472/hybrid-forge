@@ -841,3 +841,53 @@ def laundered_assertions(text: str) -> list[str]:
                 found.append(f"{name} — defined as `{helpers[name]}` — in: {line[:120]}")
                 break
     return found
+
+
+# Test-file spelling, in any language. Kept here rather than on the orchestrator
+# because ingest asks it too — at author time, where a ticket with no writable
+# test path can still be fixed for free — and `loop` imports `ingest`, so the
+# answer cannot live in `loop` without the import going the wrong way.
+TEST_DIRS = frozenset({"test", "tests", "spec", "specs", "testing"})
+
+# snake_case and dotted conventions: pytest, go, rust, rspec, jest.
+# Case-insensitive because none of them depend on capitalisation.
+SNAKE_TEST = re.compile(r"^test_|_test$|_spec$|\.test$|\.spec$", re.IGNORECASE)
+
+# PascalCase conventions: JUnit, NUnit, xUnit, Kotest, ScalaTest.
+# Case-SENSITIVE, and the capital is the whole point — `VideoExtensionsTest`
+# is a test and `latest` is not, and lowercasing the two makes them the same
+# string. The preceding character must be lowercase or a digit so a word
+# merely *containing* the letters cannot qualify: `Testimonials` does not
+# end in `Test`, and `contest` has no capital to anchor on.
+CAMEL_TEST = re.compile(r"(?:^|[a-z0-9])(?:Test|Tests|Spec|Specs)$")
+
+
+def is_test_path(path: str) -> bool:
+    """Whether this path is a test file, in any language's spelling.
+
+    The single answer to a question asked in six places: which files the plan
+    already designated as tests, which one the tester should imitate, what the
+    suite is written in, what the executor may never be granted, which files can
+    contradict a bug report, and whether a ticket has anywhere to put the tests
+    it is about to be given.
+
+    It used to be a glob match, and those globs held only the snake_case
+    conventions — `test_x`, `x_test`, `x.test` — plus a `tests/` directory at
+    the repository root. A Gradle project keeps `VideoExtensionsTest.java` under
+    `src/test/java/`, which matched none of them, so a test file the plan had
+    already named was invisible and `_test_target` invented
+    `tests/pn_001_test.java` instead — a path no JVM build compiles. The
+    tester's output was written, never compiled, never run, and every ticket
+    passed a suite that had silently excluded it.
+
+    Globs cannot replace this. `fnmatch` folds case on Windows and not on Linux,
+    so `*Test.*` matches `latest.js` on one platform and not the other; the
+    capital in `VideoExtensionsTest` is exactly the information a case-folding
+    match destroys.
+    """
+    normalized = normalize_path(path)
+    parts = normalized.split("/")
+    if any(part.lower() in TEST_DIRS for part in parts[:-1]):
+        return True
+    stem = Path(parts[-1]).stem
+    return bool(SNAKE_TEST.search(stem) or CAMEL_TEST.search(stem))

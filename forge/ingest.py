@@ -26,7 +26,7 @@ import re
 from pathlib import Path
 
 from . import routes
-from .patch import normalize_path
+from .patch import is_test_path, normalize_path
 from .providers import Message, Provider
 from .state import TICKET_FEATURE, Ticket
 
@@ -76,9 +76,9 @@ _NEEDS = re.compile(r"^\*\*Needs:\*\*\s*(?P<needs>.+)$", re.MULTILINE | re.IGNOR
 PLANNER_SYSTEM = """You are the planner in a plan-and-execute pipeline.
 
 You are given a specification written elsewhere. Convert it into an ordered
-backlog of implementation tickets. You are not being asked to redesign the
-work, question the goal, or add features — only to break what is written into
-units an executor model can implement one at a time.
+backlog of implementation tickets. Your whole job is to break what is written
+into units an executor model can implement one at a time — the design, the
+goal and the feature set arrive settled.
 
 Rules:
 - Each ticket must be independently verifiable and confined to a known set of
@@ -93,10 +93,14 @@ Rules:
   everything except what to do, and the model has to infer the target from its
   absence. Reserve prohibitions for scope, where the allowed-files list
   enforces them mechanically rather than by persuasion.
-- Mark a ticket "claude-only" when it touches authentication, authorization,
-  secrets, concurrency, shared mutable state, migrations, public API surface,
-  cryptography, or payment flows — or when the right approach is still an open
-  question. Everything else is "delegate".
+- Route a ticket to a person as `withheld:<reason>`, naming the objection:
+  `withheld:security` for authentication, authorization, session handling or
+  secrets; `withheld:concurrency` for locking, async ordering or shared mutable
+  state; `withheld:interface` for public API surface or database migrations;
+  `withheld:compliance` for cryptography, payment flows or anything with a
+  compliance dimension; `withheld:performance` where the fix depends on
+  profiling judgment; `withheld:unresolved` where what the ticket should do is
+  still genuinely open. Everything else is `delegate`.
 - Order tickets so that each one can assume the previous ones landed.
 - The executor has no filesystem. It sees only what the ticket carries, and it
   returns whole files as text. Any file it must read to get an export name, a
@@ -104,10 +108,10 @@ Rules:
   is pasted into the prompt read-only. A ticket that says "read src/api.rs"
   without listing it there is asking for something the executor cannot do, and
   it will guess instead.
-- **Never paraphrase a table.** When the specification states a legend, an
+- **Copy every table verbatim.** When the specification states a legend, an
   alphabet, an error-message list, a status-code mapping or any other lookup
-  table, copy it into the ticket's spec verbatim — every row, spelled exactly
-  as written. Summarising one is not compression, it is deletion: the executor
+  table, put it in the ticket's spec exactly as written, every row of it.
+  Summarising one is not compression, it is deletion: the executor
   cannot recover a row it was never shown, and a rule like "reject bad input
   with the exact error strings" names no strings at all. One specification
   listed eighteen legal characters and seven exact error messages; the ticket
@@ -159,13 +163,81 @@ def _unwrap_code_span(item: str) -> str:
     return item
 
 
+# A heading — markdown, or a bold line standing alone. Defined here rather than
+# beside the decision patterns below because `_logical_lines` needs it: a
+# heading ends the paragraph above it and never continues one.
+_HEADING_LINE = re.compile(r"^\s*(?:#{1,6}\s+\S|\*\*[^*]+\*\*\s*:?\s*$)")
+
+_BULLET_MARKS = ("- ", "* ", "+ ")
+
+
+def _logical_lines(text: str) -> list[str]:
+    """`text` with wrapped lines rejoined: one string per thing the author wrote.
+
+    Markdown lets a list item and a paragraph run over as many physical lines
+    as the author's column limit demands, and a specification that wraps its
+    prose will do it constantly. Reading one physical line per item silently
+    truncates every wrapped one, and the truncation is invisible downstream:
+    what reaches the ticket is a grammatical fragment that still looks like a
+    whole criterion.
+
+    One run lost 31 of 51 criteria that way. A criterion naming the point
+    `screenToCell` is called with arrived as "... returns `{x:-1,y:-1}` for the
+    point", the sign-off pass could not turn it into an assertion, and respec
+    filled the hole by inventing a point that no implementation can satisfy.
+    The backlog was parked without a single attempt. The spec was correct; only
+    the reading of it was not.
+
+    A blank line, a heading, or a new bullet always ends what came before.
+    Beyond that the two block shapes differ, and the difference is what keeps
+    this from over-reading:
+
+    - A **list item** continues only on an indented line. Markdown would also
+      accept an unindented one — lazy continuation — but here that reading is
+      unsafe in the direction that matters. "- **Decision:** the store is
+      SQLite" followed by an unindented "The board is ten columns wide" is one
+      author writing two things, and swallowing the second would protect a
+      sentence nobody marked and refuse revisions for dropping it.
+    - A **paragraph** continues on any non-blank line, indented or not, because
+      wrapped prose is written flush left and there is nothing else it could be.
+
+    Headings are returned as they stand, because `plan_decisions` reads them to
+    know which block it is in.
+    """
+    lines: list[str] = []
+    parts: list[str] = []
+    in_item = False
+
+    def flush() -> None:
+        nonlocal in_item
+        if parts:
+            lines.append(" ".join(parts))
+            parts.clear()
+        in_item = False
+
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped or _HEADING_LINE.match(raw):
+            flush()
+            if stripped:
+                lines.append(raw)
+            continue
+        if stripped.startswith(_BULLET_MARKS):
+            flush()
+            in_item = True
+        elif in_item and not raw[:1].isspace():
+            flush()
+        parts.append(stripped)
+    flush()
+    return lines
+
+
 def _bullets(text: str) -> list[str]:
-    items = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith(("- ", "* ", "+ ")):
-            items.append(_unwrap_code_span(line[2:].strip()))
-    return items
+    return [
+        _unwrap_code_span(line[2:].strip())
+        for line in _logical_lines(text)
+        if line.startswith(_BULLET_MARKS)
+    ]
 
 
 def _ids(text: str) -> list[str]:
@@ -330,15 +402,39 @@ _DECISION_HEADING = re.compile(
     re.IGNORECASE,
 )
 
-_HEADING_LINE = re.compile(r"^\s*(?:#{1,6}\s+\S|\*\*[^*]+\*\*\s*:?\s*$)")
-
 # "Decision: the PRNG is xorshift32", "- **Decision:** ..." — a single line
 # marked on its own, for a spec with no room for a section.
 _DECISION_LINE = re.compile(r"^\s*(?:[-*+]\s*)?\**\s*decisions?\b\**\s*:", re.IGNORECASE)
 
 
 def _sentences(line: str) -> list[str]:
-    return [part.strip() for part in re.split(r"(?<=[.:;])\s+", line) if part.strip()]
+    """`line` split into sentences, leaving code spans whole.
+
+    Splitting on every `.`, `:` or `;` cuts through the punctuation inside a
+    span — `"strict": true` and `"moduleResolution": "bundler"` become three
+    fragments — and a fragment long enough to clear the ratchet's floor is a
+    constraint on the revision that nobody wrote and nobody can satisfy on
+    purpose. Backticks are the one boundary the split has to respect.
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    in_span = False
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if char == "`":
+            in_span = not in_span
+        current.append(char)
+        index += 1
+        if in_span or char not in ".:;":
+            continue
+        if index < len(line) and line[index].isspace():
+            parts.append("".join(current))
+            current = []
+            while index < len(line) and line[index].isspace():
+                index += 1
+    parts.append("".join(current))
+    return [part.strip() for part in parts if part.strip()]
 
 
 def plan_decisions(text: str) -> list[str]:
@@ -356,10 +452,16 @@ def plan_decisions(text: str) -> list[str]:
     a line: everything under a heading about decisions, and any single line that
     marks itself. Anything else in the spec stays freely revisable — this
     protects what was labelled, not prose in general.
+
+    Read off logical lines rather than physical ones, because the protection is
+    worth exactly as much as the sentence it holds. A decision wrapped across
+    three lines used to shatter into "Decision:", "else." and "The base" —
+    fragments that match almost any revision, so the ratchet reported them as
+    protected while the sentence a human wrote went unguarded.
     """
     found: list[str] = []
     in_block = False
-    for line in text.splitlines():
+    for line in _logical_lines(text):
         if _DECISION_LINE.match(line):
             found.extend(_sentences(line))
             continue
@@ -369,6 +471,60 @@ def plan_decisions(text: str) -> list[str]:
         if in_block and line.strip():
             found.extend(_sentences(line))
     return list(dict.fromkeys(found))
+
+
+# A file the tester could never write into: a manifest, a lockfile, markup, or
+# anything else with no behaviour of its own to assert. A ticket writing only
+# these has nothing to test and wants no test file.
+_UNTESTABLE_FOR_SCOPE = {
+    ".json", ".jsonc", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".lock",
+    ".md", ".txt", ".rst", ".html", ".htm", ".css", ".svg", ".gitignore",
+}
+
+
+def untestable_scope(tickets: list[Ticket]) -> list[str]:
+    """Delegated tickets whose scope has nowhere to put the tests they will get.
+
+    The tester writes into a path the ticket already designates. When no
+    allowed file reads as a test file, `_test_target` invents one next to the
+    ticket's workspace — and that invented path is outside the ticket's own
+    scope, so the executor may never touch it. If what the tester writes there
+    does not compile, the one role that could fix it is refused, every attempt,
+    until the ticket parks.
+
+    That is how PB-004 died: two allowed files, neither a test, and a
+    tester-authored file failing `typecheck` on DOM properties the project's
+    config does not define. The tester and the executor both raised it during
+    sign-off — twice, in the same words — and the pass resolved `split` on the
+    planner's vote and shipped it anyway.
+
+    A `bug` ticket is exempt. Its reproduction goes to a derived path that is
+    granted as extra scope, which is why the three bug tickets beside PB-004
+    each landed in one attempt with the same shape of scope.
+
+    Quiet for a ticket that writes only files with no behaviour to assert — a
+    manifest, a lockfile, markup — since no tests are authored for those.
+    """
+    problems = []
+    for ticket in tickets:
+        if ticket.kind == "bug" or routes.is_withheld(ticket.route):
+            continue
+        if any(is_test_path(path) for path in ticket.allowed_files):
+            continue
+        testable = [
+            path
+            for path in ticket.allowed_files
+            if Path(path).suffix.lower() not in _UNTESTABLE_FOR_SCOPE
+        ]
+        if not testable:
+            continue
+        problems.append(
+            f"{ticket.ticket_id}: writes {', '.join(testable)} and lists no test "
+            f"file, so the tester's output lands outside the ticket's own scope "
+            f"and the executor cannot repair it. Add the test file to "
+            f"`Allowed files`."
+        )
+    return problems
 
 
 def graph_problems(tickets: list[Ticket]) -> list[str]:

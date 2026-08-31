@@ -497,22 +497,25 @@ Rules:
   project that runs `pytest`.
 - Copy the command as written, including flags, workspace selectors, and any
   runner prefix (`make`, `just`, `npm run`, `uv run`, `poetry run`).
-- Do not combine two commands with `&&`. Each field is one command.
-- Do not include `cd`, environment variable prefixes, or CI-only wrappers
-  (`actions/checkout`, matrix expressions, `${{ ... }}` interpolation). If a
-  command's real form depends on a CI variable, leave it empty and say so.
+- Each field holds exactly one command. Where a project chains several with
+  `&&`, report the one that field asks for.
+- Report the bare command as it would run from the repository root. A `cd`, an
+  environment-variable prefix, or a CI-only wrapper (`actions/checkout`, matrix
+  expressions, `${{ ... }}` interpolation) belongs to the harness rather than to
+  the command. Where a command's real form depends on a CI variable, leave it
+  empty and say so.
 - Some projects have no separate type-check step. That is normal — return empty
-  rather than inventing one.
+  for it.
 - `format` is different from the other three and the difference matters. It is
   a command that **rewrites files in place**, and the harness appends the paths
-  to rewrite: report `gdformat`, `prettier --write`, `ruff format`, `rustfmt`,
-  `gofmt -w`, `black`, `dart format` — never a whole-tree invocation like
-  `prettier --write .`, never a check-only mode like `black --check` or
-  `gofmt -l`, and never a `make fmt` target whose own arguments you cannot see.
-  A command that ignores the files appended to it would reformat the whole
-  repository on every attempt, which is an out-of-scope edit the loop cannot
-  undo. If the project's formatter can only be run over everything, return
-  empty — no formatter is a supported answer and a wrong one is not.
+  to rewrite, so report it in the form that accepts them: `gdformat`,
+  `prettier --write`, `ruff format`, `rustfmt`, `gofmt -w`, `black`,
+  `dart format`. A whole-tree invocation like `prettier --write .`, a check-only
+  mode like `black --check` or `gofmt -l`, and a `make fmt` target whose own
+  arguments you cannot see all ignore the appended paths and reformat the whole
+  repository on every attempt — an out-of-scope edit the loop cannot undo. Where
+  the project's formatter can only run over everything, return empty: no
+  formatter is a supported answer and a wrong one is not.
 
 Reply with a single JSON object and nothing else:
 

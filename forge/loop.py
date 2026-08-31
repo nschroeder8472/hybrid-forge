@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Callable, NamedTuple, Sequence
 
 from . import imports
+from . import manifests
 from . import toolchain
 from . import ratify as ratification
 from . import respec
@@ -74,6 +75,7 @@ from .patch import (
     foreign_bindings,
     infer_single_file,
     is_safe_path,
+    is_test_path,
     laundered_assertions,
     matches_any,
     normalize_path,
@@ -2907,7 +2909,7 @@ class Orchestrator:
             self.store.log(
                 run_id,
                 "Nothing left for the loop to retry — what remains needs a human "
-                "(claude-only tickets, a ticket parked for going nowhere, or a "
+                "(withheld tickets, a ticket parked for going nowhere, or a "
                 "failure no ticket in this backlog owns).",
                 level="warn",
                 kind="lifecycle",
@@ -4306,9 +4308,9 @@ class Orchestrator:
             lines += [f"- {entry}" for entry in echoed]
             lines += [
                 "",
-                "They are illustrations of the reply format, not files. Do not "
-                "send them again, and do not ask for scope over them — no "
-                "ticket in this project will ever write them.",
+                "They are illustrations of the reply format rather than "
+                "files. Write the paths from the allowed scope instead: no "
+                "ticket in this project will ever write these.",
                 "",
             ]
             if not rejected:
@@ -4339,9 +4341,9 @@ class Orchestrator:
         ]
         if any("neverDelegate" in entry for entry in rejected):
             lines.append(
-                "A neverDelegate path is prohibited at the project level and "
-                "will never be granted to this ticket. Implement what you can "
-                "without it, or reply BLOCKED:."
+                "A neverDelegate path is reserved at the project level, so "
+                "this ticket's scope is settled without it. Implement what you "
+                "can within that scope, or reply BLOCKED:."
             )
         lines.append(
             "If the ticket genuinely cannot be completed within that list, "
@@ -4784,7 +4786,7 @@ class Orchestrator:
         limit = self._SOURCE_LIMIT
         note = (
             f"\n[truncated at {limit} characters — this file is reference "
-            f"only, do not return it]\n"
+            f"only; leave it out of your reply]\n"
         )
         if Path(path).suffix.lower() not in self._PROSE_SUFFIXES:
             return text[:limit] + note
@@ -5061,6 +5063,13 @@ class Orchestrator:
                     ),
                 )
 
+            # Read before the write, because afterwards what the manifest used
+            # to declare is gone and git is no help: a manifest an earlier
+            # attempt on this same ticket already rewrote has no clean version
+            # left to compare against. See `forge.manifests`.
+            manifests_before = manifests.snapshot(
+                self.config.root, [edit.path for edit in scoped.edits]
+            )
             step_id = self.store.start_step(run_id, ticket.ticket_id, "apply")
             try:
                 written = apply_edits(self.config.root, scoped.edits)
@@ -5094,6 +5103,14 @@ class Orchestrator:
                 if scoped.rejected
                 else ""
             )
+
+            # Before the imports check, because a manifest that lost its
+            # dependencies breaks every command in the project rather than one
+            # module, and because verification cannot see it: the commands run
+            # where the packages are already installed.
+            gutted = self._gutted_manifests(run_id, ticket, manifests_before)
+            if gutted:
+                return StepResult(ok=False, detail=gutted)
 
             # Before the truncation check, because a file cut short is a
             # different complaint and this one is cheaper to act on: an import
@@ -5811,22 +5828,9 @@ class Orchestrator:
         "**/*Test.*", "**/*Tests.*", "**/*Spec.*", "**/*_spec.*", "**/*.spec.*",
     )
 
-    # A directory whose name says everything under it is a test. `src/test/java`
-    # and `src/test/kotlin` are reached by the bare `test` segment, so the Maven
-    # and Gradle layout needs no rule of its own.
-    _TEST_DIRS = frozenset({"test", "tests", "spec", "specs", "testing"})
-
-    # snake_case and dotted conventions: pytest, go, rust, rspec, jest.
-    # Case-insensitive because none of them depend on capitalisation.
-    _SNAKE_TEST = re.compile(r"^test_|_test$|_spec$|\.test$|\.spec$", re.IGNORECASE)
-
-    # PascalCase conventions: JUnit, NUnit, xUnit, Kotest, ScalaTest.
-    # Case-SENSITIVE, and the capital is the whole point — `VideoExtensionsTest`
-    # is a test and `latest` is not, and lowercasing the two makes them the same
-    # string. The preceding character must be lowercase or a digit so a word
-    # merely *containing* the letters cannot qualify: `Testimonials` does not
-    # end in `Test`, and `contest` has no capital to anchor on.
-    _CAMEL_TEST = re.compile(r"(?:^|[a-z0-9])(?:Test|Tests|Spec|Specs)$")
+    # The directory names, the snake_case spellings and the PascalCase ones all
+    # live in `patch.is_test_path` now, because ingest asks the same question at
+    # author time and `loop` imports `ingest`.
 
     # Languages where the filename is not decoration: the public type has to be
     # declared in a file named after it, so `pn_001_test.java` cannot hold
@@ -5859,35 +5863,10 @@ class Orchestrator:
         }
     )
 
-    @classmethod
-    def _is_test_path(cls, path: str) -> bool:
-        """Whether this path is a test file, in any language's spelling.
-
-        The single answer to a question the loop asks in five places: which
-        files the plan already designated as tests, which one the tester should
-        imitate, what the suite is written in, what the executor may never be
-        granted, and which files can contradict a bug report.
-
-        It used to be `matches_any(path, _TEST_GLOBS)`, and those globs held
-        only the snake_case conventions — `test_x`, `x_test`, `x.test` — plus a
-        `tests/` directory at the repository root. A Gradle project keeps
-        `VideoExtensionsTest.java` under `src/test/java/`, which matched none of
-        them, so a test file the plan had already named was invisible and
-        `_test_target` invented `tests/pn_001_test.java` instead — a path no JVM
-        build compiles. The tester's output was written, never compiled, never
-        run, and every ticket passed a suite that had silently excluded it.
-
-        Globs cannot replace this. `fnmatch` folds case on Windows and not on
-        Linux, so `*Test.*` matches `latest.js` on one platform and not the
-        other; the capital in `VideoExtensionsTest` is exactly the information a
-        case-folding match destroys.
-        """
-        normalized = normalize_path(path)
-        parts = normalized.split("/")
-        if any(part.lower() in cls._TEST_DIRS for part in parts[:-1]):
-            return True
-        stem = Path(parts[-1]).stem
-        return bool(cls._SNAKE_TEST.search(stem) or cls._CAMEL_TEST.search(stem))
+    @staticmethod
+    def _is_test_path(path: str) -> bool:
+        """Whether this path is a test file. See `patch.is_test_path`."""
+        return is_test_path(path)
 
     def _example_test(
         self,
@@ -6271,6 +6250,55 @@ class Orchestrator:
         verify step does not collect.
         """
         return self.config.workspace_for_ticket(ticket.allowed_files)
+
+    def _gutted_manifests(
+        self, run_id: int, ticket: Ticket, before: dict[str, str]
+    ) -> str:
+        """What to tell an executor whose rewrite dropped dependencies, or "".
+
+        The one deletion nothing downstream can catch. Verification runs where
+        the packages are already installed — that is what lets the commands run
+        at all — so a `package.json` that lost its `devDependencies` passes
+        lint, typecheck and the whole suite exactly as it did before. One run
+        recorded a ticket done that way; on a clean checkout `npm ci` installed
+        one package and every command in the project failed.
+
+        Failed as an ordinary attempt rather than parked, because the fix is
+        the smallest one there is: the executor emits whole files and has to
+        send the block back. The guidance names the entries so it does not have
+        to reconstruct them from memory, which is how they were lost.
+        """
+        losses = manifests.losses(self.config.root, before)
+        if not losses:
+            return ""
+
+        lines = []
+        for path, gone in losses:
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: {path} came back without "
+                f"{len(gone)} dependency declaration(s): {', '.join(gone)}.",
+                level="warn",
+                kind="apply",
+                data={"path": path, "dropped": gone},
+            )
+            lines.append(f"  {path} no longer declares: {', '.join(gone)}")
+
+        listing = "\n".join(lines)
+        return (
+            f"Your reply rewrote a build manifest and left out dependencies it "
+            f"already declared:\n{listing}\n\n"
+            f"Nothing else in this project can report that. The verify commands "
+            f"run where those packages are already installed, so they pass "
+            f"whether or not the manifest still asks for them — and on a clean "
+            f"checkout every one of them fails to start.\n\n"
+            f"Send the file again with those entries present, at the versions "
+            f"they had. You are emitting whole files, so every line you were "
+            f"not asked to change is one to copy across: dependency blocks, "
+            f"metadata, and fields this ticket never mentions included. Adding "
+            f"what the ticket asks for is the change; the rest of the file "
+            f"stays as it was."
+        )
 
     def _dangling_imports(
         self, run_id: int, ticket: Ticket, written: Sequence[str]
