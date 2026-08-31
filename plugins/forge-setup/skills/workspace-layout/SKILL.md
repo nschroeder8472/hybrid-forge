@@ -40,8 +40,9 @@ through `apiKeyEnv` — the *name* of an environment variable. The profile
 strips an inline `apiKey` on the way in rather than copying it to a second
 location the user does not know exists.
 
-So during setup: check the variable is *set*, never read its value, never echo
-it, never put it in a config, a log, or a commit.
+So during setup: check the variable is *set* and stop there. The variable name
+is what goes in the config; the value stays in the environment, out of every
+log, transcript and commit.
 
 ## What is committed
 
@@ -54,7 +55,7 @@ it, never put it in a config, a log, or a commit.
 
 `config.json` and `tickets/` are reviewable text and belong in PRs. `run.db` is
 a mutable log with meaningless diffs and guaranteed conflicts; it is already
-ignored. Never commit a MemPalace store either — the repo holds the pointer,
+ignored. Keep a MemPalace store out of the repo as well — it holds the pointer,
 not the index.
 
 ## One build per workspace
@@ -85,8 +86,8 @@ clear the `typecheck` entry if the test command really is the check.
 
 These live in the repo config's `loop` block and ship on. They exist because a
 run can be long without being wrong, and the failure they address is a run that
-is long *and* learning nothing. Do not turn them off to save calls without
-saying what the run gives up.
+is long *and* learning nothing. Turn one off once you can name which of those
+two is happening, and say what the run gives up when you do.
 
 - **`ratifyPasses: 2`** — every role is asked whether it can do its part of a
   ticket as written, before anything is built. Costs `roles x passes` calls per
@@ -97,6 +98,18 @@ saying what the run gives up.
   conversation, its own reply as an `assistant` message. Without it the
   executor is shown the files as disk state with nothing saying it wrote them,
   and reads its own work as somebody else's.
+- **`innerTurns: 3`** — a reply that does not compile goes straight back to the
+  executor without spending an attempt. `lint` and `typecheck` are commands the
+  loop was going to run at verify anyway, a failure there can only be the
+  executor's own, and the tester is not asked to write assertions for something
+  that does not build. Never `test`: a red suite may be the tester's assertion
+  rather than the executor's code. On the ticket that was measured, `typecheck`
+  averaged 0.7s against the tester's 12.0s, and 58 of 95 cycles wrote a test
+  file for an implementation that then failed to compile.
+- **`maxAttempts: 5`** — three absorbs a lint error and a shallow test failure.
+  Five also absorbs the failure a local executor actually produces: a correct
+  implementation in a shape the parser cannot read, which spends an attempt and
+  teaches the ticket nothing.
 - **`memory.write: true` with `dryRun: true`** — the loop records durable
   conclusions instead of only reading them. Dry-run writes nothing and logs
   what it would have written, which is what makes it safe to have on from the
@@ -115,9 +128,13 @@ And one that is not in `loop` at all but belongs to the same argument:
   from a spent attempt into nothing at all. Empty by default; no formatter is
   ever inferred.
 
-`retryCycles: -1` is the one to leave alone unless asked. Unbounded retries are
-only safe when something detects that a cycle learned nothing, and until that
-lands the cycle count is the brake.
+`retryCycles: -1` ships on, and it is the one worth putting to the user rather
+than assuming — see step 4 of `/forge-setup`. Unbounded retries are only safe
+when something detects that a cycle learned nothing, and that is `flatCycles`:
+a cycle failing in exactly the way the one before it did ends the retries, so an
+unattended run converges or stops itself. **The two settings are one decision.**
+Turning `flatCycles` off while `retryCycles` is `-1` removes the only thing that
+ends a run going nowhere, and the cycle count becomes the brake again.
 
 ## Reading `forge doctor`
 
@@ -142,10 +159,10 @@ failure actually costs:
   attempt. Cheap in seconds, and a sign the two command kinds were filled in
   independently and one of them is not what you think it is.
 
-## The one assignment to refuse
+## The one assignment that has to be two models
 
-`executor` and `reviewer` must not be the same model. A model reviewing its own
+`executor` and `reviewer` have to be different models. A model reviewing its own
 diff against a spec it just implemented accepts it, and review is the only
 thing keeping a cheap executor honest. If a machine has exactly one model
-available, say plainly that review is decorative until a second one exists —
-do not quietly configure it anyway.
+available, say plainly that review is decorative until a second one exists, and
+let the user decide with that in hand.
