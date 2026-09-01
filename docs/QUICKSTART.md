@@ -505,6 +505,39 @@ is simply skipped, which is far better than a wrong one.
 If detection finds nothing, you get empty fields. That means your repo does not
 state its commands anywhere; type them yourself.
 
+**If the build holds more than one language, the questions are asked per
+language** — the wizard counts the source files first and says what it found:
+
+```
+This build holds more than one language:
+  .rs        34 file(s)
+  .ts         3 file(s)
+Each is asked for separately. One command covering all of them reads
+as coverage for files it never runs — the run then stops at the
+preflight canary, or worse, passes a ticket nothing compiled.
+Blank means this language is not verified; `skip` means it needs no
+runner. Either can be changed later with `forge toolchain`.
+
+.rs
+lint [.rs]:
+typecheck [.rs]:
+test [.rs]:
+format [.rs]:
+```
+
+The language with the most files is asked about first. Detection is consented
+to once and then run once per language, because the answer for the wrong
+language is worse than no answer — it passes without running a line of the
+right one.
+
+Two answers that are not the same thing:
+
+- **blank** — nothing verifies this language. `forge doctor` reports it, and
+  the preflight canary refuses to start a run that would grade those tickets by
+  reading a diff.
+- **`skip`** — this language needs no runner, on the record. Nothing is
+  reported and nothing blocks.
+
 ```
 Paths the executor must never touch, comma-separated.
 Auth, migrations, and crypto belong here.

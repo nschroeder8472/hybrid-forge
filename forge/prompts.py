@@ -16,7 +16,7 @@ from typing import Any, Sequence
 
 from .failures import distill
 from .providers import Message
-from .state import Ticket
+from .state import TICKET_BUG, Ticket
 
 # The prefixes that mark a message as droppable to the budget gate. Memory and
 # ticket context live behind the first; the spec never does.
@@ -2908,6 +2908,33 @@ def _ratify_notes_block(notes: Sequence[dict], limit: int = 12) -> str:
     return "\n".join(lines)
 
 
+def _ratify_bug_note(ticket: Ticket) -> str:
+    """What stands in for acceptance criteria on a bug ticket.
+
+    A bug ticket has none, by design: its contract is a test that does not
+    exist yet, written by the tester against the report and required to fail
+    before anything may fix it. Without saying so, the sign-off pass reads
+    `(none stated)` as an unfinished ticket and asks for criteria that must not
+    be written — the party who would write them is the one being judged, and a
+    criterion authored now is satisfied the moment the code reads right, which
+    is how both of the bugs this loop was built for shipped green.
+
+    Observed, not predicted. On one live run three of four roles blocked
+    exactly there, on a report the same loop had fixed correctly an hour
+    earlier — so the block was nondeterministic as well as wrong.
+    """
+    if ticket.kind != TICKET_BUG:
+        return ""
+    return """
+This is a **bug** ticket, so it has no acceptance criteria and must not be
+given any. Its contract is the reproduction: before anything is allowed to fix
+it, the tester writes a test asserting the correct behaviour, and the test
+command has to run it and see it **fail** against the code as it stands. The
+fix is done when that same test passes. Judge the report, the scope and the
+spec; a missing criteria list is the design here, not an omission.
+"""
+
+
 def ratify_prompt(
     ticket: Ticket,
     role: str,
@@ -2955,7 +2982,7 @@ def ratify_prompt(
 
 ## Acceptance criteria
 {_criteria_block(ticket)}
-"""
+{_ratify_bug_note(ticket)}"""
 
     if sources:
         body += f"""

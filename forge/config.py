@@ -158,6 +158,39 @@ _RUNNER_LANGUAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("clippy", (".rs",)),
 )
 
+
+def _language_family(suffix: str) -> tuple[str, ...]:
+    """Every extension of the language `suffix` belongs to."""
+    for suffixes in _LANGUAGE_SUFFIXES.values():
+        if suffix in suffixes:
+            return suffixes
+    return (suffix,)
+
+
+# Each row widened to whole languages, because that is what the keys it is
+# checked against mean: `normalize_language(".ts")` is `.ts .tsx .mts .cts`, so
+# a `{".ts": "eslint ."}` written by hand, by `forge toolchain --accept` or by
+# the wizard expands to four extensions and was refused at load over the two
+# the hand-written row happened to omit — `commands.lint runs 'eslint .' for
+# .mts files, but that command runs .cjs, .js, .jsx, .mjs, .ts, .tsx`, about a
+# repository with no `.mts` file in it. Two tables enumerating the same
+# families by hand is the drift; deriving one from the other is the fix, and it
+# only ever widens what a runner is believed to cover, so no config that loaded
+# before stops loading.
+_RUNNER_LANGUAGES = tuple(
+    (
+        needle,
+        tuple(
+            dict.fromkeys(
+                extension
+                for suffix in suffixes
+                for extension in _language_family(suffix)
+            )
+        ),
+    )
+    for needle, suffixes in _RUNNER_LANGUAGES
+)
+
 # Every command applies to this when the config gives one string rather than a
 # map, and it is a legal key in its own right for a runner that covers the lot.
 ANY_LANGUAGE = "*"

@@ -229,6 +229,216 @@ class TestDetectionParsing(unittest.TestCase):
         provider.complete.assert_not_called()
 
 
+def polyglot(root: Path, files: dict[str, int]) -> Path:
+    """`{"src/lib.rs": 3}` writes three numbered files beside that name."""
+    for template, count in files.items():
+        path = Path(template)
+        for index in range(count):
+            target = root / path.parent / f"{path.stem}{index}{path.suffix}"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("x\n", encoding="utf-8")
+    return root
+
+
+class TestTheLanguageCensus(unittest.TestCase):
+    """What a build is made of, counted rather than claimed. A manifest says
+    which language a repository calls itself; the census says which ones are in
+    it, and the gap between the two is where a suite that reads none of a
+    language reports it as verified."""
+
+    def test_source_files_are_counted_by_language(self):
+        root = polyglot(temp_repo("Cargo.toml"), {"src/lib.rs": 3, "web/app.ts": 2})
+
+        self.assertEqual(toolchain.census(root), {".rs": 3, ".ts": 2})
+
+    def test_files_no_test_could_assert_on_are_not_counted(self):
+        # A stylesheet with no runner is not a gap, and asking for a command to
+        # cover one is asking for a command that cannot exist.
+        root = polyglot(
+            temp_repo("Cargo.toml"),
+            {"src/lib.rs": 1, "web/site.css": 4, "README.md": 2},
+        )
+
+        self.assertEqual(toolchain.census(root), {".rs": 1})
+
+    def test_another_builds_files_belong_to_that_build(self):
+        # The same longest-prefix rule `workspace_for` applies at run time.
+        # Without it the root counts the subproject's files as its own and asks
+        # for a command that would claim them.
+        root = polyglot(temp_repo("Cargo.toml"), {"src/lib.rs": 2, "web/app.ts": 5})
+        builds = [".", "web"]
+
+        self.assertEqual(toolchain.census(root, ".", others=builds), {".rs": 2})
+        self.assertEqual(toolchain.census(root, "web", others=builds), {".ts": 5})
+
+
+class TestTheWizardAsksPerLanguage(unittest.TestCase):
+    """`commands.test` as one string assumes a repository is one language. The
+    wizard is the cheapest place that assumption can be corrected — before a
+    run exists, before a token is spent, and while the person who knows the
+    answer is already at the keyboard."""
+
+    def setUp(self):
+        patcher = mock.patch.object(wizard, "say")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _ask(self, root: Path, answers: list[str], detection=None, builds=()):
+        found = detection if detection is not None else toolchain.Detection(
+            commands={"lint": "", "typecheck": "", "test": "detected", "format": ""},
+            confidence="high",
+            evidence=[".github/workflows/ci.yml"],
+        )
+        with mock.patch.object(
+            wizard, "detect_commands", return_value=found
+        ) as detect:
+            commands = wizard._ask_commands(
+                wizard.Answers(),
+                root,
+                wizard.Prompter(enabled=True, reader=scripted(answers)),
+                builds[0] if builds else ".",
+                builds,
+            )
+        return commands, detect
+
+    def test_a_one_language_build_is_asked_the_way_it_always_was(self):
+        # Three questions and a formatter, answered as plain strings. Most
+        # repositories are this one, and the questions they are asked must not
+        # grow because polyglot ones exist.
+        root = polyglot(temp_repo("Cargo.toml"), {"src/lib.rs": 4})
+
+        commands, _ = self._ask(root, ["y", "cargo clippy", "", "cargo test", ""])
+
+        self.assertEqual(
+            commands,
+            {
+                "lint": "cargo clippy",
+                "typecheck": "",
+                "test": "cargo test",
+                "format": "",
+            },
+        )
+
+    def test_a_two_language_build_is_asked_once_per_language(self):
+        root = polyglot(temp_repo("Cargo.toml"), {"src/lib.rs": 4, "web/app.ts": 2})
+
+        commands, _ = self._ask(
+            root,
+            [
+                "y",                                            # read the repo
+                "cargo clippy", "", "cargo test", "rustfmt",    # .rs, the bulk
+                "eslint .", "tsc --noEmit", "npm test", "",     # .ts
+            ],
+        )
+
+        self.assertEqual(commands["test"], {".rs": "cargo test", ".ts": "npm test"})
+        self.assertEqual(commands["typecheck"], {".ts": "tsc --noEmit"})
+        self.assertEqual(commands["format"], {".rs": "rustfmt"})
+
+    def test_the_language_with_the_most_files_is_asked_about_first(self):
+        root = polyglot(temp_repo("package.json"), {"web/app.ts": 9, "tools/x.py": 1})
+        asked: list[str] = []
+
+        def reader(prompt: str) -> str:
+            asked.append(prompt)
+            return "y" if "Read" in prompt else ""
+
+        with mock.patch.object(
+            wizard, "detect_commands", return_value=toolchain.Detection()
+        ):
+            wizard._ask_commands(
+                wizard.Answers(),
+                root,
+                wizard.Prompter(enabled=True, reader=reader),
+                ".",
+            )
+
+        languages = [
+            line.split("[")[1].rstrip("]: ")
+            for line in asked
+            if line.startswith(("lint", "typecheck", "test", "format"))
+        ]
+        self.assertEqual(languages[0], ".ts")
+        self.assertEqual(languages[-1], ".py")
+
+    def test_a_language_left_blank_is_recorded_as_uncovered_not_as_a_catch_all(self):
+        # The defect this whole feature exists for: one command claiming
+        # authority over a language it cannot run. A blank must stay blank.
+        root = polyglot(temp_repo("Cargo.toml"), {"src/lib.rs": 4, "web/app.js": 1})
+
+        commands, _ = self._ask(
+            root,
+            ["y", "", "", "cargo test", "", "", "", "", ""],
+            # Nothing detected, so a blank stays blank rather than taking a
+            # suggestion the person did not type.
+            detection=toolchain.Detection(commands={}, evidence=["ci.yml"]),
+        )
+        workspace = Workspace(commands=commands)
+
+        self.assertTrue(workspace.covers("test", ".rs"))
+        self.assertFalse(workspace.covers("test", ".js"))
+        self.assertNotIn("lint", commands)
+
+    def test_skip_is_stored_as_a_declared_exemption(self):
+        # "This language needs no runner" and "nobody has configured one" are
+        # different answers, and only one of them should stop a run.
+        root = polyglot(temp_repo("Cargo.toml"), {"src/lib.rs": 4, "tools/x.sh": 1})
+
+        commands, _ = self._ask(
+            root, ["y", "", "", "cargo test", "", "", "", "skip", ""]
+        )
+        workspace = Workspace(commands=commands)
+
+        self.assertTrue(workspace.exempt("test", ".sh"))
+        self.assertFalse(workspace.covers("test", ".sh"))
+
+    def test_detection_is_asked_for_each_language_separately(self):
+        # The answer for the wrong language is worse than no answer: it passes
+        # without running a line of the right one.
+        root = polyglot(temp_repo("Cargo.toml"), {"src/lib.rs": 4, "web/app.ts": 2})
+
+        _, detect = self._ask(root, ["y"] + [""] * 8)
+
+        self.assertEqual(
+            [call.kwargs["language"] for call in detect.call_args_list],
+            [".rs", ".ts"],
+        )
+
+    def test_a_failed_detection_stops_the_sweep_rather_than_repeating_it(self):
+        # Every failure here belongs to the planner or the repository, so the
+        # second call fails exactly as the first did, having cost another wait.
+        root = polyglot(temp_repo("Cargo.toml"), {"src/lib.rs": 4, "web/app.ts": 2})
+
+        _, detect = self._ask(
+            root,
+            ["y"] + [""] * 8,
+            detection=toolchain.Detection(error="planner unreachable"),
+        )
+
+        self.assertEqual(detect.call_count, 1)
+
+    def test_declining_detection_never_calls_a_model(self):
+        root = polyglot(temp_repo("Cargo.toml"), {"src/lib.rs": 4, "web/app.ts": 2})
+
+        _, detect = self._ask(root, ["n"] + [""] * 8)
+
+        detect.assert_not_called()
+
+    def test_each_build_is_asked_about_its_own_languages(self):
+        # A workspace's questions are about the files it owns. The root asking
+        # about the subproject's TypeScript is the absorption workspaces exist
+        # to stop, arriving one layer earlier.
+        root = polyglot(temp_repo("Cargo.toml"), {"src/lib.rs": 4, "web/app.ts": 2})
+        (root / "web" / "package.json").write_text("{}", encoding="utf-8")
+
+        commands, _ = self._ask(
+            root, ["y", "cargo clippy", "", "cargo test", ""], builds=(".", "web")
+        )
+
+        # One language here, so the plain-string form — and no .ts question.
+        self.assertEqual(commands["test"], "cargo test")
+
+
 class TestWizardFlow(unittest.TestCase):
     def setUp(self):
         # The wizard is chatty by design; that belongs on a terminal, not in

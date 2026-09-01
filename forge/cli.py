@@ -612,12 +612,11 @@ def _print_matrix(config: Config, workspace, census: dict[str, int]) -> list[str
     return uncovered
 
 
-# Extensions worth reporting coverage for: languages whose behavior a test
-# could assert. A stylesheet with no runner is not a gap.
-_SOURCE_SUFFIXES = frozenset(
-    """.rs .py .js .mjs .cjs .jsx .ts .tsx .go .rb .java .kt .swift .c .cc .cpp
-    .h .hpp .cs .php .sh .ps1 .lua .ex .exs .scala .dart .gd""".split()
-)
+# Extensions worth reporting coverage for. One list, shared with the census
+# the wizard asks its per-language questions from — two copies would drift, and
+# a language the wizard never asks about but doctor reports as uncovered is a
+# gap nothing offers to close.
+_SOURCE_SUFFIXES = toolchain.SOURCE_SUFFIXES
 
 
 def cmd_ingest(args: argparse.Namespace) -> int:

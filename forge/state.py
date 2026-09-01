@@ -69,7 +69,11 @@ DETAIL_CHARS = 20_000
 # a failure signature. `gdformat` handed two files exits non-zero when it
 # cannot parse one of them, having already reformatted the other, and the first
 # line of that output is `reformatted tools/dump_decor_fixtures.gd`.
-NOT_ABOUT_THE_CODE = ("record", "stuck-review", "format")
+# `canary` is here for a third reason: it is a preflight check about the
+# build rather than a run of the code, its pass is a non-zero exit, and the
+# deliberate garbage it fails over would otherwise contribute a syntax error
+# nobody wrote to whatever ticket was holding the run.
+NOT_ABOUT_THE_CODE = ("record", "stuck-review", "format", "canary")
 
 
 def _placeholders(values: tuple[str, ...]) -> str:
@@ -1439,6 +1443,28 @@ class Store:
                 "UPDATE steps SET status = ?, ended_at = ?, detail = ?, classes = ? "
                 "WHERE id = ?",
                 (status, time.time(), clip(detail, DETAIL_CHARS), json.dumps(classes), step_id),
+            )
+
+    def restate_step(self, step_id: int, status: str) -> None:
+        """Correct a closed step's status once its meaning is known.
+
+        Exit code and verdict are the same thing for every step but one. The
+        preflight canary passes by going red — a command that stays green over
+        a file which cannot parse is the failure it exists to find — so the
+        status `end_step` derives from the return code reads backwards to
+        anyone watching the run, and a check that did its job shows up in the
+        same colour as a broken build.
+
+        Written here rather than passed to `end_step` because the verdict is
+        not knowable until the output has been read, and on one branch not
+        until a second command has run. Detail is left alone: what the tool
+        said does not change, only what it meant.
+        """
+        if step_id <= 0:
+            return
+        with self._write() as connection:
+            connection.execute(
+                "UPDATE steps SET status = ? WHERE id = ?", (status, step_id)
             )
 
     def last_step_id(self, run_id: int, ticket_id: str) -> int:
