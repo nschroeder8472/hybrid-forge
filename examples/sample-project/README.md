@@ -30,6 +30,7 @@ tests/counter_test.py       its suite, green, punctuation-free on purpose
 plugin/histogram/bars.py    a second build, its own manifest, its own suite
 plugin/tests/bars_test.py
 SPEC.md                     three tickets for `forge ingest`
+STALL.md                    one ticket that cannot succeed, for the brakes
 BUG.md                      one report for `forge bug`
 .hybridforge/config.json    two workspaces, per-language commands
 ```
@@ -51,6 +52,12 @@ forge bug --file BUG.md    the reproduce-before-fix path
 
 `forge doctor` is the one to run first after any change to coverage,
 workspaces, or the canary: it prints the matrix without spending a token.
+
+`STALL.md` is ingested *instead of* `SPEC.md`, in its own copy, when a change
+touches retries, respec, convergence or how a ticket is parked. It must end
+**blocked**, and the note it leaves has to name the real problem — its first
+two runs ended `done` over a criterion nobody had met, which is what the three
+guards in `CONVERGENCE.md` were written from.
 
 `forge ingest` should report **parsed**, not planned. If it says planned, the
 spec grammar changed and `SPEC.md` no longer matches it — which is itself the

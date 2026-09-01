@@ -77,6 +77,7 @@ from .patch import (
     is_safe_path,
     is_test_path,
     laundered_assertions,
+    weakened_criteria,
     matches_any,
     normalize_path,
     parse_output,
@@ -1891,6 +1892,16 @@ class Orchestrator:
     # underscores, and javac rejects it before reading a line of the contents —
     # which is a red naming the file, and would pass this check without the
     # suite ever having run.
+    # What the tests step raises when the tester would only go green by
+    # softening a criterion, and what the attempt reads to tell that discard
+    # from every other reason a test file might not land. One string, so the
+    # message a person reads and the condition the loop branches on cannot
+    # drift apart.
+    _SOFTENED_MARK = (
+        "tester kept softening a criterion's expected value to what the code "
+        "already returns"
+    )
+
     _CANARY_STEM = "forge_preflight_canary_test"
     _CANARY_TYPE_STEM = "ForgePreflightCanaryTest"
     # What `_test_marker` builds the canary's name around, so a project using
@@ -5360,7 +5371,17 @@ class Orchestrator:
                         for edit in test_parsed.edits
                         for line in laundered_assertions(edit.content)
                     ]
-                    if not rejected_bindings and not laundered:
+                    # The third way, and the quietest: keep the call the
+                    # criterion names and replace the value it pins with what
+                    # the code returns today. Nothing fails, nothing is
+                    # reshaped, and the criterion the assertion is standing in
+                    # for is the one thing that is gone.
+                    weakened = [
+                        line
+                        for edit in test_parsed.edits
+                        for line in weakened_criteria(edit.content, ticket.criteria)
+                    ]
+                    if not rejected_bindings and not laundered and not weakened:
                         break
                     if rejected_bindings:
                         self.store.log(
@@ -5382,6 +5403,16 @@ class Orchestrator:
                             level="warn",
                             kind="ticket",
                         )
+                    if weakened:
+                        self.store.log(
+                            run_id,
+                            f"{ticket.ticket_id}: tester asserted a criterion's own "
+                            f"call against a different value than the criterion "
+                            f"states ({'; '.join(weakened)[:300]}); "
+                            + ("asking again." if remaining else "discarding the tests."),
+                            level="warn",
+                            kind="ticket",
+                        )
                     if not remaining:
                         # Discarded rather than kept. A rigged test is worse
                         # than no test: review checks the criteria itself when
@@ -5395,6 +5426,10 @@ class Orchestrator:
                             else "tester kept asserting through its own "
                             "reshaping helper; tests discarded rather than "
                             "reporting green for a criterion they do not check"
+                            if laundered
+                            else self._SOFTENED_MARK + "; tests "
+                            "discarded rather than reporting a criterion met "
+                            "that nobody has met"
                         )
 
                 if test_parsed.rejected:
@@ -5450,6 +5485,29 @@ class Orchestrator:
                     level="warn",
                     kind="ticket",
                 )
+                # One discard reason is not a weaker result but a finding. A
+                # tester that had to soften a value to make the suite green,
+                # twice, has demonstrated that the criterion contradicts code
+                # this ticket may not change — and that is a spec defect, which
+                # is a person's to settle rather than an attempt's to absorb.
+                #
+                # Left to review, it is a green ticket: the reviewer is told
+                # nothing ran and that it is the only thing standing between
+                # this ticket and `done`, and on the run this comes from it
+                # approved anyway, over a criterion the executor had itself
+                # reported as impossible in the same attempt.
+                if self._SOFTENED_MARK in unchecked:
+                    return StepResult(
+                        ok=False,
+                        blocked=True,
+                        detail=(
+                            f"the tester could only make this suite green by "
+                            f"asserting a criterion's own call against a value "
+                            f"the criterion does not state, twice. A criterion "
+                            f"here contradicts code this ticket may not write, "
+                            f"so no honest test of it can pass:\n{unchecked}"
+                        ),
+                    )
 
         # --- FORMAT --------------------------------------------------
         # Between authoring and judging, over what this attempt actually

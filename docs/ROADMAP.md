@@ -22,9 +22,19 @@ calls, 87.2k tokens, 619 seconds, zero retry cycles. That is a floor, not
 evidence about convergence: nothing failed, so no brake in that document was
 ever asked a question. What it does establish is that none of the nine fires
 spuriously on a run that is going well, which is the failure mode a set of
-unexercised brakes is most likely to have. A backlog that *stalls* is still the
-run this entry is waiting for, and the fixture is where to build one — widen a
-ticket's criteria until the executor cannot satisfy them and watch what stops.
+unexercised brakes is most likely to have. A backlog that stalls now exists:
+`examples/sample-project/STALL.md`, one ticket whose criteria contradict code
+it may not write. Its first two runs finished **done** — a green ticket over a
+criterion nobody met, produced by a sign-off pass that reworded the criterion's
+value, a tester that softened it, and a reviewer that approved with nothing
+testing it. Three mechanical guards later it ends blocked, with a note naming
+the real problem; the write-up is in [CONVERGENCE.md](CONVERGENCE.md).
+
+What that run still did not exercise is this entry's own subject. The ticket
+never reached a state where its failure classes could descend, so
+`_convergence`, the ladder and `flatCycles` have yet to be asked a question.
+The backlog worth writing next is one that is merely hard rather than
+impossible.
 
 The problem that document names: a run can be long without being wrong, and
 this one was neither converging nor able to tell. 18.2 hours, 24.5M tokens, 430

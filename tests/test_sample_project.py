@@ -93,6 +93,7 @@ class TestTheFixtureIsOnlyTheFixture(unittest.TestCase):
         "BUG.md",
         "README.md",
         "SPEC.md",
+        "STALL.md",
         "plugin/histogram/__init__.py",
         "plugin/histogram/bars.py",
         "plugin/pyproject.toml",
@@ -250,6 +251,55 @@ class TestTheSampleBacklogParses(unittest.TestCase):
     def test_every_ticket_carries_criteria_a_stub_could_not_satisfy(self):
         for ticket in self.tickets:
             self.assertGreaterEqual(len(ticket.criteria), 4, ticket.ticket_id)
+
+
+class TestTheStallBacklogCannotSucceed(unittest.TestCase):
+    """`SPEC.md` is work the loop can do; `STALL.md` is work it cannot. Every
+    brake — the attempt budget, convergence, the respec, the park — only ever
+    runs on a ticket that is going nowhere, and a fixture whose runs all finish
+    green never asks one of them a question."""
+
+    def setUp(self):
+        self.tickets, self.how, _derived = ingest(
+            (SAMPLE / "STALL.md").read_text(encoding="utf-8")
+        )
+
+    def test_it_is_one_parsed_ticket(self):
+        self.assertEqual(self.how, "parsed")
+        self.assertEqual([t.ticket_id for t in self.tickets], ["ST-001"])
+
+    def test_the_impossible_criterion_is_about_a_file_the_ticket_may_not_write(self):
+        # The defect is a spec defect and it is invisible to a reader who
+        # checks the criteria and the scope separately: the last criterion
+        # demands behaviour from `wordcount/counter.py`, which is a reference
+        # file here — readable, not writable.
+        ticket = self.tickets[0]
+
+        self.assertIn("wordcount/counter.py", ticket.reference_files)
+        self.assertNotIn("wordcount/counter.py", ticket.allowed_files)
+        self.assertIn("count_words", ticket.criteria[-1])
+
+    def test_the_criterion_contradicts_the_code_as_it_stands(self):
+        # If somebody fixes the seeded defect in the fixture, this backlog
+        # quietly becomes satisfiable and stops testing anything.
+        sys.path.insert(0, str(SAMPLE))
+        written = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        try:
+            from wordcount.counter import count_words
+        finally:
+            sys.dont_write_bytecode = written
+            sys.path.pop(0)
+
+        self.assertNotEqual(
+            count_words("Hello, world!"), {"hello": 1, "world": 1}
+        )
+
+    def test_the_stall_ticket_is_not_part_of_the_ordinary_backlog(self):
+        # Ingested instead of `SPEC.md`, never alongside it.
+        spec, _how, _derived = ingest((SAMPLE / "SPEC.md").read_text(encoding="utf-8"))
+
+        self.assertNotIn("ST-001", [ticket.ticket_id for ticket in spec])
 
 
 class TestTheSeededDefectIsStillThere(unittest.TestCase):

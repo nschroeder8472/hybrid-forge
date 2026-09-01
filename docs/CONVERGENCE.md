@@ -977,3 +977,76 @@ Three things to watch on the first real run:
 - **Whether the curve descends.** The measurement that opened this document is
   now computed per cycle by the loop itself. The claim these features make is
   that those deciles go down. That has not been observed.
+
+---
+
+## The first backlog written to fail
+
+`examples/sample-project/STALL.md` is one ticket that cannot succeed, and it
+exists because every brake in this document only ever runs on a ticket that is
+going nowhere. Four green runs of `SPEC.md` proved that none of these features
+misfires on a run that is going well, and nothing more than that.
+
+The defect in it is a *spec* defect and a subtle one: the ticket's fourth
+acceptance criterion demands behaviour from `wordcount/counter.py`, which the
+ticket may read and may not write. Every criterion is individually reasonable,
+the scope is correct for the work described, and only the pair is wrong.
+
+**The first two runs of it finished `done`.** That is the finding, and it is
+the failure this whole project exists to prevent — a green ticket over a
+criterion nobody met. The chain that produced it had three links, each of which
+looked like a smaller problem than it was:
+
+1. **Ratification reworded the criterion.** The plan pinned
+   `count_words("Hello, world!")` returns `{"hello": 1, "world": 1}`; the
+   ticket that came out of the sign-off pass said it returns `{"hello,": 1,
+   "world!": 1}` — the exact output of the code as it stood, so the criterion
+   now asserted the behaviour it had been written to reject. The ratchet
+   counted criteria and checked provenance against the spec; nothing checked
+   that a *value* survived a reword. The party being asked whether it can do
+   the work was able to lower the bar it would be judged against.
+
+2. **The tester softened the same value.** With the criterion restored, the
+   tester wrote `assertEqual(count_words("Hello, world!"), {"hello,": 1,
+   "world!": 1})` — the criterion's own call, asserted against a different
+   answer. `foreign_bindings` and `laundered_assertions` both passed it: no
+   foreign declaration, no reshaping helper, just the wrong expectation.
+
+3. **Review approved the ticket with nothing testing the criterion.** When the
+   rigged file was discarded, the reviewer was told in as many words that
+   nothing ran and that it was the only thing between this ticket and `done`.
+   It approved anyway — in an attempt where the executor had already reported
+   the criterion impossible.
+
+Three guards, each mechanical, each keyed to the exact evidence:
+
+- `respec._softened_values` refuses a same-length reword that drops a value the
+  plan pinned in a code span. Prose may be rewritten freely; what the answer
+  has to be may not.
+- `patch.weakened_criteria` rejects a test that makes a criterion's own call
+  and asserts a value the criterion does not state, and the tester is asked
+  again with the pair quoted back.
+- A discard for *that* reason blocks the ticket rather than leaving it to
+  review. A criterion that cannot be encoded without softening it contradicts
+  code the ticket may not change, which is a spec defect and a person's to
+  settle.
+
+With all three in, the same backlog ends the way it should:
+
+```
+ratify failed -> ratify ok      the reword refused, then signed off
+build, build, apply
+tests failed                    softened twice, discarded
+run: blocked | 1 ticket(s) need a human
+2 attempts, 1 retry cycle, 22 calls, 106.7k tokens
+```
+
+and the note the human gets names the real problem — *a criterion here
+contradicts code this ticket may not write, so no honest test of it can pass*.
+
+**What this still has not measured.** The ticket never reached a state where
+the failure classes could descend, so `_convergence`, the escalation ladder and
+`flatCycles` remain unexercised. The next backlog to write is one that is
+merely *hard* rather than impossible: several attempts, a shrinking set of
+distinct failures, and a ladder that should climb. That is the run the deciles
+at the top of this document were promised against.

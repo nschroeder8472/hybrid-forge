@@ -183,6 +183,12 @@ Every assertion runs the code and checks what comes back:
   one that cannot fail for the reason it exists. Where the value comes back in
   the wrong form, report that as the finding: it is the thing the criterion was
   written to catch.
+- Keep the expected value the criterion states. Where the code returns
+  something else, the assertion is supposed to fail — that failure is the
+  finding, and it is what the criterion was written to produce. Adjusting the
+  expectation to match what the code does now writes a test that cannot fail
+  and reports a criterion as met that nobody has met. If a criterion looks
+  impossible to satisfy, encode it as written and say so; do not soften it.
 - Leave the project's own commands to the harness. It runs lint, typecheck,
   the build and this suite before anything is judged, so a criterion saying
   they exit 0 is settled by the run itself and wants no assertion from you.

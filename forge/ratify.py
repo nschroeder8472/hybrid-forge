@@ -48,6 +48,7 @@ from .respec import (
     _order_shared_scope,
     _preserve_plan_context,
     _refuse_protocol_edits,
+    _softened_values,
     _refuse_verification_waivers,
     dropped_criteria,
 )
@@ -322,6 +323,22 @@ def _apply(
             level="warn",
             kind="ticket",
             data={"added": added},
+        )
+
+    lost = _softened_values(ticket, revision)
+    if lost:
+        revision.pop("criteria", None)
+        store.log(
+            run_id,
+            f"{ticket.ticket_id}: ratify reworded the acceptance criteria and "
+            f"dropped {len(lost)} value(s) the plan pinned; the revision was "
+            f"refused. A reword may say a criterion better; it may not change "
+            f"what the answer has to be, because the party being asked whether "
+            f"it can do the work is not the party that gets to lower the bar:\n"
+            + "\n".join(f"  - {value}" for value in lost[:5]),
+            level="warn",
+            kind="ticket",
+            data={"lost": lost},
         )
 
     for field_name, phrase in _refuse_protocol_edits(ticket, revision, ()):
