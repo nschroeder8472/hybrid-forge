@@ -20,3 +20,11 @@ include = ["forge*"]
 
 [tool.setuptools.package-data]
 forge = ["ui/*.html"]
+
+[tool.pytest.ini_options]
+# Only this project's own suite. `examples/sample-project` is a fixture with
+# suites of its own, written to be run by the loop from inside that tree — a
+# collector reaching into it imports them against the wrong root and fails
+# before it can say why. `tests/test_sample_project.py` runs them properly,
+# as subprocesses, with each build's own configured command.
+testpaths = ["tests"]

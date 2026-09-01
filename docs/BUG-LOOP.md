@@ -329,11 +329,75 @@ prove — a glob matched — which is why it is spelled out rather than left as
 
 ---
 
+## The first live runs
+
+Three runs against `examples/sample-project` on 2026-08-31 — a seeded defect, a
+report written in prose, a local model in every role. The first fixed it, the
+second blocked without an attempt on the same input, and the third fixed it
+again with the two defects that difference exposed repaired:
+
+```
+forge bug --file BUG.md      BUG-001, scope wordcount/counter.py,
+                             reads tests/counter_test.py, SPEC.md
+forge go                     13 steps, all ok, 12 calls, 77.3k tokens, 547 s
+
+  ratify ok
+  baseline-test ok
+  reproduce ok            red, naming the test, on the code as it stands
+  build ok / apply ok
+  test ok                 the same test, now passing
+  review ok
+  final-test ok / final-test[plugin] ok
+```
+
+The report said punctuation clung to the word and that an apostrophe inside one
+must survive. The reproduction asserted both — including `count_words("don't
+stop")` — and the fix was `word.strip(string.punctuation)`, which keeps the
+interior apostrophe by construction. Neither the report nor the ticket said
+`strip`; the reproduction is what made the second case non-negotiable.
+
+Four things the runs settled that the design could not.
+
+**The reproduction went into the suite that already existed.** `_repro_target`
+resolved to `tests/counter_test.py` rather than a derived `bug_001_test.py`,
+and the ticket's scope was widened to both files. That is the right answer for
+a project whose convention is one test module per source module, and it is not
+what a reading of the spec would predict.
+
+**One canary ran, not two.** The backlog held a single ticket scoped to the
+root build, and the canary is scoped to the backlog rather than to the tree —
+so the `plugin` build was never asked about a language no ticket writes.
+
+**`reproduce-test` was recorded as `failed` on a textbook run.** Its red *is*
+the pass, the same inversion the preflight canary has, and the panel showed one
+red step in a run where nothing went wrong. Fixed the same way, with
+`Store.restate_step`: `ok` when the reproduction fails on the code, `failed`
+when it passes and proves nothing.
+
+**Ratification demanded acceptance criteria a bug ticket must not have.** On
+the second run three of four roles refused to sign off — *the Acceptance
+criteria section still says "(none stated)" … add them there* — and the ticket
+blocked without an attempt, on the same report the first run had fixed an hour
+earlier. The pass had never been told what kind of ticket it was reading. A
+bug ticket's contract is the reproduction, and criteria written now would be
+authored by the party being judged and satisfied the moment the code reads
+right, which is how both of the defects above shipped green in the first place.
+`ratify_prompt` now says so on a bug ticket and says what stands in for them.
+
+That the block was *intermittent* is the part worth keeping: the run that
+passes says nothing about the one that will not, and only running the same
+input twice found it.
+
+On the third run a role still tried to add criteria — `ratify grew the
+acceptance criteria from 0 to 9; the revision was refused` — and the ratchet
+held, which is the outcome that pass is for. The ticket signed off and the run
+finished green.
+
 ## Trying it
 
-The two defects above are still in the test project, deliberately unfixed. They
-are the honest first test of this feature: a plain-language report, a fix, and
-the existing suite still passing afterwards.
+The two Tetris defects named above are still unfixed in that project. They are
+the harder test of this feature — a report about behaviour over time rather
+than about one call's return value.
 
 ```bash
 forge bug "after the tab is in the background for a few seconds, switching \

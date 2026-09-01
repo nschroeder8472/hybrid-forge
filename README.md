@@ -403,8 +403,35 @@ forge/profile.py          machine-level endpoints, reused by the next repo
 forge/ui/                 dashboard
 plugins/forge-setup/      Claude Code plugin: machine + repository setup
 plugins/forge-spec/       Claude Code plugin: spec authoring, triage, memory
+examples/sample-project/  the fixture a loop change is run against
+scripts/sample_workspace.py  copies that fixture somewhere a run may write
 tests/                    python -m unittest discover tests
 ```
+
+## Changing the loop
+
+Unit tests say a change is what you meant. They do not say what it does to a
+run, and most of what this project knows came from watching a real backlog
+fail. `examples/sample-project` is the cheapest imitation of that: two builds,
+a three-ticket spec on the parsed path, one dependency between tickets, a green
+baseline, and a bug the suite does not catch.
+
+```
+python scripts/sample_workspace.py     # copy it somewhere a run may write
+cd <the path it prints>
+forge --root . doctor                  # the coverage matrix, no tokens spent
+forge ingest SPEC.md                   # three tickets, parsed
+forge go
+```
+
+Run it against a copy, never in place — a run writes code, a database and an
+artifact tree, and the committed tree is a fixture. `.gitignore` holds the
+fixture as an allow-list so anything a run leaves behind is ignored rather than
+staged, and `tests/test_sample_project.py` pins what a run depends on: both
+suites green, the spec parsed rather than replanned, every path it names owned
+by a build, every ticket carrying its own test file, the four paths the spec
+must find missing, and the seeded defect still a defect. Those run with the
+ordinary suite and spend nothing.
 
 ## Status
 
