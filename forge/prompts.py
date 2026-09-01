@@ -3144,7 +3144,7 @@ Reply with a JSON object and nothing else:
   "criteria": ["every criterion, in full, including the unchanged ones"],
   "allowed_files": ["path/one"],
   "reference_files": ["path/two"],
-  "context": "anything the roles must carry, or omit this key",
+  "context": "the current context plus anything else the roles must carry, or omit this key",
   "responses": ["one line per objection: what you changed, or why you did not"]
 }
 ```
@@ -3152,6 +3152,11 @@ Reply with a JSON object and nothing else:
 Every key is optional, except that the reply has to change something. Omit a
 key to leave that field exactly as it is. `criteria` and the file lists are
 replacements rather than additions, so send them in full or not at all.
+
+`context` is a replacement too, and the ticket already has some. Send it back
+with your addition, or omit the key — a `context` that drops what is there
+loses instructions the executor depends on, and the loop puts the original back
+in front of yours rather than letting that happen.
 """
 
 
@@ -3188,6 +3193,9 @@ def ratify_revision_prompt(
 
 ## Acceptance criteria
 {_criteria_block(ticket)}
+{_ratify_bug_note(ticket)}
+## Current context (carried to every role; extend it, do not replace it)
+{ticket.context.strip() or "(none)"}
 
 ## What the plan originally asked for
 {ticket.original_spec or ticket.spec}

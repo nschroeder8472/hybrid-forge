@@ -2776,11 +2776,21 @@ class Orchestrator:
         # way — two tester calls apiece — and would have run forever under
         # `-1`. The tester's own explanation is in `blocked_note`; that is the
         # thing to read, and it needs a person.
+        #
+        # Asked of tickets that *tried*. A bug ticket blocked before the
+        # reproduce step — at ratification, on a dependency, on a scope
+        # refusal — has demonstrated nothing about the report, and sweeping it
+        # in here spends the wrong remedy on it twice: the retry a respec would
+        # have fixed is suppressed, and the log tells whoever reads it to
+        # sharpen a report that was never the problem. One live run blocked at
+        # ratification with `attempts 0` and was filed as an unreproducible
+        # bug.
         unprovable = {
             ticket.ticket_id
             for ticket in tickets
             if ticket.kind == TICKET_BUG
             and ticket.status == TICKET_BLOCKED
+            and self.store.attempted_reproduction(run_id, ticket.ticket_id)
             and not self.store.reproduced(run_id, ticket.ticket_id)
         }
         for ticket_id in sorted(unprovable):

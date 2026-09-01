@@ -142,16 +142,22 @@ The five questions this entry was written around were answered as follows.
   running something. What they share is the failure-to-revision shape, not the
   code.
 
-**Run three times, end to end.** Against `examples/sample-project` on
-2026-08-31: a prose report, a reproduction that went red on the code and green
-after the fix, one attempt, 12 calls, 77.3k tokens, no retry cycle. Two defects
-came out of it — `reproduce-test` reported as failed on a run where nothing
-went wrong, and a sign-off pass that demanded acceptance criteria a bug ticket
-must not have, which blocked the second run on the same input the first had
-fixed. Both repaired, both re-confirmed live. See the first-live-runs section
-of [BUG-LOOP.md](BUG-LOOP.md). The two Tetris defects below are still the
-harder case: a fault in behaviour over time rather than in one call's return
-value.
+**Run four times, end to end.** Against `examples/sample-project`: a prose
+report, a reproduction that went red on the code and green after the fix, one
+attempt, 12 calls, 73.5k tokens, no retry cycle, and — on the fourth run — no
+warning of any kind. Five defects came out of those runs: `reproduce-test`
+reported as failed on a run where nothing went wrong; a sign-off pass that
+demanded acceptance criteria a bug ticket must not have, which blocked the
+second run on the same input the first had fixed; the revision pass that had
+not been told either, so it proposed criteria the ratchet refused once per run;
+a revision prompt that asked for a `context` it never showed, so every revision
+replaced a paragraph it had not read; and a retry rule that filed a ticket
+blocked *before* reproduction as an unreproducible bug, suppressing the retry
+that would have helped and telling the human to sharpen a report that was never
+the problem. All repaired, all re-confirmed live. See the first-live-runs
+section of [BUG-LOOP.md](BUG-LOOP.md). The two Tetris defects below are still
+the harder case: a fault in behaviour over time rather than in one call's
+return value.
 
 - `src/game.rs` — `Game::tick` drains its accumulator with a `while` loop that
   calls `SoftDrop`, and `SoftDrop` locks the piece on collision. A frame gap of

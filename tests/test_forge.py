@@ -20388,6 +20388,113 @@ class TestATicketCanReadWhatItsDependenciesWrote(unittest.TestCase):
         self.assertEqual(logged, [])
 
 
+class TestTheRatifyRevisionSeesWhatItIsRewriting(unittest.TestCase):
+    """The revision prompt asks the planner for a `context` and never showed it
+    the one the ticket has, so every revision that touched the field replaced a
+    paragraph it had not read. `_preserve_plan_context` puts the original back
+    and logs it — which fired on all three live runs against
+    `examples/sample-project`, on runs where nothing else went wrong.
+
+    A guardrail that fires every time is not a guardrail, it is a prompt
+    defect being papered over once per run."""
+
+    def _body(self, ticket):
+        from forge.prompts import ratify_revision_prompt
+
+        notes = [{"role": "tester", "blocking": ["say what it returns"]}]
+        return " ".join(ratify_revision_prompt(ticket, notes)[-1].content.split())
+
+    def test_the_current_context_is_shown(self):
+        ticket = Ticket(
+            ticket_id="SP-001",
+            title="rank the counted words",
+            spec="add top_words",
+            criteria=["top_words({'a': 1}, 0) returns []"],
+            context="imports in this package resolve without an extension",
+        )
+
+        body = self._body(ticket)
+
+        self.assertIn("imports in this package resolve without an extension", body)
+        self.assertIn("extend it, do not replace it", body)
+
+    def test_a_ticket_with_no_context_says_so_rather_than_showing_a_hole(self):
+        body = self._body(Ticket(ticket_id="SP-002", title="x", spec="y"))
+
+        self.assertIn("Current context (carried to every role", body)
+        self.assertIn("(none)", body)
+
+    def test_a_bug_ticket_is_told_its_criteria_are_the_reproduction(self):
+        # The other half of the same defect: the sign-off pass was taught this
+        # and the revision pass was not, so the planner kept proposing criteria
+        # for a bug ticket and the ratchet kept refusing them — once per run,
+        # on every run.
+        body = self._body(
+            Ticket(
+                ticket_id="BUG-001",
+                title="punctuation is counted as part of the word",
+                kind=TICKET_BUG,
+                spec="strip punctuation from each token",
+            )
+        )
+
+        self.assertIn("no acceptance criteria and must not be given any", body)
+
+
+class TestABugBlockedBeforeReproductionIsStillRetried(unittest.TestCase):
+    """`retryCycles` skips a bug ticket that could not be reproduced, because
+    nothing between cycles makes an undemonstrable fault demonstrable. It asked
+    the wrong question: *was there a reproduction*, rather than *was one ever
+    attempted*.
+
+    A live run blocked at ratification with `attempts 0`, never reached the
+    reproduce step, and was filed as an unreproducible bug — so the retry a
+    respec would have fixed was suppressed, and the log told whoever read it to
+    sharpen a report that was never the problem."""
+
+    def _run(self, *, reproduce_step: str | None):
+        orch, _root, run_id = _stub_orchestrator({"test": "pytest -q"})
+        orch.store.add_tickets(
+            run_id,
+            [Ticket("BUG-001", title="counts punctuation", kind=TICKET_BUG)],
+        )
+        stored = orch.store.list_tickets(run_id)[0]
+        stored.status = TICKET_BLOCKED
+        stored.blocked_note = "ratification failed"
+        orch.store.update_ticket(run_id, stored)
+        if reproduce_step is not None:
+            step = orch.store.start_step(run_id, "BUG-001", "reproduce")
+            orch.store.end_step(step, reproduce_step, "output")
+        return orch, run_id
+
+    def _said(self, orch):
+        return " | ".join(
+            row["message"] for row in orch.store.events_after(0, limit=200)
+        )
+
+    def test_a_ticket_that_never_reached_the_step_is_not_called_unprovable(self):
+        orch, run_id = self._run(reproduce_step=None)
+
+        orch._retry_cycle(run_id, TICKET_BLOCKED)
+
+        self.assertNotIn("the bug was never reproduced", self._said(orch))
+        self.assertEqual(
+            orch.store.list_tickets(run_id)[0].status, TICKET_PENDING
+        )
+
+    def test_a_ticket_that_tried_and_failed_is_still_left_alone(self):
+        # The behaviour this rule exists for: one report ran fifteen cycles,
+        # two tester calls apiece, against a fault no test could show.
+        orch, run_id = self._run(reproduce_step="failed")
+
+        orch._retry_cycle(run_id, TICKET_BLOCKED)
+
+        self.assertIn("the bug was never reproduced", self._said(orch))
+        self.assertEqual(
+            orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED
+        )
+
+
 class TestRatifyKnowsABugTicketHasNoCriteria(unittest.TestCase):
     """A bug ticket has no acceptance criteria by design: its contract is a
     test that does not exist yet, and the party who would write criteria now is

@@ -1207,6 +1207,24 @@ class Store:
         ).fetchone()
         return row["detail"] if row else ""
 
+    def attempted_reproduction(self, run_id: int, ticket_id: str) -> bool:
+        """Whether reproduction was ever tried for this ticket, pass or fail.
+
+        Different question from `reproduced`, and the difference decides
+        whether a retry is worth spending. A ticket that tried and could not
+        demonstrate the fault will not do better on the next cycle — nothing
+        between cycles makes an undemonstrable fault demonstrable. A ticket
+        that never reached the step stopped somewhere else entirely, and the
+        remedy for wherever it stopped is exactly what a retry with a respec
+        is.
+        """
+        row = self._connection.execute(
+            "SELECT 1 FROM steps "
+            "WHERE run_id = ? AND ticket_id = ? AND name = 'reproduce' LIMIT 1",
+            (run_id, ticket_id),
+        ).fetchone()
+        return row is not None
+
     def failed_steps(self, run_id: int, ticket_id: str) -> list[tuple[str, str]]:
         """Every failed step this ticket recorded, as `(name, output)`, oldest first.
 

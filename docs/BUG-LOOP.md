@@ -331,15 +331,16 @@ prove — a glob matched — which is why it is spelled out rather than left as
 
 ## The first live runs
 
-Three runs against `examples/sample-project` on 2026-08-31 — a seeded defect, a
-report written in prose, a local model in every role. The first fixed it, the
-second blocked without an attempt on the same input, and the third fixed it
-again with the two defects that difference exposed repaired:
+Four runs against `examples/sample-project` — a seeded defect, a report written
+in prose, a local model in every role. The first fixed it, the second blocked
+without an attempt on the same input, the third fixed it again with the two
+defects that difference exposed repaired, and the fourth ran with no warning of
+any kind:
 
 ```
 forge bug --file BUG.md      BUG-001, scope wordcount/counter.py,
                              reads tests/counter_test.py, SPEC.md
-forge go                     13 steps, all ok, 12 calls, 77.3k tokens, 547 s
+forge go                     13 steps, all ok, 12 calls, 73.5k tokens, 521 s
 
   ratify ok
   baseline-test ok
@@ -356,7 +357,7 @@ stop")` — and the fix was `word.strip(string.punctuation)`, which keeps the
 interior apostrophe by construction. Neither the report nor the ticket said
 `strip`; the reproduction is what made the second case non-negotiable.
 
-Four things the runs settled that the design could not.
+Six things the runs settled that the design could not.
 
 **The reproduction went into the suite that already existed.** `_repro_target`
 resolved to `tests/counter_test.py` rather than a derived `bug_001_test.py`,
@@ -388,10 +389,24 @@ That the block was *intermittent* is the part worth keeping: the run that
 passes says nothing about the one that will not, and only running the same
 input twice found it.
 
-On the third run a role still tried to add criteria — `ratify grew the
-acceptance criteria from 0 to 9; the revision was refused` — and the ratchet
-held, which is the outcome that pass is for. The ticket signed off and the run
-finished green.
+**The ratify *revision* pass had not been told either.** Teaching
+`ratify_prompt` about bug tickets left the planner's revision prompt still
+showing `Acceptance criteria: (none stated)` with no explanation, so it kept
+proposing criteria and the ratchet kept refusing them — `ratify grew the
+acceptance criteria from 0 to 9; the revision was refused`, once per run, on
+every run including the third. A guardrail that fires every time is a prompt
+defect being papered over rather than a guardrail.
+
+**The revision prompt asked for a `context` it never showed.** It listed the
+spec, the scope, the criteria and the objections, and not the context the
+ticket already carries — so every revision that used the field replaced a
+paragraph it had not read, and `_preserve_plan_context` put the original back
+and logged it, again once per run on every run. The prompt now shows the
+current context and asks for it to be extended.
+
+The fourth run recorded **no warnings at all**: 13 steps, all `ok`, 12 calls,
+73.5k tokens, 521 seconds. That is the number to compare a loop change against
+— a run with nothing in the log is what this fixture is for.
 
 ## Trying it
 
