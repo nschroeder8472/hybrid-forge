@@ -22,7 +22,7 @@ second-guessing an OpenAI executor — with no code change.
   "commands": {"lint": "...", "typecheck": "...", "test": "..."},
   "neverDelegate": ["src/auth/**"],
   "memory": {"command": ["mempalace-mcp"], "room": "image-marquee"},
-  "loop": {"maxAttempts": 3, "autoCommit": false, "retryCycles": 0},
+  "loop": {"maxAttempts": 5, "autoCommit": false, "retryCycles": -1},
   "ui": {"host": "127.0.0.1", "port": 8799}
 }
 ```
@@ -530,10 +530,16 @@ class Workspace:
 class LoopSettings:
     """Knobs governing how hard the loop tries before handing back to a human."""
 
-    # Rework attempts per ticket before it is parked as blocked. Three is
-    # enough to absorb a lint error and a shallow test failure; beyond that the
-    # failure is usually a spec problem no amount of retrying fixes.
-    max_attempts: int = 3
+    # Rework attempts per ticket before it is parked as blocked. Three absorbs
+    # a lint error and a shallow test failure; five absorbs the case that
+    # actually shows up on a local executor, which is a correct implementation
+    # arriving in a shape the parser cannot read. On one shipped ticket two of
+    # the nine attempts it took were spent on a reply whose fence was wrong.
+    #
+    # Past five the failure is a spec problem no amount of retrying fixes, and
+    # `retryCycles` with a respec between cycles is the tool for that, not more
+    # attempts against the same words.
+    max_attempts: int = 5
     # Commit each verified ticket. Off by default — the first runs of an
     # autonomous loop should leave their work in the tree for inspection.
     auto_commit: bool = False
@@ -543,10 +549,20 @@ class LoopSettings:
     stop_on_blocked: bool = False
     # Whole-backlog retry cycles once the run has ended anything other than
     # done. Each one requeues every ticket that failed, blocked or was skipped
-    # and starts the loop over them again. 0 hands back to a human, which is
-    # the safe default; -1 means keep going until the backlog is clean or
-    # somebody stops the run.
-    retry_cycles: int = 0
+    # and starts the loop over them again. 0 hands back to a human; -1 keeps
+    # going until the backlog is clean or somebody stops the run.
+    #
+    # -1 by default, which was only defensible once a cycle could be measured
+    # rather than merely counted. `flatCycles` ends the retries when a cycle
+    # fails in exactly the way the previous one did, so an unattended run
+    # converges or stops on its own — observed doing both: one backlog stopped
+    # itself after a single repeated cycle, and the next landed a ticket on the
+    # cycle after the one that gave up on it.
+    #
+    # Without that detector this default is the 18-hour run in CONVERGENCE.md.
+    # Anyone turning `flatCycles` off should set this back to 0 or a small
+    # number in the same edit.
+    retry_cycles: int = -1
     # Have the planner rewrite each requeued ticket from why it failed before
     # the next cycle starts — `forge retry --respec`, applied automatically.
     # On by default: a cycle that re-runs the spec which already failed is a
@@ -687,9 +703,14 @@ class LoopSettings:
     # inside the attempt, on the same conversation thread, against the same
     # contract. Only compile-shaped checks qualify — see `_compile_gate`.
     #
-    # Off by default. It changes how attempts are counted, which is the number
-    # every convergence rule in the loop is written against.
-    inner_turns: int = 0
+    # On by default, at three. It changes how attempts are counted — the number
+    # every convergence rule in the loop is written against — which is why it
+    # shipped off, and the measurement is what moved it: `typecheck` averages
+    # 0.7s against the tester's 12.0s, and on the ticket that was measured 58 of
+    # 95 cycles wrote a test file for an implementation that then failed to
+    # compile. A turn is spent only while the error count is falling, so a reply
+    # that is not converging still charges the attempt.
+    inner_turns: int = 3
     # Whether the executor and tester are shown the linter, compiler and test
     # runner configuration that grades what they write — the real files, at
     # their real paths, resolved per language from the ticket's own scope.
@@ -1006,10 +1027,10 @@ class Config:
 
         loop = data.get("loop", {}) or {}
         config.loop = LoopSettings(
-            max_attempts=int(loop.get("maxAttempts", 3)),
+            max_attempts=int(loop.get("maxAttempts", 5)),
             auto_commit=bool(loop.get("autoCommit", False)),
             stop_on_blocked=bool(loop.get("stopOnBlocked", False)),
-            retry_cycles=int(loop.get("retryCycles", 0)),
+            retry_cycles=int(loop.get("retryCycles", -1)),
             respec_on_retry=bool(loop.get("respecOnRetry", True)),
             respec_criteria=bool(loop.get("respecCriteria", False)),
             reopen_stale_dependents=bool(
@@ -1023,7 +1044,7 @@ class Config:
             max_runtime_seconds=int(loop.get("maxRuntimeSeconds", 0)),
             baseline_verify=bool(loop.get("baselineVerify", True)),
             executor_turns=int(loop.get("executorTurns", 4)),
-            inner_turns=int(loop.get("innerTurns", 0)),
+            inner_turns=int(loop.get("innerTurns", 3)),
             prior_failures=int(loop.get("priorFailures", 8)),
             learned_limit=int(loop.get("learnedLimit", 12)),
             flat_cycles=int(loop.get("flatCycles", 0)),

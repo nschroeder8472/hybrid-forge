@@ -1,6 +1,13 @@
 # Handback: the work the loop returns, and how a human answers it
 
-**Status:** specified, not built. Against `main` at `743f87c`.
+**Status:** stages 1-5 built. Stages 6-7 — the dashboard and its write
+endpoints — are not, deliberately: §7 argues for exercising the mechanism
+through the command line before putting a network surface on it, and that
+has now happened but the run that would justify the endpoints has not.
+
+Built: `forge advise`, `forge release`, `forge discharge`,
+`forge criteria --add`, the `withheld:<reason>` route, and `withheld` as a
+status distinct from `skipped`.
 
 The loop has six ways to stop working on a ticket and hand it back. It has no
 way to be handed anything in return. Every one of those exits writes prose into

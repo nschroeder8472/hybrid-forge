@@ -32,8 +32,8 @@ what it reports rather than starting over.
 These answers are the same in every repository, so they are asked once and
 stored in the profile.
 
-**Ask what the user actually has**, do not assume the sample. The realistic
-shapes:
+**Ask what the user actually has**, and take the answer over the sample. The
+realistic shapes:
 
 - a local model — adapter `llamacpp`, pointed at a `llama-server` running in
   router mode (`--models-preset`), `baseUrl` ending in `/v1`. This is the only
@@ -58,15 +58,25 @@ retyped line now and an entire overnight run later.
   `llamacpp` the reply lists every preset section with its load status, and
   the ids there are the only values `model` may take.
 - `claude-cli`: check `claude` resolves on PATH.
-- key-based adapters: check the named environment variable is set. Never read,
-  echo, or write the key itself — only the variable name goes in config.
+- key-based adapters: check the named environment variable is set, and stop
+  there. The variable *name* is the only part that goes in config, a log, or
+  anything you print; the value stays where the user put it.
 
 Then assign the four roles: `planner`, `executor`, `tester`, `reviewer`. Any
 declared model can play any of them. Explain the tradeoff rather than picking
 silently:
 
 - A strong model on `reviewer` is what keeps a cheap executor honest.
-- **Never point `executor` and `reviewer` at the same model.** A model reviewing
+- **Then set `loop.ratifyOrder` to group the roles that share a model.** The
+  sign-off pass calls all four in that order, and on a backend serving one
+  checkpoint at a time — `llamacpp` with `exclusive`, or a router started with
+  `--models-max 1` — two roles sharing a model are free when adjacent and cost
+  a checkpoint reload when not. With `planner` and `reviewer` on one model and
+  `executor` and `tester` on another, the default order costs three reloads per
+  pass and `["planner","reviewer","executor","tester"]` costs one. Where every
+  role has its own endpoint, leave it alone: the order also decides who votes
+  blind and who answers three arguments, and the default reads in role order.
+- **Point `executor` and `reviewer` at different models.** A model reviewing
   its own diff against a spec it just implemented accepts it, and the review
   step is the only thing standing between a cheap executor and a merged
   mistake.
@@ -90,8 +100,8 @@ before it lands.
 
 ## 2. Project layer — this repository
 
-`forge init` is interactive when it has a terminal. You do not have one, so it
-takes its defaults — which is useful rather than a problem: it still reads the
+`forge init` is interactive when it has a terminal, and yours runs without one,
+so it takes its defaults — which is useful rather than a problem: it still reads the
 repo's CI config and docs to find the verify commands, and reuses the machine
 profile. Your job is to check what it chose and fix what it could not know.
 
@@ -123,9 +133,10 @@ profile. Your job is to check what it chose and fix what it could not know.
    without a target** — the loop appends the paths: `gdformat`,
    `prettier --write`, `ruff format`, `rustfmt`, `gofmt -w`, `black`,
    `dart format`. A command that ignores its arguments and walks the whole tree
-   reformats files no ticket owns, on every attempt. Never a check-only mode
-   (`black --check`, `gofmt -l`) — those report, and this one has to rewrite.
-   And never a `make fmt` target whose own arguments you cannot read.
+   reformats files no ticket owns, on every attempt. Give the mode that
+   rewrites: a check-only mode (`black --check`, `gofmt -l`) reports instead of
+   rewriting, and a `make fmt` target hides the arguments it passes, so both
+   read as a formatter and behave as something else.
 
    Blank is a supported answer and the right one when the project's formatter
    can only be run over everything.
@@ -133,22 +144,42 @@ profile. Your job is to check what it chose and fix what it could not know.
    `package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`, `build.gradle`,
    `pom.xml`. If there is more than one and the config declares no
    `workspaces`, this repository is about to verify as one build, and every
-   ticket will pay for every other build's suite on every attempt. It never
-   fails, so nothing reports it: one run spent 2.1 of 18 hours running a Godot
+   ticket will pay for every other build's suite on every attempt. It passes
+   every time, so nothing reports it: one run spent 2.1 of 18 hours running a Godot
    suite against TypeScript tickets, and wrote 229 MB of passing output to
    disk for a single ticket.
 
    Declare each manifest directory as a workspace with its own commands, or
    re-run `forge init` and answer yes when it offers. The exception is a
-   monorepo whose subdirectories genuinely share one toolchain — ask, do not
-   assume.
-4. **Leave the `loop` block alone unless the user asks.** `ratifyPasses: 2`,
-   `executorTurns: 4` and `baselineVerify: true` ship on, and each is paying
-   for something a run loses silently without it — see the `workspace-layout`
-   skill for what each one buys. If the user wants to cut model calls, say what
-   the run gives up rather than trimming quietly. `retryCycles` is the one
-   worth discussing: the default hands blocked work back after two cycles, and
-   raising it only helps on a backlog you expect to converge slowly.
+   monorepo whose subdirectories genuinely share one toolchain, and that is a
+   question for the user rather than a guess.
+4. **Ask about `retryCycles`. Leave the rest of the `loop` block alone unless
+   the user asks.** `ratifyPasses: 2`, `executorTurns: 4`, `innerTurns: 3`,
+   `maxAttempts: 5` and `baselineVerify: true` ship on, and each pays for
+   something a run loses silently without it — the `workspace-layout` skill
+   says what each one buys. If the user wants to cut model calls, say what the
+   run gives up rather than trimming quietly.
+
+   `retryCycles` is the one to put to them, because it decides how a run ends
+   when it stops making progress. Offer the three shapes:
+
+   - **`-1` — keep cycling until the backlog is clean or you stop it.** The
+     default, and the right answer for an unattended overnight run. Each cycle
+     requeues everything unfinished, respecs each ticket from why it failed,
+     and runs again.
+   - **A small number, two or three.** For a run somebody is watching, or where
+     a cycle is expensive enough to want the respec revisions read before
+     another one starts.
+   - **`0` — hand back after the first pass.** For a metered budget, or a first
+     run against a new repository where the point is to see what the loop does
+     before letting it iterate.
+
+   Two things to say alongside the answer. `-1` is bounded by `flatCycles`,
+   which ends the retries when a cycle fails in exactly the way the one before
+   it did — so the pair is a single decision, and turning `flatCycles` off while
+   `retryCycles` is `-1` removes the only thing that stops a run going nowhere.
+   And an unattended `-1` wants a brake set in the same edit: `maxRuntimeSeconds`,
+   or a spend cap on the provider.
 5. Propose a `neverDelegate` list from what is actually in this repo — auth and
    session handling, migrations, concurrency-heavy modules, published
    interfaces, CI workflow files, crypto, payment paths. One question decides
@@ -159,11 +190,12 @@ profile. Your job is to check what it chose and fix what it could not know.
    wrong caller through, a migration that runs clean and drops a column, a
    workflow edited to stop running the suite at all.
 
-   Do not add a path because it looks infrastructural. Build files, manifests,
-   lockfiles, and project config are where a large share of real bugs live, and
-   listing one costs more than it reads: `forge bug` routes any report scoped to
-   a matching path `claude-only`, so every such bug is filed already parked, for
-   a human to implement by hand. The one build-file case worth listing is a file
+   Add a path only when the loop editing it would weaken the checks the loop is
+   judged by. Build files, manifests, lockfiles and project config look
+   infrastructural and are where a large share of real bugs live, so listing one
+   costs more than it reads: `forge bug` routes any report scoped to
+   a matching path `withheld:never-delegate`, so every such bug is filed already
+   parked, for a human to implement by hand. The one build-file case worth listing is a file
    that can weaken the verify commands themselves — a test task disabled, a
    source set narrowed — and only when `autoCommit` is on, because a human
    reading the diff before it lands is the same guard by other means.

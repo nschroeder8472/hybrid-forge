@@ -14,6 +14,9 @@
     forge replay [--changed]       re-read past output with today's parsers
     forge prune [--keep N]         delete the artifact trees of old runs
     forge models                   write the llama.cpp preset the local models serve from
+    forge advise <id> "..."        tell the planner and executor something
+    forge release <id> --note ...  return a withheld ticket to the executor
+    forge discharge <id>           you wrote it by hand; verify and mark it done
     forge llama [install|list]     fetch the pinned llama.cpp build for this machine
     forge pause | resume | stop    control a running loop
     forge ui [--host H] [--port N] serve the dashboard on its own
@@ -36,7 +39,7 @@ import webbrowser
 from collections import Counter
 from pathlib import Path
 
-from . import evidence, llama, presets, replay, respec, toolchain, wizard
+from . import evidence, llama, presets, replay, respec, routes, toolchain, wizard
 from .artifacts import ARTIFACTS_DIR, GITIGNORE_LINES
 from .config import (
     ANY_LANGUAGE,
@@ -49,7 +52,7 @@ from .config import (
     normalize_workspace_root,
 )
 from .ingest import ingest as ingest_document
-from .ingest import undeclared_order, write_tickets
+from .ingest import undeclared_order, untestable_scope, write_tickets
 from .loop import (
     CONTROL_KEY,
     CONTROL_PAUSE,
@@ -70,6 +73,7 @@ from .state import (
     TICKET_DONE,
     TICKET_FAILED,
     TICKET_SKIPPED,
+    TICKET_WITHHELD,
     Store,
     Ticket,
 )
@@ -664,6 +668,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         )
 
     _warn_missing_manifests(config, tickets)
+    _warn_untestable_scope(tickets)
 
     # Said after `derive_needs` has run, so a shared writable file has already
     # been ordered and is not what this is about.
@@ -682,7 +687,11 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     verb = "parsed directly from your plan" if how == "parsed" else "planned from your spec"
     print(f"Run {run_id}: {len(tickets)} ticket(s) {verb}.\n")
     for ticket, path in zip(tickets, paths):
-        marker = " (claude-only)" if ticket.route != "delegate" else ""
+        marker = (
+            f" ({routes.describe(ticket.route)})"
+            if routes.is_withheld(ticket.route)
+            else ""
+        )
         waits = f"  [needs {', '.join(ticket.needs)}]" if ticket.needs else ""
         print(f"  {ticket.ticket_id}  {ticket.title}{marker}{waits}")
         print(f"      {path}")
@@ -1406,9 +1415,11 @@ def cmd_bug(args: argparse.Namespace) -> int:
         kind=TICKET_BUG,
         # Never delegated blindly: a bug in code the project marked off-limits
         # is exactly the kind that wants a person.
-        route="claude-only"
+        # The one reason the harness can prove rather than judge: a glob
+        # matched, which is a mechanical fact in the way an error code is.
+        route=f"{routes.WITHHELD}:never-delegate"
         if any(matches_any(p, config.never_delegate) for p in fields["allowed_files"])
-        else "delegate",
+        else routes.DELEGATE,
         spec=fields["spec"],
         allowed_files=fields["allowed_files"],
         reference_files=fields["reference_files"],
@@ -1449,10 +1460,11 @@ def cmd_bug(args: argparse.Namespace) -> int:
     if ticket.context:
         print(f"  reproduce {ticket.context}")
     print(f"\n{ticket.spec}\n")
-    if ticket.route != "delegate":
+    if routes.is_withheld(ticket.route):
         print(
-            "Routed claude-only: the scope touches a neverDelegate path, so the "
-            "loop will leave it for you."
+            f"Routed {routes.describe(ticket.route)}: the scope touches a "
+            f"neverDelegate path, so the loop will leave it for you. When you "
+            f"have written it, `forge discharge {ticket.ticket_id}`."
         )
 
     if args.go:
@@ -1553,6 +1565,19 @@ def _warn_missing_manifests(config: Config, tickets: list) -> list[str]:
     if gaps:
         print("  Add the build file as a ticket of its own, before the ones that need it.")
     return gaps
+
+
+def _warn_untestable_scope(tickets: list) -> list[str]:
+    """Say which tickets have nowhere in scope to put the tests they will get.
+
+    At ingest for the same reason as the manifest gaps: adding the path to
+    `Allowed files` costs a line now and costs the ticket later. See
+    `ingest.untestable_scope`.
+    """
+    problems = untestable_scope(tickets)
+    for problem in problems:
+        print(f"\nwarning: {problem}")
+    return problems
 
 
 def _warn_uncovered(config: Config, paths: list[str]) -> list[str]:
@@ -1784,6 +1809,212 @@ def _write_command(
     return 0
 
 
+def _verify_tree(config: Config, store: Store, run_id: int, ticket: Ticket) -> list:
+    """Run this ticket's verify commands against the tree as it stands.
+
+    The loop's own machinery, not a second implementation of it. `_verify_plan`
+    knows which build a ticket's files belong to and which languages have files
+    under it; `_shell` knows the timeout, the working directory each command
+    needs, and how to re-root the paths in its output. A discharge that ran
+    `config.commands["test"]` directly would agree with the loop right up until
+    the project had two builds.
+
+    Steps are recorded against the ticket exactly as an attempt's are, because
+    a discharge is a pass over the ticket and the step log is where a person
+    looks to see what was checked.
+
+    Built through `__new__` rather than a constructor: the orchestrator's
+    `__init__` builds providers and a budget gate, and verification needs
+    neither. Nothing here calls a model.
+    """
+    from .loop import Orchestrator
+
+    runner = Orchestrator.__new__(Orchestrator)
+    runner.config = config
+    runner.store = store
+
+    # Paired with the step name: `StepResult` carries only `ok` and `detail`,
+    # and which command produced a failure is the first thing a person reading
+    # a refused discharge needs.
+    results = []
+    for step in runner._verify_plan(ticket):
+        results.append(
+            (
+                step.name,
+                runner._shell(
+                    run_id, step.name, step.command, ticket.ticket_id,
+                    step.workspace,
+                ),
+            )
+        )
+    return results
+
+
+def _handback_target(args: argparse.Namespace) -> tuple[Config, Store, int, Ticket]:
+    """The run, the store and the ticket the three handback commands act on."""
+    config = _load(args.root)
+    store = _store(config)
+    run = store.get_run(args.run) if args.run else store.latest_run()
+    if run is None:
+        sys.exit("error: no runs yet. Ingest a spec first:\n  forge ingest plan.md")
+    run_id = int(run["id"])
+    matching = [t for t in store.list_tickets(run_id) if t.ticket_id == args.ticket]
+    if not matching:
+        sys.exit(
+            f"error: run {run_id} has no ticket {args.ticket}. "
+            f"List them with `forge status`."
+        )
+    return config, store, run_id, matching[0]
+
+
+def cmd_advise(args: argparse.Namespace) -> int:
+    """Write a note the planner and the executor will read on the next pass.
+
+    The return channel. The loop has seven ways to hand a ticket back and,
+    before this, no way to be handed anything in return: every exit wrote a
+    sentence into `blocked_note` addressed to a person who could not write one
+    back.
+
+    Nothing waits for it. The loop is unattended by design, and a gate it waits
+    on puts a human into the critical path of a system built not to have one —
+    where the failure looks exactly like a run that is thinking. A note is read
+    if it is there; a ticket that never gets one behaves as it always has.
+    """
+    _config, store, run_id, ticket = _handback_target(args)
+    text = " ".join(args.text).strip()
+    if not text:
+        sys.exit('error: say something.\n  forge advise PF-009 "the fixtures exist now"')
+
+    entry = store.advise(run_id, ticket, text)
+    store.log(
+        run_id,
+        f"{ticket.ticket_id}: a person advised — {text[:200]}",
+        kind="ticket",
+        data={"ticket": ticket.ticket_id, "author": "human"},
+    )
+    print(f"{ticket.ticket_id}: noted ({len(ticket.human_note)} in total).")
+    print(f"      {entry['text']}")
+    print(
+        "\nThe planner reads this on the next respec and the executor on the "
+        "next attempt. It is not an acceptance criterion — to move the bar, "
+        f"`forge criteria {ticket.ticket_id} --add \"...\"`."
+    )
+    return 0
+
+
+def cmd_release(args: argparse.Namespace) -> int:
+    """Return a withheld ticket to the executor, on the record.
+
+    Nothing else in the codebase writes `route` after ingest, so a ticket
+    withheld from the executor has had no way back into a run even once the
+    objection it was withheld over was answered. Its dependents stayed parked
+    behind it.
+
+    Recorded with the reason that was overruled, because a run where every
+    `security` route was released on the first cycle is a run whose triage was
+    theatre, and that should be readable afterwards.
+    """
+    _config, store, run_id, ticket = _handback_target(args)
+    if not routes.is_withheld(ticket.route):
+        print(f"{ticket.ticket_id} is already routed to the executor.")
+        return 0
+
+    note = " ".join(args.note).strip()
+    if not note:
+        sys.exit(
+            "error: releasing a withheld ticket needs a reason.\n"
+            f'  forge release {ticket.ticket_id} --note "the scope no longer '
+            f'touches auth"'
+        )
+
+    was = ticket.route
+    store.advise(run_id, ticket, f"Released from {routes.describe(was)}: {note}")
+    store.set_route(run_id, ticket, routes.DELEGATE)
+    if ticket.status == TICKET_WITHHELD:
+        store.reset_tickets(run_id, ticket_ids=[ticket.ticket_id])
+
+    store.log(
+        run_id,
+        f"{ticket.ticket_id}: released from {routes.describe(was)} by a person "
+        f"— {note[:200]}",
+        level="warn",
+        kind="ticket",
+        data={"ticket": ticket.ticket_id, "was": was, "author": "human"},
+    )
+    print(f"{ticket.ticket_id}: released from {routes.describe(was)}; now delegable.")
+    print(f"      {note}")
+    print("\nStart it with: forge go")
+    return 0
+
+
+def cmd_discharge(args: argparse.Namespace) -> int:
+    """Mark a withheld ticket done because a person wrote the code.
+
+    The transition that did not exist: the work is on disk, and the run should
+    carry on. Its dependents unblock through machinery that already exists —
+    `reopenStaleDependents` and `_park_unmet` both treat a discharged ticket as
+    any other completed one.
+
+    **It verifies before it believes.** A ticket done by hand is still a ticket
+    whose criteria have to hold, and the harness already knows how to check
+    that. A discharge against a red tree is refused with the failure shown: the
+    point of a hand-implemented ticket is that a person did work the loop could
+    not, not that the standard was suspended for it.
+    """
+    config, store, run_id, ticket = _handback_target(args)
+    if ticket.status == TICKET_DONE:
+        print(f"{ticket.ticket_id} is already done.")
+        return 0
+
+    note = " ".join(args.note).strip()
+
+    if args.no_verify:
+        # Said out loud, and recorded, because the whole argument for discharge
+        # is that the standard was not suspended.
+        print("Skipping verification — this ticket is being marked done unchecked.")
+        results = []
+    else:
+        print(f"Verifying {ticket.ticket_id} against the tree as it stands…")
+        results = _verify_tree(config, store, run_id, ticket)
+        failed = [(name, r) for name, r in results if not r.ok]
+        if failed:
+            print(f"\n{ticket.ticket_id}: NOT discharged — the tree is red.\n")
+            for name, result in failed:
+                print(f"  {name}: {result.detail.strip()[:600]}")
+            print(
+                "\nA hand-implemented ticket is still held to its criteria. Fix "
+                "the tree and run this again, or `--no-verify` to record it "
+                "anyway."
+            )
+            return 1
+        for name, _result in results:
+            print(f"  {name}: ok")
+
+    ticket.status = TICKET_DONE
+    ticket.blocked_note = ""
+    store.update_ticket(run_id, ticket)
+    if note:
+        store.advise(run_id, ticket, f"Discharged by hand: {note}")
+
+    store.log(
+        run_id,
+        f"{ticket.ticket_id}: discharged by a person"
+        + (f" — {note[:200]}" if note else "")
+        + ("; verification skipped" if args.no_verify else "; verify passed"),
+        level="warn",
+        kind="ticket",
+        data={
+            "ticket": ticket.ticket_id,
+            "author": "human",
+            "verified": not args.no_verify,
+            "was": routes.describe(ticket.route),
+        },
+    )
+    print(f"\n{ticket.ticket_id}: discharged. Its dependents are free to run.")
+    print("Continue with: forge go")
+    return 0
+
+
 def cmd_criteria(args: argparse.Namespace) -> int:
     """Show the criteria respec proposed and refused, and adopt one.
 
@@ -1806,8 +2037,24 @@ def cmd_criteria(args: argparse.Namespace) -> int:
     if args.ticket:
         pending = {k: v for k, v in pending.items() if k == args.ticket}
 
-    if not args.accept and not args.accept_all:
+    stated = [text.strip() for text in getattr(args, "add", []) if text.strip()]
+    if stated and not args.ticket:
+        sys.exit(
+            "error: name the ticket the criterion belongs to.\n"
+            '  forge criteria PF-009 --add "capture returns a seed of 3130775471"'
+        )
+
+    if not args.accept and not args.accept_all and not stated:
         return _print_pending(run_id, pending, args.ticket)
+
+    if stated and not args.accept and not args.accept_all:
+        # Stage 4 of the handback: `forge criteria --accept` widened from
+        # adopting a proposal the loop minted to stating one it never
+        # thought of. Invariant 2 — provenance decides what is immutable,
+        # not position: the ratchet refuses respec's additions because the
+        # party being judged does not raise its own bar, and a person is
+        # not that party.
+        return _adopt(config, store, run_id, args.ticket, stated, minted=False)
 
     if not args.ticket:
         sys.exit(
@@ -1834,20 +2081,46 @@ def cmd_criteria(args: argparse.Namespace) -> int:
                 )
             chosen.append(outstanding[index - 1])
 
-    ticket, adopted = store.promote_criteria(run_id, args.ticket, chosen)
+    return _adopt(config, store, run_id, args.ticket, chosen, minted=True)
+
+
+def _adopt(
+    config: Config,
+    store: Store,
+    run_id: int,
+    ticket_id: str,
+    criteria: list[str],
+    *,
+    minted: bool,
+) -> int:
+    """Put criteria into the plan's contract on a human's say-so.
+
+    Shared by the two ways that happens, which differ only in where the text
+    came from: `--accept` adopts one the loop proposed and the ratchet refused,
+    `--add` states one the loop never thought of. Both are plan-authored once
+    they land, and `minted` only changes what the log says — a criterion a
+    person wrote and one they endorsed are the same kind of thing afterwards,
+    and the record should still say which it was.
+    """
+    ticket, adopted = store.promote_criteria(run_id, ticket_id, criteria)
     if ticket is None:
-        sys.exit(f"error: run {run_id} has no ticket {args.ticket}.")
+        sys.exit(f"error: run {run_id} has no ticket {ticket_id}.")
     if not adopted:
-        print(f"{args.ticket} already carries every criterion named.")
+        print(f"{ticket_id} already carries every criterion named.")
         return 0
 
+    origin = (
+        "adopted" if minted else "stated"
+    )
     store.log(
         run_id,
-        f"{ticket.ticket_id}: a human adopted {len(adopted)} criterion(s) into "
+        f"{ticket.ticket_id}: a human {origin} {len(adopted)} criterion(s) into "
         f"the plan's contract. They are plan-authored from here — respec may "
         f"not drop or reword them.",
         kind="ticket",
-        data={"adopted": adopted, "ticket": ticket.ticket_id},
+        # Not "minted": that key already carries the list of criteria the
+        # loop proposed, and  iterates it.
+        data={"adopted": adopted, "ticket": ticket.ticket_id, "origin": origin},
     )
 
     # The tickets on disk are what a human reads to understand the run, and a
@@ -1855,9 +2128,9 @@ def cmd_criteria(args: argparse.Namespace) -> int:
     try:
         write_tickets(config.tickets_dir, [ticket])
     except OSError as exc:
-        print(f"warning: could not rewrite {args.ticket}.md ({exc}).")
+        print(f"warning: could not rewrite {ticket_id}.md ({exc}).")
 
-    print(f"{ticket.ticket_id}: adopted {len(adopted)} criterion(s) as the plan's.")
+    print(f"{ticket.ticket_id}: {origin} {len(adopted)} criterion(s) as the plan's.")
     for criterion in adopted:
         print(f"      {criterion}")
     if ticket.status == TICKET_DONE:
@@ -2140,7 +2413,60 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="adopt every outstanding proposal for the named ticket",
     )
+    p.add_argument(
+        "--add",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="state a criterion the loop never proposed. Plan-authored "
+             "from here, so the ratchet protects it — a person is not "
+             "the party being judged, which is the whole reason respec "
+             "may not do this; repeatable",
+    )
     p.set_defaults(func=cmd_criteria)
+
+    p = sub.add_parser(
+        "advise",
+        help="write a note the planner and executor read on the next pass",
+    )
+    p.add_argument("ticket", metavar="ID", help="the ticket to advise")
+    p.add_argument("text", nargs="+", help="what you want them to know")
+    p.add_argument("--run", type=int, default=0, help="run id (default: the latest)")
+    p.set_defaults(func=cmd_advise)
+
+    p = sub.add_parser(
+        "release",
+        help="return a withheld ticket to the executor, with the reason recorded",
+    )
+    p.add_argument("ticket", metavar="ID", help="the withheld ticket")
+    p.add_argument(
+        "--note",
+        nargs="+",
+        default=[],
+        required=True,
+        help="why the objection no longer applies. Required: a route released "
+             "without one leaves no record of who overruled the triage or why",
+    )
+    p.add_argument("--run", type=int, default=0, help="run id (default: the latest)")
+    p.set_defaults(func=cmd_release)
+
+    p = sub.add_parser(
+        "discharge",
+        help="mark a withheld ticket done because you wrote the code",
+    )
+    p.add_argument("ticket", metavar="ID", help="the ticket you implemented")
+    p.add_argument(
+        "--note", nargs="+", default=[], help="what you did, for the record"
+    )
+    p.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="record it done without running the verify commands. A discharge "
+             "verifies by default because a hand-implemented ticket is still "
+             "held to its criteria",
+    )
+    p.add_argument("--run", type=int, default=0, help="run id (default: the latest)")
+    p.set_defaults(func=cmd_discharge)
 
     p = sub.add_parser("retry", help="put failed tickets back on the backlog")
     p.add_argument("--run", type=int, default=0, help="run id (default: the latest)")

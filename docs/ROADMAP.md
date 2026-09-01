@@ -67,9 +67,14 @@ failure to either.
 
 ---
 
-## Handback — specified, not built
+## Handback — built
 
-**Status:** specified in [HANDBACK.md](HANDBACK.md).
+**Status:** stages 1-5 shipped as `forge advise`, `forge release`,
+`forge discharge` and `forge criteria --add`, with `withheld:<reason>` as the
+route and `withheld` as a status distinct from `skipped`. Stages 6-7 — the
+dashboard read side and its write endpoints — are deliberately not built; see
+[HANDBACK.md](HANDBACK.md) for why, and for what the mechanism has since been
+exercised against. This entry keeps the problem it was written around.
 
 The loop has seven ways to stop working on a ticket and hand it back — a route
 it will not take, an unmet dependency, `BLOCKED:`, `IMPOSSIBLE:`, a ladder
@@ -87,11 +92,12 @@ and skips it again, and nothing in the codebase ever writes `ticket.route`
 after ingest — so work a human has already implemented by hand cannot rejoin
 the run, and its dependents stay parked behind it.
 
-`claude-only` becomes `withheld:<reason>` over a closed vocabulary drawn from
-the categories the delegation-protocol skill already lists. The colon form is
-deliberate: every gate is written as `route != "delegate"` today, so a reason
-can be added without touching one of them, and rows recorded by older runs keep
-gating correctly.
+`claude-only` became `withheld:<reason>` over a closed vocabulary drawn from
+the categories the delegation-protocol skill already lists. The colon form was
+deliberate: every gate is written as `route != "delegate"`, so the reason was
+added without touching one of them, and rows recorded by older runs keep gating
+correctly — `claude-only` still parses and still withholds, reading as
+`withheld:unspecified` rather than being rewritten in place.
 
 **The gate itself is not up for removal.** A withheld ticket is withheld
 because a model should not write that code, not for want of detail, and a
@@ -143,11 +149,15 @@ a plain-language report, a fix, and the existing suite still passing afterwards.
 
 ---
 
-## Per-language verify commands
+## Per-language verify commands — built
 
-**Status:** designed, not built — [LANGUAGE-COVERAGE.md](LANGUAGE-COVERAGE.md).
+**Status:** built — [LANGUAGE-COVERAGE.md](LANGUAGE-COVERAGE.md), which carries
+the same status. All five phases landed, along with `forge toolchain` and the
+workspace layer described in [WORKSPACES.md](WORKSPACES.md). Only the wizard
+asking per language at `forge init` is still open. This entry keeps the problem
+it was written around.
 
-`commands.test` is one string, which assumes a repository is one language.
+`commands.test` was one string, which assumes a repository is one language.
 Everything downstream inherits it: which language the tester writes in, what
 verification proves, and whether a bug can be reproduced at all. Three observed
 failures share that root — a ticket that shipped green over JavaScript the suite

@@ -22,6 +22,13 @@ Still open: the conditional 2.4, and the measurement 4.1 asks for. A clean
 run from an empty repository — no drifted specs carried over — is the validation
 that has not been done yet.
 
+**Reading this later.** Line numbers, method names and proposed test names are
+all as of `961b06b` and are left that way, because a repair plan rewritten to
+match today's tree stops being evidence of what was decided and why. Several
+have since moved: `_run_ticket` is now `_work_ticket`, and where a fix landed
+its shipped test is often named differently from the one proposed here. Search
+`tests/test_forge.py` by what the test asserts rather than by the name below.
+
 ---
 
 ## Phase 0 — Baseline: done

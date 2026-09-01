@@ -84,10 +84,10 @@
     "dryRun": true
   },
   "loop": {
-    "maxAttempts": 3,
+    "maxAttempts": 5,
     "autoCommit": false,
     "stopOnBlocked": false,
-    "retryCycles": 2,
+    "retryCycles": -1,
     "respecOnRetry": true,
     "respecCriteria": false,
     "reopenStaleDependents": true,
@@ -100,7 +100,7 @@
     "baselineVerify": true,
     "bugHypotheses": 3,
     "executorTurns": 4,
-    "innerTurns": 0,
+    "innerTurns": 3,
     "toolchainContext": true,
     "priorFailures": 8,
     "learnedLimit": 12,

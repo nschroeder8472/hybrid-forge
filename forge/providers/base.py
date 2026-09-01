@@ -19,6 +19,7 @@ them:
 
 from __future__ import annotations
 
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -400,6 +401,41 @@ class Provider(ABC):
         room to generate the budget set by hand.
         """
         return self.timeout_notes()
+
+
+_REASONING_CLOSE = re.compile(r"</(?:think|thinking|reasoning)\s*>", re.IGNORECASE)
+_REASONING_OPEN = re.compile(r"<(?:think|thinking|reasoning)\s*>", re.IGNORECASE)
+
+
+def strip_reasoning(text: str) -> str:
+    """The answer out of a reply that carries its chain of thought inline.
+
+    A thinking model is supposed to return its reasoning in a sibling field, and
+    most servers do. llama.cpp does not always: depending on the chat template
+    and how the server was started, the whole `<think>…</think>` block arrives
+    in `content` instead, and every parser downstream then reads the model's
+    deliberation as its answer.
+
+    That is not a cosmetic problem. One sign-off pass rehearsed the required
+    reply format inside its own reasoning, and the ratification parser — which
+    scans for a `BLOCKING:` heading and takes what follows — collected the
+    prompt's own placeholder lines as blocking objections. The ticket was parked
+    partly on the strings `...` and `(one line each, or NONE)`.
+
+    Everything up to and including the last closing tag goes. An opening tag
+    with no closing one means the model never finished thinking and there is no
+    answer to find; returning the deliberation would hand a parser prose that
+    argues with itself, so the empty string is the honest result and callers
+    already treat it as unreadable output.
+    """
+    if not text:
+        return text
+    closes = list(_REASONING_CLOSE.finditer(text))
+    if closes:
+        return text[closes[-1].end() :].strip()
+    if _REASONING_OPEN.search(text):
+        return ""
+    return text
 
 
 def split_system(messages: list[Message]) -> tuple[str, list[Message]]:

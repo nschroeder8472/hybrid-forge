@@ -7,10 +7,11 @@ nothing.
 
 Everything it reports comes from `forge.ingest` itself, so it cannot drift from
 what ingest will actually do. What it adds on top are the authoring traps the
-parser does not consider errors: a criterion wrapped onto a second line loses
-its tail, and a section the parser does not recognize folds its bullets into
-the section above it. Both are silent, and both change what the executor is
-told to do.
+parser does not consider errors: a bullet whose continuation is not indented
+loses its tail, a section the parser does not recognize folds its bullets into
+the section above it, and a criterion restating what the harness already runs
+buys nothing while costing a test that shells out to run it. All of them are
+silent, and all of them change what the executor is told to do.
 
     python check_spec.py <spec.md>
 
@@ -33,6 +34,7 @@ try:
         parse_plan,
         plan_decisions,
         shared_file_conflicts,
+        untestable_scope,
     )
 except ImportError:
     sys.exit(
@@ -49,6 +51,46 @@ VAGUE = re.compile(
 
 BULLET = re.compile(r"^\s*[-*+]\s+\S")
 HEADING = re.compile(r"^#{1,6}\s+(?P<text>.+?)\s*$")
+
+# The route spelling that names the party who decided instead of the objection.
+RETIRED_ROUTE = re.compile(r"^\*\*Route:\*\*\s*claude-only\b", re.IGNORECASE)
+
+# A criterion about the project's own commands rather than about its code.
+HARNESS_CRITERION = re.compile(
+    r"\b(?:npm|npx|yarn|pnpm|bun|cargo|go|make|just|uv|poetry|pip|python|pytest|"
+    r"tox|dotnet|gradle|gradlew|mvn|swift|mix|composer|deno)\b"
+    r"[^.]{0,140}?\bexits?\b[^.]{0,40}?\b0\b",
+    re.IGNORECASE,
+)
+
+# A test file is written by the tester and read by nobody, so one that no other
+# ticket names is the ordinary case rather than a loose end.
+TEST_PATH = re.compile(r"(^|/)(tests?|spec)/|[._-](test|spec)\.[a-z0-9]+$")
+
+# Files that are terminal by convention: an entry point is imported by the
+# runtime rather than by a module, and a config file is read by a tool. Neither
+# is waiting for a call site, so neither is evidence of anything.
+TERMINAL_PATH = re.compile(
+    r"(^|/)(index|main|app|cli|__main__|mod|lib)\.[a-z0-9]+$"
+    r"|(^|/)[^/]*\.config\.[a-z0-9]+$"
+    r"|(^|/)(tsconfig[^/]*|package|package-lock|deno|composer|cargo|pyproject|go)"
+    r"\.(json|jsonc|toml|mod)$"
+    r"|\.(html|css|md|ya?ml|ini|cfg|txt)$",
+    re.IGNORECASE,
+)
+
+
+# An entry point: the file a person starts, as opposed to a module something
+# imports. Narrower than TERMINAL_PATH, which also covers config.
+RUNNABLE_PATH = re.compile(
+    r"(^|/)(index\.html?|main|app|cli|server|__main__|bin)\.[a-z0-9]+$"
+    r"|(^|/)(index|main)\.html?$",
+    re.IGNORECASE,
+)
+
+
+def normalized(path: str) -> str:
+    return path.replace("\\", "/").strip().lower()
 
 
 def unrecognized_headings(text: str) -> list[str]:
@@ -84,16 +126,111 @@ def unrecognized_headings(text: str) -> list[str]:
     return found
 
 
-def wrapped_bullets(text: str) -> list[str]:
-    """Bullets whose next line continues them — the continuation is dropped."""
+def lazy_continuations(text: str) -> list[str]:
+    """Bullets continued on an unindented line — that line is dropped.
+
+    A wrapped bullet is fine as long as its continuation is indented, which is
+    what every formatter produces. Flush-left is the ambiguous case, and the
+    parser resolves it the safe way: "- **Decision:** the store is SQLite"
+    followed by an unindented "The board is ten columns wide" is one author
+    writing two things, and joining them would put a sentence nobody marked
+    under a protection nobody asked for. The cost is that a criterion wrapped
+    flush-left still reaches the tester as its first line only.
+
+    Indent the continuation by two spaces and it joins.
+    """
     lines = text.splitlines()
     found = []
     for index, line in enumerate(lines[:-1]):
         if not BULLET.match(line):
             continue
         nxt = lines[index + 1]
-        if nxt.strip() and not BULLET.match(nxt) and not HEADING.match(nxt):
+        if not nxt.strip() or BULLET.match(nxt) or HEADING.match(nxt):
+            continue
+        if not nxt[:1].isspace():
             found.append(line.strip())
+    return found
+
+
+def retired_routes(text: str) -> list[str]:
+    """`Route:` lines using the old spelling, which records no reason.
+
+    `claude-only` still withholds the ticket — nothing about that changed — but
+    it names the party who decided rather than the objection, and it reads as
+    `withheld:unspecified` everywhere it is displayed. A reader six weeks later
+    cannot reconstruct which category it fell under.
+    """
+    return [
+        line.strip() for line in text.splitlines() if RETIRED_ROUTE.match(line.strip())
+    ]
+
+
+def harness_criteria(tickets: list) -> list[str]:
+    """Criteria asserting that the project's own commands exit 0.
+
+    The harness runs lint, typecheck, the build and the suite before anything
+    is judged, and review happens only on a tree where they passed, so a
+    criterion repeating that is settled by the run itself.
+
+    It is not inert, either. The tester's job is to turn every criterion into an
+    assertion — so one backlog that put "npm run test exits 0" on all five of
+    its tickets got a suite that shelled out to run all four commands, invoked
+    itself behind an environment-variable guard to avoid recursing, took ten
+    times as long, and measured a different suite from the one that runs.
+    """
+    found = []
+    for ticket in tickets:
+        for criterion in ticket.criteria:
+            if HARNESS_CRITERION.search(criterion):
+                found.append(f"{ticket.ticket_id}: {criterion}")
+    return found
+
+
+def unread_products(tickets: list) -> list[str]:
+    """Files a ticket writes that no other ticket writes, reads, or names.
+
+    Not an error — a leaf module is ordinary and most backlogs have one. Worth
+    printing because the failing shape is indistinguishable from inside the
+    spec: a module something was supposed to call, where no ticket was ever
+    given the file holding the call.
+
+    One backlog shipped a coordinate ruler that way. Its ticket said "the shell
+    paints it", the shell's file belonged to a ticket that had already landed,
+    and the sentence naming the integration sat in the only ticket that could
+    not act on it. Every check passed and nothing ever imported the result.
+    """
+    seen: dict[str, set[str]] = {}
+    for ticket in tickets:
+        for path in list(ticket.allowed_files) + list(ticket.reference_files):
+            seen.setdefault(normalized(path), set()).add(ticket.ticket_id)
+    found = []
+    for ticket in tickets:
+        for path in ticket.allowed_files:
+            key = normalized(path)
+            if TEST_PATH.search(key) or TERMINAL_PATH.search(key):
+                continue
+            if seen.get(key, set()) - {ticket.ticket_id}:
+                continue
+            found.append(f"{ticket.ticket_id}: {path}")
+    return found
+
+
+def entry_points(tickets: list) -> list[str]:
+    """Entry points this backlog writes — files a person starts.
+
+    Printed as a reminder rather than a warning, because the thing it asks about
+    lives in prose the parser cannot read. When a backlog produces something
+    runnable, three requirements are routinely left out of the spec and all
+    three fail silently: how it starts, the control that gets data into it, and
+    what the person sees. One backlog shipped an editor with a hidden file input
+    and nothing to open it — 146 tests green, four commands clean, and a page
+    that could not be used at all.
+    """
+    found = []
+    for ticket in tickets:
+        for path in ticket.allowed_files:
+            if RUNNABLE_PATH.search(normalized(path)):
+                found.append(f"{ticket.ticket_id}: {path}")
     return found
 
 
@@ -132,14 +269,21 @@ def main(argv: list[str]) -> int:
             fatal.append(f"{ticket.ticket_id}: delegated with no allowed files")
 
     warn: list[str] = []
+    warn += untestable_scope(tickets)
     for ticket in tickets:
         for criterion in ticket.criteria:
             if VAGUE.search(criterion):
                 warn.append(f"{ticket.ticket_id}: vague criterion -- {criterion!r}")
-    for bullet in wrapped_bullets(text):
-        warn.append(f"wrapped bullet, tail is dropped -- {bullet!r}")
+    for bullet in lazy_continuations(text):
+        warn.append(
+            f"bullet continued on an unindented line, tail is dropped -- {bullet!r}"
+        )
     for heading in unrecognized_headings(text):
         warn.append(f"unrecognized heading, folds into the section above -- {heading!r}")
+    for line in retired_routes(text):
+        warn.append(f"retired route spelling, records no reason -- {line!r}")
+    for item in harness_criteria(tickets):
+        warn.append(f"criterion the harness already settles -- {item}")
 
     derived = derive_needs(tickets)
     if derived:
@@ -147,7 +291,27 @@ def main(argv: list[str]) -> int:
         for later, earlier, path_name in derived:
             print(f"  {later} after {earlier}  ({path_name})")
 
-    decisions = plan_decisions(text)
+    runnable = entry_points(tickets)
+    if runnable:
+        print("\nThis backlog writes an entry point:")
+        for item in runnable:
+            print(f"  > {item}")
+        print("  Check some ticket owns each of: the command that starts it,")
+        print("  the control a person uses to give it something to work on,")
+        print("  what the readout says, and what shows before anything loads.")
+
+    loose = unread_products(tickets)
+    if loose:
+        print("\nWritten here, named by no other ticket:")
+        for item in loose:
+            print(f"  . {item}")
+        print("  A leaf module is fine. A module something was meant to call is")
+        print("  not -- check that some ticket owns the file holding the call.")
+
+    # `respec._DECISION_FLOOR`: a decision short enough to turn up inside an
+    # unrelated sentence by accident proves nothing, so the ratchet ignores it.
+    # Counting those here would report protection the run does not have.
+    decisions = [item for item in plan_decisions(text) if len(item) >= 24]
     print(f"\nProtected decisions: {len(decisions)}")
     for decision in decisions[:5]:
         print(f"  - {decision}")

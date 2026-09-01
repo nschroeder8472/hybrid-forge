@@ -35,8 +35,8 @@ no context at all because it reads as authoritative.
 
 **The daemon retrieves on its own.** When `memory.url` is set, the loop queries
 MemPalace before each ticket and passes the result to both the executor and the
-reviewer. You do not need to hand-populate context for an autonomous run, and
-`forge doctor` will tell you whether retrieval is actually working.
+reviewer. An autonomous run populates its own context, and `forge doctor` tells
+you whether retrieval is actually working.
 
 **You still retrieve when planning.** A ticket's own `context` field is for
 constraints you found while deciding *what* the ticket should be — the daemon's
@@ -70,9 +70,10 @@ Record only what is durable:
 - Conventions the executor must follow next time.
 - Review corrections — what was wrong, and what right looks like.
 
-Do not record: ticket-by-ticket narration, transient state, the contents of
-files (the repo already holds those), or anything reconstructible from git
-history.
+Hold each candidate to two questions: will it still be true in six months, and
+could a future reader recover it from the repository instead? Ticket-by-ticket
+narration, transient state, file contents and anything reconstructible from git
+history all fail that test — the repo and its history already hold them.
 
 ## What belongs in the repo instead
 
@@ -85,6 +86,7 @@ history.
 └── run.db             # gitignored — mutable run state, not an artifact
 ```
 
-Never commit the palace database itself. It is a binary index, it produces
-meaningless diffs, it conflicts on every concurrent session, and it defeats the
-point of having one authoritative copy on the host.
+Leave the palace database on its host and commit the pointer to it. The
+database is a binary index: it produces meaningless diffs, it conflicts on every
+concurrent session, and copying it into the repo defeats the point of having one
+authoritative copy.

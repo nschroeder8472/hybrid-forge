@@ -658,8 +658,8 @@ does what). Any declared model can play any role:
     "test":      "cargo test"
   },
   "neverDelegate": ["src/auth/**", "src/wasm_bridge.rs"],
-  "loop": { "maxAttempts": 3, "autoCommit": false, "stopOnBlocked": false,
-            "retryCycles": 0, "respecOnRetry": true, "respecCriteria": false },
+  "loop": { "maxAttempts": 5, "autoCommit": false, "stopOnBlocked": false,
+            "retryCycles": -1, "respecOnRetry": true, "respecCriteria": false },
   "ui":   { "host": "127.0.0.1", "port": 8799 }
 }
 ```
@@ -854,6 +854,19 @@ Forge names the case rather than passing the empty string on, and retries once
 with `reasoning_effort: none` so the call is not simply lost. The fix is still
 config.
 
+**Sometimes it arrives in `content` after all.** Depending on the chat template
+and how `llama-server` was started, the whole `<think>…</think>` block comes
+back inline instead of in a sibling field — and then every parser downstream
+reads the model's deliberation as its answer. One sign-off pass was recorded as
+blocking a ticket on the strings `...` and `(one line each, or NONE)`, which are
+the prompt's own placeholders, quoted back while the model was still deciding
+what to say. Forge strips reasoning at the provider boundary now: the answer is
+what follows the last closing tag, and an opening tag the model never closed
+yields an empty string, because a reply that never finished thinking has no
+answer in it. Nothing to configure — it is worth knowing only because a reply
+that looks truncated in the logs may have been trimmed here rather than by the
+server.
+
 **On llama.cpp, cap the thinking in the preset.** `reasoning-budget` is a hard
 ceiling on reasoning tokens, after which the model must begin its answer:
 
@@ -895,7 +908,7 @@ only when a full suite is slow enough that paying it per ticket costs more than
 the attempts it saves:
 
 ```json
-"loop": { "maxAttempts": 3, "baselineVerify": false }
+"loop": { "baselineVerify": false }
 ```
 
 **`executorTurns`** (default `4`) replays that many prior attempts to the
@@ -917,7 +930,7 @@ stranger's. See [CONVERGENCE.md](CONVERGENCE.md). Set it to `0` to restore the
 flat prompt:
 
 ```json
-"loop": { "maxAttempts": 3, "executorTurns": 0 }
+"loop": { "executorTurns": 0 }
 ```
 
 Nothing else changes. The conversation is rebuilt from `run.db` on every call,
@@ -1141,6 +1154,20 @@ documents go through the planner model. `forge ingest` tells you which path it
 took; it matters, because a re-planned document has the model's wording of your
 criteria rather than yours.
 
+Check a draft before ingesting it. The parser has traps that cost tickets and
+report nothing at ingest — a bullet whose continuation is not indented loses its
+tail, an unrecognised heading folds its bullets into the section above, and a
+criterion about the project's own commands becomes a test that shells out to run
+them:
+
+```bash
+python plugins/forge-spec/scripts/check_spec.py plan.md
+```
+
+It writes nothing and reads the same parser `forge ingest` does. The grammar it
+enforces is documented in the `spec-contract` skill under
+[`plugins/forge-spec/`](../plugins/forge-spec/).
+
 ### Review the backlog
 
 ```bash
@@ -1148,8 +1175,8 @@ cat .hybridforge/tickets/*.md
 ```
 
 This is the last cheap moment to catch a ticket routed `delegate` that should
-have been `claude-only`. Edit the ticket files and re-ingest if the split is
-wrong — that is much less expensive than discovering it three hours in.
+have been withheld. Edit the ticket files and re-ingest if the split is wrong —
+that is much less expensive than discovering it three hours in.
 
 ### Go
 
@@ -1338,8 +1365,12 @@ the planner has just called impossible is a spec bent around a contradiction.
 Everything above is a human typing `forge retry --respec` the next morning. The
 loop can do it itself:
 
+It does, by default — `retryCycles` is `-1`, which is "until the backlog is
+clean or you stop it". To bound it instead, or to hand every run straight back:
+
 ```json
 "loop": { "retryCycles": 2, "respecOnRetry": true }
+"loop": { "retryCycles": 0 }
 ```
 
 ```bash
@@ -1350,19 +1381,21 @@ forge go --retries 2 --no-respec
 
 When the backlog empties with anything still `failed`, `blocked` or `skipped`,
 a cycle requeues all of it, respecs each ticket from its recorded failures, and
-runs the backlog again. `0` is the default and hands the run back to you.
+runs the backlog again. `0` hands the run back to you after the first pass.
 
-**`-1` means until success or stop, and nothing else ends it.** `forge stop`,
-Ctrl-C, `loop.maxRuntimeSeconds` and a spend cap all still apply — they are the
-brakes, so set one before leaving it. Three things bound it on their own:
+**`-1` means until success or stop.** `forge stop`, Ctrl-C,
+`loop.maxRuntimeSeconds` and a spend cap all still apply — they are the brakes,
+and one of them is worth setting before leaving a run overnight. Four things
+bound it on their own, and the last is why `-1` is the default at all:
 
 - The spent count lives in the run database, not in memory, so a killed daemon
   resuming yesterday's run continues its budget instead of starting a new one.
 - A cycle with nothing to requeue ends the run rather than spinning. Two cases
   reach it: every ticket landed and the *final* verify still fails — breakage
-  no ticket owns or has the scope to fix — or what is left is claude-only.
-  Triage still holds during a retry, so a claude-only ticket is never requeued;
-  it would only be skipped again, once per cycle, forever.
+  no ticket owns or has the scope to fix — or what is left is withheld.
+  Triage still holds during a retry, so a withheld ticket stays withheld rather
+  than being requeued; it would only be skipped again, once per cycle, forever.
+  `forge release` or `forge discharge` is how one moves.
 - **A respec that changed nothing ends the run.** The respec runs *before* the
   requeue, and if every ticket comes back as written there is no cycle left to
   run — the executor would receive the identical ticket that already failed,
@@ -1372,11 +1405,21 @@ brakes, so set one before leaving it. Three things bound it on their own:
   `respecOnRetry` is on and the planner cannot be reached at all.
 - `forge retry` resets the count. A human who has just replaced the specs the
   automatic cycles gave up on gets the full budget against the new ones.
+- **A cycle that repeats itself ends the retries.** `flatCycles` compares a
+  cycle against the one before it by which *kinds* of failure it produced on
+  which tickets. Identical means nothing is varying, so another cycle arrives
+  back here — the run stops and says so. This is the measurement that makes
+  `-1` a defensible default rather than an open-ended spend: an unattended run
+  converges or stops. Both have been observed, one backlog stopping itself
+  after a single repeated cycle and the next landing a ticket on the cycle
+  after the one that gave up on it. **Turn `flatCycles` off and `-1` loses its
+  floor** — set `retryCycles` back to `0` or a small number in the same edit.
 
 Each cycle costs a full backlog of executor calls plus one planner call per
 requeued ticket, and the attempt numbering carries on from the last one — so
-`retryCycles: 2` with `maxAttempts: 3` is up to nine attempts on a ticket that
-keeps failing. `stopOnBlocked: true` short-circuits all of it: a blocked ticket
+`retryCycles: 2` with the default `maxAttempts: 5` is up to fifteen attempts on
+a ticket that keeps failing, and `-1` is bounded by the repeat detector rather
+than by arithmetic. `stopOnBlocked: true` short-circuits all of it: a blocked ticket
 stops the run there, and a stopped run is not retried.
 
 Retried attempts are numbered on from where the last cycle stopped, so a ticket

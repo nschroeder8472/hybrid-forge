@@ -70,19 +70,21 @@ EXAMPLE_PATH_PREFIX = "EXAMPLE-ONLY/"
 EXECUTOR_SYSTEM = """You are the executor in a plan-and-execute pipeline.
 
 A senior engineer has already made the design decisions. Implement the spec
-exactly as written. Do not redesign it.
+exactly as written, taking its design as given.
 
 Rules:
 - Only modify files in the allowed scope. Anything else is out of bounds and
   will be rejected before it reaches disk.
-- Implement every acceptance criterion. Add nothing that was not requested.
+- Implement every acceptance criterion, and stop where they stop. What the
+  ticket asks for is the whole deliverable.
 - Use the libraries and signatures the spec names.
 - Established project context describes decisions already made on this project.
   Follow it. If it contradicts the spec, say so with BLOCKED: rather than
   silently picking one.
-- If the spec is ambiguous or you believe it is wrong, DO NOT GUESS. Reply with
-  a line starting `BLOCKED:` explaining precisely what is unclear, and nothing
-  else. A blocked ticket is a useful outcome; a plausible guess is not.
+- Where the spec is ambiguous or you believe it is wrong, say so instead of
+  choosing for it. Reply with a line starting `BLOCKED:` explaining precisely
+  what is unclear, and nothing else. A blocked ticket is a useful outcome; a
+  plausible guess is not.
 - If you believe NO implementation could satisfy this ticket as written — two
   criteria demanding different results from the same call, a criterion asserting
   a value the spec's own algorithm cannot produce — add a line starting
@@ -92,8 +94,8 @@ Rules:
   or refute it rather than taking your word.
 - Output the COMPLETE contents of every file you change. For each one, put the
   file path on its own line, then a fenced code block containing the whole
-  file. No partial files, no diffs, no ellipses. One block per file, and never
-  two blocks for the same path.
+  file. Whole files only — a diff, an excerpt or an ellipsis leaves the file
+  written as what you sent. One block per file, each path appearing once.
 - If a file's own contents contain a ``` fence — README.md and any other
   markdown almost always does — wrap that file in a LONGER fence: four
   backticks, or five. A three-backtick fence around content that itself uses
@@ -118,8 +120,8 @@ EXAMPLE-ONLY/second_file.txt
 the entire contents of the second file
 ```
 
-Those two `EXAMPLE-ONLY/` paths are the shape of an answer, not part of one.
-Never send them back. Every path in your reply comes from the allowed scope.
+Those two `EXAMPLE-ONLY/` paths are the shape of an answer rather than part of
+one. Every path in your reply comes from the allowed scope.
 
 Nothing else is read. These are the ways a reply gets discarded, and the first
 is by far the most common:
@@ -145,38 +147,50 @@ WRONG — a fenced block with no path anywhere. There is nothing to write it to:
 the entire contents of the first file
 ```
 
-The path line carries no decoration: no `//`, no `#`, no bullet, no bold, no
-backticks, no heading marks. Just the path, then a newline, then the fence.
+The path line is the bare path, then a newline, then the fence. Decoration of
+any kind — `//`, `#`, a bullet, bold, backticks, heading marks — makes it a
+line of prose, and the block below it goes nowhere.
 """
 
 TESTER_SYSTEM = """You write tests that encode criteria decided upstream.
 
 You are given acceptance criteria authored during planning. Encode exactly
-those criteria as assertions. Do not invent additional criteria, and do not
-weaken a criterion to make it easier to satisfy.
+those criteria as assertions: each at the strength the criterion states, and
+none beyond the ones you were handed.
 
 Assert on behavior, through the public interface, and on nothing else. The
 whole suite runs on every later ticket too, so an assertion about the shape of
 the repository rather than the behavior of the code becomes a trap that a
 future ticket walks into and cannot disarm — the file is not in its scope.
 
-Never:
-- Read a source file and assert on its text. `read_to_string("src/lib.rs")`
-  compared against an expected string fails the moment any later ticket adds a
-  line to it, which is a thing later tickets are supposed to do.
-- Assert that a file exists, does not exist, or has a particular length.
-- Assert on the exact whole contents of any file, including generated assets.
-- Declare foreign-function bindings (`extern`, `dlopen`, `ctypes`) against the
-  code under test. Import it the way the rest of the project imports it. An
-  `extern` block re-declares a symbol instead of referencing it, so the linker
-  never pulls it in and the target fails to link rather than to assert.
-- Reshape a value before comparing it to what a criterion pins. A helper of
-  your own that masks, shifts, scales or offsets the call's result — `>>> 0`,
-  `& 0xFFFFFFFF`, `% 256` — turns the criterion into something it does not say
-  and the assertion into one that cannot fail for the reason it exists. If the
-  value comes back in the wrong form, report that; do not correct it on the way
-  to the comparison.
-- Write anything to a path other than the one file you are told to write.
+Every assertion runs the code and checks what comes back:
+
+- Call the code under test and assert on the value it produces. An assertion
+  against a source file's text — `read_to_string("src/lib.rs")` compared with
+  an expected string — fails the moment any later ticket adds a line to it,
+  which is a thing later tickets are supposed to do.
+- Let importing the module be the proof that it is there. An assertion that a
+  file exists, is absent, or has a particular length pins the shape of the
+  repository rather than the behavior of the code, and so does an expected copy
+  of a whole file or a generated asset.
+- Import the code the way the rest of the project imports it. A foreign-function
+  declaration (`extern`, `dlopen`, `ctypes`) re-declares a symbol instead of
+  referencing it, so the linker never pulls it in and the target fails to link
+  rather than to assert.
+- Compare the call's result exactly as it comes back. A helper of your own that
+  masks, shifts, scales or offsets it — `>>> 0`, `& 0xFFFFFFFF`, `% 256` —
+  turns the criterion into something it does not say, and the assertion into
+  one that cannot fail for the reason it exists. Where the value comes back in
+  the wrong form, report that as the finding: it is the thing the criterion was
+  written to catch.
+- Leave the project's own commands to the harness. It runs lint, typecheck,
+  the build and this suite before anything is judged, so a criterion saying
+  they exit 0 is settled by the run itself and wants no assertion from you.
+  Spend the file on the functions the ticket added instead. A suite that shells
+  out to those commands pays their whole runtime on every ticket from here on,
+  and one that invokes itself has to be taught not to recurse — at which point
+  what it measures is a different suite from the one that runs.
+- Confine your output to the one file you are told to write.
 
 Output the complete contents of that one test file: the path on its own line,
 then a fenced code block with the whole file. The path goes OUTSIDE the fence,
@@ -187,8 +201,8 @@ EXAMPLE-ONLY/your_test_file.txt
 the entire contents of the test file
 ```
 
-That path is the shape of an answer, not part of one. Write the path you were
-actually given; a reply naming any other is discarded.
+That path is the shape of an answer rather than part of one. Write the path
+you were actually given; a reply naming any other is discarded.
 
 A path written inside the fence — as `// src/test/...`, or as a bare first
 line — is not read as a path. Nothing is written and the answer is discarded.
@@ -203,9 +217,10 @@ it, and it is what earns the fix an attempt.
 
 This is the opposite of your usual instruction, so be exact about it:
 
-- Assert the CORRECT behavior. Never encode the fault as though it were
-  expected: a test asserting that three pieces lock is a test that passes today
-  and passes forever, and it certifies the bug instead of catching it.
+- Assert the CORRECT behavior — what the code should do once the bug is gone.
+  A test encoding the fault as the expectation, asserting that three pieces
+  lock, passes today and passes forever: it certifies the bug instead of
+  catching it.
 - Fail for the reported reason and no other. `assert False`, a syntax error, an
   import of something that does not exist — all of those fail, and none of them
   proves anything. The failure must be the assertion you wrote comparing what
@@ -213,17 +228,16 @@ This is the opposite of your usual instruction, so be exact about it:
 - Assert on behavior through the public interface. This test outlives the fix
   and runs on every later ticket in this project, so it must keep testing the
   behavior rather than the arrangement of the code.
-- If the report is too vague to assert anything specific, say so instead of
+- Where the report is too vague to assert anything specific, say so instead of
   guessing. Reply with a single line starting `BLOCKED:` naming what you would
   need to know. A test written from a guess proves nothing and is then trusted
   by everything downstream.
-
-Never:
-- Read a source file and assert on its text, or assert that a file exists.
-- Assert on the exact whole contents of any file.
-- Declare foreign-function bindings (`extern`, `dlopen`, `ctypes`) against the
-  code under test. Import it the way the rest of the project imports it.
-- Write anything to a path other than the one file you are told to write.
+- Call the code and assert on what it returns. An assertion about a source
+  file's text, about a file existing, or about a file's exact contents pins the
+  arrangement of the repository rather than the behavior.
+- Import the code the way the rest of the project imports it, rather than
+  declaring foreign-function bindings (`extern`, `dlopen`, `ctypes`) against it.
+- Confine your output to the one file you are told to write.
 
 Output the complete contents of that one test file: the path on its own line,
 then a fenced code block with the whole file. The path goes OUTSIDE the fence,
@@ -234,8 +248,8 @@ EXAMPLE-ONLY/your_test_file.txt
 the entire contents of the test file
 ```
 
-That path is the shape of an answer, not part of one. Write the path you were
-actually given; a reply naming any other is discarded.
+That path is the shape of an answer rather than part of one. Write the path
+you were actually given; a reply naming any other is discarded.
 
 A path written inside the fence — as `// src/test/...`, or as a bare first
 line — is not read as a path. Nothing is written and the answer is discarded.
@@ -262,8 +276,8 @@ Rules:
   of this codebase. "Handle the timing better" is not a spec. "`Game::tick`
   drains its accumulator with a loop that can lock several pieces in one frame;
   it should lock at most one per tick and reset the accumulator on lock" is.
-- Do not describe the fix as a diff or name the lines to change. State the
-  behavior; the executor is the one reading the code.
+- State the behavior and leave the shape of the change to the executor, which
+  is the role that reads the code.
 - Acceptance criteria are optional here and usually unnecessary: a reproduction
   test is written before any fix is attempted, and that test is the contract.
   Add one only for a consequence the reproduction cannot check.
@@ -287,13 +301,14 @@ passed".
 Check specifically:
 - Every acceptance criterion is actually satisfied, not approximated.
 - Tests assert real behavior rather than restating the implementation.
-- No silent scope creep, dropped error handling, or swallowed exceptions.
+- Every change in the diff is one the spec asked for, and every error path it
+  touches is still handled or still propagates.
 - Nothing contradicts the established project context, when any is supplied.
 
 EVERY objection must cite what you looked at. Quote the line you are objecting
 to, or — when you are objecting that something is missing — name the exact text
-you searched for and did not find. An objection with neither is not a finding,
-and you must not raise it.
+you searched for and did not find. An objection carrying neither is not a
+finding; send the ones that carry a citation and drop the rest.
 
 This is not a formality. Reviewers reject work that is plainly present: one
 said a canvas "does not specify a width of 240 and a height of 480" about a
@@ -307,8 +322,8 @@ Then give your reasoning, shortest decisive point first, each point carrying
 its citation. Reject when a criterion is unmet or the diff does something the
 spec did not ask for.
 
-Write only your verdict and your reasoning. Do not restate the sections you
-were given — no `## Spec`, no `## Diff`, no repetition of earlier attempts.
+Write your verdict and your reasoning, and end there. Whoever reads this
+already has the spec, the diff and the earlier attempts in front of them.
 """
 
 
@@ -326,10 +341,12 @@ Record ONLY:
 - A convention a future implementer must follow to stay consistent.
 - A review correction: what was wrong, and what right looks like.
 
-Never record:
-- Narration of what this ticket did. That is what git history is for.
-- File contents, diffs, function signatures, or anything reconstructible from
-  the repository.
+Hold every candidate entry to two questions: will it still be true in six
+months, and could a future reader recover it from the repository instead? What
+fails that test, and belongs in NOTHING:
+- Narration of what this ticket did. Git history is where that lives.
+- File contents, diffs, function signatures, or anything else reconstructible
+  from the repository.
 - Transient state: what passed, what the test output was, how many attempts.
 - Restatements of the spec or the acceptance criteria.
 - Credentials, tokens, keys, or connection strings, in any form.
@@ -378,11 +395,10 @@ VERDICT: unclear
   parks work that would have landed, and a wrong `winnable` spends another
   dozen cycles.
 
-Never:
-- Judge the implementation's quality. It failed; that is established.
-- Propose a revised spec or new criteria. That is the planner's, and you are
-  being asked about the contract, not writing one.
-- Repeat the failure text back. It is above; say what it means.
+Keep to the one question. The implementation's quality is settled — it failed
+— and the revised spec is the planner's to write; you are being asked whether
+the contract holds, not asked to write one. The failure text is already above,
+so spend your sentences on what it means.
 
 Reply with the verdict line, then two to five sentences and nothing else."""
 
@@ -408,7 +424,8 @@ any part of this repository would need to know:
   needs a guard."
 - "Imports in this package resolve with an explicit .js extension."
 
-Never record:
+An entry qualifies when a ticket touching any other part of this repository
+would still need it. What fails that test, and belongs in NOTHING:
 - Anything about this ticket's implementation, approach, or what went wrong
   with it. It failed, and why it failed is in the run log where it belongs.
 - A convention that applies only to the files this one ticket owned.
@@ -731,6 +748,57 @@ def _one_subject_at_a_time(entries: Sequence[dict], limit: int) -> list[dict]:
     return kept
 
 
+ADVICE_HEADING = "## What a person said about this ticket"
+
+
+def advice_message(ticket: Ticket, limit: int = 8) -> Message | None:
+    """Notes a human wrote against this ticket, newest last.
+
+    The loop has seven ways to hand a ticket back and, until this, no way to be
+    handed anything in return. Every exit wrote a sentence to a person who
+    could not write one back.
+
+    Framed the way `learned` is framed, with one difference stated in as many
+    words: this was written by a person about this ticket, and it outranks what
+    earlier attempts concluded. `learned` is what the loop worked out from its
+    own failures; a note is what somebody who can read the repository decided.
+    Where they disagree, the loop is the one that has been wrong before.
+
+    Never concatenated into a system message, and rendered under its own
+    heading like every other history block. Text that entered the harness from
+    outside must not be able to imitate the harness — the same reason
+    `strip_prompt_echo` exists.
+
+    Not shown to the reviewer. What the reviewer is shown is the bar, and the
+    bar moves through criteria or it does not move; a person who wants it moved
+    adds a criterion, which `forge criteria --add` lets them do.
+    """
+    entries = [note for note in (ticket.human_note or []) if note.get("text")]
+    if not entries:
+        return None
+    # Newest last, so the most recent thing a person said is the last thing
+    # read before the ticket itself.
+    shown = entries[-limit:]
+    dropped = len(entries) - len(shown)
+    lines = [f"- {note['text'].strip()}" for note in shown]
+    older = (
+        f"\n\n({dropped} earlier note(s) not shown.)" if dropped else ""
+    )
+    return Message(
+        role="user",
+        content=f"""{ADVICE_HEADING}
+Written by a person about this ticket, after seeing where it got stuck. This
+outranks anything earlier attempts concluded: those are the loop's own guesses
+from its own failures, and this is somebody who can read the repository.
+
+It is not an acceptance criterion. What you are judged against is the criteria
+below and nothing else — if a note asks for something the criteria do not, the
+criteria are what the reviewer will read.
+
+{chr(10).join(lines)}{older}""",
+    )
+
+
 def learned_message(ticket: Ticket, limit: int = 12) -> Message | None:
     """What earlier attempts worked out about this repository.
 
@@ -822,6 +890,13 @@ def build_prompt(
     if established is not None:
         messages.append(established)
 
+    # After the loop's own conclusions, because where the two disagree
+    # the person is the one who has not already been wrong about this
+    # ticket, and the last thing read before the ticket should be theirs.
+    advice = advice_message(ticket)
+    if advice is not None:
+        messages.append(advice)
+
     settled = ratification_message(ticket)
     if settled is not None:
         messages.append(settled)
@@ -861,7 +936,7 @@ both rather than alternating between them.
 ## Spec
 {ticket.spec}
 
-## Allowed scope (do not modify anything outside this list)
+## Allowed scope (the only files you may write)
 {_files_block(ticket)}
 
 ## Acceptance criteria
@@ -881,7 +956,7 @@ Return the complete file. Preserve everything you are not changing.
 """
         if reference:
             body += f"""
-## Reference — read only, do not return these files
+## Reference — read only; leave these out of your reply
 This is the real source. Take export names, signatures, and enum order from
 here rather than assuming them.
 
@@ -892,7 +967,7 @@ here rather than assuming them.
     if failure_context:
         tail += f"""
 ## Your previous attempt failed verification
-Fix the cause. Do not work around the check.
+Fix the cause, so the check passes on its own terms.
 
 {failure_context}
 """
@@ -907,9 +982,9 @@ Fix the cause. Do not work around the check.
 ## Your last answer could not be read, and nothing was written
 {malformed}
 
-Send the same implementation again in the format above. Do not rewrite the
-code to fix this — the code was never the problem, and changing it now loses
-work that may already have been correct.
+Send the same implementation again in the format above, byte for byte. The
+code was never the problem here — the reply's shape was — and rewriting it now
+loses work that may already have been correct.
 """
 
     if not prior_turns:
@@ -938,7 +1013,7 @@ work that may already have been correct.
     # not passed it.
     newest = tail or f"""
 ## Your previous attempt failed verification
-Fix the cause. Do not work around the check.
+Fix the cause, so the check passes on its own terms.
 
 {last_failed}
 """
@@ -996,10 +1071,10 @@ def tests_prompt(
 {test_path}
 ```
 This is the only path you may write. It already holds this ticket's tests if
-there are any — replace it wholesale. Do not add a second file, do not pick a
-different name, and do not append a suffix: anything else is discarded before
-it reaches disk, and a file you abandon under another name keeps running
-against every later ticket in this project.
+there are any — replace it wholesale. One file, at that exact path, with that
+exact name: anything else is discarded before it reaches disk, and a file you
+abandon under another name keeps running against every later ticket in this
+project.
 
 ## Files under test
 {files}
@@ -1144,6 +1219,13 @@ report — not something to correct on the way to the comparison.
     established = learned_message(ticket, learned_limit)
     if established is not None:
         messages.append(established)
+
+    # After the loop's own conclusions, because where the two disagree
+    # the person is the one who has not already been wrong about this
+    # ticket, and the last thing read before the ticket should be theirs.
+    advice = advice_message(ticket)
+    if advice is not None:
+        messages.append(advice)
     # What the roles settled before any code existed. The tester is the role
     # most likely to have asked for a criterion to be made measurable, and it
     # should see whether it got it rather than rediscovering the same problem
@@ -1295,8 +1377,9 @@ What has been disproved is where the previous ticket said it comes from.
 
 So: propose a different cause.
 
-- Do not re-propose what has already been ruled out. Naming the same files
-  again with the same reasoning wastes the only budget this ticket has.
+- Propose somewhere the earlier ticket did not look. The files already ruled
+  out are listed below, and naming them again with the same reasoning spends
+  the only budget this ticket has.
 - Reason from what would actually produce the reported symptom. If the value
   the report mentions is correct everywhere it is computed, then what is wrong
   is where it is displayed, transported, cached, or re-initialised — follow it
@@ -1349,7 +1432,7 @@ Scoped to: {', '.join(ticket.allowed_files) or "(nothing named)"}
 """
 
     if ruled_out:
-        body += "\n## Already ruled out — do not propose these again\n"
+        body += "\n## Already ruled out — look past these\n"
         for spec, why in ruled_out:
             body += f"\n- **{spec.strip().splitlines()[0][:200]}**\n  {why.strip()[:400]}\n"
 
@@ -1522,9 +1605,9 @@ yours and nobody else can fix it. Either it did not build, or it ran and died
 before it reached an assertion: it tried to start a process, open a path, or
 reach a service, and did not get one. Neither reproduces anything.
 
-Fix exactly what they point at and keep the assertion. If what failed was
-something outside the test process, do not retry it differently — assert on the
-same behavior by a means the running process can observe directly.
+Fix exactly what they point at and keep the assertion. Where what failed was
+something outside the test process, reach the same behavior by a means the
+running process can observe directly rather than by starting that thing again.
 """
 
     if superseded:
@@ -1709,12 +1792,12 @@ def _prior_verdicts_message(prior_verdicts: Sequence[str]) -> Message | None:
         content=f"""{PRIOR_VERDICTS_HEADING}
 {earlier}
 
-Read these before deciding. If the objection you raised has been addressed,
-that is progress — do not replace it with a fresh objection you never raised
-before, which ends the ticket in three rounds over three unrelated points. If
-the same defect is still there, say so plainly and in the same terms: a
-rejection that repeats is evidence the spec is wrong rather than the code, and
-saying it in those words is what gets that noticed.
+Read these before deciding. Where the objection you raised has been addressed,
+that is progress: accept it as met and let the ticket move, rather than putting
+a fresh objection in its place — three rounds over three unrelated points ends
+the ticket. Where the same defect is still there, say so plainly and in the same
+terms: a rejection that repeats is evidence the spec is wrong rather than the
+code, and saying it in those words is what gets that noticed.
 """,
     )
 
@@ -1777,9 +1860,9 @@ ticket authority over the test that contradicts it is that failure in one step �
 if the reproduction asserts the wrong thing, you are approving the deletion of
 the test that would have caught it.
 
-So do not rule on which assertion is more recent, or which is more convenient,
-or on the fact that the ticket is stuck. Rule on which one is *right*, and say
-why in terms of the report and the two assertions in front of you.
+So rule on which assertion is *right*, and say why in terms of the report and
+the two assertions in front of you. Which one is more recent, which is more
+convenient, and how long the ticket has been stuck are all beside that question.
 
 Answer with exactly one of these on the first line, then your argument:
 
@@ -2224,14 +2307,16 @@ Read the failures as evidence about the spec:
 
 Rules:
 
-- Keep the same goal. You are clarifying a ticket, not replacing it with an
-  easier one. Never satisfy a criterion by deleting it.
-- Prefer precision over volume. Add the sentence that removes the ambiguity;
-  do not restate the whole ticket.
+- Keep the same goal. You are clarifying a ticket rather than replacing it
+  with an easier one, so a criterion that is hard to satisfy stays, and it is
+  the spec around it that changes.
+- Prefer precision over volume: add the one sentence that removes the
+  ambiguity and leave the rest of the ticket standing.
 - Every criterion must describe the behavior of code this ticket writes. This
   ticket is one of many sharing a repository, and a criterion that reaches
-  outside its own scope cannot be satisfied and cannot be retired. Never write
-  a criterion that:
+  outside its own scope cannot be satisfied and cannot be retired. Every
+  criterion you write is checkable by running this ticket's code, which rules
+  out one that:
     * requires a file to be absent, deleted, or unchanged;
     * pins the exact or total contents of a file ("contains exactly the two
       lines ... and nothing else") — a later ticket will legitimately add to
@@ -2240,26 +2325,28 @@ Rules:
       an import, or declaring a symbol;
     * describes the state of the build rather than the behavior of the code
       ("the suite compiles", "no target references X").
-  If a failure was caused by a file this ticket does not own, that is not a
-  spec defect. Leave the criteria alone and say so in the rationale.
+  Where a failure was caused by a file this ticket does not own, that is
+  evidence about the backlog rather than a spec defect: leave the criteria
+  standing and say so in the rationale.
 - Write each criterion in the calling convention the language actually uses. A
   criterion stated as a bare C symbol invites a test that declares an `extern`
   binding, which fails to link instead of failing to assert.
-- Never write anything about how the executor should format its reply. Fences,
-  backticks, where the file path goes, whether contents are "raw" — all of that
-  is fixed by the harness, which states it to the executor directly and parses
-  what comes back. A failure that looks like a formatting problem is not yours
-  to fix, and a spec that contradicts the harness makes the ticket impossible:
-  one told the executor not to use code fences, when a fence is the only thing
-  the parser can read. Say it in the rationale instead.
+- Write about behavior and leave the reply format to the harness. Fences,
+  backticks, where the file path goes, whether contents are "raw" — the harness
+  fixes all of it, states it to the executor directly, and parses what comes
+  back. A spec that contradicts the harness makes the ticket impossible: one
+  told the executor to skip code fences, when a fence is the only thing the
+  parser can read. Where a failure looks like a formatting problem, say so in
+  the rationale, which is the channel that reaches a person.
 - A spec may state a decision as well as a requirement — "randomness is a
   xorshift32 seeded from JavaScript", under a heading saying it is settled.
   Copy every such sentence back into the revised spec, in its own words. They
   are not criteria, so nothing downstream checks them: drop one and the ticket
   goes green against a choice nobody made. If the failures show a decision is
   the problem, say so in the rationale — that is a human's call, not yours.
-- `context` is appended to the plan's, never written over it. It carries rules
-  the executor needs on every attempt, and they are not yours to retire.
+- `context` is appended to the plan's paragraph, which stays exactly as it is.
+  It carries rules the executor needs on every attempt, and they outlive any
+  one revision.
 - If the failures show the work simply was not finished — no recurring theme,
   no ambiguity, nothing the spec could have prevented — say so by returning
   the ticket essentially unchanged with a rationale explaining why.
@@ -2272,11 +2359,11 @@ Rules:
   each, stated as fact.
   It is not a requirement and nothing enforces it: the reviewer is not shown
   it and no criterion is made from it. That is the point — write down what is
-  true here, not a new bar for the executor to clear. If the thing you want to
-  say is a demand, it belongs in `criteria` or nowhere.
+  true here, and leave the bar for the executor to `criteria`, which is where a
+  demand belongs.
   Entries accumulate across cycles and are never removed, so a fact you state
-  twice is counted rather than duplicated. Say nothing rather than restating
-  the spec.
+  twice is counted rather than duplicated. An empty list is the right answer
+  whenever all you would be writing is the spec again.
 
 Reply with JSON and nothing else:
 
@@ -2376,8 +2463,8 @@ fact about that cause, not about the report.
 
 {dead}
 
-**Do not propose any of these again**, and do not narrow the scope back to the
-files they named. A reproduction that would not fail against a cause is the
+**Propose a cause none of these named**, and keep the scope pointed away from
+the files they named. A reproduction that would not fail against a cause is the
 strongest evidence available that the cause is not where the bug is. If the
 current spec is also wrong, propose something *new*; if you have nothing new,
 say so in `rationale` and leave the ticket as written.
@@ -2425,9 +2512,9 @@ write in `context` is appended to it, not put in its place.
 ## The code as it exists right now
 These are the real contents of the files this ticket writes and reads. Every
 statement you make about how this code behaves must be checked against them.
-Do not describe a function, a field, a coordinate convention, or an index base
-that contradicts what is here — if the code and the current spec disagree,
-say which one you are changing and why.
+Describe every function, field, coordinate convention and index base as this
+code has it — and where the code and the current spec disagree, say which of
+the two you are changing and why.
 
 {_sources_block(sources)}
 """
@@ -2442,11 +2529,11 @@ asserts. A spec that instructs one thing while the reproduction asserts another
 cannot be satisfied by any edit, and six consecutive revisions guessed at a
 filename that was written three lines into a test nobody was shown.
 
-Do not put it in `allowed_files`. It is the standard this ticket is measured
-against, and it will be removed from any scope you propose. If you conclude the
-reproduction itself is what is wrong, say that in `rationale` and leave the spec
-alone — the loop retires a reproduction by having the tester write a new one,
-never by letting the executor edit it.
+Leave it in `reference_files`. It is the standard this ticket is measured
+against, and it will be removed from any scope you propose. Where you conclude
+the reproduction itself is what is wrong, say that in `rationale` and leave the
+spec standing — the loop retires a reproduction by having the tester write a
+new one, which is the only route by which one changes.
 """
 
     if contradiction:
@@ -2478,8 +2565,8 @@ You have two honest answers:
   it is the right answer whenever the report contradicts something the project
   deliberately decided.
 
-Do not rewrite the spec to dodge the contradiction, and do not weaken the
-reproduction. Both leave the disagreement in place and hide it.
+Name the contradiction and let it stand. A spec rewritten around it, or a
+weakened reproduction, leaves the disagreement in place and hides it.
 """
 
     body += f"""
@@ -2533,15 +2620,16 @@ applied to it:
   writing it down raises no bar, it only makes an existing demand checkable.
   Quote the spec's own wording when you do that — the closer the two are, the
   more reliably it is recognised as a restatement rather than a new demand.
-  A criterion the spec does not state is refused. Never add one to describe a
-  bug the attempts happened to produce.
+  Every criterion you add traces to something the spec states; one describing a
+  bug the attempts happened to produce is refused.
 
 Omit `criteria` entirely to leave them exactly as they are.
 
 ## If a criterion cannot be satisfied at all
 Some criteria are not wrong, they are impossible: two that contradict each
 other, or one asserting a specific value that no implementation of this spec
-produces. Do not rewrite the spec to chase it, and do not weaken it by hand.
+produces. Report it rather than chasing it: the spec stays as it is and the
+criterion keeps its full strength.
 
 Reply with an `impossible` field naming the criterion and the contradiction,
 in plain terms a human can check. That parks the ticket for a person to settle
@@ -2551,6 +2639,27 @@ and costs nothing further. It is the right answer, not a failure to answer:
 No xorshift32 with the shifts this spec defines produces that sequence — \
 seed 1 yields [2, ...]. Either the constant or the criterion is wrong, and \
 nothing in the failures says which."}}
+"""
+
+    notes = [n for n in (ticket.human_note or []) if n.get("text")]
+    if notes:
+        # A fifth evidence block into a shape already built to carry four, and
+        # the only one whose author can see the repository. It goes before the
+        # stuck block deliberately: if a person has already said why the ticket
+        # is stuck, that should be read before the loop's own account of it.
+        written = "\n".join(f"- {n['text'].strip()}" for n in notes[-8:])
+        body += f"""
+## What a person said about this ticket
+Written by a human after seeing where it got stuck, and the only evidence here
+whose author could read the repository. Where it disagrees with the failures
+below, they are what the loop observed and this is what somebody made of it.
+
+{written}
+
+A person may state an acceptance criterion and you may not — that rule is about
+provenance, not position, and they are not the party being judged. If a note
+asks for one, it is theirs to add with `forge criteria --add`; putting it in
+your revision is still you raising the bar.
 """
 
     if stuck:
@@ -2596,7 +2705,7 @@ An executor that cannot pass a ticket has every reason to conclude nobody can,
 so this is a claim to check against the criteria above, not a finding either.
 """
         body += """
-Answer one of two things, and do not split the difference.
+Answer one of two things, whole.
 
 - **The ticket cannot be satisfied as written.** Reply with `impossible`,
   naming the criterion and the contradiction in plain terms a person can check.
@@ -2611,8 +2720,8 @@ Answer one of two things, and do not split the difference.
   words spends another cycle proving it again — if you cannot name the thing
   that will now happen differently, the honest answer is the one above.
 
-Do not return the ticket essentially unchanged. Unchanged is the one reply that
-guarantees another identical cycle."""
+Return a ticket that differs in something the next attempt will act on.
+Unchanged is the one reply that guarantees another identical cycle."""
     else:
         body += "\nRevise the ticket so the next attempt can succeed."
 
@@ -2706,24 +2815,27 @@ Two things are worth separating, and the format keeps them apart:
 - **Suggestion** — you can do your part, and the ticket would still be better
   with this. Sign off anyway.
 
-Do not object to a ticket for being small, for lacking detail you do not need,
-or for stylistic reasons. Do not restate the ticket back. Do not propose work
-the ticket does not ask for — a ticket that does less than you would like is
-not a defect, and scope you add here is scope somebody has to verify.
+Raise an objection when the ticket stops you doing your part, and sign off in
+every other case. Sign a ticket that is smaller than you would have written,
+one that leaves out detail you do not need, and one written in a style you
+would not have chosen — all three are tickets you can work under. Keep what you
+write to the objection itself: the planner already has the ticket in front of
+it, and scope you add here is scope somebody has to verify.
 
-Do not object that the work has not been done yet. There is no implementation,
-no diff and no test run to look at, and there is not meant to be — that is the
-premise of this pass, not something missing from it. "I cannot verify this
-because the code is not here" is true of every ticket that reaches you, and it
-answers a question nobody asked.
+Judge the ticket as a contract, not as work. There is no implementation, no
+diff and no test run, and that is this pass's premise — every ticket reaching
+you is in that state, so it is common ground rather than a finding. The
+question to hold in mind is whether this contract is one you could work under
+once the code exists.
 
-Reply in exactly this format and nothing else:
+Reply in exactly this format and nothing else, one line per point, writing
+NONE where you have none:
 
-SIGNOFF: yes
+SIGNOFF: <yes|no>
 BLOCKING:
-- (one line each, or NONE)
+- NONE
 SUGGEST:
-- (one line each, or NONE)
+- NONE
 
 `SIGNOFF: yes` with a blocking objection listed is read as no. You have named
 something you cannot work under, and the loop takes your reason over your vote.
@@ -2739,9 +2851,9 @@ RATIFY_QUESTIONS = {
         "the right dependencies, and does its scope match what it describes?"
     ),
     "executor": (
-        "Could you produce this implementation from the spec, the scope, and "
-        "the reference files listed — without opening a file you have not been "
-        "given, and without writing outside the allowed scope?"
+        "Could you produce this implementation using only the spec, the scope, "
+        "and the reference files listed, writing only inside the allowed "
+        "scope?"
     ),
     "tester": (
         "Could you turn every acceptance criterion into a test that fails "
@@ -2754,11 +2866,24 @@ RATIFY_QUESTIONS = {
     # checking — three such objections parked one ticket that had never been
     # attempted, and the suggestions attached to them restated the ticket's own
     # spec back as instructions.
+    #
+    # The command criteria are named as settled for the same reason. Almost
+    # every backlog ends its criteria with "lint, typecheck and test all exit
+    # 0", which is true of a criterion the harness settles and the reviewer
+    # never has to: verification runs before review and review only happens on
+    # a green tree. Asked to name what it could not settle by reading, the
+    # reviewer named those — correctly — in 11 of 16 sign-off passes across two
+    # runs, and signed off in none of them. A role that can never agree is not
+    # a fourth vote.
     "reviewer": (
         "Once this ticket has been built, could you rule on the diff from "
-        "these criteria alone? Name any criterion you could not settle by "
-        "reading a change — one needing the code run, a value nobody has "
-        "measured, or a judgement the criteria do not pin down."
+        "these criteria alone? The harness runs the project's lint, typecheck "
+        "and test commands before the diff reaches you, and review happens "
+        "only on a tree where they passed, so read every criterion about a "
+        "command exiting cleanly as already settled and sign off on it. Name a "
+        "criterion that would still leave you guessing with the diff in front "
+        "of you: a value nobody has measured, or a judgement the criteria do "
+        "not pin down."
     ),
 }
 
@@ -2843,8 +2968,9 @@ def ratify_prompt(
 {RATIFICATION_HEADING}
 {_ratify_notes_block(notes)}
 
-The ticket above already reflects what the planner changed. Do not re-raise a
-point that has been answered unless the answer is wrong, and say why if it is.
+The ticket above already reflects what the planner changed. Treat an answered
+point as answered; raise one again only where the answer is wrong, and say why
+it is wrong when you do.
 """
 
     messages.append(
@@ -2861,18 +2987,27 @@ _RATIFY_SECTION = re.compile(
     r"^\s*\**\s*(blocking|suggest(?:ion|ions|ed)?)\s*\**\s*[:\-]\s*(.*)$", re.IGNORECASE
 )
 _RATIFY_NONE = re.compile(r"^\(?\s*(none|n/?a|nothing)\b", re.IGNORECASE)
+# The format block's own filler, handed back verbatim. A model that rehearses
+# the shape it was asked for before answering in it writes these lines, and
+# reading them as objections parks tickets on the prompt's own punctuation.
+_RATIFY_ECHO = re.compile(r"^(?:[.…]+|one line each\b.*|\(one line each\b.*)$", re.IGNORECASE)
 _BARE_VOTE = ("yes", "accept", "agree", "ok", "signoff: yes", "signoff yes")
 
 
 def _ratify_points(raw: Sequence[str]) -> list[str]:
-    """Clean one section's lines: strip bullets, drop the NONE placeholder."""
+    """Clean one section's lines: strip bullets, drop placeholders, dedup.
+
+    Deduplicated because a role that drafts its answer and then writes it out
+    says everything twice, and three objections listed six times reads as a
+    ticket in far worse shape than it is.
+    """
     points = []
     for line in raw:
         text = line.strip().lstrip("-*• \t").strip()
-        if not text or _RATIFY_NONE.match(text):
+        if not text or _RATIFY_NONE.match(text) or _RATIFY_ECHO.match(text):
             continue
         points.append(text)
-    return points
+    return list(dict.fromkeys(points))
 
 
 def parse_ratify(text: str) -> tuple[bool, list[str], list[str]]:
@@ -2887,6 +3022,13 @@ def parse_ratify(text: str) -> tuple[bool, list[str], list[str]]:
     A `yes` alongside a blocking objection is read as no. The role has named
     something it cannot work under, and taking the vote over the reason is how
     a sign-off pass becomes a formality that changes nothing.
+
+    Only the last sign-off in the reply counts. A model that works up to its
+    answer writes the format out more than once — a draft, a correction, then
+    the thing it means — and reading the whole reply merges every draft into the
+    final vote. One executor's ticket was blocked on `...` and `(one line each,
+    or NONE)`, which are the prompt's placeholders, quoted back while it was
+    still deciding what to say.
     """
     signed = False
     saw_vote = False
@@ -2894,7 +3036,12 @@ def parse_ratify(text: str) -> tuple[bool, list[str], list[str]]:
     blocking: list[str] = []
     suggestions: list[str] = []
 
-    for line in (text or "").splitlines():
+    lines = (text or "").splitlines()
+    votes = [index for index, line in enumerate(lines) if _SIGNOFF_LINE.match(line)]
+    if votes:
+        lines = lines[votes[-1] :]
+
+    for line in lines:
         vote = _SIGNOFF_LINE.match(line)
         if vote:
             saw_vote = True
@@ -2943,14 +3090,24 @@ and — unlike a revision after a failure — the acceptance criteria. This is t
 moment the contract is settled: a criterion that cannot be tested should be
 made testable now, and a missing one should be added now.
 
-What you must not do:
+What the rewrite has to preserve:
 
-- Do not weaken a criterion to make an objection go away. A criterion nobody
-  checks is worse than one somebody objected to.
-- Do not widen the scope past the files the work actually needs.
-- Do not turn this into a different ticket. The plan asked for something; a
-  revision that does more than was asked is a new ticket, not this one.
-- Do not drop something the plan stated because a role found it inconvenient.
+- Every criterion keeps its bar. Where a role could not test one, make it
+  testable by saying more about it, and let what it demands stand — a criterion
+  nobody checks is worse than one somebody objected to.
+- The scope stays the files the work actually needs.
+- The ticket stays this ticket. The plan asked for something, and a revision
+  doing more than was asked is a new ticket rather than this one.
+- Everything the plan stated stays stated, a role finding it inconvenient
+  included.
+- A criterion that looks incomplete — it names a call and stops, or demands a
+  value without saying what produced it — is reported in `responses` and left
+  exactly as it stands. Far likelier that a human wrote it whole and it reached
+  you damaged than that they meant it this way, and a number you supply to
+  finish the sentence becomes a contract nobody agreed to. One ticket was
+  rewritten to demand that a point at the origin map to the cell above and left
+  of the grid; the two roles that had to work under it refused, correctly, and
+  the backlog stopped there without an attempt.
 
 Reply with a JSON object and nothing else:
 
@@ -3073,6 +3230,6 @@ code existed. The ticket above is the result, agreed {status}.
 
 {_ratify_notes_block(ticket.ratify_notes)}
 
-This is settled. Do not re-open it — work to the ticket as it now stands.
+This is settled. Work to the ticket as it now stands.
 """,
     )
