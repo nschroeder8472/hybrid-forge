@@ -92,6 +92,7 @@ class TestTheFixtureIsOnlyTheFixture(unittest.TestCase):
         ".hybridforge/config.json",
         "BUG.md",
         "README.md",
+        "HARD.md",
         "SPEC.md",
         "STALL.md",
         "plugin/histogram/__init__.py",
@@ -300,6 +301,69 @@ class TestTheStallBacklogCannotSucceed(unittest.TestCase):
         spec, _how, _derived = ingest((SAMPLE / "SPEC.md").read_text(encoding="utf-8"))
 
         self.assertNotIn("ST-001", [ticket.ticket_id for ticket in spec])
+
+
+class TestTheHardBacklogIsHardAndNotImpossible(unittest.TestCase):
+    """`SPEC.md` lands on the first attempt and `STALL.md` cannot be landed at
+    all, so neither exercises the middle of the loop: several attempts, a
+    failure set that shrinks, convergence measured on it, the ladder climbing.
+    `HARD.md` is the one that should end done and take its time."""
+
+    def setUp(self):
+        self.tickets, self.how, _derived = ingest(
+            (SAMPLE / "HARD.md").read_text(encoding="utf-8")
+        )
+
+    def test_it_is_one_parsed_ticket(self):
+        self.assertEqual(self.how, "parsed")
+        self.assertEqual([t.ticket_id for t in self.tickets], ["HP-001"])
+
+    def test_every_criterion_is_satisfiable_by_a_correct_implementation(self):
+        # The difference between this backlog and `STALL.md`, and the property
+        # that decides which one the loop is being tested against. Checked by
+        # implementing the spec here and reading the criteria back.
+        from decimal import ROUND_HALF_UP, Decimal
+
+        def shares(counts):
+            if not counts:
+                return []
+            total = sum(counts.values())
+            width = max(len(word) for word in counts)
+            ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+            return [
+                f"{word.ljust(width)} "
+                f"{(Decimal(100 * count) / Decimal(total)).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP)}%"
+                for word, count in ranked
+            ]
+
+        self.assertEqual(shares({"a": 1, "b": 1}), ["a 50.0%", "b 50.0%"])
+        self.assertEqual(
+            shares({"apple": 2, "b": 1}), ["apple 66.7%", "b     33.3%"]
+        )
+        self.assertEqual(
+            shares({"a": 1, "b": 2, "c": 3}), ["c 50.0%", "b 33.3%", "a 16.7%"]
+        )
+        self.assertEqual(
+            shares({"b": 1, "a": 1, "c": 1}),
+            ["a 33.3%", "b 33.3%", "c 33.3%"],
+        )
+        self.assertEqual(shares({"a": 13, "b": 67}), ["b 83.8%", "a 16.3%"])
+        self.assertEqual(shares({}), [])
+
+    def test_the_rounding_criterion_is_a_real_trap(self):
+        # The criterion exists because the obvious implementation gets it
+        # wrong. If Python ever rounds this half away from zero, the ticket
+        # stops being hard and this fixture stops testing anything.
+        self.assertEqual(round(16.25, 1), 16.2)
+
+    def test_it_writes_files_the_other_specs_do_not(self):
+        spec, _how, _derived = ingest((SAMPLE / "SPEC.md").read_text(encoding="utf-8"))
+        theirs = {path for ticket in spec for path in ticket.allowed_files}
+        mine = {path for ticket in self.tickets for path in ticket.allowed_files}
+
+        self.assertEqual(theirs & mine, set())
+        for path in mine:
+            self.assertFalse((SAMPLE / path).exists(), path)
 
 
 class TestTheSeededDefectIsStillThere(unittest.TestCase):

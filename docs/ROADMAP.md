@@ -30,11 +30,19 @@ value, a tester that softened it, and a reviewer that approved with nothing
 testing it. Three mechanical guards later it ends blocked, with a note naming
 the real problem; the write-up is in [CONVERGENCE.md](CONVERGENCE.md).
 
-What that run still did not exercise is this entry's own subject. The ticket
+What that run still did not exercise is this entry's own subject: the ticket
 never reached a state where its failure classes could descend, so
 `_convergence`, the ladder and `flatCycles` have yet to be asked a question.
-The backlog worth writing next is one that is merely hard rather than
-impossible.
+
+`examples/sample-project/HARD.md` was written to be the backlog that would ask
+them — satisfiable, and not on the first try. It has been landed on the first
+try four times, across two versions of it, the second with nine exact criteria
+and seven independent details. Difficulty that comes from care is not
+difficulty for this executor; what defeats it is a spec that is wrong. That is
+also what the `Puzzle-Path` run these features came from was: 430 attempts
+against criteria that could not all hold at once. So the honest test of the ten
+features is a backlog whose specs are subtly wrong in a way that takes several
+attempts to expose, and writing one is what this entry now waits on.
 
 The problem that document names: a run can be long without being wrong, and
 this one was neither converging nor able to tell. 18.2 hours, 24.5M tokens, 430

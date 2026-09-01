@@ -20580,6 +20580,74 @@ class TestATicketWhoseCriterionCannotBeTestedHonestlyBlocks(unittest.TestCase):
         self.assertNotIn("no honest test of it can pass", stored.blocked_note)
 
 
+class TestOnlyTheValueAfterACallIsPinned(unittest.TestCase):
+    """A criterion explains itself as well as pinning a value, and the
+    explanation is written in code spans too.
+
+    The first run of `HARD.md` blocked on this. Its rounding criterion reads
+    `shares({"a": 13, "b": 67})` returns `["b 83.8%", "a 16.3%"]` — `16.25`
+    rounds away from zero to `16.3`, which `round(16.25, 1)` does not do. A
+    test that asserts the list has no reason to mention `16.25`, and reading
+    all four spans as pinned turned an honest test into a softened one, twice,
+    and parked a ticket that was going fine."""
+
+    CRITERION = (
+        '`shares({"a": 13, "b": 67})` returns `["b 83.8%", "a 16.3%"]` - '
+        "`16.25` rounds away from zero to `16.3`, which `round(16.25, 1)` "
+        "does not do."
+    )
+
+    def test_only_the_returned_value_is_required(self):
+        from forge.patch import pinned_values
+
+        self.assertEqual(pinned_values(self.CRITERION), ['["b 83.8%", "a 16.3%"]'])
+
+    def test_an_honest_test_of_it_is_not_flagged(self):
+        from forge.patch import weakened_criteria
+
+        honest = (
+            'self.assertEqual(shares({"a": 13, "b": 67}), '
+            '["b 83.8%", "a 16.3%"])'
+        )
+
+        self.assertEqual(weakened_criteria(honest, [self.CRITERION]), [])
+
+    def test_softening_that_same_value_is_still_caught(self):
+        from forge.patch import weakened_criteria
+
+        softened = (
+            'self.assertEqual(shares({"a": 13, "b": 67}), '
+            '["b 83.8%", "a 16.2%"])'
+        )
+
+        self.assertEqual(len(weakened_criteria(softened, [self.CRITERION])), 1)
+
+    def test_a_reword_may_drop_the_aside_but_not_the_value(self):
+        from forge.respec import _softened_values
+
+        ticket = Ticket("HP-001", criteria=[self.CRITERION])
+
+        kept = _softened_values(
+            ticket,
+            {
+                "criteria": [
+                    '`shares({"a": 13, "b": 67})` returns `["b 83.8%", "a 16.3%"]`.'
+                ]
+            },
+        )
+        moved = _softened_values(
+            ticket,
+            {
+                "criteria": [
+                    '`shares({"a": 13, "b": 67})` returns `["b 83.8%", "a 16.2%"]`.'
+                ]
+            },
+        )
+
+        self.assertEqual(kept, [])
+        self.assertEqual(moved, ['["b 83.8%", "a 16.3%"]'])
+
+
 class TestRatifyMayRewordACriterionButNotItsValue(unittest.TestCase):
     """The count ratchet asks whether the bar was raised. Nothing asked whether
     it was lowered.

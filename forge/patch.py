@@ -816,46 +816,85 @@ _CALL_SPAN = re.compile(r"^[A-Za-z_][\w.]*\s*\(.*\)$", re.DOTALL)
 
 
 def _flatten(text: str) -> str:
-    """Whitespace collapsed and quotes unified, for comparing spellings.
+    """Whitespace removed and quotes unified, for comparing spellings.
 
-    A test may wrap an assertion across three lines and prefer double quotes
-    where the criterion used single ones without saying anything different.
-    Neither is a weakening, and neither should be reported as one.
+    A test may wrap a long assertion over five lines, put the list it compares
+    against one element per line, and prefer double quotes where the criterion
+    used single ones. None of that says anything different, and all of it
+    defeated a collapse-to-one-space rule: a criterion's `["a  45.5%", ...]`
+    and the same list written one element per line differ by a space after the
+    bracket, so the check called an honest test a softened one and parked a
+    ticket that was going fine.
+
+    Removing whitespace rather than collapsing it gives up on padding \u2014 a test
+    asserting `"a 45.5%"` where the criterion says `"a      45.5%"` now passes
+    this check. That is a real miss, and the right direction to miss in: this
+    is a net for a swapped *value*, what it costs when wrong is a parked
+    ticket, and it had produced two false positives in its first two runs.
     """
-    return re.sub(r"\s+", " ", (text or "").replace("'", '"').replace("\u2019", '"'))
+    return re.sub(r"\s+", "", (text or "").replace("'", '"').replace("\u2019", '"'))
 
 
-def _states(value: str, haystack: str) -> bool:
-    """Whether `haystack` states `value`, allowing a mapping to be reordered."""
-    if value in haystack:
+def _states(value: str, flattened: str) -> bool:
+    """Whether `flattened` states `value`, allowing for how it was written.
+
+    `value` is a criterion's span as the author wrote it; `flattened` is the
+    whole test file with its whitespace gone. Three tolerances, each earned by
+    a false positive rather than imagined:
+
+    - whitespace and quote style, which say nothing (see `_flatten`);
+    - the order of a mapping's pairs, because `{"a": 1, "b": 2}` and
+      `{"b": 2, "a": 1}` are the same expectation;
+    - a collection written one element per line with a trailing comma, which
+      is what every formatter produces and what no criterion contains — so a
+      bracketed value is checked element by element rather than whole.
+    """
+    wanted = _flatten(value)
+    if wanted in flattened:
         return True
-    inner = value.strip()
-    if inner.startswith("{") and inner.endswith("}"):
-        # `{"a": 1, "b": 2}` and `{"b": 2, "a": 1}` are the same expectation.
-        parts = [part.strip() for part in inner[1:-1].split(",") if part.strip()]
-        return bool(parts) and all(part in haystack for part in parts)
+    inner = wanted.strip()
+    for opener, closer in (("{", "}"), ("[", "]"), ("(", ")")):
+        if inner.startswith(opener) and inner.endswith(closer):
+            parts = [part for part in inner[1:-1].split(",") if part]
+            return bool(parts) and all(part in flattened for part in parts)
     return False
 
 
 def pinned_values(criterion: str) -> list[str]:
-    """The values a criterion states, as written, whitespace and quotes aside.
+    """What each call this criterion names has to produce, as written.
 
     A criterion's code spans are the part of it meant to be reproduced
     verbatim — by the tester in an assertion, and by anything that revises the
-    ticket. The spans that are calls are what to run; the rest are what the
-    answer has to be, and those are the contract.
+    ticket. But only some of them are the contract: the span *after* a call is
+    what that call must return, and the rest are the author explaining
+    themselves.
+
+    The distinction is not academic. A criterion reading
+
+        `shares({"a": 13, "b": 67})` returns `["b 83.8%", "a 16.3%"]` —
+        `16.25` rounds away from zero to `16.3`, which `round(16.25, 1)` does
+        not do.
+
+    pins one value. Reading all four spans as pinned made an honest test look
+    like a softened one, because a test that asserts the list has no reason to
+    mention `16.25` — and on the run that found this, the ticket was blocked
+    for it. A value stated before its call is not collected either, which
+    misses a real weakening rather than inventing one.
     """
-    return [
-        _flatten(span)
-        for span in _CODE_SPAN.findall(criterion or "")
-        if not _CALL_SPAN.match(span.strip())
-    ]
+    values: list[str] = []
+    spans = [span.strip() for span in _CODE_SPAN.findall(criterion or "")]
+    for index, span in enumerate(spans[:-1]):
+        following = spans[index + 1]
+        if _CALL_SPAN.match(span) and not _CALL_SPAN.match(following):
+            if following not in values:
+                values.append(following)
+    return values
 
 
 def calls_named(criterion: str) -> list[str]:
     """The calls a criterion names, as written."""
     return [
-        _flatten(span)
+        span.strip()
         for span in _CODE_SPAN.findall(criterion or "")
         if _CALL_SPAN.match(span.strip())
     ]
@@ -893,11 +932,13 @@ def weakened_criteria(text: str, criteria: Sequence[str]) -> list[str]:
         values = pinned_values(criterion)
         if not calls or not values:
             continue
-        if not any(call in haystack for call in calls):
+        if not any(_flatten(call) in haystack for call in calls):
             continue
         missing = [value for value in values if not _states(value, haystack)]
         if missing:
-            found.append(f"{_flatten(criterion)[:160]} :: {missing[0][:80]}")
+            # Reported as the author wrote it. The flattened form is for
+            # comparing; a person reading the log needs the criterion back.
+            found.append(f"{' '.join(criterion.split())[:160]} :: {missing[0][:80]}")
     return found
 
 

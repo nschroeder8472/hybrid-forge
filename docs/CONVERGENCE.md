@@ -1046,7 +1046,52 @@ contradicts code this ticket may not write, so no honest test of it can pass*.
 
 **What this still has not measured.** The ticket never reached a state where
 the failure classes could descend, so `_convergence`, the escalation ladder and
-`flatCycles` remain unexercised. The next backlog to write is one that is
-merely *hard* rather than impossible: several attempts, a shrinking set of
-distinct failures, and a ladder that should climb. That is the run the deciles
-at the top of this document were promised against.
+`flatCycles` remain unexercised.
+
+## The backlog that was supposed to be hard
+
+`examples/sample-project/HARD.md` was written to be that run: satisfiable, but
+not on the first try. One function, and every detail pinned exactly — a
+percentage always written to one decimal place, rounding half away from zero
+where `round()` does not, a right-aligned six-character field, padding to the
+longest label, a `limit` that folds the remainder into an `other` row whose
+label sets that width, and a summary line with singular and plural forms.
+
+It has not been hard once. Four runs, two versions — four exact details, then
+nine — and the local executor landed every criterion on the first attempt each
+time, in seven model calls and under 60k tokens. The delivered
+`shares(counts, limit=0)` was checked against all nine criteria independently
+afterwards; it is correct on every one, including the `16.25 -> 16.3` case that
+`round()` gets wrong.
+
+So the middle of this document remains unexercised, and the reason is worth
+writing down rather than working around: **difficulty that comes from care is
+not difficulty for this executor.** What defeats it is a spec that is wrong —
+a criterion contradicting code the ticket may not change, two criteria
+demanding different values from one call, a design question left unresolved.
+Every failure this fixture has produced has been of that kind, and so was the
+`Puzzle-Path` run these ten features were derived from: 430 attempts against
+criteria that could not all hold at once.
+
+That reframes what the ten features are for. They are not a way to make a
+capable model converge on well-specified work — it already does, first try.
+They are the machinery that stops a *defective spec* from consuming a night,
+and the honest test of them is a backlog whose specs are subtly wrong in ways
+that take several attempts to expose. `STALL.md` is the crude version of that
+and stops in one attempt. The version worth writing next is a ticket whose
+criteria are individually satisfiable and jointly impossible only for inputs
+the executor reaches on its second or third attempt.
+
+**The two false positives that came out of these runs.** `weakened_criteria`
+was written from the stall run and immediately parked two healthy tickets:
+
+- A criterion explains itself in code spans as well as pinning a value —
+  ``16.25`` and ``round(16.25, 1)`` in the rounding criterion above — and every
+  span was being read as a required value. Only the span *following a call* is
+  the contract now.
+- The tester wrote its expected list one element per line with a trailing
+  comma, and the check compared whitespace-collapsed strings, so the honest
+  test differed from the criterion by a space after `[`. Comparison now ignores
+  whitespace entirely and checks a bracketed value element by element — which
+  also gives up on catching a padding-only softening, the right direction to
+  miss in for a net whose cost when wrong is a parked ticket.

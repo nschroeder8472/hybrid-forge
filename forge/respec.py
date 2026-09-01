@@ -22,7 +22,7 @@ from typing import Callable, Sequence
 
 from .evidence import MAX_LOCATE, locate_named, repo_files
 from .ingest import derive_needs, plan_decisions, whole_file_claims
-from .patch import is_safe_path, normalize_path, pinned_values
+from .patch import _flatten, _states, is_safe_path, normalize_path, pinned_values
 from .prompts import parse_respec, respec_prompt
 from .providers import Completion, Message, ProviderError
 from .state import Store, Ticket, _criterion_key
@@ -513,11 +513,13 @@ def _softened_values(ticket: Ticket, revision: dict) -> list[str]:
     # spellings that have already been normalised the same way: a reviser that
     # prefers double quotes, or wraps a long criterion across two lines, has
     # said nothing different and must not be refused for it.
-    stated = {value for text in proposed for value in pinned_values(str(text))}
+    stated = " ".join(
+        value for text in proposed for value in pinned_values(str(text))
+    )
     lost: list[str] = []
     for criterion in ticket.criteria:
         for value in pinned_values(criterion):
-            if value not in stated and value not in lost:
+            if not _states(value, _flatten(stated)) and value not in lost:
                 lost.append(value)
     return lost
 
