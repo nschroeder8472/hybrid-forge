@@ -371,7 +371,7 @@ and the one that produced this run.
 | 4 | **2** — empty `typecheck` warns for languages that have one | trivial | Yes, at preflight | **done** — `TYPECHECKERS`, `Workspace.unchecked`; reported by `doctor` and at run start, never gated |
 | 5 | **3b** — ingest closure checks | moderate | Yes, at ingest | **done** — phase 4 refuses a backlog no build owns; `toolchain.manifest_gaps` reports a language nothing can build (`LOOP-INVARIANTS.md` §17). `ingest.undeclared_order` reports the zero-`needs` shape |
 | 6 | **4** — normative structure / `reference_files` | moderate | No — but it is why the code was wrong even where it parsed | **done** — planned ingests attach their source document; the planner is told not to paraphrase tables; prose references keep their tables when trimmed |
-| 7 | **1c** — assert the authored test actually ran | moderate | Yes, at the first tests step | **done** — `failures.test_count`, `_test_was_collected`; `LOOP-INVARIANTS.md` §16 |
+| 7 | **1c** — assert the authored test actually ran | moderate | Yes, at the first tests step | **done** — `failures.reported_test_count`, `_test_was_collected`; `LOOP-INVARIANTS.md` §16 |
 | 8 | **workspaces** | largest | Yes, and it is the durable shape | **done** — `WORKSPACES.md`, all five phases |
 
 Items 1–4 are each independently sufficient to have turned this run red, and

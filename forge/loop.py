@@ -61,7 +61,7 @@ from .failures import (
     reroot,
     signatures,
     strip_ansi,
-    test_count,
+    reported_test_count,
 )
 from .ingest import write_tickets
 from .memory import MemoryClient, MemoryRefused, MemoryUnavailable, ticket_query
@@ -117,7 +117,7 @@ from .prompts import (
     review_prompt,
     scope_argument_prompt,
     strip_prompt_echo,
-    tests_prompt,
+    write_tests_prompt,
 )
 from .state import (
     DETAIL_CHARS,
@@ -1434,7 +1434,7 @@ class Orchestrator:
             # passed, because it is not about failures at all: it is how many
             # tests this project had before the tester wrote one. See
             # `_test_was_collected`.
-            counted = test_count(result.detail)
+            counted = reported_test_count(result.detail)
             if counted is not None:
                 self._baseline_counts[name] = counted
             if result.ok:
@@ -5274,7 +5274,7 @@ class Orchestrator:
                     completion = self._call(
                         run_id,
                         "tester",
-                        tests_prompt(
+                        write_tests_prompt(
                             ticket,
                             written,
                         # One fixed path per ticket. A tester free to name its
@@ -6481,7 +6481,7 @@ class Orchestrator:
             return ""
 
         before = self._baseline_counts.get(step)
-        after = test_count(output)
+        after = reported_test_count(output)
         if before is None or after is None:
             # Said once per run, not once per ticket: it is a fact about the
             # runner, and repeating it for every ticket would train a reader to

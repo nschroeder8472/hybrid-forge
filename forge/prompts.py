@@ -1027,7 +1027,7 @@ Fix the cause, so the check passes on its own terms.
     return messages
 
 
-def tests_prompt(
+def write_tests_prompt(
     ticket: Ticket,
     changed_files: list[str],
     *,
@@ -1517,7 +1517,7 @@ def repro_prompt(
 ) -> list[Message]:
     """Ask the tester for the test that must fail before anything is fixed.
 
-    Separate from `tests_prompt` because the instruction is inverted. That one
+    Separate from `write_tests_prompt` because the instruction is inverted. That one
     encodes criteria and treats a failing assertion as the ticket's failure;
     this one is asked for a failure on purpose, and a test that passes is the
     result that stops the ticket.

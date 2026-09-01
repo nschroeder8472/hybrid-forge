@@ -98,7 +98,7 @@ from forge.failures import (
     locations,
     reroot,
     signatures,
-    test_count,
+    reported_test_count,
 )
 from forge.prompts import (
     FAILURE_CLASSES_HEADING,
@@ -124,7 +124,7 @@ from forge.prompts import (
     respec_prompt,
     review_prompt,
     strip_prompt_echo,
-    tests_prompt,
+    write_tests_prompt,
 )
 from forge.providers import available_kinds, build_provider
 from forge.providers.base import (
@@ -3496,7 +3496,7 @@ class TestExecutorSeesSource(unittest.TestCase):
         # fails to compile, and every later ticket's verify step dies on a
         # file unrelated to it.
         ticket = Ticket("T-1", spec="s", criteria=["c"])
-        body = tests_prompt(
+        body = write_tests_prompt(
             ticket,
             ["src/game.rs"],
             test_path="tests/t_1_test.rs",
@@ -3505,11 +3505,11 @@ class TestExecutorSeesSource(unittest.TestCase):
         self.assertIn("pub fn over(&self) -> bool", body)
         self.assertIn("code under test", body)
 
-    def test_tester_prompt_without_sources_is_unchanged(self):
+    def test_the_prompt_without_sources_is_unchanged(self):
         ticket = Ticket("T-1", spec="s", criteria=["c"])
         self.assertNotIn(
             "code under test",
-            tests_prompt(ticket, ["a.rs"], test_path="tests/t_1_test.rs")[-1].content,
+            write_tests_prompt(ticket, ["a.rs"], test_path="tests/t_1_test.rs")[-1].content,
         )
 
     def test_respec_can_add_reference_files(self):
@@ -3710,7 +3710,7 @@ class TestTesterEvidence(unittest.TestCase):
         self.assertIsNone(orch._example_test([]))
 
     def test_prompt_carries_the_runner_and_the_example(self):
-        messages = tests_prompt(
+        messages = write_tests_prompt(
             Ticket("T-1", criteria=["x is 1"]),
             ["app.py"],
             test_path="tests/t_1_test.py",
@@ -3723,11 +3723,11 @@ class TestTesterEvidence(unittest.TestCase):
         self.assertIn("import unittest", body)
 
     def test_prompt_without_an_example_still_asks_for_repo_conventions(self):
-        body = tests_prompt(Ticket("T-1"), ["app.py"], test_path="tests/t_1_test.py")[-1].content
+        body = write_tests_prompt(Ticket("T-1"), ["app.py"], test_path="tests/t_1_test.py")[-1].content
         self.assertIn("conventions already used in this repository", body)
 
     def test_failure_context_reaches_the_tester(self):
-        body = tests_prompt(
+        body = write_tests_prompt(
             Ticket("T-1", criteria=["x is 1"]),
             ["app.py"],
             test_path="tests/t_1_test.py",
@@ -3739,14 +3739,14 @@ class TestTesterEvidence(unittest.TestCase):
         # The dangerous reading of "your tests failed" is "make them pass".
         # A tester that deletes an assertion turns a caught defect into a green
         # suite over broken code.
-        body = tests_prompt(
+        body = write_tests_prompt(
             Ticket("T-1"), ["app.py"], test_path="tests/t_1_test.py", failure_context="boom"
         )[-1].content
         self.assertIn("not yours to correct", body)
         self.assertIn("keep the assertion as written", body)
 
     def test_a_clean_first_attempt_carries_no_failure_section(self):
-        body = tests_prompt(Ticket("T-1"), ["app.py"], test_path="tests/t_1_test.py")[-1].content
+        body = write_tests_prompt(Ticket("T-1"), ["app.py"], test_path="tests/t_1_test.py")[-1].content
         self.assertNotIn("did not pass verification", body)
 
 
@@ -6374,7 +6374,7 @@ class TestTheTesterIsPointedAtItsOwnErrors(unittest.TestCase):
         self.assertEqual(errors_naming(self.LINT, ""), [])
 
     def test_the_prompt_puts_them_in_front_of_the_tester(self):
-        body = tests_prompt(
+        body = write_tests_prompt(
             Ticket("TT-001", criteria=["cells() returns four"]),
             ["src/piece.rs"],
             test_path="tests/tt_001_test.rs",
@@ -6386,7 +6386,7 @@ class TestTheTesterIsPointedAtItsOwnErrors(unittest.TestCase):
         self.assertIn("unused variable", body)
 
     def test_a_clean_attempt_carries_no_such_section(self):
-        body = tests_prompt(
+        body = write_tests_prompt(
             Ticket("TT-001", criteria=["cells() returns four"]),
             ["src/piece.rs"],
             test_path="tests/tt_001_test.rs",
@@ -6395,7 +6395,7 @@ class TestTheTesterIsPointedAtItsOwnErrors(unittest.TestCase):
         self.assertNotIn("errors are in the file you are about to write", body)
 
     def test_the_three_branches_are_all_stated(self):
-        body = tests_prompt(
+        body = write_tests_prompt(
             Ticket("TT-001", criteria=["c"]),
             ["src/piece.rs"],
             test_path="tests/tt_001_test.rs",
@@ -6469,7 +6469,7 @@ class TestForeignBindingsInTests(unittest.TestCase):
                 self.assertIn(label, found[0])
 
     def test_the_prompt_quotes_back_what_was_rejected(self):
-        body = tests_prompt(
+        body = write_tests_prompt(
             Ticket("TT-004", criteria=["game_score() returns 0"]),
             ["src/wasm.rs"],
             test_path="tests/tt_004_test.rs",
@@ -6480,7 +6480,7 @@ class TestForeignBindingsInTests(unittest.TestCase):
         self.assertIn('extern "C" {', body)
 
     def test_a_clean_answer_carries_no_rejection_section(self):
-        body = tests_prompt(
+        body = write_tests_prompt(
             Ticket("TT-004", criteria=["game_score() returns 0"]),
             ["src/wasm.rs"],
             test_path="tests/tt_004_test.rs",
@@ -6694,7 +6694,7 @@ class TestTheTesterIsAskedAgainForLaunderedAssertions(unittest.TestCase):
         self.assertTrue(self._tests_file(root).exists())
 
     def test_the_prompt_quotes_back_what_was_rejected(self):
-        body = tests_prompt(
+        body = write_tests_prompt(
             Ticket("TT-004", criteria=["randi() returns 4071818419"]),
             ["src/rng.ts"],
             test_path="tests/rng.test.ts",
@@ -11415,7 +11415,7 @@ class TestATicketKeepsWhatItsAttemptsEstablished(unittest.TestCase):
             "T-1", learned=[{"text": "The linter forbids trailing whitespace.", "count": 1}]
         )
 
-        shown = _joined(tests_prompt(ticket, ["src/a.gd"], test_path="tests/t.gd"))
+        shown = _joined(write_tests_prompt(ticket, ["src/a.gd"], test_path="tests/t.gd"))
 
         self.assertIn("forbids trailing whitespace", shown)
 
@@ -12426,7 +12426,7 @@ class TestTheToolchainReachesThePrompt(unittest.TestCase):
         self.assertIn("not in your scope", block)
 
     def test_the_tester_is_shown_it_too(self):
-        messages = tests_prompt(
+        messages = write_tests_prompt(
             Ticket("T-1"), ["src/a.ts"], test_path="tests/t.ts", toolchain=self.RULES
         )
 
@@ -12797,16 +12797,16 @@ class TestCountingWhatARunnerSaidItRan(unittest.TestCase):
             ("9 examples, 0 failures", 9),
         ):
             with self.subTest(output=output):
-                self.assertEqual(test_count(output), expected)
+                self.assertEqual(reported_test_count(output), expected)
 
     def test_a_runner_that_prints_no_count_says_so(self):
-        self.assertIsNone(test_count("ok  \tgithub.com/x/y\t0.012s"))
-        self.assertIsNone(test_count(""))
+        self.assertIsNone(reported_test_count("ok  \tgithub.com/x/y\t0.012s"))
+        self.assertIsNone(reported_test_count(""))
 
     def test_the_largest_number_wins(self):
         # pytest prints `collected 12 items` and then `12 passed`; a suite that
         # grew shows the growth in whichever number is biggest.
-        self.assertEqual(test_count("collected 12 items\n5 passed, 7 failed"), 12)
+        self.assertEqual(reported_test_count("collected 12 items\n5 passed, 7 failed"), 12)
 
 
 class TestAGreenThatRanNoneOfTheTicketsTests(unittest.TestCase):
@@ -18321,7 +18321,7 @@ class TestRatificationInTheLoop(unittest.TestCase):
         )
         for messages in (
             build_prompt(ticket),
-            tests_prompt(ticket, ["src/a.rs"], test_path="tests/t.rs"),
+            write_tests_prompt(ticket, ["src/a.rs"], test_path="tests/t.rs"),
             review_prompt(ticket, "diff --git a b"),
         ):
             joined = "\n".join(m.content for m in messages)
