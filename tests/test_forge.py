@@ -1895,6 +1895,29 @@ class TestCommandsAreKeyedByLanguage(unittest.TestCase):
         self.assertEqual(config.command_for("test", "src/a.py"), "pytest -q")
         self.assertTrue(config.covers("test", ".py"))
 
+    def test_a_typescript_key_is_not_refused_over_the_extensions_nobody_wrote(self):
+        # `.ts` means the whole TypeScript family, `.mts` and `.cts` included,
+        # so the key expands to four extensions. The runner table listed six of
+        # the eight JavaScript-and-TypeScript ones by hand, and the ordinary
+        # config every path here writes — the wizard's, `forge toolchain
+        # --accept`'s, a person's — was refused at load over the two it omitted,
+        # in a repository with no `.mts` file in it.
+        config = self._config(
+            {"lint": {".ts": "eslint ."}, "test": {".ts": "npm test"}}
+        )
+
+        config.validate()
+        self.assertTrue(config.covers("test", ".ts"))
+        self.assertTrue(config.covers("test", ".mts"))
+
+    def test_a_command_for_a_language_it_cannot_run_is_still_refused(self):
+        # Widening a runner to whole languages must not widen it across them.
+        with self.assertRaises(ConfigError) as caught:
+            self._config({"test": {".py": "cargo test"}}).validate()
+
+        self.assertIn(".py", str(caught.exception))
+        self.assertIn("cargo test", str(caught.exception))
+
     def test_a_map_answers_per_language(self):
         config = self._config({"test": {".rs": "cargo test", ".js": "node --test web/"}})
 
@@ -7812,6 +7835,65 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         self.assertNotIn("executor", seen)
         self.assertIn("proved nothing", seen["tester"][1])
 
+    def _recording_shell(self, orch, root: Path):
+        """`_shell_until_fixed`, writing the rows the real one writes.
+
+        The stub above returns a bare `StepResult`, which is enough for every
+        question about control flow and answers none about what a person
+        watching the run sees.
+        """
+        inner = self._shell_until_fixed(root)
+
+        def shell(run_id, name, command, ticket="", **kwargs):
+            result = inner(run_id, name, command, ticket, **kwargs)
+            if not command.strip():
+                return result
+            step = orch.store.start_step(run_id, ticket, name)
+            orch.store.end_step(step, "ok" if result.ok else "failed", result.detail)
+            return StepResult(ok=result.ok, detail=result.detail, step_id=step)
+
+        return shell
+
+    def _status_of(self, orch, run_id, name):
+        row = orch.store._connection.execute(
+            "SELECT status FROM steps WHERE name = ? ORDER BY id DESC LIMIT 1", (name,)
+        ).fetchone()
+        return row["status"] if row else None
+
+    def test_the_reproductions_red_is_recorded_as_the_pass_it_is(self):
+        # This step is inverted like the canary: red over the code as it
+        # stands is exactly what it is for, and the exit code says the
+        # opposite. Left as the shell recorded it, a textbook bug run shows one
+        # red step in the panel and teaches whoever is watching to discount it.
+        orch, root, run_id = self._orch()
+        orch._shell = self._recording_shell(orch, root)
+        self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertEqual(orch.store.list_tickets(run_id)[0].status, TICKET_DONE)
+        self.assertEqual(self._status_of(orch, run_id, "reproduce-test"), "ok")
+
+    def test_a_reproduction_that_proves_nothing_is_recorded_as_a_failure(self):
+        # The other half: exit 0 means the test passed against the bug, so
+        # nothing was demonstrated and the ticket parks.
+        orch, _root, run_id = self._orch()
+
+        def shell(run_id_, name, command, ticket="", **_kwargs):
+            if not command.strip():
+                return StepResult(ok=True, detail="")
+            step = orch.store.start_step(run_id_, ticket, name)
+            orch.store.end_step(step, "ok", "1 passed")
+            return StepResult(ok=True, detail="1 passed", step_id=step)
+
+        orch._shell = shell
+        self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        self.assertEqual(orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED)
+        self.assertEqual(self._status_of(orch, run_id, "reproduce-test"), "failed")
+
     def test_an_unreproducible_bug_is_not_retried_forever(self):
         """A real run spent fifteen retry cycles on one report — two tester
         calls apiece — and would have spent them forever under `retryCycles:
@@ -8647,6 +8729,112 @@ class TestTheCanaryMeasuresCoverageInsteadOfGuessing(unittest.TestCase):
         said = "\n".join(row["message"] for row in orch.store.events_after(0, limit=500))
         self.assertIn("verification here would prove nothing", said)
         self.assertIn("loop.preflightCanary", said)
+
+
+class TestTheCanaryIsRecordedAsWhatItMeant(unittest.TestCase):
+    """A step's colour is read by whoever is watching the run, and for the
+    canary the exit code says the opposite of the verdict. Red over a file that
+    cannot parse is the pass; green is the failure the check exists to find. A
+    run whose preflight always shows `failed` teaches the person watching it to
+    ignore the one panel that would have told them the build cannot verify
+    itself."""
+
+    def _orch(self, commands, files=("app.py",)):
+        return TestTheCanaryMeasuresCoverageInsteadOfGuessing._orch(
+            self, commands, files=files
+        )
+
+    def _recording_shell(self, orch, verdicts):
+        """A `_shell` that writes the same row the real one does.
+
+        `verdicts` maps a step name to its exit status, so a test can drive
+        each branch and still read back what the panel would show.
+        """
+
+        def shell(run, name, _command, _ticket="", **_kwargs):
+            ok, detail = verdicts[name]
+            step = orch.store.start_step(run, "", name)
+            orch.store.end_step(step, "ok" if ok else "failed", detail)
+            return StepResult(ok=ok, detail=detail, step_id=step)
+
+        return shell
+
+    def _statuses(self, orch, run_id):
+        return {row["name"]: row["status"] for row in orch.store.recent_steps(run_id)}
+
+    def test_red_naming_the_canary_is_recorded_as_a_pass(self):
+        orch, _root, run_id = self._orch({"test": "pytest"})
+        named = "tests/forge_preflight_canary_test.py:1: SyntaxError"
+        orch._shell = self._recording_shell(orch, {"canary[.py]": (False, named)})
+
+        self.assertEqual(orch._canary(run_id), [])
+
+        self.assertEqual(self._statuses(orch, run_id), {"canary[.py]": "ok"})
+
+    def test_green_over_a_file_that_cannot_parse_is_recorded_as_a_failure(self):
+        orch, _root, run_id = self._orch({"test": "gdunit-launcher"})
+        orch._shell = self._recording_shell(orch, {"canary[.py]": (True, "0 tests")})
+
+        self.assertEqual(len(orch._canary(run_id)), 1)
+
+        self.assertEqual(self._statuses(orch, run_id), {"canary[.py]": "failed"})
+
+    def test_a_build_whose_failures_name_nothing_is_recorded_as_a_failure(self):
+        orch, _root, run_id = self._orch({"test": "pytest"})
+        orch._shell = self._recording_shell(
+            orch,
+            {
+                "canary[.py]": (False, "FAILED (errors=1)"),
+                "canary[.py]-control": (True, ""),
+            },
+        )
+
+        self.assertEqual(len(orch._canary(run_id)), 1)
+
+        # The canary keeps the red it earned; the control run exited 0 and is
+        # the half that proves the gap, so it is not left reading as a pass.
+        self.assertEqual(
+            self._statuses(orch, run_id),
+            {"canary[.py]": "failed", "canary[.py]-control": "failed"},
+        )
+
+    def test_red_either_way_is_recorded_as_neither(self):
+        # Nothing was proved about the language and nothing about this build is
+        # known to be wrong. `requireGreenBaseline` is the gate for the tree's
+        # own red, and both colours would misreport this.
+        orch, _root, run_id = self._orch({"test": "pytest"})
+        blank = "ERROR: could not import conftest"
+        orch._shell = self._recording_shell(
+            orch,
+            {"canary[.py]": (False, blank), "canary[.py]-control": (False, blank)},
+        )
+
+        self.assertEqual(orch._canary(run_id), [])
+
+        self.assertEqual(
+            self._statuses(orch, run_id),
+            {"canary[.py]": "inconclusive", "canary[.py]-control": "inconclusive"},
+        )
+
+    def test_the_canarys_garbage_is_never_some_tickets_failure(self):
+        # The body is a syntax error nobody wrote. Classified like any other
+        # red, it would join the class set convergence counts.
+        orch, _root, run_id = self._orch({"test": "pytest"})
+        orch._shell = self._recording_shell(
+            orch,
+            {
+                "canary[.py]": (
+                    False,
+                    "tests/forge_preflight_canary_test.py:1: SyntaxError: "
+                    "invalid syntax",
+                )
+            },
+        )
+
+        orch._canary(run_id)
+
+        rows = orch.store.recent_steps(run_id)
+        self.assertEqual([json.loads(row["classes"]) for row in rows], [[]])
 
 
 class TestTheCanaryAgainstRealToolchains(unittest.TestCase):
@@ -20198,6 +20386,172 @@ class TestATicketCanReadWhatItsDependenciesWrote(unittest.TestCase):
 
         self.assertEqual(updated, [])
         self.assertEqual(logged, [])
+
+
+class TestTheRatifyRevisionSeesWhatItIsRewriting(unittest.TestCase):
+    """The revision prompt asks the planner for a `context` and never showed it
+    the one the ticket has, so every revision that touched the field replaced a
+    paragraph it had not read. `_preserve_plan_context` puts the original back
+    and logs it — which fired on all three live runs against
+    `examples/sample-project`, on runs where nothing else went wrong.
+
+    A guardrail that fires every time is not a guardrail, it is a prompt
+    defect being papered over once per run."""
+
+    def _body(self, ticket):
+        from forge.prompts import ratify_revision_prompt
+
+        notes = [{"role": "tester", "blocking": ["say what it returns"]}]
+        return " ".join(ratify_revision_prompt(ticket, notes)[-1].content.split())
+
+    def test_the_current_context_is_shown(self):
+        ticket = Ticket(
+            ticket_id="SP-001",
+            title="rank the counted words",
+            spec="add top_words",
+            criteria=["top_words({'a': 1}, 0) returns []"],
+            context="imports in this package resolve without an extension",
+        )
+
+        body = self._body(ticket)
+
+        self.assertIn("imports in this package resolve without an extension", body)
+        self.assertIn("extend it, do not replace it", body)
+
+    def test_a_ticket_with_no_context_says_so_rather_than_showing_a_hole(self):
+        body = self._body(Ticket(ticket_id="SP-002", title="x", spec="y"))
+
+        self.assertIn("Current context (carried to every role", body)
+        self.assertIn("(none)", body)
+
+    def test_a_bug_ticket_is_told_its_criteria_are_the_reproduction(self):
+        # The other half of the same defect: the sign-off pass was taught this
+        # and the revision pass was not, so the planner kept proposing criteria
+        # for a bug ticket and the ratchet kept refusing them — once per run,
+        # on every run.
+        body = self._body(
+            Ticket(
+                ticket_id="BUG-001",
+                title="punctuation is counted as part of the word",
+                kind=TICKET_BUG,
+                spec="strip punctuation from each token",
+            )
+        )
+
+        self.assertIn("no acceptance criteria and must not be given any", body)
+
+
+class TestABugBlockedBeforeReproductionIsStillRetried(unittest.TestCase):
+    """`retryCycles` skips a bug ticket that could not be reproduced, because
+    nothing between cycles makes an undemonstrable fault demonstrable. It asked
+    the wrong question: *was there a reproduction*, rather than *was one ever
+    attempted*.
+
+    A live run blocked at ratification with `attempts 0`, never reached the
+    reproduce step, and was filed as an unreproducible bug — so the retry a
+    respec would have fixed was suppressed, and the log told whoever read it to
+    sharpen a report that was never the problem."""
+
+    def _run(self, *, reproduce_step: str | None):
+        orch, _root, run_id = _stub_orchestrator({"test": "pytest -q"})
+        orch.store.add_tickets(
+            run_id,
+            [Ticket("BUG-001", title="counts punctuation", kind=TICKET_BUG)],
+        )
+        stored = orch.store.list_tickets(run_id)[0]
+        stored.status = TICKET_BLOCKED
+        stored.blocked_note = "ratification failed"
+        orch.store.update_ticket(run_id, stored)
+        if reproduce_step is not None:
+            step = orch.store.start_step(run_id, "BUG-001", "reproduce")
+            orch.store.end_step(step, reproduce_step, "output")
+        return orch, run_id
+
+    def _said(self, orch):
+        return " | ".join(
+            row["message"] for row in orch.store.events_after(0, limit=200)
+        )
+
+    def test_a_ticket_that_never_reached_the_step_is_not_called_unprovable(self):
+        orch, run_id = self._run(reproduce_step=None)
+
+        orch._retry_cycle(run_id, TICKET_BLOCKED)
+
+        self.assertNotIn("the bug was never reproduced", self._said(orch))
+        self.assertEqual(
+            orch.store.list_tickets(run_id)[0].status, TICKET_PENDING
+        )
+
+    def test_a_ticket_that_tried_and_failed_is_still_left_alone(self):
+        # The behaviour this rule exists for: one report ran fifteen cycles,
+        # two tester calls apiece, against a fault no test could show.
+        orch, run_id = self._run(reproduce_step="failed")
+
+        orch._retry_cycle(run_id, TICKET_BLOCKED)
+
+        self.assertIn("the bug was never reproduced", self._said(orch))
+        self.assertEqual(
+            orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED
+        )
+
+
+class TestRatifyKnowsABugTicketHasNoCriteria(unittest.TestCase):
+    """A bug ticket has no acceptance criteria by design: its contract is a
+    test that does not exist yet, and the party who would write criteria now is
+    the party being judged by them.
+
+    The sign-off pass was never told that. On a live run against
+    `examples/sample-project` three of four roles refused the same report the
+    loop had fixed correctly an hour before — `the Acceptance criteria section
+    still says "(none stated)" … add them there` — and the ticket blocked
+    without an attempt. Nondeterministic as well as wrong, which is the worst
+    version: the run that passes teaches you nothing about the one that will
+    not."""
+
+    def _body(self, ticket, role="tester"):
+        from forge.prompts import ratify_prompt
+
+        return " ".join(ratify_prompt(ticket, role)[-1].content.split())
+
+    def _bug(self):
+        return Ticket(
+            ticket_id="BUG-001",
+            title="punctuation is counted as part of the word",
+            kind=TICKET_BUG,
+            spec="count_words should strip punctuation from each token",
+            allowed_files=["wordcount/counter.py"],
+        )
+
+    def test_every_role_is_told_the_missing_criteria_are_the_design(self):
+        for role in ("planner", "executor", "tester", "reviewer"):
+            with self.subTest(role=role):
+                body = self._body(self._bug(), role)
+                self.assertIn("no acceptance criteria and must not be given any", body)
+                self.assertIn("a missing criteria list is the design here", body)
+
+    def test_it_says_what_stands_in_for_them(self):
+        # Not merely "do not ask": a role that is told what the contract *is*
+        # can still refuse the ticket for a real reason.
+        body = self._body(self._bug())
+
+        self.assertIn("Its contract is the reproduction", body)
+        self.assertIn("see it **fail** against the code as it stands", body)
+
+    def test_a_feature_ticket_is_told_none_of_this(self):
+        # Its criteria are the contract, and an excuse for having none would
+        # dismantle the pass. `_criteria_block` still reports `(none stated)`
+        # there, and a role is still right to block on it.
+        body = self._body(
+            Ticket(
+                ticket_id="SP-001",
+                title="rank the counted words",
+                spec="add top_words",
+                criteria=["top_words({'a': 1}, 0) returns []"],
+            )
+        )
+
+        self.assertNotIn("must not be given any", body)
+        self.assertIn("top_words({'a': 1}, 0) returns []", body)
 
 
 class TestRatifyMayRewordCriteriaButNotInventThem(unittest.TestCase):

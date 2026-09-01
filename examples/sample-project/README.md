@@ -1,0 +1,107 @@
+# The sample project
+
+A repository small enough to run a whole forge loop against in minutes, and
+real enough that a change to the loop meets the things a real run meets: two
+builds, a spec on the parsed path, a dependency between tickets, a green
+baseline, and a bug the suite does not catch.
+
+It exists so a change to the loop can be *run*, not only unit-tested. Most of
+what this project has learned came from watching a real backlog fail; this is
+the cheapest available imitation of that.
+
+## Run it against a copy, never in place
+
+A run writes code, a database, and artifacts. Copy the fixture out of the
+repository first — the committed tree is a fixture, and a run that edits it in
+place turns the next test into a report about the last run:
+
+```
+python scripts/sample_workspace.py            # copies to a temp directory
+python scripts/sample_workspace.py /tmp/try   # or somewhere you name
+```
+
+It prints the path it wrote and the first command to run there.
+
+## What is in it
+
+```
+wordcount/counter.py        count_words — the root build's code
+tests/counter_test.py       its suite, green, punctuation-free on purpose
+plugin/histogram/bars.py    a second build, its own manifest, its own suite
+plugin/tests/bars_test.py
+SPEC.md                     three tickets for `forge ingest`
+BUG.md                      one report for `forge bug`
+.hybridforge/config.json    two workspaces, per-language commands
+```
+
+The two builds are the point of the layout. `plugin/` has its own manifest and
+its own tests directory, so the loop has to resolve each ticket to the build
+that owns it and run that build's command from that build's directory. A
+change that breaks workspace resolution shows up here as a command run from the
+wrong place, not as a subtle test failure.
+
+## The four things to run
+
+```
+forge --root . doctor      what runs against each language of each build
+forge ingest SPEC.md       three tickets, parsed — no planner model runs
+forge go                   the loop
+forge bug --file BUG.md    the reproduce-before-fix path
+```
+
+`forge doctor` is the one to run first after any change to coverage,
+workspaces, or the canary: it prints the matrix without spending a token.
+
+`forge ingest` should report **parsed**, not planned. If it says planned, the
+spec grammar changed and `SPEC.md` no longer matches it — which is itself the
+finding.
+
+## The invariants this fixture keeps
+
+The forge suite pins all of these in `tests/test_sample_project.py`, so the
+fixture cannot rot quietly:
+
+- **Both suites pass on the committed tree.** `requireGreenBaseline` stops a
+  run over a red tree, so a fixture that ships red cannot be run at all.
+- **The spec takes the parsed path** and yields exactly three tickets, one of
+  which depends on another, one of which lives in the second build.
+- **Every ticket names its own test file** in `Allowed files`. A ticket without
+  one gets a test written outside its scope, and then the executor is refused
+  every time it tries to repair it.
+- **Every path the spec names belongs to a build.** An unowned file is refused
+  at ingest, which is correct and would make this fixture useless.
+- **`count_words` still mishandles punctuation.** That is the seeded defect
+  `BUG.md` reports, and it is deliberately not fixed. Fix it in your copy, not
+  here.
+
+## Keeping it clean
+
+The fixture is 15 files and nothing else. A run writes several more —
+`wordcount/report.py`, two test files, a database, a tickets directory, an
+artifact tree — and every one of them is ignored rather than named, by an
+allow-list in the repository's `.gitignore`:
+
+```
+examples/sample-project/**
+!examples/sample-project/**/
+!examples/sample-project/*.md
+… one line per committed file
+```
+
+So a new step that writes a new file is ignored by default instead of being
+committed the next time somebody stages everything, and adding a file to the
+fixture means adding a line there. `git add -f` is the escape hatch.
+
+Two things that ignore rules cannot do, and the guard suite does instead:
+`TestTheFixtureIsOnlyTheFixture` fails when the working tree holds a file that
+is not the fixture's, and pins the four paths `SPEC.md` names that must *not*
+exist yet — a ticket whose files all exist is one the loop can satisfy by
+changing nothing. A modification to a tracked file is not ignorable at all, so
+check `git diff -- examples/` before committing if a run has been near it.
+
+## Models
+
+The config points every role at a local `llama.cpp` server on
+`http://127.0.0.1:8080/v1`. Change the endpoint, the model name, or the roles
+in your copy — nothing in the fixture depends on which models you bring. The
+commands, the spec, and the layout are what it is for.

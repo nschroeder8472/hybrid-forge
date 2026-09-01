@@ -1,0 +1,51 @@
+{
+  "room": "sample-project",
+  "models": {
+    "local": {
+      "kind": "llamacpp",
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "model": "qwen3.8",
+      "contextWindow": 32768,
+      "maxOutputTokens": 8192
+    }
+  },
+  "roles": {
+    "planner": "local",
+    "executor": "local",
+    "tester": "local",
+    "reviewer": "local"
+  },
+  "workspaces": [
+    {
+      "root": ".",
+      "commands": {
+        "lint": { ".py": "skip" },
+        "typecheck": { ".py": "skip" },
+        "test": { ".py": "python -m unittest discover -s tests -p \"*_test.py\" -t ." }
+      }
+    },
+    {
+      "root": "plugin",
+      "commands": {
+        "lint": { ".py": "skip" },
+        "typecheck": { ".py": "skip" },
+        "test": { ".py": "python -m unittest discover -s tests -p \"*_test.py\" -t ." }
+      }
+    }
+  ],
+  "neverDelegate": [],
+  "memory": { "url": "", "room": "" },
+  "loop": {
+    "maxAttempts": 3,
+    "retryCycles": 1,
+    "autoCommit": false,
+    "preflight": true,
+    "preflightCanary": true,
+    "requireGreenBaseline": true
+  },
+  "ui": {
+    "host": "127.0.0.1",
+    "port": 8799,
+    "enabled": true
+  }
+}

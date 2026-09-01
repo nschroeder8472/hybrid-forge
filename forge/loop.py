@@ -335,6 +335,10 @@ class StepResult:
     # caller decides whether an inner turn is left to spend; see
     # `_compile_gate` and `loop.innerTurns`.
     retry_build: bool = False
+    # The `steps` row this result was recorded as, or 0 for a result nothing
+    # ran. Only a caller whose verdict differs from the exit code needs it —
+    # see `Store.restate_step` and the canary below.
+    step_id: int = 0
 
 
 class Stopped(Exception):
@@ -859,7 +863,7 @@ class Orchestrator:
             )
         except subprocess.TimeoutExpired:
             self.store.end_step(step_id, "failed", f"{name} timed out after 1800s")
-            return StepResult(ok=False, detail=f"{name} timed out")
+            return StepResult(ok=False, detail=f"{name} timed out", step_id=step_id)
 
         # Stripped before anything reads it, for the same reason it is rerooted
         # here rather than at each reader: every pattern in `failures` is
@@ -876,7 +880,7 @@ class Orchestrator:
         )
         ok = result.returncode == 0
         self.store.end_step(step_id, "ok" if ok else "failed", output)
-        return StepResult(ok=ok, detail=output)
+        return StepResult(ok=ok, detail=output, step_id=step_id)
 
     def _note_toolchain(self, name: str, command: str, result: StepResult) -> None:
         """Record a verify command that never reached the code. First one only.
@@ -2144,6 +2148,10 @@ class Orchestrator:
             self._remove_canary(run_id, absolute)
 
         if result.ok:
+            # Exit 0 is the failure here: a runner that reads this language
+            # cannot pass over a file that will not parse. Recorded as what it
+            # means rather than as what the shell returned.
+            self.store.restate_step(result.step_id, "failed")
             return (
                 f"`{command}` stayed green over {path}, a file that cannot "
                 f"parse. It does not run {suffix}. Every {suffix} ticket in "
@@ -2155,10 +2163,17 @@ class Orchestrator:
             )
 
         if self._names_the_canary(result.detail, path):
+            # Red, over the canary, naming it. Both halves of the check met.
+            self.store.restate_step(result.step_id, "ok")
             return ""
 
         confirm = self._shell(run_id, f"{label}-control", command, workspace=workspace)
         if not confirm.ok:
+            # Red either way: nothing was proved about this language, and
+            # nothing about this build is known to be wrong. Neither colour is
+            # honest, so the pair says so in its own word.
+            self.store.restate_step(result.step_id, "inconclusive")
+            self.store.restate_step(confirm.step_id, "inconclusive")
             self.store.log(
                 run_id,
                 f"canary for {suffix} in {workspace.root} was inconclusive: "
@@ -2171,6 +2186,10 @@ class Orchestrator:
             )
             return ""
 
+        # The canary's own red already reads as the failure it is. The control
+        # run is the half that proves it: exit 0 without the canary means the
+        # red *was* the canary and the build could not say so.
+        self.store.restate_step(confirm.step_id, "failed")
         return (
             f"`{command}` failed over {path} without naming it. It reads "
             f"{suffix}, but nothing in its output can be attributed to a file, "
@@ -2757,11 +2776,21 @@ class Orchestrator:
         # way — two tester calls apiece — and would have run forever under
         # `-1`. The tester's own explanation is in `blocked_note`; that is the
         # thing to read, and it needs a person.
+        #
+        # Asked of tickets that *tried*. A bug ticket blocked before the
+        # reproduce step — at ratification, on a dependency, on a scope
+        # refusal — has demonstrated nothing about the report, and sweeping it
+        # in here spends the wrong remedy on it twice: the retry a respec would
+        # have fixed is suppressed, and the log tells whoever reads it to
+        # sharpen a report that was never the problem. One live run blocked at
+        # ratification with `attempts 0` and was filed as an unreproducible
+        # bug.
         unprovable = {
             ticket.ticket_id
             for ticket in tickets
             if ticket.kind == TICKET_BUG
             and ticket.status == TICKET_BLOCKED
+            and self.store.attempted_reproduction(run_id, ticket.ticket_id)
             and not self.store.reproduced(run_id, ticket.ticket_id)
         }
         for ticket_id in sorted(unprovable):
@@ -7019,6 +7048,11 @@ class Orchestrator:
                 # retry to overwrite; a passing test hurts nothing while it
                 # sits there, and deleting it would throw away the thing the
                 # next attempt is supposed to improve on.
+                #
+                # Recorded as the failure it is, against the exit code that
+                # says the opposite — this step is inverted for the same reason
+                # the canary is, and `restate_step` is the same fix.
+                self.store.restate_step(result.step_id, "failed")
                 passed_instead = distill(result.detail, limit=2000) or "(no output)"
                 self.store.end_step(
                     step_id, "failed", f"the test passed, so nothing was proved:\n{passed_instead}"
@@ -7099,6 +7133,10 @@ class Orchestrator:
                 )
                 continue
 
+            # Red, on the code rather than on itself. That is the whole
+            # point of the step, so it is not left reading as a failed one in
+            # the panel a person watches.
+            self.store.restate_step(result.step_id, "ok")
             proof = distill(result.detail, limit=4000)
             self.store.end_step(step_id, "ok", proof)
             self.store.log(

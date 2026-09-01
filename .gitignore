@@ -32,3 +32,27 @@ entities.json
 *.egg-info/
 build/
 dist/
+
+# The sample project under examples/ is a fixture. A run inside it writes
+# code, tickets, a database and an artifact tree, and none of that is the
+# fixture — so what belongs to it is listed rather than what a run leaves
+# behind. A new step that writes a new file is then ignored by default
+# instead of being committed the next time somebody stages everything.
+#
+# Adding a file to the fixture means adding a line here. `git add -f` is the
+# escape hatch while you decide.
+examples/sample-project/**
+!examples/sample-project/**/
+!examples/sample-project/*.md
+!examples/sample-project/pyproject.toml
+!examples/sample-project/.hybridforge/.gitignore
+!examples/sample-project/.hybridforge/config.json
+!examples/sample-project/wordcount/__init__.py
+!examples/sample-project/wordcount/counter.py
+!examples/sample-project/tests/__init__.py
+!examples/sample-project/tests/counter_test.py
+!examples/sample-project/plugin/pyproject.toml
+!examples/sample-project/plugin/histogram/__init__.py
+!examples/sample-project/plugin/histogram/bars.py
+!examples/sample-project/plugin/tests/__init__.py
+!examples/sample-project/plugin/tests/bars_test.py

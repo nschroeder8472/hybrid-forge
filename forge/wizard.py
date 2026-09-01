@@ -30,6 +30,7 @@ import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any, Callable
 
 from . import toolchain
@@ -241,6 +242,7 @@ def detect_commands(
     models: dict[str, dict[str, Any]],
     roles: dict[str, str],
     where: Path | None = None,
+    language: str = "",
 ) -> toolchain.Detection:
     """Ask the planner model what this repo's verify commands are.
 
@@ -248,6 +250,10 @@ def detect_commands(
     its own commands in its own files, and the repository root's answer for
     them is the answer for a different project. The model still runs with the
     repository as its `cwd`, because that is where the checkout is.
+
+    `language` narrows the question the same way, and for a sharper reason: a
+    polyglot repository states a command for each of its languages, and the
+    answer for the wrong one passes without running a line of the right one.
 
     Uses the planner because it is the reading-and-judgment role and is usually
     the strongest model configured. The repo root is passed through to a
@@ -270,7 +276,7 @@ def detect_commands(
     except Exception as exc:  # noqa: BLE001 - a bad block is a failed detection
         return toolchain.Detection(error=f"could not build the planner model: {exc}")
 
-    return toolchain.detect(where or root, provider)
+    return toolchain.detect(where or root, provider, language=language)
 
 
 # ----------------------------------------------------------------------
@@ -282,7 +288,10 @@ def detect_commands(
 class Answers:
     models: dict[str, dict[str, Any]] = field(default_factory=dict)
     roles: dict[str, str] = field(default_factory=dict)
-    commands: dict[str, str] = field(default_factory=dict)
+    # One command per kind, or — when the build holds more than one language —
+    # a map of extension to command per kind. Both spellings are what `config`
+    # reads; see `_commands_for`.
+    commands: dict[str, Any] = field(default_factory=dict)
     memory: dict[str, Any] = field(default_factory=dict)
     room: str = ""
     never_delegate: list[str] = field(default_factory=list)
@@ -547,7 +556,10 @@ def _ask_repo(answers: Answers, root: Path, prompter: Prompter) -> None:
     builds = _ask_builds(root, prompter)
     if builds:
         answers.workspaces = [
-            Workspace(root=build, commands=_ask_commands(answers, root, prompter, build))
+            Workspace(
+                root=build,
+                commands=_ask_commands(answers, root, prompter, build, builds),
+            )
             for build in builds
         ]
         answers.commands = {}
@@ -592,30 +604,145 @@ def _ask_builds(root: Path, prompter: Prompter) -> list[str]:
 
 
 def _ask_commands(
-    answers: Answers, root: Path, prompter: Prompter, build: str
-) -> dict[str, str]:
-    """One build's commands, detected from inside it and confirmed."""
+    answers: Answers,
+    root: Path,
+    prompter: Prompter,
+    build: str,
+    builds: Sequence[str] = (),
+) -> dict[str, Any]:
+    """One build's commands, detected from inside it and confirmed.
+
+    Asked per language when the build holds more than one, because one command
+    for all of them is the configuration this repository's own gates refuse:
+    `forge doctor` reports it as a catch-all, the preflight canary blocks a run
+    over a language the command does not read, and a ticket in that language is
+    otherwise graded by reading its diff. Somebody answering these questions
+    anyway is the cheapest place to close that, and the only one where the
+    answer is not already costing a run.
+    """
     where = root if build == REPO_ROOT else root / build
     if build != REPO_ROOT:
         say(f"\n\033[1m{build}\033[0m")
+
+    languages = toolchain.census(root, build, others=builds)
+    if len(languages) > 1:
+        return _ask_per_language(answers, root, prompter, where, languages)
+
     suggested = _detect_or_ask(answers, root, prompter, where=where)
-    commands = {
+    commands: dict[str, Any] = {
         "lint": prompter.ask("\nlint", suggested.get("lint", "")),
         "typecheck": prompter.ask("typecheck", suggested.get("typecheck", "")),
         "test": prompter.ask("test", suggested.get("test", "")),
     }
-    # Asked last and explained, because it is the one command here that is not
-    # a whole invocation: the loop appends the files it just wrote. It runs
-    # before verification and its own failure never parks a ticket, so a ticket
-    # whose only defect is whitespace costs nothing instead of an attempt. One
-    # run spent 117 of a ticket's 160 lint failures on exactly that. Blank is a
-    # supported answer and the safe one.
+    _say_format_note()
+    commands["format"] = prompter.ask("format", suggested.get("format", ""))
+    return commands
+
+
+def _say_format_note() -> None:
+    """Why `format` is asked apart from the three that verify.
+
+    It is the one command here that is not a whole invocation: the loop appends
+    the files it just wrote. It runs before verification and its own failure
+    never parks a ticket, so a ticket whose only defect is whitespace costs
+    nothing instead of an attempt. One run spent 117 of a ticket's 160 lint
+    failures on exactly that. Blank is a supported answer and the safe one.
+    """
     say("\nA formatter is optional, and pays for itself the first time a lint")
     say("failure is only whitespace. The loop appends the files it wrote, so")
     say("give the command *without* a target:  gdformat  /  prettier --write")
     say("/  ruff format  /  rustfmt  /  gofmt -w.  Blank for none.")
-    commands["format"] = prompter.ask("format", suggested.get("format", ""))
-    return commands
+
+
+def _ask_per_language(
+    answers: Answers,
+    root: Path,
+    prompter: Prompter,
+    where: Path,
+    languages: dict[str, int],
+) -> dict[str, Any]:
+    """The same four questions, once per language this build actually holds.
+
+    Ranked by file count, so the language the build is mostly made of is
+    answered first and a stray file last — which is also the order in which
+    somebody gives up, and the one where giving up costs least.
+
+    A blank answer is a real answer: that language has no runner, `doctor`
+    reports it, and the canary refuses to start a run that would grade it by
+    reading. `skip` says it needs none, which `config` stores as a declared
+    exemption rather than a gap. Telling those two apart is the whole reason
+    the question is asked per language.
+    """
+    ranked = sorted(languages.items(), key=lambda item: (-item[1], item[0]))
+    say("\nThis build holds more than one language:")
+    for suffix, count in ranked:
+        say(f"  {suffix:<6} {count:>5} file(s)")
+    say("Each is asked for separately. One command covering all of them reads")
+    say("as coverage for files it never runs — the run then stops at the")
+    say("preflight canary, or worse, passes a ticket nothing compiled.")
+    say("Blank means this language is not verified; `skip` means it needs no")
+    say("runner. Either can be changed later with `forge toolchain`.")
+
+    detected = _detect_per_language(
+        answers, root, prompter, where, [suffix for suffix, _ in ranked]
+    )
+    _say_format_note()
+
+    commands: dict[str, dict[str, str]] = {}
+    for suffix, _count in ranked:
+        say(f"\n\033[1m{suffix}\033[0m")
+        suggested = detected.get(suffix, {})
+        for kind in ("lint", "typecheck", "test", "format"):
+            answer = prompter.ask(f"{kind} [{suffix}]", suggested.get(kind, ""))
+            if answer:
+                commands.setdefault(kind, {})[suffix] = answer
+    # A kind nobody answered for any language is left out rather than written
+    # as an empty map: `commands_for` reads a missing key and an empty one the
+    # same way, and the file should say only what was decided.
+    return dict(commands)
+
+
+def _detect_per_language(
+    answers: Answers,
+    root: Path,
+    prompter: Prompter,
+    where: Path,
+    suffixes: Sequence[str],
+) -> dict[str, dict[str, str]]:
+    """Detection defaults per language: one question, then one call each.
+
+    Consent is asked once. Asking per language would be the same decision put
+    four times over, and what is being consented to — reading files already in
+    this repository — does not change with the language being asked about.
+
+    A failure ends the sweep rather than being retried per language. Every
+    failure here is a property of the planner or of the repository — no model
+    configured, nothing to read, the endpoint down — so the next call fails
+    exactly as the first did, having cost another wait.
+    """
+    subject = "this repo" if where == root else where.name
+    if not prompter.confirm(
+        f"\nRead {subject}'s CI config and docs to find them", default=True
+    ):
+        return {}
+
+    found: dict[str, dict[str, str]] = {}
+    for suffix in suffixes:
+        say(f"  reading for {suffix}…")
+        detection = detect_commands(
+            root, answers.models, answers.roles, where=where, language=suffix
+        )
+        if not detection.ok:
+            say(f"  \033[33mskipped\033[0m  {detection.error}")
+            say("  Enter them yourself, or leave blank and fill them in later.")
+            break
+        if not detection.found_anything:
+            say(f"  nothing here states a verify command for {suffix}.")
+            continue
+        if detection.confidence != "high":
+            say("  \033[33mlow confidence\033[0m — check these before accepting.")
+        found[suffix] = detection.commands
+    return found
 
 
 def _detect_or_ask(

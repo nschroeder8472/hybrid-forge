@@ -358,6 +358,22 @@ and wrong for a file that will not parse: `compileall` names the file twice, in
 file as unable to attribute. The claim being checked is only ever "the command
 told us which file".
 
+**A canary step is recorded as its verdict, not as its exit code.** Every other
+step in the loop means what the shell returned; this one is inverted — red over
+a file that cannot parse is the pass, and green is the failure it exists to
+find. Left as `end_step` derived it, the dashboard showed `failed` beside a
+check that had just done its job, on every run, which teaches whoever is
+watching to ignore the one panel that reports a build unable to verify itself.
+`Store.restate_step` writes the verdict once it is known — after the output has
+been read, and on one branch after the control run. `reproduce-test` in the bug
+loop is the other inverted step and is recorded the same way: red over the code
+as it stands is what it exists to produce, and exit 0 means the reproduction
+proved nothing. Red either way is recorded
+as `inconclusive`: nothing was proved about the language and nothing about the
+build is known to be wrong, and both colours would say otherwise. `canary` is
+in `NOT_ABOUT_THE_CODE` for the same reason — a syntax error nobody wrote must
+not join a ticket's failure classes.
+
 `preflightCanary` is also deliberately **not** coupled to `preflight`. That one
 probes the models; this measures the tree, and somebody who skips the model
 probe because they just ran `forge doctor` has said nothing about whether their

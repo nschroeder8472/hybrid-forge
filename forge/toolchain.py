@@ -32,11 +32,14 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import evidence
+from .config import REPO_ROOT
 from .providers import Message, Provider, ProviderError
 
 # Per-file and total caps on gathered evidence. The prompt has to fit whatever
@@ -440,6 +443,56 @@ def manifest_gaps(config: Any, tickets: Sequence[Any]) -> list[str]:
 
 def _normal(path: str) -> str:
     return str(path).replace("\\", "/").lstrip("./").lower()
+
+
+# Extensions worth asking a coverage question about: languages whose behaviour
+# a test could assert. A stylesheet with no runner is not a gap, and a census
+# that counted one would ask the person to configure a runner for it.
+SOURCE_SUFFIXES = frozenset(
+    """.rs .py .js .mjs .cjs .jsx .ts .tsx .go .rb .java .kt .swift .c .cc .cpp
+    .h .hpp .cs .php .sh .ps1 .lua .ex .exs .scala .dart .gd""".split()
+)
+
+# Enough files to know which languages a build is made of. The question this
+# answers is "which of these are here at all", and the ranking beyond the first
+# few thousand files does not change it.
+CENSUS_LIMIT = 4000
+
+
+def census(
+    root: Path, build: str = REPO_ROOT, others: Sequence[str] = ()
+) -> dict[str, int]:
+    """Which languages a build owns, and how many files of each.
+
+    `others` are the repository's other builds. A file under one of them
+    belongs to that build and not to this one, which is the same
+    longest-prefix rule `Config.workspace_for` applies at run time — without
+    it the repository root counts every subproject's files as its own and asks
+    for a command that would claim them.
+
+    Counts what is on disk rather than what a manifest claims, because the
+    claim is exactly what goes stale: a repository that "is a Rust project"
+    with 4,000 lines of TypeScript in it is the case the per-language
+    commands exist for, and no `Cargo.toml` says so.
+    """
+    here = _normal(build)
+    prefix = "" if here in ("", REPO_ROOT, ".") else f"{here}/"
+    deeper = tuple(
+        f"{_normal(other)}/"
+        for other in others
+        if _normal(other) != here and _normal(other).startswith(prefix)
+    )
+    counts: Counter[str] = Counter()
+    for path in evidence.repo_files(root, limit=CENSUS_LIMIT):
+        candidate = _normal(path)
+        if prefix and not candidate.startswith(prefix):
+            continue
+        if candidate.startswith(deeper):
+            continue
+        suffix = Path(candidate).suffix.lower()
+        if suffix in SOURCE_SUFFIXES:
+            counts[suffix] += 1
+    return dict(counts)
 
 
 def discover_workspaces(root: Path, *, max_depth: int = MAX_WORKSPACE_DEPTH) -> list[str]:

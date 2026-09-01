@@ -7,15 +7,24 @@ deleted rather than implemented.
 
 ---
 
-## Convergence — built, never run
+## Convergence — built, barely run
 
 **Status:** ten features specified in [CONVERGENCE.md](CONVERGENCE.md), derived
 from the `Puzzle-Path` run of 2026-08-22/23. Nine shipped; Feature 5 was built,
-replayed against that run's own data, and reverted. **No backlog has run with
-any of it on** — every number in that document is a replay over recorded steps,
-which is the weaker evidence in the direction that matters: it shows what the
-code would have done to failures that already happened, not what a live run
-does to the failures it causes itself.
+replayed against that run's own data, and reverted. Every number in that
+document is a replay over recorded steps, which is the weaker evidence in the
+direction that matters: it shows what the code would have done to failures that
+already happened, not what a live run does to the failures it causes itself.
+
+**One live backlog has now run with all of it on** —
+`examples/sample-project`, 2026-08-31: three tickets, 27 steps, all green, 21
+calls, 87.2k tokens, 619 seconds, zero retry cycles. That is a floor, not
+evidence about convergence: nothing failed, so no brake in that document was
+ever asked a question. What it does establish is that none of the nine fires
+spuriously on a run that is going well, which is the failure mode a set of
+unexercised brakes is most likely to have. A backlog that *stalls* is still the
+run this entry is waiting for, and the fixture is where to build one — widen a
+ticket's criteria until the executor cannot satisfy them and watch what stops.
 
 The problem that document names: a run can be long without being wrong, and
 this one was neither converging nor able to tell. 18.2 hours, 24.5M tokens, 430
@@ -133,8 +142,22 @@ The five questions this entry was written around were answered as follows.
   running something. What they share is the failure-to-revision shape, not the
   code.
 
-**Still open: it has never been run.** Every part of it is covered by tests and
-none of it has met a real model, a real repository, or the two defects below.
+**Run four times, end to end.** Against `examples/sample-project`: a prose
+report, a reproduction that went red on the code and green after the fix, one
+attempt, 12 calls, 73.5k tokens, no retry cycle, and — on the fourth run — no
+warning of any kind. Five defects came out of those runs: `reproduce-test`
+reported as failed on a run where nothing went wrong; a sign-off pass that
+demanded acceptance criteria a bug ticket must not have, which blocked the
+second run on the same input the first had fixed; the revision pass that had
+not been told either, so it proposed criteria the ratchet refused once per run;
+a revision prompt that asked for a `context` it never showed, so every revision
+replaced a paragraph it had not read; and a retry rule that filed a ticket
+blocked *before* reproduction as an unreproducible bug, suppressing the retry
+that would have helped and telling the human to sharpen a report that was never
+the problem. All repaired, all re-confirmed live. See the first-live-runs
+section of [BUG-LOOP.md](BUG-LOOP.md). The two Tetris defects below are still
+the harder case: a fault in behaviour over time rather than in one call's
+return value.
 
 - `src/game.rs` — `Game::tick` drains its accumulator with a `while` loop that
   calls `SoftDrop`, and `SoftDrop` locks the piece on collision. A frame gap of
@@ -152,10 +175,10 @@ a plain-language report, a fix, and the existing suite still passing afterwards.
 ## Per-language verify commands — built
 
 **Status:** built — [LANGUAGE-COVERAGE.md](LANGUAGE-COVERAGE.md), which carries
-the same status. All five phases landed, along with `forge toolchain` and the
-workspace layer described in [WORKSPACES.md](WORKSPACES.md). Only the wizard
-asking per language at `forge init` is still open. This entry keeps the problem
-it was written around.
+the same status. All five phases landed, along with `forge toolchain`, the
+workspace layer described in [WORKSPACES.md](WORKSPACES.md), and the wizard
+asking per language at `forge init`. Nothing here is open. This entry keeps the
+problem it was written around.
 
 `commands.test` was one string, which assumes a repository is one language.
 Everything downstream inherits it: which language the tester writes in, what

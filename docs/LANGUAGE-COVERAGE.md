@@ -1,9 +1,6 @@
 # Per-language verify commands — design spec
 
-**Status:** built. Only the wizard asking per language at `forge init` is
-outstanding; everything else in this spec is in. Each phase landed on its
-own with tests; the sections below describe the whole design, and what is not
-yet built is marked.
+**Status:** built, including the wizard.
 
 `commands.lint`, `.typecheck` and `.test` are single strings, which encodes an
 assumption no real project keeps: that a repository is one language. Everything
@@ -259,10 +256,35 @@ block for an uncovered language, `_repro_target` the same. *Tests: a `.js`
 ticket gets a `.js` test file; an uncovered ticket blocks before any model call;
 the bug loop's block names the language.*
 
-**4 — `forge toolchain` and the setup loop. Done**, bar the wizard. Per-language detection, the
+**4 — `forge toolchain` and the setup loop. Done.** Per-language detection, the
 coverage matrix, the accept flow, the wizard asking per language, ingest and
 `forge bug` reporting uncovered scope up front. *Tests: detection scoped to one
-language; nothing is written without the accept flag.*
+language; nothing is written without the accept flag; a two-language build is
+asked once per language and a one-language build is asked exactly as it was
+before; a blank stays uncovered and `skip` becomes a declared exemption.*
+
+Two things the wizard's implementation settled that the spec did not say:
+
+**The census decides, and it counts files rather than reading manifests.** A
+build is asked per language only when it holds more than one, so the ordinary
+single-language repository is asked the three questions it always was and its
+config keeps the plain-string spelling. `toolchain.census` applies the same
+longest-prefix ownership rule as `Config.workspace_for`, so the root is not
+asked about a subproject's TypeScript — the absorption workspaces exist to
+stop, arriving one layer earlier. It shares its extension list with `doctor`;
+two copies would drift, and a language the wizard never asks about but doctor
+reports as uncovered is a gap nothing offers to close.
+
+**`_RUNNER_LANGUAGES` is now derived from `_LANGUAGE_SUFFIXES` rather than
+written beside it.** Keying a command to `.ts` expands to the whole TypeScript
+family, `.mts` and `.cts` included, and the hand-written runner rows listed six
+of the eight JavaScript-and-TypeScript extensions. So the ordinary config this
+wizard writes was refused at load — `commands.lint runs 'eslint .' for .mts
+files, but that command runs .cjs, .js, .jsx, .mjs, .ts, .tsx` — about a
+repository with no `.mts` file in it. Deriving one table from the other only
+ever widens what a runner is believed to cover, so nothing that loaded before
+stops loading, and a command keyed to a language it genuinely cannot run is
+still refused.
 
 **5 — Lint and typecheck. Done.** The same map, reported not gated.
 
