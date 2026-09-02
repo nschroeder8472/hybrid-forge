@@ -733,8 +733,14 @@ _TEST_COUNTS = (
 )
 
 
-def test_count(output: str) -> int | None:
+def reported_test_count(output: str) -> int | None:
     """How many tests a runner said it ran, or `None` when it did not say.
+
+    Named away from `test_` deliberately: pytest collects any name with that
+    prefix from a module it imports, so the old spelling was gathered out of
+    the test suite's own imports and reported as a broken test on every run.
+    Two lines of error above the summary, on every green run, is how a person
+    learns to stop reading the summary.
 
     `None` is a real answer and the caller must treat it as one. Reading "no
     number printed" as "no tests ran" would fail every `go test` in existence,

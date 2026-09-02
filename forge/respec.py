@@ -22,7 +22,7 @@ from typing import Callable, Sequence
 
 from .evidence import MAX_LOCATE, locate_named, repo_files
 from .ingest import derive_needs, plan_decisions, whole_file_claims
-from .patch import is_safe_path, normalize_path
+from .patch import _flatten, _states, is_safe_path, normalize_path, pinned_values
 from .prompts import parse_respec, respec_prompt
 from .providers import Completion, Message, ProviderError
 from .state import Store, Ticket, _criterion_key
@@ -480,6 +480,48 @@ def _dropped_decisions(
         if len(_normalise(decision)) >= _DECISION_FLOOR
         and _normalise(decision) not in kept
     ]
+
+
+def _softened_values(ticket: Ticket, revision: dict) -> list[str]:
+    """Values the plan pinned that a reworded criteria list no longer states.
+
+    The count ratchet asks whether the bar was *raised*. This asks whether it
+    was lowered, which is the same act from the other side and is the one
+    nothing was watching: a criterion said `count_words("Hello, world!")`
+    returns `{"hello": 1, "world": 1}`, and the ticket that came back out of
+    ratification said it returns `{"hello,": 1, "world!": 1}` — the behaviour
+    the criterion existed to reject, and the exact output of the code as it
+    stood. Same number of criteria, same call, same shape. The tester encoded
+    what it was given, the suite went green, the reviewer read a passing
+    assertion about the right function, and the ticket shipped `done` over a
+    criterion nobody had met.
+
+    Values only, and only those written in code spans. The prose around them
+    may be rewritten freely — saying a criterion better is the work this pass
+    exists to do. What the answer has to be is not the reviser's to move.
+    """
+    proposed = revision.get("criteria")
+    if not isinstance(proposed, list) or not proposed:
+        return []
+    # A list that changed length is the count ratchet's business, and its two
+    # refusals — grew, or came back shorter — say more about what happened than
+    # this one could. Speaking first would replace their message with a worse
+    # one for a case they already cover.
+    if len(proposed) != len(ticket.criteria):
+        return []
+    # Both sides read through `pinned_values`, so the comparison is between
+    # spellings that have already been normalised the same way: a reviser that
+    # prefers double quotes, or wraps a long criterion across two lines, has
+    # said nothing different and must not be refused for it.
+    stated = " ".join(
+        value for text in proposed for value in pinned_values(str(text))
+    )
+    lost: list[str] = []
+    for criterion in ticket.criteria:
+        for value in pinned_values(criterion):
+            if not _states(value, _flatten(stated)) and value not in lost:
+                lost.append(value)
+    return lost
 
 
 def _preserve_plan_context(ticket: Ticket, revision: dict) -> bool:

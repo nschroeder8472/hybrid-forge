@@ -22,9 +22,27 @@ calls, 87.2k tokens, 619 seconds, zero retry cycles. That is a floor, not
 evidence about convergence: nothing failed, so no brake in that document was
 ever asked a question. What it does establish is that none of the nine fires
 spuriously on a run that is going well, which is the failure mode a set of
-unexercised brakes is most likely to have. A backlog that *stalls* is still the
-run this entry is waiting for, and the fixture is where to build one — widen a
-ticket's criteria until the executor cannot satisfy them and watch what stops.
+unexercised brakes is most likely to have. A backlog that stalls now exists:
+`examples/sample-project/STALL.md`, one ticket whose criteria contradict code
+it may not write. Its first two runs finished **done** — a green ticket over a
+criterion nobody met, produced by a sign-off pass that reworded the criterion's
+value, a tester that softened it, and a reviewer that approved with nothing
+testing it. Three mechanical guards later it ends blocked, with a note naming
+the real problem; the write-up is in [CONVERGENCE.md](CONVERGENCE.md).
+
+What that run still did not exercise is this entry's own subject: the ticket
+never reached a state where its failure classes could descend, so
+`_convergence`, the ladder and `flatCycles` have yet to be asked a question.
+
+`examples/sample-project/HARD.md` was written to be the backlog that would ask
+them — satisfiable, and not on the first try. It has been landed on the first
+try four times, across two versions of it, the second with nine exact criteria
+and seven independent details. Difficulty that comes from care is not
+difficulty for this executor; what defeats it is a spec that is wrong. That is
+also what the `Puzzle-Path` run these features came from was: 430 attempts
+against criteria that could not all hold at once. So the honest test of the ten
+features is a backlog whose specs are subtly wrong in a way that takes several
+attempts to expose, and writing one is what this entry now waits on.
 
 The problem that document names: a run can be long without being wrong, and
 this one was neither converging nor able to tell. 18.2 hours, 24.5M tokens, 430

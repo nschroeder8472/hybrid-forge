@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -800,6 +801,144 @@ def _normalizers(lines: list[str]) -> dict[str, str]:
             body = _RETURN.match(lines[index + 1]) if index + 1 < len(lines) else None
             if body and _is_normalizer(header.group(2), body.group(1)):
                 found[header.group(1)] = line
+    return found
+
+
+# A backtick span in a criterion. Criteria are written by a person and the
+# values they pin are spelled in code spans, which is the one part of a
+# criterion that is meant to be reproduced verbatim in the test.
+_CODE_SPAN = re.compile(r"`([^`]+)`")
+
+# `name(...)` or `mod.name(...)` spanning the whole span: a call the test is
+# expected to make. Anchored at both ends so `2 word(s), 2 occurrence(s)` — a
+# value that happens to contain parentheses — is read as the value it is.
+_CALL_SPAN = re.compile(r"^[A-Za-z_][\w.]*\s*\(.*\)$", re.DOTALL)
+
+
+def _flatten(text: str) -> str:
+    """Whitespace removed and quotes unified, for comparing spellings.
+
+    A test may wrap a long assertion over five lines, put the list it compares
+    against one element per line, and prefer double quotes where the criterion
+    used single ones. None of that says anything different, and all of it
+    defeated a collapse-to-one-space rule: a criterion's `["a  45.5%", ...]`
+    and the same list written one element per line differ by a space after the
+    bracket, so the check called an honest test a softened one and parked a
+    ticket that was going fine.
+
+    Removing whitespace rather than collapsing it gives up on padding \u2014 a test
+    asserting `"a 45.5%"` where the criterion says `"a      45.5%"` now passes
+    this check. That is a real miss, and the right direction to miss in: this
+    is a net for a swapped *value*, what it costs when wrong is a parked
+    ticket, and it had produced two false positives in its first two runs.
+    """
+    return re.sub(r"\s+", "", (text or "").replace("'", '"').replace("\u2019", '"'))
+
+
+def _states(value: str, flattened: str) -> bool:
+    """Whether `flattened` states `value`, allowing for how it was written.
+
+    `value` is a criterion's span as the author wrote it; `flattened` is the
+    whole test file with its whitespace gone. Three tolerances, each earned by
+    a false positive rather than imagined:
+
+    - whitespace and quote style, which say nothing (see `_flatten`);
+    - the order of a mapping's pairs, because `{"a": 1, "b": 2}` and
+      `{"b": 2, "a": 1}` are the same expectation;
+    - a collection written one element per line with a trailing comma, which
+      is what every formatter produces and what no criterion contains — so a
+      bracketed value is checked element by element rather than whole.
+    """
+    wanted = _flatten(value)
+    if wanted in flattened:
+        return True
+    inner = wanted.strip()
+    for opener, closer in (("{", "}"), ("[", "]"), ("(", ")")):
+        if inner.startswith(opener) and inner.endswith(closer):
+            parts = [part for part in inner[1:-1].split(",") if part]
+            return bool(parts) and all(part in flattened for part in parts)
+    return False
+
+
+def pinned_values(criterion: str) -> list[str]:
+    """What each call this criterion names has to produce, as written.
+
+    A criterion's code spans are the part of it meant to be reproduced
+    verbatim — by the tester in an assertion, and by anything that revises the
+    ticket. But only some of them are the contract: the span *after* a call is
+    what that call must return, and the rest are the author explaining
+    themselves.
+
+    The distinction is not academic. A criterion reading
+
+        `shares({"a": 13, "b": 67})` returns `["b 83.8%", "a 16.3%"]` —
+        `16.25` rounds away from zero to `16.3`, which `round(16.25, 1)` does
+        not do.
+
+    pins one value. Reading all four spans as pinned made an honest test look
+    like a softened one, because a test that asserts the list has no reason to
+    mention `16.25` — and on the run that found this, the ticket was blocked
+    for it. A value stated before its call is not collected either, which
+    misses a real weakening rather than inventing one.
+    """
+    values: list[str] = []
+    spans = [span.strip() for span in _CODE_SPAN.findall(criterion or "")]
+    for index, span in enumerate(spans[:-1]):
+        following = spans[index + 1]
+        if _CALL_SPAN.match(span) and not _CALL_SPAN.match(following):
+            if following not in values:
+                values.append(following)
+    return values
+
+
+def calls_named(criterion: str) -> list[str]:
+    """The calls a criterion names, as written."""
+    return [
+        span.strip()
+        for span in _CODE_SPAN.findall(criterion or "")
+        if _CALL_SPAN.match(span.strip())
+    ]
+
+
+def weakened_criteria(text: str, criteria: Sequence[str]) -> list[str]:
+    """Criteria whose call the test makes and whose stated value it does not.
+
+    Returned as `criterion :: value it does not state`, empty when every
+    criterion that was encoded was encoded as written. ASCII, because this
+    string reaches a Windows console and a subprocess decode on its way to the
+    tester, and the canary learned what a stray dash costs there.
+
+    The third way a test file passes without checking anything, after a foreign
+    binding and a reshaping helper, and the quietest: keep the call, replace
+    the expected value with what the code currently returns. A criterion said
+    `count_words("Hello, world!")` returns `{"hello": 1, "world": 1}`; the test
+    asserted the same call equals `{"hello,": 1, "world!": 1}`, which is the
+    behaviour the criterion existed to reject. The suite was green, the
+    reviewer read a passing assertion about the right function, and the ticket
+    shipped `done` over a criterion nobody had met.
+
+    A net rather than a parser, like the two checks above it. It only speaks
+    when the criterion pins a value in a code span *and* the test makes the
+    call the criterion names — so a criterion the tester rendered a different
+    way, or did not encode at all, is somebody else's question. The cost of a
+    false positive is one rewrite.
+    """
+    haystack = _flatten(text)
+    if not haystack:
+        return []
+    found: list[str] = []
+    for criterion in criteria:
+        calls = calls_named(criterion)
+        values = pinned_values(criterion)
+        if not calls or not values:
+            continue
+        if not any(_flatten(call) in haystack for call in calls):
+            continue
+        missing = [value for value in values if not _states(value, haystack)]
+        if missing:
+            # Reported as the author wrote it. The flattened form is for
+            # comparing; a person reading the log needs the criterion back.
+            found.append(f"{' '.join(criterion.split())[:160]} :: {missing[0][:80]}")
     return found
 
 

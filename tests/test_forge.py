@@ -98,7 +98,7 @@ from forge.failures import (
     locations,
     reroot,
     signatures,
-    test_count,
+    reported_test_count,
 )
 from forge.prompts import (
     FAILURE_CLASSES_HEADING,
@@ -124,7 +124,7 @@ from forge.prompts import (
     respec_prompt,
     review_prompt,
     strip_prompt_echo,
-    tests_prompt,
+    write_tests_prompt,
 )
 from forge.providers import available_kinds, build_provider
 from forge.providers.base import (
@@ -3496,7 +3496,7 @@ class TestExecutorSeesSource(unittest.TestCase):
         # fails to compile, and every later ticket's verify step dies on a
         # file unrelated to it.
         ticket = Ticket("T-1", spec="s", criteria=["c"])
-        body = tests_prompt(
+        body = write_tests_prompt(
             ticket,
             ["src/game.rs"],
             test_path="tests/t_1_test.rs",
@@ -3505,11 +3505,11 @@ class TestExecutorSeesSource(unittest.TestCase):
         self.assertIn("pub fn over(&self) -> bool", body)
         self.assertIn("code under test", body)
 
-    def test_tester_prompt_without_sources_is_unchanged(self):
+    def test_the_prompt_without_sources_is_unchanged(self):
         ticket = Ticket("T-1", spec="s", criteria=["c"])
         self.assertNotIn(
             "code under test",
-            tests_prompt(ticket, ["a.rs"], test_path="tests/t_1_test.rs")[-1].content,
+            write_tests_prompt(ticket, ["a.rs"], test_path="tests/t_1_test.rs")[-1].content,
         )
 
     def test_respec_can_add_reference_files(self):
@@ -3710,7 +3710,7 @@ class TestTesterEvidence(unittest.TestCase):
         self.assertIsNone(orch._example_test([]))
 
     def test_prompt_carries_the_runner_and_the_example(self):
-        messages = tests_prompt(
+        messages = write_tests_prompt(
             Ticket("T-1", criteria=["x is 1"]),
             ["app.py"],
             test_path="tests/t_1_test.py",
@@ -3723,11 +3723,11 @@ class TestTesterEvidence(unittest.TestCase):
         self.assertIn("import unittest", body)
 
     def test_prompt_without_an_example_still_asks_for_repo_conventions(self):
-        body = tests_prompt(Ticket("T-1"), ["app.py"], test_path="tests/t_1_test.py")[-1].content
+        body = write_tests_prompt(Ticket("T-1"), ["app.py"], test_path="tests/t_1_test.py")[-1].content
         self.assertIn("conventions already used in this repository", body)
 
     def test_failure_context_reaches_the_tester(self):
-        body = tests_prompt(
+        body = write_tests_prompt(
             Ticket("T-1", criteria=["x is 1"]),
             ["app.py"],
             test_path="tests/t_1_test.py",
@@ -3739,14 +3739,14 @@ class TestTesterEvidence(unittest.TestCase):
         # The dangerous reading of "your tests failed" is "make them pass".
         # A tester that deletes an assertion turns a caught defect into a green
         # suite over broken code.
-        body = tests_prompt(
+        body = write_tests_prompt(
             Ticket("T-1"), ["app.py"], test_path="tests/t_1_test.py", failure_context="boom"
         )[-1].content
         self.assertIn("not yours to correct", body)
         self.assertIn("keep the assertion as written", body)
 
     def test_a_clean_first_attempt_carries_no_failure_section(self):
-        body = tests_prompt(Ticket("T-1"), ["app.py"], test_path="tests/t_1_test.py")[-1].content
+        body = write_tests_prompt(Ticket("T-1"), ["app.py"], test_path="tests/t_1_test.py")[-1].content
         self.assertNotIn("did not pass verification", body)
 
 
@@ -6374,7 +6374,7 @@ class TestTheTesterIsPointedAtItsOwnErrors(unittest.TestCase):
         self.assertEqual(errors_naming(self.LINT, ""), [])
 
     def test_the_prompt_puts_them_in_front_of_the_tester(self):
-        body = tests_prompt(
+        body = write_tests_prompt(
             Ticket("TT-001", criteria=["cells() returns four"]),
             ["src/piece.rs"],
             test_path="tests/tt_001_test.rs",
@@ -6386,7 +6386,7 @@ class TestTheTesterIsPointedAtItsOwnErrors(unittest.TestCase):
         self.assertIn("unused variable", body)
 
     def test_a_clean_attempt_carries_no_such_section(self):
-        body = tests_prompt(
+        body = write_tests_prompt(
             Ticket("TT-001", criteria=["cells() returns four"]),
             ["src/piece.rs"],
             test_path="tests/tt_001_test.rs",
@@ -6395,7 +6395,7 @@ class TestTheTesterIsPointedAtItsOwnErrors(unittest.TestCase):
         self.assertNotIn("errors are in the file you are about to write", body)
 
     def test_the_three_branches_are_all_stated(self):
-        body = tests_prompt(
+        body = write_tests_prompt(
             Ticket("TT-001", criteria=["c"]),
             ["src/piece.rs"],
             test_path="tests/tt_001_test.rs",
@@ -6469,7 +6469,7 @@ class TestForeignBindingsInTests(unittest.TestCase):
                 self.assertIn(label, found[0])
 
     def test_the_prompt_quotes_back_what_was_rejected(self):
-        body = tests_prompt(
+        body = write_tests_prompt(
             Ticket("TT-004", criteria=["game_score() returns 0"]),
             ["src/wasm.rs"],
             test_path="tests/tt_004_test.rs",
@@ -6480,7 +6480,7 @@ class TestForeignBindingsInTests(unittest.TestCase):
         self.assertIn('extern "C" {', body)
 
     def test_a_clean_answer_carries_no_rejection_section(self):
-        body = tests_prompt(
+        body = write_tests_prompt(
             Ticket("TT-004", criteria=["game_score() returns 0"]),
             ["src/wasm.rs"],
             test_path="tests/tt_004_test.rs",
@@ -6694,7 +6694,7 @@ class TestTheTesterIsAskedAgainForLaunderedAssertions(unittest.TestCase):
         self.assertTrue(self._tests_file(root).exists())
 
     def test_the_prompt_quotes_back_what_was_rejected(self):
-        body = tests_prompt(
+        body = write_tests_prompt(
             Ticket("TT-004", criteria=["randi() returns 4071818419"]),
             ["src/rng.ts"],
             test_path="tests/rng.test.ts",
@@ -11415,7 +11415,7 @@ class TestATicketKeepsWhatItsAttemptsEstablished(unittest.TestCase):
             "T-1", learned=[{"text": "The linter forbids trailing whitespace.", "count": 1}]
         )
 
-        shown = _joined(tests_prompt(ticket, ["src/a.gd"], test_path="tests/t.gd"))
+        shown = _joined(write_tests_prompt(ticket, ["src/a.gd"], test_path="tests/t.gd"))
 
         self.assertIn("forbids trailing whitespace", shown)
 
@@ -12426,7 +12426,7 @@ class TestTheToolchainReachesThePrompt(unittest.TestCase):
         self.assertIn("not in your scope", block)
 
     def test_the_tester_is_shown_it_too(self):
-        messages = tests_prompt(
+        messages = write_tests_prompt(
             Ticket("T-1"), ["src/a.ts"], test_path="tests/t.ts", toolchain=self.RULES
         )
 
@@ -12797,16 +12797,16 @@ class TestCountingWhatARunnerSaidItRan(unittest.TestCase):
             ("9 examples, 0 failures", 9),
         ):
             with self.subTest(output=output):
-                self.assertEqual(test_count(output), expected)
+                self.assertEqual(reported_test_count(output), expected)
 
     def test_a_runner_that_prints_no_count_says_so(self):
-        self.assertIsNone(test_count("ok  \tgithub.com/x/y\t0.012s"))
-        self.assertIsNone(test_count(""))
+        self.assertIsNone(reported_test_count("ok  \tgithub.com/x/y\t0.012s"))
+        self.assertIsNone(reported_test_count(""))
 
     def test_the_largest_number_wins(self):
         # pytest prints `collected 12 items` and then `12 passed`; a suite that
         # grew shows the growth in whichever number is biggest.
-        self.assertEqual(test_count("collected 12 items\n5 passed, 7 failed"), 12)
+        self.assertEqual(reported_test_count("collected 12 items\n5 passed, 7 failed"), 12)
 
 
 class TestAGreenThatRanNoneOfTheTicketsTests(unittest.TestCase):
@@ -18321,7 +18321,7 @@ class TestRatificationInTheLoop(unittest.TestCase):
         )
         for messages in (
             build_prompt(ticket),
-            tests_prompt(ticket, ["src/a.rs"], test_path="tests/t.rs"),
+            write_tests_prompt(ticket, ["src/a.rs"], test_path="tests/t.rs"),
             review_prompt(ticket, "diff --git a b"),
         ):
             joined = "\n".join(m.content for m in messages)
@@ -20493,6 +20493,334 @@ class TestABugBlockedBeforeReproductionIsStillRetried(unittest.TestCase):
         self.assertEqual(
             orch.store.list_tickets(run_id)[0].status, TICKET_BLOCKED
         )
+
+
+class TestATicketWhoseCriterionCannotBeTestedHonestlyBlocks(unittest.TestCase):
+    """Discarding a rigged test file leaves the criteria to review, which is
+    right when the tester merely wrote a bad file and wrong when it could not
+    write a good one.
+
+    On the unsatisfiable backlog the tester softened the same criterion twice,
+    the file was discarded both times, and the reviewer — told in as many words
+    that nothing ran and that it was the only thing between this ticket and
+    `done` — approved it anyway. In the same attempt the executor had already
+    reported the criterion impossible. Three parties saw it and the ticket
+    still finished green.
+
+    A criterion that cannot be encoded without softening it contradicts code
+    the ticket may not write. That is a spec defect, and a spec defect is a
+    person's to settle."""
+
+    def _orch(self):
+        orch, root, run_id = _stub_orchestrator({"test": "pytest -q"})
+        orch.config.loop.max_attempts = 1
+        orch.store.add_tickets(
+            run_id,
+            [
+                Ticket(
+                    "ST-001",
+                    title="summarise a word count",
+                    spec="add summarize",
+                    allowed_files=["src/summary.py"],
+                    criteria=[
+                        '`count_words("Hello, world!")` returns '
+                        '`{"hello": 1, "world": 1}`.'
+                    ],
+                )
+            ],
+        )
+        return orch, root, run_id
+
+    def test_it_blocks_rather_than_going_green_over_an_untested_criterion(self):
+        orch, _root, run_id = self._orch()
+        orch._shell = lambda *_a, **_k: StepResult(ok=True, detail="1 passed")
+
+        def call(_run_id, role, _messages, **_kwargs):
+            text = {
+                # The tester softens the value, every time it is asked.
+                "tester": 'tests/st_001_test.py\n```python\ndef test_counts():\n'
+                '    assert count_words("Hello, world!") == '
+                '{"hello,": 1, "world!": 1}\n```',
+                "executor": "src/summary.py\n```python\nVALUE = 1\n```",
+            }.get(role, "ACCEPT")
+            return Completion(text=text, usage=Usage(), finish_reason="stop")
+
+        orch._call = call
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        stored = orch.store.list_tickets(run_id)[0]
+        self.assertEqual(stored.status, TICKET_BLOCKED)
+        self.assertIn("no honest test of it can pass", stored.blocked_note)
+
+    def test_another_discard_reason_still_leaves_it_to_review(self):
+        # A tester that ran out of output room wrote no file, which says
+        # nothing about whether the criteria can be met. That case is a weaker
+        # result, not a finding, and review still judges it.
+        orch, _root, run_id = self._orch()
+        orch._shell = lambda *_a, **_k: StepResult(ok=True, detail="1 passed")
+
+        def call(_run_id, role, _messages, **_kwargs):
+            if role == "tester":
+                return Completion(text="", usage=Usage(), finish_reason="length")
+            text = (
+                "src/summary.py\n```python\nVALUE = 1\n```"
+                if role == "executor"
+                else "ACCEPT"
+            )
+            return Completion(text=text, usage=Usage(), finish_reason="stop")
+
+        orch._call = call
+
+        orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
+
+        # However this attempt ends, it does not end as the finding above:
+        # nothing here was demonstrated about whether the criteria can be met.
+        stored = orch.store.list_tickets(run_id)[0]
+        self.assertNotIn("no honest test of it can pass", stored.blocked_note)
+
+
+class TestOnlyTheValueAfterACallIsPinned(unittest.TestCase):
+    """A criterion explains itself as well as pinning a value, and the
+    explanation is written in code spans too.
+
+    The first run of `HARD.md` blocked on this. Its rounding criterion reads
+    `shares({"a": 13, "b": 67})` returns `["b 83.8%", "a 16.3%"]` — `16.25`
+    rounds away from zero to `16.3`, which `round(16.25, 1)` does not do. A
+    test that asserts the list has no reason to mention `16.25`, and reading
+    all four spans as pinned turned an honest test into a softened one, twice,
+    and parked a ticket that was going fine."""
+
+    CRITERION = (
+        '`shares({"a": 13, "b": 67})` returns `["b 83.8%", "a 16.3%"]` - '
+        "`16.25` rounds away from zero to `16.3`, which `round(16.25, 1)` "
+        "does not do."
+    )
+
+    def test_only_the_returned_value_is_required(self):
+        from forge.patch import pinned_values
+
+        self.assertEqual(pinned_values(self.CRITERION), ['["b 83.8%", "a 16.3%"]'])
+
+    def test_an_honest_test_of_it_is_not_flagged(self):
+        from forge.patch import weakened_criteria
+
+        honest = (
+            'self.assertEqual(shares({"a": 13, "b": 67}), '
+            '["b 83.8%", "a 16.3%"])'
+        )
+
+        self.assertEqual(weakened_criteria(honest, [self.CRITERION]), [])
+
+    def test_softening_that_same_value_is_still_caught(self):
+        from forge.patch import weakened_criteria
+
+        softened = (
+            'self.assertEqual(shares({"a": 13, "b": 67}), '
+            '["b 83.8%", "a 16.2%"])'
+        )
+
+        self.assertEqual(len(weakened_criteria(softened, [self.CRITERION])), 1)
+
+    def test_a_reword_may_drop_the_aside_but_not_the_value(self):
+        from forge.respec import _softened_values
+
+        ticket = Ticket("HP-001", criteria=[self.CRITERION])
+
+        kept = _softened_values(
+            ticket,
+            {
+                "criteria": [
+                    '`shares({"a": 13, "b": 67})` returns `["b 83.8%", "a 16.3%"]`.'
+                ]
+            },
+        )
+        moved = _softened_values(
+            ticket,
+            {
+                "criteria": [
+                    '`shares({"a": 13, "b": 67})` returns `["b 83.8%", "a 16.2%"]`.'
+                ]
+            },
+        )
+
+        self.assertEqual(kept, [])
+        self.assertEqual(moved, ['["b 83.8%", "a 16.3%"]'])
+
+
+class TestRatifyMayRewordACriterionButNotItsValue(unittest.TestCase):
+    """The count ratchet asks whether the bar was raised. Nothing asked whether
+    it was lowered.
+
+    On the first deliberately-unsatisfiable backlog run against
+    `examples/sample-project`, the ticket that came back out of ratification
+    said `count_words("Hello, world!")` returns `{"hello,": 1, "world!": 1}`.
+    The plan had said `{"hello": 1, "world": 1}`. Same count, same call, same
+    shape — and the new value was the exact output of the code as it stood, so
+    the criterion now asserted the behaviour it had been written to reject.
+    Everything downstream did its job on the contract it was handed: the tester
+    encoded it, the suite went green, the reviewer read a passing assertion
+    about the right function, and the ticket shipped `done`."""
+
+    PLAN = ['`count_words("Hello, world!")` returns `{"hello": 1, "world": 1}`.']
+
+    def _lost(self, proposed):
+        from forge.respec import _softened_values
+
+        return _softened_values(Ticket("ST-001", criteria=self.PLAN), {"criteria": proposed})
+
+    def test_the_observed_value_swapped_in_is_refused(self):
+        lost = self._lost(
+            ['`count_words("Hello, world!")` returns `{"hello,": 1, "world!": 1}`.']
+        )
+
+        self.assertEqual(lost, ['{"hello": 1, "world": 1}'])
+
+    def test_rewording_the_prose_around_the_value_is_the_passs_job(self):
+        # What ratification exists to do. Only the value is held.
+        lost = self._lost(
+            [
+                "Counting the words of the string `\"Hello, world!\"` with "
+                '`count_words("Hello, world!")` gives exactly '
+                '`{"hello": 1, "world": 1}`.'
+            ]
+        )
+
+        self.assertEqual(lost, [])
+
+    def test_quote_style_and_wrapping_are_not_a_change(self):
+        lost = self._lost(
+            ["`count_words('Hello, world!')` returns\n  `{'hello': 1, 'world': 1}`."]
+        )
+
+        self.assertEqual(lost, [])
+
+    def test_a_shorter_list_is_left_to_the_count_ratchet(self):
+        # It refuses that case with a message about what was dropped, which
+        # says more than this guard could. Speaking first would replace it.
+        self.assertEqual(self._lost([]), [])
+
+    def test_the_refusal_is_reported_and_the_criteria_kept(self):
+        from forge.ratify import _apply
+
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        run_id = store.create_run("goal")
+        ticket = Ticket("ST-001", criteria=self.PLAN)
+        store.add_tickets(run_id, [ticket])
+        revision = {
+            "spec": "unchanged",
+            "criteria": [
+                '`count_words("Hello, world!")` returns `{"hello,": 1, "world!": 1}`.'
+            ],
+        }
+
+        _apply(store, run_id, ticket, revision, root=None)
+
+        self.assertNotIn("criteria", revision)
+        self.assertEqual(revision["spec"], "unchanged")
+        said = " ".join(row["message"] for row in store.events_after(0, limit=50))
+        self.assertIn("value(s) the plan pinned", said)
+
+
+class TestATestMayNotSoftenTheValueACriterionPins(unittest.TestCase):
+    """The third way a test file passes while checking nothing, after a foreign
+    binding and a reshaping helper, and the quietest of the three: keep the
+    call the criterion names and swap the expected value for what the code
+    returns today.
+
+    Observed on the first deliberately-unsatisfiable backlog run against
+    `examples/sample-project`. The criterion said `count_words("Hello,
+    world!")` returns `{"hello": 1, "world": 1}`; the tester asserted the same
+    call equals `{"hello,": 1, "world!": 1}` — the behaviour the criterion
+    existed to reject — and the ticket shipped `done`. A green suite, a
+    reviewer reading a passing assertion about the right function, and a
+    criterion nobody had met."""
+
+    CRITERION = (
+        '`count_words("Hello, world!")` returns `{"hello": 1, "world": 1}`.'
+    )
+
+    def test_the_observed_value_swapped_in_is_caught(self):
+        from forge.patch import weakened_criteria
+
+        test = (
+            'def test_counts(self):\n'
+            '    self.assertEqual(count_words("Hello, world!"), '
+            '{"hello,": 1, "world!": 1})\n'
+        )
+
+        found = weakened_criteria(test, [self.CRITERION])
+
+        self.assertEqual(len(found), 1, found)
+        self.assertIn('{"hello": 1, "world": 1}', found[0])
+
+    def test_the_criterion_encoded_as_written_is_left_alone(self):
+        from forge.patch import weakened_criteria
+
+        test = (
+            'self.assertEqual(count_words("Hello, world!"), '
+            '{"hello": 1, "world": 1})'
+        )
+
+        self.assertEqual(weakened_criteria(test, [self.CRITERION]), [])
+
+    def test_a_mapping_written_in_another_order_is_the_same_expectation(self):
+        from forge.patch import weakened_criteria
+
+        test = (
+            'self.assertEqual(count_words("Hello, world!"), '
+            '{"world": 1, "hello": 1})'
+        )
+
+        self.assertEqual(weakened_criteria(test, [self.CRITERION]), [])
+
+    def test_wrapping_and_quote_style_are_not_weakenings(self):
+        # A tester that breaks a long assertion over three lines and prefers
+        # double quotes has said nothing different.
+        from forge.patch import weakened_criteria
+
+        test = (
+            "self.assertEqual(\n"
+            "    count_words('Hello, world!'),\n"
+            "    {'hello': 1, 'world': 1},\n"
+            ")"
+        )
+
+        self.assertEqual(weakened_criteria(test, [self.CRITERION]), [])
+
+    def test_a_criterion_the_test_never_calls_is_somebody_elses_question(self):
+        # Unencoded criteria are what review and the pending-criteria report
+        # are for. This check only speaks when the call is present and the
+        # value is not.
+        from forge.patch import weakened_criteria
+
+        self.assertEqual(
+            weakened_criteria("self.assertEqual(summarize({}), \"0\")", [self.CRITERION]),
+            [],
+        )
+
+    def test_a_criterion_pinning_no_value_is_not_judged(self):
+        from forge.patch import weakened_criteria
+
+        self.assertEqual(
+            weakened_criteria(
+                'self.assertRaises(ValueError, top_words, {"a": 1}, -1)',
+                ["`top_words({...}, -1)` raises ValueError."],
+            ),
+            [],
+        )
+
+    def test_a_value_that_merely_contains_parentheses_is_read_as_a_value(self):
+        # `2 word(s), 2 occurrence(s)` is an expected string, not a call, and
+        # reading it as one would let the real weakening through.
+        from forge.patch import weakened_criteria
+
+        criterion = '`summarize({"a": 2})` returns `1 word(s), 2 occurrence(s)`.'
+        test = 'self.assertEqual(summarize({"a": 2}), "1 word, 2 occurrences")'
+
+        found = weakened_criteria(test, [criterion])
+
+        self.assertEqual(len(found), 1, found)
 
 
 class TestRatifyKnowsABugTicketHasNoCriteria(unittest.TestCase):

@@ -977,3 +977,121 @@ Three things to watch on the first real run:
 - **Whether the curve descends.** The measurement that opened this document is
   now computed per cycle by the loop itself. The claim these features make is
   that those deciles go down. That has not been observed.
+
+---
+
+## The first backlog written to fail
+
+`examples/sample-project/STALL.md` is one ticket that cannot succeed, and it
+exists because every brake in this document only ever runs on a ticket that is
+going nowhere. Four green runs of `SPEC.md` proved that none of these features
+misfires on a run that is going well, and nothing more than that.
+
+The defect in it is a *spec* defect and a subtle one: the ticket's fourth
+acceptance criterion demands behaviour from `wordcount/counter.py`, which the
+ticket may read and may not write. Every criterion is individually reasonable,
+the scope is correct for the work described, and only the pair is wrong.
+
+**The first two runs of it finished `done`.** That is the finding, and it is
+the failure this whole project exists to prevent — a green ticket over a
+criterion nobody met. The chain that produced it had three links, each of which
+looked like a smaller problem than it was:
+
+1. **Ratification reworded the criterion.** The plan pinned
+   `count_words("Hello, world!")` returns `{"hello": 1, "world": 1}`; the
+   ticket that came out of the sign-off pass said it returns `{"hello,": 1,
+   "world!": 1}` — the exact output of the code as it stood, so the criterion
+   now asserted the behaviour it had been written to reject. The ratchet
+   counted criteria and checked provenance against the spec; nothing checked
+   that a *value* survived a reword. The party being asked whether it can do
+   the work was able to lower the bar it would be judged against.
+
+2. **The tester softened the same value.** With the criterion restored, the
+   tester wrote `assertEqual(count_words("Hello, world!"), {"hello,": 1,
+   "world!": 1})` — the criterion's own call, asserted against a different
+   answer. `foreign_bindings` and `laundered_assertions` both passed it: no
+   foreign declaration, no reshaping helper, just the wrong expectation.
+
+3. **Review approved the ticket with nothing testing the criterion.** When the
+   rigged file was discarded, the reviewer was told in as many words that
+   nothing ran and that it was the only thing between this ticket and `done`.
+   It approved anyway — in an attempt where the executor had already reported
+   the criterion impossible.
+
+Three guards, each mechanical, each keyed to the exact evidence:
+
+- `respec._softened_values` refuses a same-length reword that drops a value the
+  plan pinned in a code span. Prose may be rewritten freely; what the answer
+  has to be may not.
+- `patch.weakened_criteria` rejects a test that makes a criterion's own call
+  and asserts a value the criterion does not state, and the tester is asked
+  again with the pair quoted back.
+- A discard for *that* reason blocks the ticket rather than leaving it to
+  review. A criterion that cannot be encoded without softening it contradicts
+  code the ticket may not change, which is a spec defect and a person's to
+  settle.
+
+With all three in, the same backlog ends the way it should:
+
+```
+ratify failed -> ratify ok      the reword refused, then signed off
+build, build, apply
+tests failed                    softened twice, discarded
+run: blocked | 1 ticket(s) need a human
+2 attempts, 1 retry cycle, 22 calls, 106.7k tokens
+```
+
+and the note the human gets names the real problem — *a criterion here
+contradicts code this ticket may not write, so no honest test of it can pass*.
+
+**What this still has not measured.** The ticket never reached a state where
+the failure classes could descend, so `_convergence`, the escalation ladder and
+`flatCycles` remain unexercised.
+
+## The backlog that was supposed to be hard
+
+`examples/sample-project/HARD.md` was written to be that run: satisfiable, but
+not on the first try. One function, and every detail pinned exactly — a
+percentage always written to one decimal place, rounding half away from zero
+where `round()` does not, a right-aligned six-character field, padding to the
+longest label, a `limit` that folds the remainder into an `other` row whose
+label sets that width, and a summary line with singular and plural forms.
+
+It has not been hard once. Four runs, two versions — four exact details, then
+nine — and the local executor landed every criterion on the first attempt each
+time, in seven model calls and under 60k tokens. The delivered
+`shares(counts, limit=0)` was checked against all nine criteria independently
+afterwards; it is correct on every one, including the `16.25 -> 16.3` case that
+`round()` gets wrong.
+
+So the middle of this document remains unexercised, and the reason is worth
+writing down rather than working around: **difficulty that comes from care is
+not difficulty for this executor.** What defeats it is a spec that is wrong —
+a criterion contradicting code the ticket may not change, two criteria
+demanding different values from one call, a design question left unresolved.
+Every failure this fixture has produced has been of that kind, and so was the
+`Puzzle-Path` run these ten features were derived from: 430 attempts against
+criteria that could not all hold at once.
+
+That reframes what the ten features are for. They are not a way to make a
+capable model converge on well-specified work — it already does, first try.
+They are the machinery that stops a *defective spec* from consuming a night,
+and the honest test of them is a backlog whose specs are subtly wrong in ways
+that take several attempts to expose. `STALL.md` is the crude version of that
+and stops in one attempt. The version worth writing next is a ticket whose
+criteria are individually satisfiable and jointly impossible only for inputs
+the executor reaches on its second or third attempt.
+
+**The two false positives that came out of these runs.** `weakened_criteria`
+was written from the stall run and immediately parked two healthy tickets:
+
+- A criterion explains itself in code spans as well as pinning a value —
+  ``16.25`` and ``round(16.25, 1)`` in the rounding criterion above — and every
+  span was being read as a required value. Only the span *following a call* is
+  the contract now.
+- The tester wrote its expected list one element per line with a trailing
+  comma, and the check compared whitespace-collapsed strings, so the honest
+  test differed from the criterion by a space after `[`. Comparison now ignores
+  whitespace entirely and checks a bracketed value element by element — which
+  also gives up on catching a padding-only softening, the right direction to
+  miss in for a net whose cost when wrong is a parked ticket.

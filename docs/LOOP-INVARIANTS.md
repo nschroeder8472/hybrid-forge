@@ -824,7 +824,7 @@ without guessing.
 | `imports.unresolved` / `_dangling_imports` | every attempt that writes a file |
 | `_source_reference` | every planned ingest |
 | `_trim_reference` | every reference file over the source limit |
-| `failures.test_count` / `_test_was_collected` | every passing test step on a ticket that authored one |
+| `failures.reported_test_count` / `_test_was_collected` | every passing test step on a ticket that authored one |
 | `toolchain.manifest_gaps` | every ingest, and once at run start |
 | `ingest.undeclared_order` | every ingest |
 | `environment_failure` / `_note_toolchain` | every verify step |

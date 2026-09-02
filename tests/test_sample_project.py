@@ -92,7 +92,9 @@ class TestTheFixtureIsOnlyTheFixture(unittest.TestCase):
         ".hybridforge/config.json",
         "BUG.md",
         "README.md",
+        "HARD.md",
         "SPEC.md",
+        "STALL.md",
         "plugin/histogram/__init__.py",
         "plugin/histogram/bars.py",
         "plugin/pyproject.toml",
@@ -250,6 +252,118 @@ class TestTheSampleBacklogParses(unittest.TestCase):
     def test_every_ticket_carries_criteria_a_stub_could_not_satisfy(self):
         for ticket in self.tickets:
             self.assertGreaterEqual(len(ticket.criteria), 4, ticket.ticket_id)
+
+
+class TestTheStallBacklogCannotSucceed(unittest.TestCase):
+    """`SPEC.md` is work the loop can do; `STALL.md` is work it cannot. Every
+    brake — the attempt budget, convergence, the respec, the park — only ever
+    runs on a ticket that is going nowhere, and a fixture whose runs all finish
+    green never asks one of them a question."""
+
+    def setUp(self):
+        self.tickets, self.how, _derived = ingest(
+            (SAMPLE / "STALL.md").read_text(encoding="utf-8")
+        )
+
+    def test_it_is_one_parsed_ticket(self):
+        self.assertEqual(self.how, "parsed")
+        self.assertEqual([t.ticket_id for t in self.tickets], ["ST-001"])
+
+    def test_the_impossible_criterion_is_about_a_file_the_ticket_may_not_write(self):
+        # The defect is a spec defect and it is invisible to a reader who
+        # checks the criteria and the scope separately: the last criterion
+        # demands behaviour from `wordcount/counter.py`, which is a reference
+        # file here — readable, not writable.
+        ticket = self.tickets[0]
+
+        self.assertIn("wordcount/counter.py", ticket.reference_files)
+        self.assertNotIn("wordcount/counter.py", ticket.allowed_files)
+        self.assertIn("count_words", ticket.criteria[-1])
+
+    def test_the_criterion_contradicts_the_code_as_it_stands(self):
+        # If somebody fixes the seeded defect in the fixture, this backlog
+        # quietly becomes satisfiable and stops testing anything.
+        sys.path.insert(0, str(SAMPLE))
+        written = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        try:
+            from wordcount.counter import count_words
+        finally:
+            sys.dont_write_bytecode = written
+            sys.path.pop(0)
+
+        self.assertNotEqual(
+            count_words("Hello, world!"), {"hello": 1, "world": 1}
+        )
+
+    def test_the_stall_ticket_is_not_part_of_the_ordinary_backlog(self):
+        # Ingested instead of `SPEC.md`, never alongside it.
+        spec, _how, _derived = ingest((SAMPLE / "SPEC.md").read_text(encoding="utf-8"))
+
+        self.assertNotIn("ST-001", [ticket.ticket_id for ticket in spec])
+
+
+class TestTheHardBacklogIsHardAndNotImpossible(unittest.TestCase):
+    """`SPEC.md` lands on the first attempt and `STALL.md` cannot be landed at
+    all, so neither exercises the middle of the loop: several attempts, a
+    failure set that shrinks, convergence measured on it, the ladder climbing.
+    `HARD.md` is the one that should end done and take its time."""
+
+    def setUp(self):
+        self.tickets, self.how, _derived = ingest(
+            (SAMPLE / "HARD.md").read_text(encoding="utf-8")
+        )
+
+    def test_it_is_one_parsed_ticket(self):
+        self.assertEqual(self.how, "parsed")
+        self.assertEqual([t.ticket_id for t in self.tickets], ["HP-001"])
+
+    def test_every_criterion_is_satisfiable_by_a_correct_implementation(self):
+        # The difference between this backlog and `STALL.md`, and the property
+        # that decides which one the loop is being tested against. Checked by
+        # implementing the spec here and reading the criteria back.
+        from decimal import ROUND_HALF_UP, Decimal
+
+        def shares(counts):
+            if not counts:
+                return []
+            total = sum(counts.values())
+            width = max(len(word) for word in counts)
+            ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+            return [
+                f"{word.ljust(width)} "
+                f"{(Decimal(100 * count) / Decimal(total)).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP)}%"
+                for word, count in ranked
+            ]
+
+        self.assertEqual(shares({"a": 1, "b": 1}), ["a 50.0%", "b 50.0%"])
+        self.assertEqual(
+            shares({"apple": 2, "b": 1}), ["apple 66.7%", "b     33.3%"]
+        )
+        self.assertEqual(
+            shares({"a": 1, "b": 2, "c": 3}), ["c 50.0%", "b 33.3%", "a 16.7%"]
+        )
+        self.assertEqual(
+            shares({"b": 1, "a": 1, "c": 1}),
+            ["a 33.3%", "b 33.3%", "c 33.3%"],
+        )
+        self.assertEqual(shares({"a": 13, "b": 67}), ["b 83.8%", "a 16.3%"])
+        self.assertEqual(shares({}), [])
+
+    def test_the_rounding_criterion_is_a_real_trap(self):
+        # The criterion exists because the obvious implementation gets it
+        # wrong. If Python ever rounds this half away from zero, the ticket
+        # stops being hard and this fixture stops testing anything.
+        self.assertEqual(round(16.25, 1), 16.2)
+
+    def test_it_writes_files_the_other_specs_do_not(self):
+        spec, _how, _derived = ingest((SAMPLE / "SPEC.md").read_text(encoding="utf-8"))
+        theirs = {path for ticket in spec for path in ticket.allowed_files}
+        mine = {path for ticket in self.tickets for path in ticket.allowed_files}
+
+        self.assertEqual(theirs & mine, set())
+        for path in mine:
+            self.assertFalse((SAMPLE / path).exists(), path)
 
 
 class TestTheSeededDefectIsStillThere(unittest.TestCase):
