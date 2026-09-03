@@ -654,10 +654,52 @@ names the contradiction, which is a reason rather than a count, and
 `flatCycles` stays off because parking on the count alone still trades a
 stalled ticket for a killed one.
 
-**Files.** `Ticket.cycle_classes`, `cycle_mark`, `flat_cycles`;
-`Store.record_convergence`, `Store.last_step_id`, and an `after` argument on
-`Store.ticket_classes`; `Orchestrator._convergence` and `_measure_cycle`,
-called from `_retry_cycle` before the backlog-wide comparison.
+### The set also has a size, and nothing was reading it
+
+A class is `(step, code, file)` on purpose: the same rule broken twice in one
+file is one thing to learn, and separating `TS2532` at line 40 from `TS2532` at
+line 51 is how an executor failed the same way 512 times without anything
+noticing. The cost of that key is on the other side of the comparison. Seven
+`E501` in one file and the single `E501` left after six of them are fixed are
+the same class, so a ticket working its findings off one at a time produces an
+unchanged set and reads `flat`.
+
+Replayed against `arm-blind`'s recorded lint output — the same real findings,
+truncated to fewer of them — 7 findings, then 3, then 1 read `flat` twice and
+reached `reviewWhenStuck`'s default rung. The ladder was escalating a ticket
+converging as fast as anything in this repository ever has, and asking a paid
+reviewer whether its contract can be met at all.
+
+So `_convergence` now reads the size of the set as well as its members. An
+unchanged set whose findings are strictly fewer than the last cycle's is
+`descending`; unchanged and equal, or unchanged and larger, stays `flat`.
+More of the same failure is not progress, and the brake that fires on it is the
+one that belongs there.
+
+The count is of `signatures` rather than of classes, because signatures keep
+the location and are therefore the number a class deliberately discards. It is
+taken in `end_step`, in the same pass as the classes and from the same
+uncut output, and stored on the step as `findings` — counting on read would be
+counting the clipped copy, which is a different number.
+
+A cycle's volume is the last failed step of each *kind*, not the sum over the
+cycle's attempts. Summed, a cycle of three attempts failing 7, 3 and 1 totals
+11 against the next cycle's 3, and every cycle that spends more attempts than
+the last would read as a regression. Per kind rather than per step, because a
+cycle ending on a red suite has not fixed the lint findings it was also
+carrying.
+
+Zero findings means *could not be counted*, not *nothing failed* — the same
+contract `signatures` has always had, and the distinction a whole `flake8` run
+parsing to nothing was made of. A comparison involving one stays `flat`, so
+output the parser cannot read never buys a ticket another cycle.
+
+**Files.** `Ticket.cycle_classes`, `cycle_mark`, `flat_cycles`, `cycle_volume`;
+a `findings` column on `steps` written by `Store.end_step`;
+`Store.record_convergence`, `Store.last_step_id`, `Store.ticket_volume`, and an
+`after` argument on `Store.ticket_classes`; `Orchestrator._convergence` and
+`_measure_cycle`, called from `_retry_cycle` before the backlog-wide
+comparison.
 
 **Done when.** The dashboard can answer "is this ticket getting closer" — it
 can now — and the loop acts on the answer, which waits on Features 8 and 9.

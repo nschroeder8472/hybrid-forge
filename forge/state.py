@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-from .failures import classify, clip, distill
+from .failures import classify, clip, distill, signatures
 
 # How much of a step's output is kept. Enough for any compiler's diagnostics
 # and for a runner's summary, and not so much that a backlog of gdUnit runs —
@@ -417,8 +417,22 @@ class Ticket:
     # See docs/CONVERGENCE.md.
     tests_fingerprint: str = ""
     # Consecutive cycles that produced exactly the classes the one before them
-    # did. Reset by any cycle that changes the set in either direction.
+    # did, and no fewer findings of them. Reset by any cycle that changes the
+    # set in either direction, and by one that shrinks it without changing it.
     flat_cycles: int = 0
+    # How many distinct findings the previous cycle ended on, summed over the
+    # kinds of step that failed. `cycle_classes` says *what* is wrong and this
+    # says *how much of it*: named per code and per file, seven `E501` in one
+    # file and one `E501` in that file are the same class, so a ticket fixing
+    # six of the seven reads as having done nothing at all. On the recording
+    # this comes from, 7 findings falling to 3 and then to 1 is `flat` twice
+    # over and reaches the rung the ladder escalates on. See
+    # `Orchestrator._convergence` and docs/CONVERGENCE.md.
+    #
+    # Zero means *not measurable* rather than *nothing failed*: a step whose
+    # output no pattern in `failures` recognises has no findings to count, and
+    # a comparison against it must not read as a descent.
+    cycle_volume: int = 0
     # Distinctive constants this ticket's spec has stated and then dropped, in
     # the order it dropped them.
     #
@@ -572,6 +586,7 @@ class Ticket:
             tests_fingerprint=row["tests_fingerprint"] or "",
             abandoned_values=json.loads(row["abandoned_values"] or "[]"),
             flat_cycles=row["flat_cycles"] or 0,
+            cycle_volume=row["cycle_volume"] or 0,
         )
 
 
@@ -654,6 +669,8 @@ class Store:
         ("tickets", "cycle_classes", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "cycle_mark", "INTEGER NOT NULL DEFAULT 0"),
         ("tickets", "flat_cycles", "INTEGER NOT NULL DEFAULT 0"),
+        ("tickets", "cycle_volume", "INTEGER NOT NULL DEFAULT 0"),
+        ("steps", "findings", "INTEGER NOT NULL DEFAULT 0"),
         ("tickets", "tests_fingerprint", "TEXT NOT NULL DEFAULT ''"),
         ("tickets", "abandoned_values", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "impossible_fingerprint", "TEXT NOT NULL DEFAULT ''"),
@@ -1449,8 +1466,16 @@ class Store:
         They are computed from the whole of it, before the stored copy is cut
         down. What is kept on disk is what a person and a later prompt read;
         what a class is derived from is everything the tool said.
+
+        The count of distinct findings is taken in the same pass and for the
+        same reason. It is a count of `signatures` rather than of classes,
+        because that is the number a class deliberately throws away: `E501` at
+        seven lines of one file is one class and seven things to fix, and
+        convergence needs to be able to see six of them go. Counting on read
+        would be counting the *clipped* copy, which is a different number.
         """
         classes: list[str] = []
+        findings = 0
         if status == "failed" and detail.strip():
             row = self._connection.execute(
                 "SELECT name FROM steps WHERE id = ?", (step_id,)
@@ -1459,11 +1484,19 @@ class Store:
             # `NOT_ABOUT_THE_CODE` for what one cost.
             if row is not None and _step_kind(row["name"]) not in NOT_ABOUT_THE_CODE:
                 classes = sorted(classify(row["name"], detail))
+                findings = len(signatures(detail))
         with self._write() as connection:
             connection.execute(
-                "UPDATE steps SET status = ?, ended_at = ?, detail = ?, classes = ? "
-                "WHERE id = ?",
-                (status, time.time(), clip(detail, DETAIL_CHARS), json.dumps(classes), step_id),
+                "UPDATE steps SET status = ?, ended_at = ?, detail = ?, classes = ?, "
+                "findings = ? WHERE id = ?",
+                (
+                    status,
+                    time.time(),
+                    clip(detail, DETAIL_CHARS),
+                    json.dumps(classes),
+                    findings,
+                    step_id,
+                ),
             )
 
     def restate_step(self, step_id: int, status: str) -> None:
@@ -1562,12 +1595,13 @@ class Store:
             connection.execute(
                 "UPDATE tickets SET cycle_classes = :cycle_classes, "
                 "cycle_mark = :cycle_mark, flat_cycles = :flat_cycles, "
-                "updated_at = :now "
+                "cycle_volume = :cycle_volume, updated_at = :now "
                 "WHERE run_id = :run_id AND ticket_id = :ticket_id",
                 {
                     "cycle_classes": json.dumps(sorted(ticket.cycle_classes)),
                     "cycle_mark": int(ticket.cycle_mark),
                     "flat_cycles": int(ticket.flat_cycles),
+                    "cycle_volume": int(ticket.cycle_volume),
                     "run_id": run_id,
                     "ticket_id": ticket.ticket_id,
                     "now": time.time(),
@@ -1619,6 +1653,39 @@ class Store:
         return sorted(
             seen.values(), key=lambda entry: (-entry["count"], entry["name"])
         )
+
+    def ticket_volume(self, run_id: int, ticket_id: str, after: int = 0) -> int:
+        """How many distinct findings this ticket's cycle *ended* on.
+
+        The companion to `ticket_classes`, and deliberately not summed the same
+        way. Classes are the union over the cycle, because a kind of failure
+        that appeared at any point in it is a kind of failure the cycle had.
+        A count cannot be unioned like that: a cycle of three attempts failing
+        7, 3 and 1 would total 11 against the next cycle's 3, and every cycle
+        that spends more attempts than the last would read as a regression.
+
+        So it is the last failed step of each *kind* — the size of the problem
+        as the cycle handed it over. Per kind rather than per step because a
+        cycle that ends on a red test suite has not fixed the lint findings it
+        was also carrying; per kind rather than in total because the last step
+        of the cycle is whichever one happened to run last.
+
+        Zero means nothing in the cycle could be counted, not that nothing
+        failed — `signatures` returns the empty set for output no pattern
+        recognises, and `_convergence` must not read that as a descent.
+        """
+        rows = self._connection.execute(
+            "SELECT name, findings FROM steps "
+            "WHERE run_id = ? AND ticket_id = ? AND status = 'failed' AND id > ? "
+            f"AND {_STEP_KIND_SQL} NOT IN ({_placeholders(NOT_ABOUT_THE_CODE)}) "
+            "ORDER BY id",
+            (run_id, ticket_id, after, *NOT_ABOUT_THE_CODE),
+        ).fetchall()
+
+        latest: dict[str, int] = {}
+        for row in rows:
+            latest[_step_kind(row["name"])] = int(row["findings"] or 0)
+        return sum(latest.values())
 
     def recent_steps(self, run_id: int, limit: int = 40) -> list[sqlite3.Row]:
         return list(

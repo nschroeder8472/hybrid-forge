@@ -145,12 +145,15 @@ has always said to write fixtures from recordings — and the seam between them
 is where both defects above hid.
 
 Replayed that way, `_convergence`, `flatCycles` and rung one of the ladder all
-run, deterministically and without a GPU. What it establishes: a failure set
+run, deterministically and without a GPU. What it established: a failure set
 shrinking *within one file* — 7 findings, then 3, then 1 of the same recorded
-`E501` output — reads `FLAT` twice and reaches `reviewWhenStuck`'s default
-rung, so the ladder escalates a ticket converging as fast as anything here ever
-has. That is the *Adaptive ticket loop* entry's argument happening to real
-output, and the strongest case yet for its volume signal.
+`E501` output — read `FLAT` twice and reached `reviewWhenStuck`'s default rung,
+so the ladder escalated a ticket converging as fast as anything here ever has.
+That is the *Adaptive ticket loop* entry's argument happening to real output,
+and it is the one thing in that entry that has since been built:
+`_convergence` now reads the size of the failure set as well as its members,
+and the same recorded curve descends. See the volume section of
+[CONVERGENCE.md](CONVERGENCE.md).
 
 **Which changes what this entry is waiting for.** After eleven runs the reading
 is no longer that the fixture is not hard enough, nor that its specs are too
@@ -175,13 +178,22 @@ than a proposal.
 
 The problem it names is the half of churn the convergence work does not
 measure. `_convergence` compares this cycle's failure classes against the last
-and answers *is the set moving* — `descending`, `churning`, `flat`. Nothing
-reads *how big the set is*. A ticket failing on 38 distinct classes and one
-failing on 7 are indistinguishable to every brake in the loop, and the only
-remedies either is offered are another attempt, a respec, or a park. The
-missing remedy is decomposition, and the invariant that makes it safe where
-respec is not: the union of the children's acceptance criteria must cover the
-parent's, so scope is conserved by construction rather than by judgement.
+and answers *is the set moving* — `descending`, `churning`, `flat`. A ticket
+failing on 38 distinct classes and one failing on 7 are indistinguishable to
+every brake in the loop, and the only remedies either is offered are another
+attempt, a respec, or a park. The missing remedy is decomposition, and the
+invariant that makes it safe where respec is not: the union of the children's
+acceptance criteria must cover the parent's, so scope is conserved by
+construction rather than by judgement.
+
+**Half of that is now built, and it is the half that was costing something.**
+`_convergence` reads the number of findings a cycle ended on as well as the
+classes, so a set shrinking inside one class descends instead of reading flat —
+the false stall the recorded `E501` curve demonstrated. What is still unbuilt
+is everything the volume was wanted *for*: nothing chooses a remedy from how
+large the set is, and no ticket is ever split. The signal is recorded on the
+ticket as `cycle_volume` and named in the log, which is where the entry below
+says a signal should sit until a live run has an opinion about the threshold.
 
 Three things the revision settled against the reference run rather than by
 argument, each worth reading before picking the document up:

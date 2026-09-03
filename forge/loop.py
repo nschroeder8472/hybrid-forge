@@ -2565,8 +2565,11 @@ class Orchestrator:
     FLAT = "flat"              # the same set, again
     CLEARED = "cleared"        # nothing failed this cycle at all
 
-    def _convergence(self, run_id: int, ticket: Ticket) -> tuple[str, list[str]]:
-        """Where this ticket's cycle stands against the last, and its classes.
+    def _convergence(
+        self, run_id: int, ticket: Ticket
+    ) -> tuple[str, list[str], int]:
+        """Where this ticket's cycle stands against the last, its classes, and
+        how many findings it ended on.
 
         Measured on failure *classes* rather than on the raw text, because that
         is the only form in which two attempts at the same mistake are the same
@@ -2579,6 +2582,25 @@ class Orchestrator:
         block in its own prompt is written for and which more attempts can
         genuinely resolve; flat is nothing varying at all, which more attempts
         cannot.
+
+        An unchanged set is not on its own nothing varying, and that is what
+        the volume comparison is here for. A class is `(step, code, file)`
+        precisely so that the same rule broken twice in one file is one thing
+        to learn — which means seven `E501` in one file and the single `E501`
+        left after six are fixed are the *same class*, and a set comparison
+        cannot tell them apart. Replayed against the recorded output of
+        `arm-blind`, 7 findings falling to 3 and then to 1 reads `FLAT` twice
+        and reaches `reviewWhenStuck`'s default rung: the ladder escalating a
+        ticket converging as fast as anything here ever has. So an unchanged
+        set whose findings are strictly fewer is `DESCENDING`.
+
+        Both counts have to be measurable for that to mean anything. Zero is
+        `signatures` saying it could not attribute the output rather than
+        saying the output was clean — the distinction a whole `flake8` run
+        being invisible was made of — so a comparison involving one stays
+        `FLAT` and the ladder keeps its say. A set that has grown stays `FLAT`
+        too: more of the same failure is not progress, and the brake it fires
+        is the one that belongs on it.
         """
         current = sorted(
             entry["name"]
@@ -2586,18 +2608,22 @@ class Orchestrator:
                 run_id, ticket.ticket_id, after=ticket.cycle_mark
             )
         )
+        volume = self.store.ticket_volume(
+            run_id, ticket.ticket_id, after=ticket.cycle_mark
+        )
         previous = sorted(ticket.cycle_classes)
         if not current:
-            return self.CLEARED, current
+            return self.CLEARED, current, volume
         if not previous:
-            return self.FIRST, current
+            return self.FIRST, current, volume
         if current == previous:
-            return self.FLAT, current
+            shrunk = 0 < volume < ticket.cycle_volume
+            return (self.DESCENDING if shrunk else self.FLAT), current, volume
         gone = set(previous) - set(current)
         arrived = set(current) - set(previous)
         if arrived and gone:
-            return self.CHURNING, current
-        return self.DESCENDING if gone else self.CHURNING, current
+            return self.CHURNING, current, volume
+        return (self.DESCENDING if gone else self.CHURNING), current, volume
 
     def _measure_cycle(self, run_id: int, ticket: Ticket) -> str:
         """Record where the ticket's cycle stands, and say so. Returns the state.
@@ -2608,24 +2634,40 @@ class Orchestrator:
         and nothing anywhere answered "is this ticket getting closer". A
         descending ticket should be visibly worth its next cycle.
         """
-        state, current = self._convergence(run_id, ticket)
-        # Read before the assignment below overwrites it.
+        state, current, volume = self._convergence(run_id, ticket)
+        # Read before the assignments below overwrite them.
         before = len(ticket.cycle_classes)
+        before_volume = ticket.cycle_volume
         ticket.flat_cycles = ticket.flat_cycles + 1 if state == self.FLAT else 0
         ticket.cycle_classes = current
+        ticket.cycle_volume = volume
         ticket.cycle_mark = self.store.last_step_id(run_id, ticket.ticket_id)
         self.store.record_convergence(run_id, ticket)
 
         if state in (self.FIRST, self.CLEARED):
             return state
         if state == self.DESCENDING:
+            # Two ways to descend, and a person reading the log needs to know
+            # which: a kind of failure went away, or the same kinds are being
+            # worked off one finding at a time.
+            movement = (
+                f"{len(current)} kind(s) of failure left, down from {before}"
+                if len(current) != before
+                else f"the same {len(current)} kind(s), "
+                f"down from {before_volume} findings to {volume}"
+            )
             self.store.log(
                 run_id,
-                f"{ticket.ticket_id}: converging — {len(current)} kind(s) of "
-                f"failure left, down from {before}. The next cycle is worth "
-                f"running.",
+                f"{ticket.ticket_id}: converging — {movement}. The next cycle "
+                f"is worth running.",
                 kind="ticket",
-                data={"ticket": ticket.ticket_id, "state": state, "classes": current},
+                data={
+                    "ticket": ticket.ticket_id,
+                    "state": state,
+                    "classes": current,
+                    "findings": volume,
+                    "findings_before": before_volume,
+                },
             )
             return state
         if state == self.CHURNING:
@@ -2636,15 +2678,25 @@ class Orchestrator:
                 f"something the last one satisfied.",
                 level="warn",
                 kind="ticket",
-                data={"ticket": ticket.ticket_id, "state": state, "classes": current},
+                data={
+                    "ticket": ticket.ticket_id,
+                    "state": state,
+                    "classes": current,
+                    "findings": volume,
+                },
             )
             return state
 
         self.store.log(
             run_id,
             f"{ticket.ticket_id}: flat — this cycle failed on exactly the same "
-            f"{len(current)} kind(s) as the last, for the "
-            f"{_ordinal(ticket.flat_cycles)} cycle running:\n"
+            f"{len(current)} kind(s) as the last"
+            + (
+                f", and on {volume} finding(s) against {before_volume}"
+                if volume and before_volume
+                else ""
+            )
+            + f", for the {_ordinal(ticket.flat_cycles)} cycle running:\n"
             + "\n".join(f"  - {name}" for name in current[:6]),
             level="warn",
             kind="ticket",
@@ -2652,6 +2704,8 @@ class Orchestrator:
                 "ticket": ticket.ticket_id,
                 "state": state,
                 "classes": current,
+                "findings": volume,
+                "findings_before": before_volume,
                 "flat_cycles": ticket.flat_cycles,
             },
         )

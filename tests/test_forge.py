@@ -149,6 +149,7 @@ from forge.providers.claude_cli import (
     parse_reset_time,
 )
 from forge.state import (
+    DETAIL_CHARS,
     TICKET_BLOCKED,
     TICKET_BUG,
     TICKET_DONE,
@@ -11988,6 +11989,97 @@ class TestTheLoopCountsWhatKeepsFailing(unittest.TestCase):
         orch.config.loop.prior_failures = 5
 
         self.assertEqual(orch._prior_failures, 5)
+
+
+class TestTheLoopCountsHowMuchKeepsFailing(unittest.TestCase):
+    """A class is `(step, code, file)`, so a file with seven `E501` in it and
+    the same file with one left are the same class. `ticket_volume` is the
+    number that comparison throws away, and without it a ticket working its
+    findings off one at a time reads as one that has done nothing."""
+
+    def _store(self):
+        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        return store, store.create_run("goal")
+
+    def _fail(self, store, run_id, name, detail, ticket="T-1"):
+        step = store.start_step(run_id, ticket, name)
+        store.end_step(step, "failed", detail)
+
+    def _lint(self, lines):
+        return "".join(
+            f"./a.py:{line}:80: E501 line too long (91 > 79 characters)\n"
+            for line in lines
+        )
+
+    def test_it_counts_the_findings_not_the_kinds(self):
+        store, run_id = self._store()
+
+        self._fail(store, run_id, "lint", self._lint(range(1, 8)))
+
+        self.assertEqual(len(store.ticket_classes(run_id, "T-1")), 1)
+        self.assertEqual(store.ticket_volume(run_id, "T-1"), 7)
+
+    def test_a_cycle_is_measured_on_where_it_ended(self):
+        # Not the sum over the cycle's attempts. Summed, a cycle of three
+        # attempts failing 7, 3 and 1 totals 11 against the next cycle's 3, and
+        # every cycle that spends more attempts than the last reads as a
+        # regression.
+        store, run_id = self._store()
+
+        for count in (7, 3, 1):
+            self._fail(store, run_id, "lint", self._lint(range(1, count + 1)))
+
+        self.assertEqual(store.ticket_volume(run_id, "T-1"), 1)
+
+    def test_each_kind_of_step_is_counted_where_it_ended(self):
+        # A cycle ending on a red suite has not fixed the lint findings it was
+        # also carrying, so the last lint still counts.
+        store, run_id = self._store()
+
+        suite = "FAIL tests/a.test.ts\nAssertionError: x"
+        self._fail(store, run_id, "lint", self._lint(range(1, 4)))
+        self._fail(store, run_id, "test", suite)
+
+        self.assertEqual(
+            store.ticket_volume(run_id, "T-1"), 3 + len(signatures(suite))
+        )
+
+    def test_a_step_that_cannot_fail_the_ticket_is_not_counted(self):
+        # The same exclusion `ticket_classes` makes, for the same reason: a
+        # recorder that ran out of budget must not move the ticket's numbers.
+        store, run_id = self._store()
+
+        self._fail(store, run_id, "lint", self._lint([1]))
+        self._fail(store, run_id, "record", "the planner spent its whole budget")
+
+        self.assertEqual(store.ticket_volume(run_id, "T-1"), 1)
+
+    def test_output_nothing_recognises_counts_as_nothing_measurable(self):
+        store, run_id = self._store()
+
+        self._fail(store, run_id, "lint", "something no pattern here matches\n")
+
+        self.assertEqual(store.ticket_volume(run_id, "T-1"), 0)
+
+    def test_it_is_counted_before_the_stored_copy_is_cut_down(self):
+        # `end_step` clips what it writes; the count is taken from the whole of
+        # what the tool said, like the classes beside it.
+        store, run_id = self._store()
+        many = self._lint(range(1, 4000))
+        self.assertGreater(len(many), DETAIL_CHARS)
+
+        self._fail(store, run_id, "lint", many)
+
+        self.assertEqual(store.ticket_volume(run_id, "T-1"), 3999)
+
+    def test_the_mark_scopes_it_to_one_cycle(self):
+        store, run_id = self._store()
+        self._fail(store, run_id, "lint", self._lint(range(1, 8)))
+        mark = store.last_step_id(run_id, "T-1")
+
+        self._fail(store, run_id, "lint", self._lint(range(1, 4)))
+
+        self.assertEqual(store.ticket_volume(run_id, "T-1", after=mark), 3)
 
 
 class TestTheRetryBrakeComparesClasses(unittest.TestCase):
