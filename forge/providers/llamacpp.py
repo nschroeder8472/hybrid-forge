@@ -362,6 +362,12 @@ class LlamaCppProvider(OpenAICompatProvider):
             context_window=int(self.config.get("contextWindow", 0) or 0),
             max_output_tokens=int(self.config.get("maxOutputTokens", 4096)),
             supports_temperature=bool(self.config.get("supportsTemperature", True)),
+            # A property of the checkpoint, not of the adapter: a GGUF with a
+            # projector beside it can see and one without cannot. `multimodal`
+            # is the same key `presets` reads to decide whether to write
+            # `mmproj-auto = false`, so a model declared blind here is one the
+            # router was told not to load a projector for.
+            supports_images=bool(self.config.get("multimodal", False)),
         )
         if not caps.context_window:
             # The preset's own `-c`, when it pins one. Never the trained

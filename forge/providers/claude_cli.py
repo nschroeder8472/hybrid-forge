@@ -157,6 +157,7 @@ class ClaudeCLIProvider(Provider):
         # Zero means the caller did not care; the budget decides. An
         # explicit timeout is always truthy and passes through.
         timeout = timeout or self.request_timeout(max_tokens)
+        self._require_vision(messages)
         system, turns = split_system(messages)
 
         argv = [self.binary, "-p", "--output-format", "json"]
@@ -172,7 +173,7 @@ class ClaudeCLIProvider(Provider):
         argv += self.extra_args
 
         prompt = "\n\n".join(
-            f"{'User' if m.role == 'user' else 'Assistant'}: {m.content}" for m in turns
+            f"{'User' if m.role == 'user' else 'Assistant'}: {m.text}" for m in turns
         )
 
         if not shutil.which(self.binary):
@@ -290,4 +291,10 @@ class ClaudeCLIProvider(Provider):
             max_output_tokens=int(self.config.get("maxOutputTokens", 32_000)),
             # The CLI has no temperature knob; the loop must not try to set one.
             supports_temperature=False,
+            # The prompt reaches the CLI as text on stdin and there is nowhere
+            # to put bytes. Naming a file path instead would not work either:
+            # this adapter defaults to no tools, which is what makes it behave
+            # like the completion endpoint the loop assumes, so a reviewer sent
+            # `assets/hero.png` would be ruling on a filename.
+            supports_images=False,
         )

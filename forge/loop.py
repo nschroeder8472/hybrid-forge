@@ -255,7 +255,7 @@ def _droppable(message: Message) -> bool:
     """
     if message.role == "assistant":
         return True
-    return message.role == "user" and message.content.startswith(_DROPPABLE_HEADINGS)
+    return message.role == "user" and message.text.startswith(_DROPPABLE_HEADINGS)
 
 
 CONTROL_KEY = "command"

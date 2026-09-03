@@ -33,6 +33,7 @@ only at `forge init`, so repos initialized by an older version are covered too.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -64,6 +65,27 @@ _GITIGNORE_LINES = (
 GITIGNORE_LINES = "".join(line + "\n" for line in _GITIGNORE_LINES)
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+# Bytes a record must never inline. A prompt that carried an image would
+# otherwise reach `json.dumps(..., default=str)` and be written as the repr of
+# its own bytes: megabytes of `PNG` in a file whose entire purpose is being
+# read by eye at 2am. Recorded as media type, size and digest instead — and by
+# path where one is known, which is where the bytes actually are.
+_IMAGE_SUMMARY_KEYS = ("media_type", "bytes", "digest")
+
+
+def _readable(value: Any) -> Any:
+    """One payload value, with anything unreadable reduced to a description."""
+    summary = getattr(value, "summary", None)
+    if callable(summary) and hasattr(value, "digest"):
+        return summary()
+    if isinstance(value, (bytes, bytearray)):
+        return {"bytes": len(value), "digest": hashlib.sha256(value).hexdigest()[:16]}
+    if isinstance(value, dict):
+        return {key: _readable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_readable(item) for item in value]
+    return value
 
 
 def safe_name(value: str, fallback: str = "unnamed") -> str:
@@ -139,7 +161,7 @@ class Artifacts:
             "attempt": max(1, attempt),
             "step": name,
             "recorded_at": time.time(),
-            **payload,
+            **{key: _readable(value) for key, value in payload.items()},
         }
 
         try:

@@ -19,6 +19,7 @@ a fact rather than a best effort.
 
 from __future__ import annotations
 
+import base64
 import os
 from typing import Any
 
@@ -27,6 +28,7 @@ from .base import (
     DERIVE_TIMEOUT,
     Capabilities,
     Completion,
+    ImagePart,
     Message,
     Provider,
     ProviderBadResponse,
@@ -39,6 +41,33 @@ from .base import (
 # pointing forge at has more, so this is a floor that makes the budget gate
 # work rather than an estimate of anything — `forge doctor` says to set it.
 DEFAULT_CONTEXT_WINDOW = 8192
+
+
+def _turn(message: Message) -> dict[str, Any]:
+    """One turn in the chat-completions shape.
+
+    A string stays a string. The parts form is the multi-part `content` array
+    every OpenAI-compatible server that accepts images accepts, with the image
+    inlined as a `data:` URL rather than fetched from one — the server would
+    be reaching back out over the network for a file only the daemon has.
+    """
+    if isinstance(message.content, str):
+        return {"role": message.role, "content": message.content}
+    return {
+        "role": message.role,
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{part.media_type};base64,"
+                    + base64.b64encode(part.data).decode("ascii")
+                },
+            }
+            if isinstance(part, ImagePart)
+            else {"type": "text", "text": part.text}
+            for part in message.parts
+        ],
+    }
 
 
 class OpenAICompatProvider(Provider):
@@ -102,9 +131,10 @@ class OpenAICompatProvider(Provider):
         # Zero means the caller did not care; the budget decides. An
         # explicit timeout is always truthy and passes through.
         timeout = timeout or self.request_timeout(max_tokens)
+        self._require_vision(messages)
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "messages": [_turn(m) for m in messages],
             "max_tokens": max_tokens,
             **self.sampling,
             # Last, so a hand-written body can still override anything above it.
@@ -248,6 +278,10 @@ class OpenAICompatProvider(Provider):
             context_window=int(self.config.get("contextWindow", 0) or 0),
             max_output_tokens=int(self.config.get("maxOutputTokens", 4096)),
             supports_temperature=bool(self.config.get("supportsTemperature", True)),
+            # Off unless the operator says otherwise. "OpenAI-compatible" is a
+            # claim about the request shape, not about the model behind it, and
+            # nothing here can ask an arbitrary endpoint whether it can see.
+            supports_images=bool(self.config.get("multimodal", False)),
         )
         if not caps.context_window:
             caps.context_window = DEFAULT_CONTEXT_WINDOW

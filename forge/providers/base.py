@@ -19,6 +19,7 @@ them:
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from abc import ABC, abstractmethod
@@ -34,9 +35,104 @@ Role = Literal["planner", "executor", "tester", "reviewer"]
 
 
 @dataclass
+class TextPart:
+    """Ordinary prompt text, as one part of a message."""
+
+    text: str
+
+
+@dataclass
+class ImagePart:
+    """An image inlined into a prompt.
+
+    Carried as bytes and base64-encoded at the wire edge, per provider, so the
+    loop never holds a provider's encoding of it.
+
+    `width` and `height` are metadata supplied by whoever built the part, not
+    something read out of the pixels. The daemon does not decode images — it
+    has no image library and an image is arbitrary bytes from a model — but
+    the budget gate still has to price the message, and every provider that
+    bills for images bills by area. A part with no dimensions is priced at the
+    worst case rather than at zero: an under-priced prompt overflows a context
+    window after it has been paid for.
+    """
+
+    media_type: str
+    data: bytes
+    width: int = 0
+    height: int = 0
+    # Where the bytes live on disk, when they came from a file. Recorded in
+    # artifacts instead of the bytes themselves.
+    path: str = ""
+
+    @property
+    def digest(self) -> str:
+        """A stable identity for these bytes.
+
+        What a record keeps instead of the image, and what a prompt
+        fingerprint hashes: two prompts differing only in the image they carry
+        are two different prompts.
+        """
+        return hashlib.sha256(self.data).hexdigest()
+
+    def summary(self) -> dict[str, Any]:
+        """The part as something a JSON record can hold."""
+        return {
+            "media_type": self.media_type,
+            "bytes": len(self.data),
+            "digest": self.digest[:16],
+            "width": self.width,
+            "height": self.height,
+            "path": self.path,
+        }
+
+
+Part = TextPart | ImagePart
+
+
+@dataclass
 class Message:
+    """One turn of a prompt.
+
+    `content` stays a `str` and means exactly what it used to. Every prompt in
+    the loop builds one that way and none of them changed: a string is read as
+    a single `TextPart`, and the parts list exists for the one thing a string
+    cannot carry. A reviewer that cannot see the image is not a reviewer —
+    which is true of a screenshot attached to an ordinary code ticket, with no
+    image generation anywhere in the picture.
+    """
+
     role: Literal["system", "user", "assistant"]
-    content: str
+    content: str | list[Part]
+
+    @property
+    def parts(self) -> list[Part]:
+        """The content as parts, whichever way it was given."""
+        if isinstance(self.content, str):
+            return [TextPart(self.content)]
+        return list(self.content)
+
+    @property
+    def text(self) -> str:
+        """Every text part, joined.
+
+        What a caller that reasons about prompt *prose* wants — the droppable
+        check, the system-message split, a log line. An image contributes
+        nothing to it and must not contribute a placeholder either: a heading
+        check reading `[image]` is a check reading something no prompt builder
+        wrote.
+        """
+        if isinstance(self.content, str):
+            return self.content
+        return "".join(
+            part.text for part in self.content if isinstance(part, TextPart)
+        )
+
+    @property
+    def images(self) -> list[ImagePart]:
+        if isinstance(self.content, str):
+            return []
+        return [part for part in self.content if isinstance(part, ImagePart)]
 
 
 @dataclass
@@ -111,6 +207,13 @@ class Capabilities:
     max_output_tokens: int = 4096
     supports_system_role: bool = True
     supports_temperature: bool = True
+    # Whether this model can be shown an image. Off by default, and declared
+    # rather than assumed: on llamacpp it is a property of the checkpoint
+    # rather than of the adapter — a GGUF with a projector beside it can see
+    # and one without cannot, and forge turns the projector off by default
+    # because it costs VRAM no text-only role uses. A blind model handed an
+    # image is not a slower reviewer, it is a reviewer ruling on a filename.
+    supports_images: bool = False
     # Reserved headroom so a slightly-off token estimate does not overflow.
     safety_margin_tokens: int = 512
 
@@ -144,6 +247,18 @@ class ProviderBadResponse(ProviderError):
 
 class ProviderAuthError(ProviderError):
     """Bad or missing credentials. Never retried — it will not fix itself."""
+
+    retryable = False
+
+
+class ProviderCannotSee(ProviderError):
+    """A model without vision was handed an image.
+
+    Never retried: the checkpoint does not grow a projector between attempts.
+    Raised rather than silently dropping the image, because a prompt that says
+    "does this match the criteria" with the image removed is a question the
+    model will answer anyway.
+    """
 
     retryable = False
 
@@ -361,6 +476,24 @@ class Provider(ABC):
 
         return estimate_messages(messages)
 
+    def _require_vision(self, messages: list[Message]) -> None:
+        """Refuse a prompt carrying an image this model cannot see.
+
+        Every adapter calls this before it formats a request. Checked here
+        rather than at `config.validate()` alone because a role's capability is
+        a property of the model it is pointed at, and a prompt only sometimes
+        carries an image.
+        """
+        if not any(message.images for message in messages):
+            return
+        if self.capabilities().supports_images:
+            return
+        raise ProviderCannotSee(
+            f"{self.name} ({self.kind}, model={self.model}) was given a prompt "
+            f"carrying an image and cannot see one. Point this role at a "
+            f"multimodal model, or do not send it images."
+        )
+
     # Enough for a reasoning model to think before it answers. The probe used
     # to ask for 16, which a reasoning model spends entirely on its preamble:
     # it returned an empty string with finish_reason "length" and the endpoint
@@ -453,6 +586,6 @@ def split_system(messages: list[Message]) -> tuple[str, list[Message]]:
     Anthropic and Gemini both want the system prompt outside the turn list.
     Multiple system messages are concatenated rather than dropped.
     """
-    system_parts = [m.content for m in messages if m.role == "system"]
+    system_parts = [m.text for m in messages if m.role == "system"]
     rest = [m for m in messages if m.role != "system"]
     return "\n\n".join(system_parts), rest

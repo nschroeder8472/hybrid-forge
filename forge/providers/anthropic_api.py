@@ -17,6 +17,7 @@ wrong:
 
 from __future__ import annotations
 
+import base64
 import os
 from typing import Any
 
@@ -25,6 +26,7 @@ from .base import (
     DERIVE_TIMEOUT,
     Capabilities,
     Completion,
+    ImagePart,
     Message,
     Provider,
     ProviderAuthError,
@@ -33,6 +35,34 @@ from .base import (
 )
 
 API_VERSION = "2023-06-01"
+
+
+def _turn(message: Message) -> dict[str, Any]:
+    """One turn in the shape the Messages API takes.
+
+    A plain string stays a plain string: content blocks are equivalent, and
+    sending them where a string was sent before would change every recorded
+    request body for no reason.
+    """
+    if isinstance(message.content, str):
+        return {"role": message.role, "content": message.content}
+    return {
+        "role": message.role,
+        "content": [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": part.media_type,
+                    "data": base64.b64encode(part.data).decode("ascii"),
+                },
+            }
+            if isinstance(part, ImagePart)
+            else {"type": "text", "text": part.text}
+            for part in message.parts
+        ],
+    }
+
 
 # Models that reject temperature/top_p/top_k with a 400. Matched as prefixes so
 # a dated snapshot of the same family is covered too.
@@ -86,11 +116,12 @@ class AnthropicProvider(Provider):
         # Zero means the caller did not care; the budget decides. An
         # explicit timeout is always truthy and passes through.
         timeout = timeout or self.request_timeout(max_tokens)
+        self._require_vision(messages)
         system, turns = split_system(messages)
         payload: dict[str, Any] = {
             "model": self.model,
             "max_tokens": max_tokens,
-            "messages": [{"role": m.role, "content": m.content} for m in turns],
+            "messages": [_turn(m) for m in turns],
         }
         if system:
             payload["system"] = system
@@ -152,7 +183,7 @@ class AnthropicProvider(Provider):
         system, turns = split_system(messages)
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [{"role": m.role, "content": m.content} for m in turns],
+            "messages": [_turn(m) for m in turns],
         }
         if system:
             payload["system"] = system
@@ -183,6 +214,10 @@ class AnthropicProvider(Provider):
             context_window=context_window,
             max_output_tokens=max_output,
             supports_temperature=self._accepts_temperature(),
+            # Every Claude model this adapter reaches takes images. `vision:
+            # false` on the model block is for a future one that does not,
+            # and for an operator who wants the refusal rather than the bill.
+            supports_images=bool(self.config.get("vision", True)),
         )
         return self._caps
 

@@ -334,7 +334,13 @@ adds `forge toolchain` to set one up. Five phases, each landing on its own.
 
 ## Image generation as a ticket kind
 
-**Status:** designed, not built — [IMAGE-LOOP.md](IMAGE-LOOP.md).
+**Status:** phase 1 built, the rest designed — [IMAGE-LOOP.md](IMAGE-LOOP.md).
+Multimodal messages landed on their own: a prompt may carry an `ImagePart`, a
+provider declares whether it can see one, and a model that cannot is refused
+before the request rather than shown a question with the image removed. That is
+useful with no image generation anywhere — a reviewer handed a screenshot on an
+ordinary code ticket — and it is the only part of this entry that does not
+depend on the spec below surviving contact with a model.
 
 The loop's steps are named after code, but only two of them are about code. The
 rest is a shape: produce an artifact under a scope, check it mechanically, have
@@ -353,10 +359,9 @@ Three things make it more than a `kind` string, and the spec is mostly about
 them.
 
 - **A reviewer that cannot see the image is not a reviewer.** `Message.content`
-  is a `str` and every adapter formats it as one. Multimodal messages are
-  phase 1, and they ship useful on their own — a reviewer handed a screenshot on
-  an ordinary code ticket needs the same change, with no image generation in the
-  picture.
+  was a `str` and every adapter formatted it as one. This was phase 1 and it is
+  built; it shipped useful on its own, which is the argument the phase order was
+  making.
 - **There is no compiler.** A six-fingered hand passes every mechanical check
   that can be written. Dimensions, palette distance, OCR and safe-area
   occupancy are real and worth asserting, and they are also a shell script the
@@ -393,11 +398,12 @@ Found while reviewing the loop, judged not worth building yet.
   makes it behave like the completion endpoint the loop assumes. A stronger
   version would let a role *declare* what it needs — "this role reads text and
   returns text" — and refuse a provider that cannot promise it, rather than
-  relying on a default. The image spec above makes this load-bearing: a reviewer
-  that has to *see* needs a capability most adapters cannot offer — and on
-  `llamacpp` it is not even a property of the adapter but of the checkpoint,
-  since forge turns the projector off by default. Discovering that at review
-  time costs the ticket.
+  relying on a default. One capability now works that way and only one:
+  `supports_images` is declared per model, and a prompt carrying an image
+  reaches a provider that cannot see it as a refusal rather than as a silently
+  text-only question. It is still discovered at call time rather than at
+  `config.validate()`, because nothing yet knows a role is *going* to be sent
+  an image — which is what `kind: image` would settle.
 - **Cross-ticket oscillation detection.** The executor now sees its last two
   failures, which is enough to spot an A-then-B-then-A cycle if it reads them.
   Detecting the cycle mechanically — comparing failure signatures across
