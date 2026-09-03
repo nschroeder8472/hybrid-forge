@@ -42,18 +42,127 @@ difficulty for this executor; what defeats it is a spec that is wrong. That is
 also what the `Puzzle-Path` run these features came from was: 430 attempts
 against criteria that could not all hold at once. So the honest test of the ten
 features is a backlog whose specs are subtly wrong in a way that takes several
-attempts to expose, and writing one is what this entry now waits on.
+attempts to expose.
 
-The problem that document names: a run can be long without being wrong, and
-this one was neither converging nor able to tell. 18.2 hours, 24.5M tokens, 430
-attempts on one ticket, and the distinct-error-kinds-per-failure curve is flat
-across every decile of every stuck ticket. The loop had no measure of progress,
-its only durable per-ticket learning slot was rebuilt from the plan every cycle,
-and the models were being graded against linter and compiler configuration they
-were never shown.
+`examples/sample-project/GRIND.md` was written to be that backlog and has now
+run twice, both 2026-09-01. It did not reach the middle either, and how it
+missed is the finding.
 
-The stall-detection note under *Deferred from the review* below is the same
-problem seen from the image loop, and Feature 7 is its general answer.
+Both runs ended `done`, both tickets, on the first attempt, with zero retry
+cycles and no failed step — 19 calls and 129.8k tokens in 1081 seconds, then 19
+calls and 132.7k tokens in 1116 seconds. All four delivered files are correct
+on every criterion, checked independently afterwards. The second run was made
+because the first was `n = 1`; it reproduced, with three of the four files
+byte-identical to the first run's.
+
+- **`GR-001`** bet that what defeats this executor is state over time rather
+  than breadth — a sliding window whose evictions have to reduce counts, drop a
+  word that falls to zero, and leave a list handed out earlier alone, with every
+  criterion a sequence of calls. Nine for nine, one attempt. It joins `HARD.md`
+  as a control case.
+- **`GR-002`** was written to be jointly impossible and is not: its criteria
+  hold together under a correction that runs in one direction only, adding a
+  shortfall when the rounded shares fall short of `100` and leaving them alone
+  when they overshoot. The impossibility argument assumed a symmetric fix.
+
+What the loop did with `GR-002` is the result worth keeping. On both runs all
+four roles refused to sign it on pass 1, each naming the same defect — *each
+`1/3` share rounds to `33`, so the displayed percentages sum to `99`* — and the
+planner repaired the **spec** while the criteria ratchet held seven criteria
+unchanged. Pass 2 unanimous, build green first attempt, and the delivered
+`table.py` identical between runs, so the repair converged on the same
+asymmetric rule rather than stumbling onto it once. The first live evidence
+that the sign-off pass catches a genuine spec defect and puts the repair where
+it belongs.
+
+**Lint was switched on, and it changed nothing.** The fixture graded a ticket
+on its unit tests alone — `lint` and `typecheck` were `skip` for `.py` in both
+workspaces — while the `Puzzle-Path` stall was overwhelmingly a lint stall. So
+`flake8` was turned on in both builds on 2026-09-02 and `GRIND.md` run a third
+time. Every lint step passed: start, baseline, per-attempt, final, both builds,
+both tickets, no finding, and the delivered files are clean at `79` as well as
+at the configured `88`. Whatever defeats this executor, writing lint-clean
+Python is not it.
+
+The run did cost one extra attempt, and the reviewer spent it: `GR-002`'s first
+attempt met all seven criteria and was rejected because the equal-thirds test
+asserted only the sum, where the ratification record had the tester promising
+exact expected rows. That is `weakened_criteria`'s failure class caught by
+judgement on a ticket the mechanical net had passed — and a point against the
+*Reviewer cost* entry below.
+
+It still did not reach the convergence machinery. `_measure_cycle` runs over
+tickets eligible for a *retry cycle*, and `GR-002` finished inside its first
+one, so `_convergence` was never called and `flat_cycles` stayed `0`. Two
+attempts is not a cycle.
+
+**Which narrows what this entry waits on.** Three kinds of defective spec are
+now distinguishable, and only one of them reaches the convergence machinery.
+`STALL.md` is a criterion contradicting code the ticket may not write — no
+revision inside the ticket fixes it, so it parks. `GR-002` is a rule that
+cannot produce one of its own criteria — revising the rule fixes it, before a
+build call is spent. Neither becomes a failing attempt, and every brake in
+[CONVERGENCE.md](CONVERGENCE.md) lives on failing attempts. What is left is a
+ticket that ratification signs off honestly and whose *work* the executor then
+gets wrong several times over, hard enough to exhaust `maxAttempts` and be
+requeued — because only a requeue reaches `_measure_cycle`. Every attempt at
+that shape so far — four runs of `HARD.md` and three of `GR-001` — has landed
+on the first try.
+
+**The experiment that stopped trying to out-hard the executor has run:**
+[BLIND-GRADING.md](BLIND-GRADING.md), three times on 2026-09-03. It put the
+reference run's actual defect back — a grading rule no prompt contains — and
+changed one variable, `loop.toolchainContext`, between two otherwise identical
+arms. Results:
+
+- **Feature 1 has live evidence.** Showing the executor the `.flake8` it is
+  graded by cut first-pass findings from 24 to 4, charged attempts from 3 to 1,
+  and tokens by a quarter. Everything said about toolchain context before this
+  was a replay.
+- **Feature 6 was seen working once, under conditions a defect created.** At
+  `maxAttempts: 2` the ticket failed its cycle, recorded *"the verify lint
+  rejects E501 for lines longer than 50 characters in this repository"*, and
+  the next cycle landed on its first attempt — against a reference run whose
+  context column held the plan's paragraph verbatim after 86 cycles. Round two,
+  with the defect fixed, produced no failed cycle and so no learning to record.
+- **`_measure_cycle` ran for the first time**, recorded the cycle's classes and
+  returned `FIRST` — and stopped running again once the defect below was fixed.
+
+**Round two, after fixing what round one found, re-measured all of it.** The
+first round's compile gate could not count lint findings, so it charged two
+attempts it should not have; with that repaired, both arms land in **one**
+attempt and nothing is ever requeued. Feature 1's honest value is therefore not
+`3 attempts against 1` but 24 findings against 4, one extra gated turn, and 19%
+more tokens. And the only time this fixture reached `_measure_cycle` was on the
+strength of that bug: fixing it took the requeue away.
+
+**The evidence now comes from replay, not from another live run.**
+`tests/recorded.py` drives a real `Orchestrator` with the model and shell
+scripted and the failure *details* lifted verbatim from these runs' databases
+by `scripts/harvest_recording.py`. Both halves already existed — the suite has
+scripted models throughout, and §9 of [LOOP-INVARIANTS.md](LOOP-INVARIANTS.md)
+has always said to write fixtures from recordings — and the seam between them
+is where both defects above hid.
+
+Replayed that way, `_convergence`, `flatCycles` and rung one of the ladder all
+run, deterministically and without a GPU. What it establishes: a failure set
+shrinking *within one file* — 7 findings, then 3, then 1 of the same recorded
+`E501` output — reads `FLAT` twice and reaches `reviewWhenStuck`'s default
+rung, so the ladder escalates a ticket converging as fast as anything here ever
+has. That is the *Adaptive ticket loop* entry's argument happening to real
+output, and the strongest case yet for its volume signal.
+
+**Which changes what this entry is waiting for.** After eleven runs the reading
+is no longer that the fixture is not hard enough, nor that its specs are too
+good. It is that every mechanism below the ladder absorbs the failure the
+ladder exists to escalate: the compile gate answers a lint failure inside the
+attempt, the learning slot and respec answer it across a cycle, and
+ratification answers a defective spec before a build call is spent. What would
+reach the ladder is a defect whose *failure text does not describe it* — the
+reference run's `TS2532 object is possibly undefined` names a symptom whose
+cause is a compiler flag two files away, where `E501 line too long (52 > 50
+characters)` hands over the rule. That is the fixture's next ticket, if there
+is one.
 
 ---
 
