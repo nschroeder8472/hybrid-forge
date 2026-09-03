@@ -19,7 +19,7 @@
     {
       "root": ".",
       "commands": {
-        "lint": { ".py": "skip" },
+        "lint": { ".py": "python -m flake8 ." },
         "typecheck": { ".py": "skip" },
         "test": { ".py": "python -m unittest discover -s tests -p \"*_test.py\" -t ." }
       }
@@ -27,7 +27,7 @@
     {
       "root": "plugin",
       "commands": {
-        "lint": { ".py": "skip" },
+        "lint": { ".py": "python -m flake8 ." },
         "typecheck": { ".py": "skip" },
         "test": { ".py": "python -m unittest discover -s tests -p \"*_test.py\" -t ." }
       }

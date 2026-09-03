@@ -138,7 +138,9 @@ def _artifact_records(config: Config, run_id: int | None, ticket: str | None) ->
     return found
 
 
-def _step_records(config: Config, store: Store, run_id: int | None, ticket: str | None) -> list[Record]:
+def _step_records(
+    config: Config, store: Store, run_id: int | None, ticket: str | None
+) -> list[Record]:
     """The database's copy, for runs recorded before artifacts existed.
 
     Clipped at 20k characters by the writer, and carrying no record of what the

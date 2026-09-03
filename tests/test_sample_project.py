@@ -88,13 +88,16 @@ class TestTheFixtureIsOnlyTheFixture(unittest.TestCase):
     the working tree, which is what a person reads."""
 
     EXPECTED = {
+        ".flake8",
         ".hybridforge/.gitignore",
         ".hybridforge/config.json",
         "BUG.md",
         "README.md",
+        "GRIND.md",
         "HARD.md",
         "SPEC.md",
         "STALL.md",
+        "plugin/.flake8",
         "plugin/histogram/__init__.py",
         "plugin/histogram/bars.py",
         "plugin/pyproject.toml",
@@ -321,33 +324,67 @@ class TestTheHardBacklogIsHardAndNotImpossible(unittest.TestCase):
     def test_every_criterion_is_satisfiable_by_a_correct_implementation(self):
         # The difference between this backlog and `STALL.md`, and the property
         # that decides which one the loop is being tested against. Checked by
-        # implementing the spec here and reading the criteria back.
+        # implementing the spec here and reading every criterion back — all
+        # nine, so a revision of the spec that outruns this reference is a
+        # failure here rather than a silently weaker guard.
         from decimal import ROUND_HALF_UP, Decimal
 
-        def shares(counts):
+        def shares(counts, limit=0):
             if not counts:
                 return []
             total = sum(counts.values())
-            width = max(len(word) for word in counts)
             ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-            return [
-                f"{word.ljust(width)} "
-                f"{(Decimal(100 * count) / Decimal(total)).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP)}%"
-                for word, count in ranked
-            ]
+            shown = list(ranked)
+            if 0 < limit < len(ranked):
+                shown = ranked[:limit]
+                shown.append(("other", sum(count for _label, count in ranked[limit:])))
+            width = max(len(label) for label, _count in shown)
+            rows = []
+            for label, count in shown:
+                share = (Decimal(100 * count) / Decimal(total)).quantize(
+                    Decimal("0.1"), rounding=ROUND_HALF_UP
+                )
+                rows.append(f"{label.ljust(width)} " + f"{share}%".rjust(6))
+            words = f"{len(counts)} word{'' if len(counts) == 1 else 's'}"
+            occurrences = f"{total} occurrence{'' if total == 1 else 's'}"
+            return rows + [f"{words}, {occurrences}"]
 
-        self.assertEqual(shares({"a": 1, "b": 1}), ["a 50.0%", "b 50.0%"])
         self.assertEqual(
-            shares({"apple": 2, "b": 1}), ["apple 66.7%", "b     33.3%"]
+            shares({"a": 1, "b": 1}),
+            ["a  50.0%", "b  50.0%", "2 words, 2 occurrences"],
         )
         self.assertEqual(
-            shares({"a": 1, "b": 2, "c": 3}), ["c 50.0%", "b 33.3%", "a 16.7%"]
+            shares({"apple": 2, "b": 1}),
+            ["apple  66.7%", "b      33.3%", "2 words, 3 occurrences"],
+        )
+        self.assertEqual(
+            shares({"a": 1, "b": 2, "c": 3}),
+            ["c  50.0%", "b  33.3%", "a  16.7%", "3 words, 6 occurrences"],
         )
         self.assertEqual(
             shares({"b": 1, "a": 1, "c": 1}),
-            ["a 33.3%", "b 33.3%", "c 33.3%"],
+            ["a  33.3%", "b  33.3%", "c  33.3%", "3 words, 3 occurrences"],
         )
-        self.assertEqual(shares({"a": 13, "b": 67}), ["b 83.8%", "a 16.3%"])
+        self.assertEqual(
+            shares({"a": 13, "b": 67}),
+            ["b  83.8%", "a  16.3%", "2 words, 80 occurrences"],
+        )
+        self.assertEqual(
+            shares({"a": 1}), ["a 100.0%", "1 word, 1 occurrence"]
+        )
+        self.assertEqual(
+            shares({"a": 5, "b": 3, "c": 2, "d": 1}, 2),
+            [
+                "a      45.5%",
+                "b      27.3%",
+                "other  27.3%",
+                "4 words, 11 occurrences",
+            ],
+        )
+        self.assertEqual(
+            shares({"a": 2, "b": 1}, 5),
+            ["a  66.7%", "b  33.3%", "2 words, 3 occurrences"],
+        )
         self.assertEqual(shares({}), [])
 
     def test_the_rounding_criterion_is_a_real_trap(self):
@@ -364,6 +401,204 @@ class TestTheHardBacklogIsHardAndNotImpossible(unittest.TestCase):
         self.assertEqual(theirs & mine, set())
         for path in mine:
             self.assertFalse((SAMPLE / path).exists(), path)
+
+
+class TestTheGrindBacklogReachesTheMiddleOfTheLoop(unittest.TestCase):
+    """`GRIND.md` was written for the middle of `docs/CONVERGENCE.md` — a
+    failure set with somewhere to descend from — and its one run did not reach
+    it: both tickets done, one attempt each, nothing failed.
+
+    `GR-001` landed first try, so it is a control case beside `HARD.md`.
+    `GR-002` was written to be jointly impossible and is not: its criteria hold
+    together under an asymmetric correction, which is proved here rather than
+    argued, because arguing it is what got it wrong the first time. What was
+    defective was the ticket's stated *rule*, and the sign-off pass refused the
+    ticket over exactly that."""
+
+    def setUp(self):
+        self.tickets, self.how, _derived = ingest(
+            (SAMPLE / "GRIND.md").read_text(encoding="utf-8")
+        )
+        self.grind = {ticket.ticket_id: ticket for ticket in self.tickets}
+
+    def test_it_is_two_parsed_tickets(self):
+        self.assertEqual(self.how, "parsed")
+        self.assertEqual([t.ticket_id for t in self.tickets], ["GR-001", "GR-002"])
+
+    def test_neither_ticket_waits_on_the_other(self):
+        # A dependency would park GR-002 behind GR-001 rather than running it,
+        # and the whole point is that the two halves fail independently.
+        for ticket in self.tickets:
+            self.assertEqual(ticket.needs, [], ticket.ticket_id)
+
+    def test_the_satisfiable_ticket_is_satisfiable(self):
+        # The property that separates GR-001 from `STALL.md`. Checked by
+        # implementing its spec here and reading all nine criteria back.
+        class Stream:
+            def __init__(self, window):
+                if window < 1:
+                    raise ValueError("window must be positive")
+                self.window = window
+                self.texts = []
+                self.counts = {}
+
+            def add(self, text):
+                if len(self.texts) >= self.window:
+                    for word in self.texts.pop(0):
+                        self.counts[word] -= 1
+                        if self.counts[word] == 0:
+                            del self.counts[word]
+                words = [word.lower() for word in text.split()]
+                self.texts.append(words)
+                for word in words:
+                    self.counts[word] = self.counts.get(word, 0) + 1
+
+            def top(self, n):
+                ranked = sorted(self.counts.items(), key=lambda kv: (-kv[1], kv[0]))
+                return ranked[:n]
+
+            def distinct(self):
+                return len(self.counts)
+
+        with self.assertRaises(ValueError) as raised:
+            Stream(0)
+        self.assertEqual(str(raised.exception), "window must be positive")
+
+        stream = Stream(2)
+        stream.add("a b")
+        self.assertEqual(stream.top(5), [("a", 1), ("b", 1)])
+        self.assertEqual(stream.distinct(), 2)
+
+        stream = Stream(2)
+        for text in ("a", "b", "c"):
+            stream.add(text)
+        self.assertEqual(stream.top(5), [("b", 1), ("c", 1)])
+        self.assertEqual(stream.distinct(), 2)
+
+        stream = Stream(2)
+        stream.add("a")
+        stream.add("a")
+        self.assertEqual(stream.top(5), [("a", 2)])
+        stream.add("b")
+        self.assertEqual(stream.top(5), [("a", 1), ("b", 1)])
+
+        stream = Stream(2)
+        stream.add("a")
+        handed_out = stream.top(5)
+        self.assertEqual(handed_out, [("a", 1)])
+        stream.add("a")
+        self.assertEqual(handed_out, [("a", 1)])
+        self.assertEqual(stream.top(5), [("a", 2)])
+
+        stream = Stream(1)
+        stream.add("b a a c")
+        self.assertEqual(stream.top(5), [("a", 2), ("b", 1), ("c", 1)])
+        self.assertEqual(stream.top(2), [("a", 2), ("b", 1)])
+
+        stream = Stream(1)
+        stream.add("A a")
+        self.assertEqual(stream.top(5), [("a", 2)])
+
+        stream = Stream(3)
+        self.assertEqual(stream.top(5), [])
+        self.assertEqual(stream.distinct(), 0)
+
+        stream = Stream(1)
+        stream.add("a")
+        self.assertEqual(stream.top(0), [])
+
+    def test_the_second_tickets_criteria_hold_together_asymmetrically(self):
+        # GR-002 was written to be jointly impossible and is not, which the run
+        # of 2026-09-01 established and this pins. All seven criteria hold at
+        # once under a correction that runs in one direction only — the rule
+        # the sign-off pass wrote into the spec, reproduced here.
+        from decimal import ROUND_HALF_UP, Decimal
+
+        def rounded(counts):
+            total = sum(counts.values())
+            ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+            return ranked, [
+                int(
+                    (Decimal(100 * count) / Decimal(total)).quantize(
+                        Decimal("1"), rounding=ROUND_HALF_UP
+                    )
+                )
+                for _word, count in ranked
+            ]
+
+        def table(counts):
+            if not counts:
+                return []
+            ranked, percents = rounded(counts)
+            shortfall = 100 - sum(percents)
+            if shortfall > 0:
+                first = min(counts)
+                percents[[word for word, _count in ranked].index(first)] += shortfall
+            width = max(len(word) for word in counts)
+            return [
+                f"{word.ljust(width)} {percent}%"
+                for (word, _count), percent in zip(ranked, percents)
+            ]
+
+        def shown_total(rows):
+            return sum(int(row.split()[-1].rstrip("%")) for row in rows)
+
+        self.assertEqual(table({"a": 1, "b": 1}), ["a 50%", "b 50%"])
+        self.assertEqual(table({"apple": 3, "b": 1}), ["apple 75%", "b     25%"])
+        self.assertEqual(table({"b": 1, "a": 1}), ["a 50%", "b 50%"])
+        self.assertEqual(table({"a": 1, "b": 1, "c": 4}), ["c 67%", "a 17%", "b 17%"])
+        self.assertEqual(table({"a": 1, "b": 7}), ["b 88%", "a 13%"])
+        self.assertEqual(shown_total(table({"a": 1, "b": 1, "c": 1})), 100)
+        self.assertEqual(table({}), [])
+        self.assertIn("100", self.grind["GR-002"].criteria[5])
+
+    def test_the_symmetric_reading_of_the_second_ticket_really_does_fail(self):
+        # And why the ticket reads as impossible: the rule its own spec states
+        # yields 99 where a criterion asks for 100, and the two criteria that
+        # pin rows summing to 101 block every correction that runs in both
+        # directions, largest-remainder included. That is a defect in the
+        # ticket's rule rather than in what it promises, which is why revising
+        # the spec repaired it and the criteria ratchet never had to move.
+        from decimal import ROUND_HALF_UP, Decimal
+
+        def shares(counts):
+            total = sum(counts.values())
+            return [
+                int(
+                    (Decimal(100 * count) / Decimal(total)).quantize(
+                        Decimal("1"), rounding=ROUND_HALF_UP
+                    )
+                )
+                for count in counts.values()
+            ]
+
+        self.assertEqual(sum(shares({"a": 1, "b": 1, "c": 1})), 99)
+        self.assertEqual(sum(shares({"a": 1, "b": 1, "c": 4})), 101)
+        self.assertEqual(sum(shares({"a": 1, "b": 7})), 101)
+
+    def test_the_rounding_criterion_is_a_real_trap(self):
+        # Same reason `HARD.md` pins its own: the criterion exists because the
+        # obvious implementation gets it wrong.
+        self.assertEqual(round(12.5), 12)
+
+    def test_it_writes_files_the_other_specs_do_not(self):
+        mine = {path for ticket in self.tickets for path in ticket.allowed_files}
+        for name in ("SPEC.md", "HARD.md", "STALL.md"):
+            other, _how, _derived = ingest((SAMPLE / name).read_text(encoding="utf-8"))
+            theirs = {path for ticket in other for path in ticket.allowed_files}
+            self.assertEqual(theirs & mine, set(), name)
+        for path in mine:
+            self.assertFalse((SAMPLE / path).exists(), path)
+
+    def test_every_ticket_names_its_own_test_file(self):
+        # Without one the tester writes outside the ticket's scope and the
+        # executor is refused every time it tries to repair what it wrote —
+        # which would park both tickets for a reason this backlog is not about.
+        for ticket in self.tickets:
+            self.assertTrue(
+                any("test" in path for path in ticket.allowed_files),
+                f"{ticket.ticket_id} has no test file in its allowed files",
+            )
 
 
 class TestTheSeededDefectIsStillThere(unittest.TestCase):

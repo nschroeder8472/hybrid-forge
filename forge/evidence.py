@@ -564,10 +564,11 @@ def locate_named(root: Path, path: str, files: Sequence[str] | None = None) -> s
     return found[0] if len(found) == 1 else ""
 
 
-
 # A path-shaped run of characters: at least one slash, an extension, no spaces.
 # Deliberately narrow. Prose is full of things that look like identifiers and
 # almost nothing that looks like this.
+
+
 _PATH_TOKEN = re.compile(r"[A-Za-z0-9_./\\-]*[/\\][A-Za-z0-9_./\\-]*\.[A-Za-z0-9]{1,8}")
 
 # A bare name that could be a file's stem: carries a digit or an underscore, so

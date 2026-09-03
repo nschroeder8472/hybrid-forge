@@ -669,7 +669,7 @@ class TestWizardFlow(unittest.TestCase):
 
     def test_a_failing_probe_gives_up_after_a_bounded_number_of_retries(self):
         # Unbounded retry would trap someone whose endpoint is simply down.
-        root = temp_repo()
+        temp_repo()
         attempts = []
 
         def probe(_name, block):

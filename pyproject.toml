@@ -12,6 +12,13 @@ requires-python = ">=3.10"
 # an overnight run never began.
 dependencies = []
 
+# Lint is not optional. The repository is flake8-clean and `tests/test_lint.py`
+# fails rather than skips when the tool is missing, because an enforcement that
+# disappears on the machine without it enforces nothing. `pytest` is here for
+# the same reason: the suite is how any of this is checked.
+[project.optional-dependencies]
+dev = ["flake8>=7", "pytest>=8"]
+
 [project.scripts]
 forge = "forge.cli:main"
 

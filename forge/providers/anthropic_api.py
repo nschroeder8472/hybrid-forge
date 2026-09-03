@@ -28,7 +28,6 @@ from .base import (
     Message,
     Provider,
     ProviderAuthError,
-    ProviderBadResponse,
     Usage,
     split_system,
 )

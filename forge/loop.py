@@ -37,7 +37,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Sequence
+from typing import Any, NamedTuple, Sequence
 
 from . import imports
 from . import manifests
@@ -48,10 +48,9 @@ from . import evidence
 from . import routes
 from .artifacts import ABANDONED_DIR, Artifacts, safe_name
 from .budget import BudgetGate, Wait
-from .config import ANY_LANGUAGE, REPO_ROOT, ROLES, Config, ConfigError, Workspace
+from .config import ANY_LANGUAGE, REPO_ROOT, Config, ConfigError, Workspace
 from .failures import (
     blocks_naming,
-    classify,
     clip,
     distill,
     environment_failure,
@@ -87,7 +86,6 @@ from .providers import (
     Completion,
     ContextOverflow,
     Message,
-    Provider,
     ProviderError,
     RateLimited,
 )
@@ -102,7 +100,6 @@ from .prompts import (
     RATIFICATION_HEADING,
     TOOLCHAIN_HEADING,
     build_prompt,
-    ratification_message,
     STUCK_UNCLEAR,
     STUCK_UNWINNABLE,
     convention_prompt,
@@ -259,6 +256,7 @@ def _droppable(message: Message) -> bool:
     if message.role == "assistant":
         return True
     return message.role == "user" and message.content.startswith(_DROPPABLE_HEADINGS)
+
 
 CONTROL_KEY = "command"
 CONTROL_RUN = "run"
@@ -2387,12 +2385,12 @@ class Orchestrator:
                 f"{', '.join(failed)} is already failing, on files this "
                 f"backlog owns:\n"
                 + "\n".join(f"  - {path} ({owned[normalize_path(path)]})" for path in blamed[:8])
-                + f"\n\nStarted rather than gated. Each of these has a ticket "
-                f"that has not run yet, and clearing them is what those "
-                f"tickets are for — a bug ticket's reproduction is red on "
-                f"purpose until its fix lands, and a plan is routinely red "
-                f"between the ticket that calls a class and the one that "
-                f"writes it.",
+                + "\n\nStarted rather than gated. Each of these has a ticket "
+                "that has not run yet, and clearing them is what those "
+                "tickets are for — a bug ticket's reproduction is red on "
+                "purpose until its fix lands, and a plan is routinely red "
+                "between the ticket that calls a class and the one that "
+                "writes it.",
                 level="warn",
                 kind="verify",
                 data={"steps": failed, "owned": owned},
@@ -3455,8 +3453,8 @@ class Orchestrator:
                 run_id,
                 f"{ticket.ticket_id}: reads {len(by_name)} file(s) its own spec "
                 f"names — " + ", ".join(by_name[:6]) + ". A ticket's scope is "
-                f"computed from what it may write; these are files it was told "
-                f"to read and could not.",
+                "computed from what it may write; these are files it was told "
+                "to read and could not.",
                 level="info",
                 kind="ticket",
                 data={"named": by_name},
@@ -3710,6 +3708,14 @@ class Orchestrator:
         # cannot compile would spend all of it before the second attempt began.
         spent = 0
         errors_left = 0
+        # What the last gated turn was told, whitespace-collapsed. Read only
+        # when `signatures` cannot parse the output: an empty set from it means
+        # *cannot attribute*, never *no errors*, and counting it as zero made
+        # every unparseable tool look stalled on the second turn. A lint run
+        # was exactly that — 24 findings, no diagnostic block, `0 error(s) to
+        # answer`, and the attempt charged for failing to reduce a count that
+        # had never been taken.
+        last_detail = ""
         # Whether the next attempt runs with the compile gate switched off.
         #
         # Set after a stall, and this is load-bearing. The gate returns before
@@ -3749,10 +3755,18 @@ class Orchestrator:
                 # rather than costing a fifth of the budget that decides
                 # whether the spec is rewritten underneath the work.
                 remaining = signatures(outcome.detail)
-                stalled = bool(spent) and len(remaining) >= errors_left
+                collapsed = " ".join(outcome.detail.split())
+                if remaining:
+                    stalled = bool(spent) and len(remaining) >= errors_left
+                else:
+                    # Nothing parsed as a diagnostic, so there is no count to
+                    # compare. The honest question left is whether the tool
+                    # said the same thing twice.
+                    stalled = bool(spent) and collapsed == last_detail
                 if not stalled and spent < self.config.loop.inner_turns:
                     spent += 1
                     errors_left = len(remaining)
+                    last_detail = collapsed
                     ticket.attempts -= 1
                     self.store.update_ticket(run_id, ticket)
                     self.store.log(
@@ -3760,8 +3774,14 @@ class Orchestrator:
                         f"{ticket.ticket_id}: what this attempt wrote does not "
                         f"compile, so the tester was not asked and the attempt "
                         f"was not charged — inner turn {spent} of "
-                        f"{self.config.loop.inner_turns}, {len(remaining)} "
-                        f"error(s) to answer.",
+                        f"{self.config.loop.inner_turns}, "
+                        + (
+                            f"{len(remaining)} error(s) to answer."
+                            if remaining
+                            else "and nothing in the output parsed as a "
+                            "diagnostic, so the answer is judged on whether "
+                            "the output changes."
+                        ),
                         kind="ticket",
                     )
                     failure_context = outcome.detail
@@ -3776,7 +3796,15 @@ class Orchestrator:
                     run_id,
                     f"{ticket.ticket_id}: "
                     + (
-                        f"{len(remaining)} compile error(s) left, against "
+                        (
+                            "the same output as the last inner turn, and "
+                            "nothing in it parsed as a diagnostic to count"
+                            if stalled
+                            else f"nothing in the output parsed as a "
+                            f"diagnostic to count, after {spent} inner turn(s)"
+                        )
+                        if not remaining
+                        else f"{len(remaining)} compile error(s) left, against "
                         f"{errors_left} before the last inner turn"
                         if stalled
                         else f"{len(remaining)} compile error(s) left after "
@@ -4112,10 +4140,10 @@ class Orchestrator:
         same thing — the two demands side by side, and where each one lives.
         """
         lines = [
-            f"BLOCKED: this ticket cannot be satisfied within its scope, and "
-            f"another attempt would not change that.",
+            "BLOCKED: this ticket cannot be satisfied within its scope, and "
+            "another attempt would not change that.",
             "",
-            f"The fix works. The reproduction "
+            "The fix works. The reproduction "
             + (f"`{repro[0]}` " if repro else "")
             + "passes against it.",
             "",
@@ -5288,25 +5316,25 @@ class Orchestrator:
                         write_tests_prompt(
                             ticket,
                             written,
-                        # One fixed path per ticket. A tester free to name its
-                        # own file renames it on every retry and leaves the
-                        # previous one running forever.
-                        test_path=test_path,
-                        test_command=self.config.command_for("test", test_path),
-                        example_test=example,
-                        # The executor already gets this. Without it here, a
-                        # tester that wrote one wrong assertion rewrites the
-                        # same one every attempt, and the ticket burns its
-                        # retries asking the executor to fix code that was
-                        # never broken — and that it cannot fix anyway, since
-                        # the test file is outside its allowed scope.
-                        failure_context=failure_context,
-                        # The tester has no checkout either. Left to guess at
-                        # the API it just wrote assertions for, it reaches for
-                        # private fields and wrong argument types — which does
-                        # not fail a test, it fails to compile, and then every
-                        # later ticket's verify step fails on a file that has
-                        # nothing to do with it. All read-only here: the tester
+                            # One fixed path per ticket. A tester free to name its
+                            # own file renames it on every retry and leaves the
+                            # previous one running forever.
+                            test_path=test_path,
+                            test_command=self.config.command_for("test", test_path),
+                            example_test=example,
+                            # The executor already gets this. Without it here, a
+                            # tester that wrote one wrong assertion rewrites the
+                            # same one every attempt, and the ticket burns its
+                            # retries asking the executor to fix code that was
+                            # never broken — and that it cannot fix anyway, since
+                            # the test file is outside its allowed scope.
+                            failure_context=failure_context,
+                            # The tester has no checkout either. Left to guess at
+                            # the API it just wrote assertions for, it reaches for
+                            # private fields and wrong argument types — which does
+                            # not fail a test, it fails to compile, and then every
+                            # later ticket's verify step fails on a file that has
+                            # nothing to do with it. All read-only here: the tester
                             # writes its own file and returns none of these.
                             sources=self._sources_for(ticket, extra=written)[0],
                             # Keyed on the tester's own file as well as the

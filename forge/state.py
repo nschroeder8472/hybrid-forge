@@ -204,6 +204,7 @@ RUN_DONE = "done"
 RUN_FAILED = "failed"
 RUN_STOPPED = "stopped"
 
+
 def _criterion_key(criterion: str) -> str:
     """A criterion reduced to what it asserts, for comparing two spellings.
 
@@ -291,7 +292,8 @@ class Ticket:
     # spends its attempts on code it may not open. But quarantine cannot always
     # take a failed ticket's work back out, so its own breakage may be on disk
     # when the next cycle starts and the fresh baseline reads it as
-    # pre-existing — amnesty for the exact errors it just wrote. That is not hypothetical: one run's debt climbed 3, 7, 13, 20
+    # pre-existing — amnesty for the exact errors it just wrote. That is not
+    # hypothetical: one run's debt climbed 3, 7, 13, 20
     # across seven tickets, every one of them passing verification.
     #
     # Charging is what separates the two. A signature recorded here is never
@@ -843,7 +845,8 @@ class Store:
                 connection.execute(
                     "INSERT OR REPLACE INTO tickets "
                     "(run_id, ticket_id, title, route, kind, status, position, attempts, "
-                    " attempt_base, spec, allowed_files, reference_files, criteria, needs, dep_stamp, "
+                    " attempt_base, spec, allowed_files, reference_files, criteria, "
+                    "needs, dep_stamp, "
                     " baseline_tree, charged_failures, context, "
                     " blocked_note, original_spec, original_criteria, original_context, "
                     " updated_at) "

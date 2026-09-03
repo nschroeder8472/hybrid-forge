@@ -40,7 +40,6 @@ import atexit
 import json
 import os
 import queue
-import re
 import subprocess
 import threading
 import time
@@ -210,7 +209,9 @@ class _MCPSession:
     def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         result = self._rpc("tools/call", {"name": name, "arguments": arguments})
         if result.get("isError"):
-            raise MemoryUnavailable(f"tool {name!r} reported an error: {_content_text(result)[:300]}")
+            raise MemoryUnavailable(
+                f"tool {name!r} reported an error: {_content_text(result)[:300]}"
+            )
         return _content_text(result)
 
 
@@ -508,7 +509,9 @@ def _as_argv(value: Any) -> list[str]:
         return value.split()
     if isinstance(value, (list, tuple)):
         return [str(part) for part in value]
-    raise MemoryUnavailable(f"memory.command must be a list or a string, got {type(value).__name__}")
+    raise MemoryUnavailable(
+        f"memory.command must be a list or a string, got {type(value).__name__}"
+    )
 
 
 # ----------------------------------------------------------------------

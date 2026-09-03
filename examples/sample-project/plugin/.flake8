@@ -1,0 +1,6 @@
+[flake8]
+# The plugin build's own, deliberately a copy rather than a reference upward:
+# `toolchain_context` resolves a linter config by walking from a writable file
+# to its *workspace* root, so a shared file above this directory is one the
+# roles working here would be graded against and never shown.
+max-line-length = 88

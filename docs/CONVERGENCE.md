@@ -978,6 +978,10 @@ Three things to watch on the first real run:
   now computed per cycle by the loop itself. The claim these features make is
   that those deciles go down. That has not been observed.
 
+The backlog written to put the last two of those questions is
+`examples/sample-project/GRIND.md`; the section it belongs to is the last one
+in this document.
+
 ---
 
 ## The first backlog written to fail
@@ -1095,3 +1099,140 @@ was written from the stall run and immediately parked two healthy tickets:
   whitespace entirely and checks a bracketed value element by element — which
   also gives up on catching a padding-only softening, the right direction to
   miss in for a net whose cost when wrong is a parked ticket.
+
+---
+
+## The backlog written for the middle, and what it caught instead
+
+`examples/sample-project/GRIND.md` is two tickets written to reach the middle
+of this document, and two runs of it — both 2026-09-01 — that did not get
+there. Both ended `done`, both tickets, one attempt each, zero retry cycles, no
+failed step: 19 calls and 129.8k tokens in 1081 seconds, then 19 calls and
+132.7k tokens in 1116 seconds. `_convergence`, the ladder and `flatCycles` were
+never asked a question, because nothing failed. All four delivered files were
+checked against every criterion independently afterwards and are correct on all
+of them.
+
+The second run exists because the first was `n = 1` and this document's own
+standard for a claim is higher than that. It reproduced: same step sequence,
+same ratification shape, and three of the four delivered files byte-identical
+to the first run's. Only one test file differs, and in the stricter direction —
+run 2's tester pinned the exact rows beside the sum assertion.
+
+**`GR-001` was the state-over-time bet, and it landed first try.** The theory
+was that what this executor cannot absorb is not breadth — `HARD.md` settled
+that — but behaviour across calls: a `Stream` with a sliding window over the
+last `n` texts, where eviction has to reduce counts, drop a word that falls to
+zero from both `top` and `distinct`, treat two identical texts as two entries,
+and leave a list handed out earlier alone. Nine criteria, every one a sequence
+of calls. The delivered class used a `deque`, computed each text's token counts
+once, subtracted them on eviction, deleted the key when the remainder was zero,
+and sorted freshly on every `top`. Nine for nine, one attempt, no failed step,
+and the identical file both times.
+
+So the conclusion of the section above widens rather than changing: difficulty
+that comes from care is not difficulty for this executor, and neither is
+difficulty that comes from state.
+
+**`GR-002` was written to be jointly impossible and was not.** Six ordinary
+criteria and a seventh asking the percentages of `table({"a": 1, "b": 1, "c": 1})`
+to sum to `100`, where three equal shares of a total of three each round to
+`33` and sum to `99`. The impossibility argument was that reaching `100` means
+giving some row a value other than its own rounded share, and the two criteria
+pinning rows that sum to `101` — `67 + 17 + 17` and `88 + 13` — forbid exactly
+that.
+
+The argument assumed the correction had to run in both directions. It does not.
+Add the shortfall when the rounded shares fall short of `100`, leave them alone
+when they overshoot, and all seven criteria hold: `34/33/33` for the equal
+thirds, both `101` cases untouched. Ugly, and permitted.
+
+**What the loop did with it is the result, and it reproduced.** On both runs
+all four roles refused to sign on pass 1, each naming the same defect in its own
+words — *each `1/3` share rounds
+to `33`, so the displayed percentages sum to `99`*. The planner then revised
+the **spec** to state the asymmetric rule, and the criteria ratchet held: seven
+criteria before ratification, the same seven after, none reworded. Pass 2 was
+unanimous and the build met all seven on its first attempt — both times, with
+the same `table.py` character for character, so the planner's repair converged
+on the same asymmetric rule twice rather than stumbling onto it once.
+
+That is the first time on a live run that the sign-off pass has refused a
+ticket over a genuine spec defect and the repair has gone into the spec while
+the criteria stood — the exact division `respec._softened_values` was written
+to enforce, exercised from the other side.
+
+**And it is why this backlog never reached the machinery below.** The defect it
+carries is a third kind, and the cheapest to hold. `STALL.md` is a criterion
+that contradicts code the ticket may not write: no revision inside the ticket
+can fix it, so it parks. `GR-002` is a *rule* that cannot produce one of its own
+criteria: revising the rule fixes it without touching what the ticket promises,
+and ratification does that before a build call is spent. Neither becomes a
+failing attempt, which is where every brake in this document lives.
+
+So the middle is still unexercised, and the reason has narrowed to something
+worth stating precisely. Reaching it needs a ticket whose spec and criteria are
+mutually consistent — so ratification signs it — and whose *work* the executor
+then gets wrong several times over. Six runs at that shape now exist — four of
+`HARD.md`, two of `GR-001` — and every one landed on the first attempt. That is either a statement about this class of
+work or a statement about this executor, and nothing in the fixture yet
+distinguishes them.
+
+## The linter that was supposed to make it fail
+
+`examples/sample-project` graded a ticket on its unit tests and nothing else:
+`lint` and `typecheck` were both `skip` for `.py` in both workspaces. Set
+against the run this document opens with, that is the whole gap. PF-009's 225
+failed steps carried 1,125 trailing-whitespace occurrences and 117 of its 160
+lint failures had whitespace as their *only* problem; PF-003's carried 512
+`TS2532`. The stall was a lint-and-compiler stall, and the fixture could not
+produce one.
+
+So lint was switched on — 2026-09-02, `python -m flake8 .` in both workspaces,
+each build carrying its own `.flake8` at `max-line-length = 88` inside its own
+workspace root so `toolchain_context` can resolve it — and `GRIND.md` was run a
+third time.
+
+**Every lint step passed.** Start, baseline, per-attempt, final, both builds,
+both tickets: not one finding. The delivered files are clean at 88 and clean at
+79. The hypothesis that mechanical grading was the missing difficulty is
+answered, and the answer is no.
+
+**One attempt was spent, and the reviewer spent it.** `GR-002`'s first attempt
+met all seven criteria and was rejected: the reviewer read the ratification
+settlement record, found the tester had accepted the repaired spec by promising
+*the exact expected rows* for the equal-thirds case, and observed that the test
+on disk asserted only the sum — so it would pass with the shortfall added to
+the wrong label or the rows misordered. The second attempt pinned the rows and
+was accepted.
+
+That is `patch.weakened_criteria`'s failure class caught by judgement on a
+ticket the mechanical net had passed, which is the strongest evidence yet for
+the reviewer being worth ~100% of the money on a hybrid run — and an argument
+against the *Reviewer cost* entry in [ROADMAP.md](ROADMAP.md), which proposes
+skipping review on trivial diffs.
+
+**And it still did not reach this document.** `_measure_cycle` runs over the
+tickets eligible for a *retry cycle*; `GR-002` finished inside its first one, so
+`_convergence` was never called, `flat_cycles` stayed `0`, and no convergence
+event was logged. Two attempts is not a cycle. What the machinery needs is a
+ticket that exhausts `maxAttempts` and gets requeued, which nothing in this
+fixture has ever done except `STALL.md`, and that one parks on a guard before
+the ladder starts.
+
+| run | lint | GR-001 | GR-002 | calls | tokens | seconds |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | skip | 1 | 1 | 19 | 129.8k | 1081 |
+| 2 | skip | 1 | 1 | 19 | 132.7k | 1116 |
+| 3 | flake8 | 1 | **2** | 21 | 156.9k | 1417 |
+
+Run 3 also ended the byte-identical agreement of runs 1 and 2: both of its
+delivered files differ from theirs. That agreement was a property of those two
+runs, not of the ticket.
+
+`TestTheGrindBacklogReachesTheMiddleOfTheLoop` pins both halves by
+implementation rather than by argument — arguing it is what produced the wrong
+claim about `GR-002` in the first place. It implements `GR-001` and checks all
+nine criteria, implements the asymmetric rule and checks that all seven of
+`GR-002`'s hold together under it, and computes the `99` and the two `101`s
+that make the symmetric reading fail.

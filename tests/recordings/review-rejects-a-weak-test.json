@@ -1,0 +1,12 @@
+{
+  "note": "GRIND run 3, 2026-09-02: the reviewer read the ratification record, found the tester had promised exact rows, and rejected a test that asserted only the sum.",
+  "steps": [
+    {
+      "step": 25,
+      "ticket": "GR-002",
+      "name": "review",
+      "status": "failed",
+      "detail": "REJECT\n\nThe implementation satisfies the listed acceptance criteria, but the settled ticket requires the equal-thirds case to be checked with exact expected rows, and the test does not do that.\n\n- The settlement record says the tester accepted the fix by adding \u201cthe exact expected rows for `table({\"a\": 1, \"b\": 1, \"c\": 1})` so the sum criterion can be checked deterministically,\u201d and Pass 2 planner suggested: \u201cAdd the exact expected rows for `table({\"a\": 1, \"b\": 1, \"c\": 1})` to the acceptance criteria.\u201d\n- The test on disk only asserts the sum:\n  ```python\n  def test_equal_thirds_sum_to_one_hundred(self):\n      rows = table({\"a\": 1, \"b\": 1, \"c\": 1})\n      self.assertEqual(sum(_percent(row) for row in rows), 100)\n  ```\n  It does not assert the exact rows, e.g. `[\"a 34%\", \"b 33%\", \"c 33%\"]`, so it would pass even if the shortfall were added to the wrong label or the rows were misordered, as long as the percentages summed to 100.\n\nEverything else I checked matches the spec:\n- `table({\"a\": 1, \"b\": 1})` produces `[\"a 50%\", \"b 50%\"]`.\n- `table({\"apple\": 3, \"b\": 1})` produces `[\"apple 75%\", \"b     25%\"]` because `label.ljust(width)` pads `b` to width 5 and then adds exactly one separator space.\n- `table({\"b\": 1, \"a\": 1})` produces `[\"a 50%\", \"b 50%\"]` because `ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))`.\n- `table({\"a\": 1, \"b\": 1, \"c\": 4})` produces `[\"c 67%\", \"a 17%\", \"b 17%\"]`; the rounded shares sum to 101, so the code leaves them unchanged.\n- `table({\"a\": 1, \"b\": 7})` produces `[\"b 88%\", \"a 13%\"]`; `Decimal(1) * 100 / Decimal(8)` is `12.5`, and `quantize(Decimal(\"1\"), rounding=ROUND_HALF_UP)` gives `13`.\n- `table({})` returns `[]` via `if not counts: return []`.\n- The module imports only `decimal` and does not import from `wordcount.counter`."
+    }
+  ]
+}

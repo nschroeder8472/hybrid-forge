@@ -515,6 +515,18 @@ The daemon and CLI have **no runtime dependencies** — stdlib Python 3.10+ only
 That is deliberate: a failed `pip install` is a bad way to discover that an
 overnight run never started.
 
+Working *on* hybrid-forge needs two more:
+
+```bash
+pip install -e "/path/to/hybrid-forge[dev]"   # adds flake8 and pytest
+```
+
+Both are required rather than suggested. `tests/test_lint.py` runs `flake8` over
+the tree and fails when the tool is absent instead of skipping — an enforcement
+that disappears on the machine that lacks it enforces nothing — and the fixture
+under `examples/sample-project` now grades generated code with the same linter,
+which is what makes a run there able to fail the way real runs do.
+
 If you want the loop to drive Claude for planning and review, Claude Code must
 be installed **on whatever machine runs the daemon** — the `claude-cli` adapter
 shells out to it. That machine is usually your workstation, not the GPU host.

@@ -141,7 +141,9 @@ def post_json(
         # 400s that mention context are worth naming precisely — the loop reacts
         # to overflow differently from a generic bad request.
         lowered = detail.lower()
-        if "context" in lowered and ("length" in lowered or "window" in lowered or "too long" in lowered):
+        if "context" in lowered and (
+            "length" in lowered or "window" in lowered or "too long" in lowered
+        ):
             from .base import ContextOverflow
 
             raise ContextOverflow(f"{url}: {detail[:300]}") from exc
