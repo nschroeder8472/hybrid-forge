@@ -46,7 +46,6 @@ from forge.ingest import (
     parse_plan,
     graph_problems,
     looks_like_plan,
-    parse_plan,
     plan_decisions,
     untestable_scope,
     plan_with_model,
@@ -1348,7 +1347,10 @@ class TestRespec(unittest.TestCase):
         failures = store.ticket_failures(run_id, "T-1")
         # Oldest first: a rejection that recurs is the signal that the spec,
         # not the implementation, is what needs changing.
-        self.assertEqual([f["detail"] for f in failures], ["REJECT first", "REJECT second", "REJECT third"])
+        self.assertEqual(
+            [f["detail"] for f in failures],
+            ["REJECT first", "REJECT second", "REJECT third"],
+        )
 
     def test_failures_survive_the_requeue(self):
         store, run_id = self._store_with_a_rejected_ticket()
@@ -1516,7 +1518,9 @@ class TestAutomaticRetryCycles(unittest.TestCase):
         orchestrator, store, run_id = self._orchestrator(
             tickets=[Ticket("T-1", status="done")], retry_cycles=-1
         )
-        orchestrator._shell = lambda _run, _name, _cmd, _ticket="", **_kwargs: StepResult(ok=False, detail="boom")
+        orchestrator._shell = lambda _run, _name, _cmd, _ticket="", **_kwargs: (
+            StepResult(ok=False, detail="boom")
+        )
 
         self.assertIs(orchestrator._retry_cycle(run_id, "blocked"), False)
         self.assertEqual(store.get_control(f"retries:{run_id}", "0"), "0")
@@ -2282,7 +2286,11 @@ class TestRespecCannotReviveARuledOutCause(unittest.TestCase):
             budget=1024,
         )
 
-        logged = [r["message"] for r in store.events_after(0) if "already disproved" in r["message"]]
+        logged = [
+            r["message"]
+            for r in store.events_after(0)
+            if "already disproved" in r["message"]
+        ]
         self.assertTrue(logged, "reverting to a dead hypothesis must be reported")
 
     def test_a_genuinely_new_hypothesis_still_goes_through(self):
@@ -2361,7 +2369,9 @@ class TestAnOlderTestMayAssertTheBugItself(unittest.TestCase):
         root = Path(tempfile.mkdtemp())
         (root / "src").mkdir()
         (root / "tests").mkdir()
-        (root / "src" / "piece.rs").write_text("pub fn color(k: usize) -> u8 { 255 }\n", encoding="utf-8")
+        (root / "src" / "piece.rs").write_text(
+            "pub fn color(k: usize) -> u8 { 255 }\n", encoding="utf-8"
+        )
         (root / "tests" / "tt_001_test.rs").write_text(
             "#[test]\nfn test_color_values() {\n"
             "    assert_eq!(piece::color(kind), (kind as u8) + 1);\n}\n",
@@ -2478,7 +2488,10 @@ class TestAnOlderTestMayAssertTheBugItself(unittest.TestCase):
         # Only the pre-existing failures are excused, not the file they are in.
         orch, run_id, store = self._orchestrator()
         ticket = store.list_tickets(run_id)[0]
-        stale = "thread 'test_unrelated' (11) panicked at tests\\tt_009_test.rs:3:1:\nassertion failed\n"
+        stale = (
+            "thread 'test_unrelated' (11) panicked at tests\\tt_009_test.rs:3:1:\n"
+            "assertion failed\n"
+        )
 
         found = orch._contradicting_tests(
             ticket, self._repro(), stale + self.FAILURE, signatures(stale)
@@ -2538,8 +2551,12 @@ class TestRetiringAnAssertionNeedsAnArgument(unittest.TestCase):
         root = Path(tempfile.mkdtemp())
         (root / "tests").mkdir()
         (root / "src").mkdir()
-        (root / "src" / "piece.rs").write_text("pub fn color(k: usize) -> u8 { 255 }\n", encoding="utf-8")
-        (root / "tests" / "tt_001_test.rs").write_text("assert_eq!(color(k), k + 1);\n", encoding="utf-8")
+        (root / "src" / "piece.rs").write_text(
+            "pub fn color(k: usize) -> u8 { 255 }\n", encoding="utf-8"
+        )
+        (root / "tests" / "tt_001_test.rs").write_text(
+            "assert_eq!(color(k), k + 1);\n", encoding="utf-8"
+        )
         config = Config(
             root=root,
             models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
@@ -2553,7 +2570,9 @@ class TestRetiringAnAssertionNeedsAnArgument(unittest.TestCase):
             [Ticket("BUG-002", kind="bug", spec="color(0) is 255", allowed_files=["src/piece.rs"])],
         )
         orch = Orchestrator(config, store)
-        orch._contradictions["BUG-002"] = {"tests/tt_001_test.rs": ["panicked at tests/tt_001_test.rs:87"]}
+        orch._contradictions["BUG-002"] = {
+            "tests/tt_001_test.rs": ["panicked at tests/tt_001_test.rs:87"]
+        }
         orch._call = lambda *a, **k: Completion(text=reply, usage=Usage())
         return orch, run_id, store
 
@@ -2615,7 +2634,15 @@ class TestRetiringAnAssertionNeedsAnArgument(unittest.TestCase):
         run_id = store.create_run("bug", source="the I piece renders black")
         store.add_tickets(
             run_id,
-            [Ticket("BUG-002", kind="bug", spec="old", allowed_files=["src/piece.rs"], status="failed")],
+            [
+                Ticket(
+                    "BUG-002",
+                    kind="bug",
+                    spec="old",
+                    allowed_files=["src/piece.rs"],
+                    status="failed",
+                )
+            ],
         )
         step = store.start_step(run_id, "BUG-002", "verify-test")
         store.end_step(step, "failed", "contradiction")
@@ -2659,7 +2686,9 @@ class TestReadingScopeIsWiderThanWritingScope(unittest.TestCase):
         (root / "src" / "lib.rs").write_text(
             "pub mod board;\npub mod game;\npub mod piece;\n", encoding="utf-8"
         )
-        (root / "src" / "game.rs").write_text("pub struct Game { pub level: u32 }\n", encoding="utf-8")
+        (root / "src" / "game.rs").write_text(
+            "pub struct Game { pub level: u32 }\n", encoding="utf-8"
+        )
         (root / "src" / "board.rs").write_text("pub struct Board;\n", encoding="utf-8")
         (root / "src" / "piece.rs").write_text("pub struct Piece;\n", encoding="utf-8")
         return root
@@ -3686,7 +3715,8 @@ class TestTesterEvidence(unittest.TestCase):
         orch, root = self._orchestrator()
         (root / "tests").mkdir()
         (root / "tests" / "test_thing.py").write_text(
-            "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_x(self):\n        pass\n",
+            "import unittest\n\n\nclass T(unittest.TestCase):\n"
+            "    def test_x(self):\n        pass\n",
             encoding="utf-8",
         )
 
@@ -3723,7 +3753,9 @@ class TestTesterEvidence(unittest.TestCase):
         self.assertIn("import unittest", body)
 
     def test_prompt_without_an_example_still_asks_for_repo_conventions(self):
-        body = write_tests_prompt(Ticket("T-1"), ["app.py"], test_path="tests/t_1_test.py")[-1].content
+        body = write_tests_prompt(
+            Ticket("T-1"), ["app.py"], test_path="tests/t_1_test.py"
+        )[-1].content
         self.assertIn("conventions already used in this repository", body)
 
     def test_failure_context_reaches_the_tester(self):
@@ -3746,7 +3778,9 @@ class TestTesterEvidence(unittest.TestCase):
         self.assertIn("keep the assertion as written", body)
 
     def test_a_clean_first_attempt_carries_no_failure_section(self):
-        body = write_tests_prompt(Ticket("T-1"), ["app.py"], test_path="tests/t_1_test.py")[-1].content
+        body = write_tests_prompt(
+            Ticket("T-1"), ["app.py"], test_path="tests/t_1_test.py"
+        )[-1].content
         self.assertNotIn("did not pass verification", body)
 
 
@@ -4913,7 +4947,15 @@ class TestRespecMayNotWidenIntoASecondBuild(unittest.TestCase):
         run_id = store.create_run("goal")
         store.add_tickets(
             run_id,
-            [Ticket("PF-009", status="failed", attempts=5, allowed_files=list(allowed), spec="one")],
+            [
+                Ticket(
+                    "PF-009",
+                    status="failed",
+                    attempts=5,
+                    allowed_files=list(allowed),
+                    spec="one",
+                )
+            ],
         )
         step = store.start_step(run_id, "PF-009", "test")
         store.end_step(step, "failed", "Parse Error: nope")
@@ -5601,7 +5643,8 @@ class TestFilingABugFromTheCommandLine(unittest.TestCase):
         (root / "src" / "game.py").write_text(
             "def tick(dt):\n    while dt > 0:\n        lock()\n", encoding="utf-8"
         )
-        for args in (["init", "-q"], ["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]):
+        commit = ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]
+        for args in (["init", "-q"], ["add", "-A"], commit):
             subprocess.run(["git", *args], cwd=root, capture_output=True, check=False)
         return root
 
@@ -6979,7 +7022,8 @@ class TestEvidenceForABugReport(unittest.TestCase):
         (root / "target").mkdir()
         (root / "target" / "junk.rs").write_text("noise\n", encoding="utf-8")
         (root / ".gitignore").write_text("target/\n", encoding="utf-8")
-        for args in (["init", "-q"], ["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]):
+        commit = ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]
+        for args in (["init", "-q"], ["add", "-A"], commit):
             subprocess.run(["git", *args], cwd=root, capture_output=True, check=False)
         return root
 
@@ -7064,7 +7108,8 @@ class TestLocatingAVagueReport(unittest.TestCase):
         (root / "src" / "render.py").write_text(
             "def draw():\n    pass\n", encoding="utf-8"
         )
-        for args in (["init", "-q"], ["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]):
+        commit = ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]
+        for args in (["init", "-q"], ["add", "-A"], commit):
             subprocess.run(["git", *args], cwd=root, capture_output=True, check=False)
         return root
 
@@ -7617,7 +7662,10 @@ class TestAWrongDiagnosisIsReplacedRatherThanParked(unittest.TestCase):
                 return StepResult(ok=True, detail="")
             proven = state["scope"] == reproduces_on
             if proven:
-                return StepResult(ok=False, detail="tests/bug_001_test.py::test_x FAILED\nassert 0 == 1")
+                return StepResult(
+                    ok=False,
+                    detail="tests/bug_001_test.py::test_x FAILED\nassert 0 == 1",
+                )
             return StepResult(ok=True, detail="1 passed")
 
         orch._call = call
@@ -7626,7 +7674,7 @@ class TestAWrongDiagnosisIsReplacedRatherThanParked(unittest.TestCase):
 
     def test_a_disproved_explanation_is_replaced_and_the_ticket_continues(self):
         orch, root, run_id = self._orch()
-        seen = self._drive(
+        self._drive(
             orch, root, planner=[self._second_hypothesis()], reproduces_on=["web/main.js"]
         )
 
@@ -7821,7 +7869,9 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
 
     def test_a_reproduction_that_passes_proves_nothing_and_parks(self):
         orch, _root, run_id = self._orch()
-        orch._shell = lambda _r, _n, command, _ticket="", **_kwargs: StepResult(ok=True, detail="1 passed")
+        orch._shell = lambda _r, _n, command, _ticket="", **_kwargs: StepResult(
+            ok=True, detail="1 passed"
+        )
         seen = self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
 
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
@@ -7904,7 +7954,9 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         every time."""
         orch, _root, run_id = self._orch()
         orch.config.loop.retry_cycles = -1
-        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(ok=True, detail="1 passed")
+        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(
+            ok=True, detail="1 passed"
+        )
         self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
 
@@ -7920,7 +7972,9 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         orch, root, run_id = self._orch()
         orch.config.loop.retry_cycles = -1
         orch.config.loop.respec_on_retry = False
-        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(ok=False, detail=self.TEST_FAILURE)
+        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(
+            ok=False, detail=self.TEST_FAILURE
+        )
         self._calls(orch, tester=self._GOOD_TEST, executor="src/a.py\n```python\n# no fix\n```")
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
 
@@ -7937,7 +7991,9 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         (root / "web" / "main.js").write_text("run()\n", encoding="utf-8")
         (root / "src").mkdir(exist_ok=True)
         (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
-        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(ok=True, detail="1 passed")
+        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(
+            ok=True, detail="1 passed"
+        )
         self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
 
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
@@ -7950,7 +8006,9 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         orch, root, run_id = self._orch()
         (root / "src").mkdir(exist_ok=True)
         (root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
-        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(ok=True, detail="1 passed")
+        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(
+            ok=True, detail="1 passed"
+        )
         self._calls(orch, tester=self._GOOD_TEST, executor=self._FIX)
 
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
@@ -7959,7 +8017,9 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
 
     def test_a_report_too_vague_to_assert_is_handed_back(self):
         orch, _root, run_id = self._orch()
-        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(ok=False, detail=self.TEST_FAILURE)
+        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(
+            ok=False, detail=self.TEST_FAILURE
+        )
         seen = self._calls(
             orch,
             tester="BLOCKED: the report does not say what value was expected",
@@ -7995,7 +8055,9 @@ class TestABugIsReproducedBeforeItIsFixed(unittest.TestCase):
         # it is the one assertion here demonstrated against real behavior, and
         # it is half of what the ticket was for.
         orch, root, run_id = self._orch()
-        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(ok=False, detail=self.TEST_FAILURE)
+        orch._shell = lambda _r, _n, _c, _ticket="", **_kwargs: StepResult(
+            ok=False, detail=self.TEST_FAILURE
+        )
         self._calls(
             orch, tester=self._GOOD_TEST, executor="src/a.py\n```python\n# no fix\n```"
         )
@@ -8169,7 +8231,6 @@ class TestEveryLanguageIsVerified(unittest.TestCase):
         self.assertEqual(ran, ["baseline-test[.js]", "baseline-test[.rs]"])
         self.assertIn("test[.js]", baseline)
         self.assertNotIn("test[.rs]", baseline)
-
 
 
 def _workspace_repo(workspaces, files=(), commands=None):
@@ -8979,7 +9040,7 @@ class TestAFailureKeepsItsAddress(unittest.TestCase):
 
     def test_the_unrerooted_path_matches_nothing_the_ticket_owns(self):
         # Why this ships with the cwd change rather than after it.
-        root = self._repo()
+        self._repo()
         output = "src/level.ts(12,5): error TS2307: Cannot find module."
 
         self.assertFalse(errors_naming(output, "tools/path-forge/src/level.ts"))
@@ -10929,7 +10990,9 @@ class TestTheExecutorCanSayTheTicketIsImpossible(unittest.TestCase):
         outcome = orch._attempt(run_id, Ticket("T-1", allowed_files=["src/a.ts"]), "")
 
         self.assertFalse(outcome.blocked)
-        self.assertEqual((root / "src" / "a.ts").read_text(encoding="utf-8"), "export const x = 1;\n")
+        self.assertEqual(
+            (root / "src" / "a.ts").read_text(encoding="utf-8"), "export const x = 1;\n"
+        )
         self.assertIn("criteria disagree", orch._impossible_claims["T-1"])
 
     def test_the_claim_is_reported_once_not_every_attempt(self):
@@ -13348,7 +13411,11 @@ class TestATicketNothingCanRunDoesNotRun(unittest.TestCase):
 
     def test_a_declared_language_is_not_reported_as_unlinted_either(self):
         orch, run_id, _ticket, _called = self._orch(
-            {"lint": {".rs": "cargo clippy"}, "typecheck": "", "test": {".rs": "cargo test", ".sh": False}},
+            {
+                "lint": {".rs": "cargo clippy"},
+                "typecheck": "",
+                "test": {".rs": "cargo test", ".sh": False},
+            },
             allowed=("build.sh",),
         )
         (orch.config.root / "build.sh").write_text("echo hi\n", encoding="utf-8")
@@ -13642,7 +13709,16 @@ class TestReplayingWhatARunRecorded(unittest.TestCase):
         # on "same attempt" compared the wrong two and reported three parser
         # changes where the parser had not changed at all.
         config, store, run_id = self._project()
-        self._record(config, run_id, "T-1", 1, 1, "tests", {"role": "tester"}, "tests/t.py\n```\n1\n```")
+        self._record(
+            config,
+            run_id,
+            "T-1",
+            1,
+            1,
+            "tests",
+            {"role": "tester"},
+            "tests/t.py\n```\n1\n```",
+        )
         self._record(config, run_id, "T-1", 1, 2, "build", {"role": "executor"}, self.REPLY)
         self._record(config, run_id, "T-1", 1, 3, "apply", {"written": ["src/a.py"]})
 
@@ -13780,7 +13856,9 @@ class TestAWholeFileWithNoPathLineIsStillTheFile(unittest.TestCase):
         return "\n".join(out)
 
     def test_the_whole_file_is_recovered(self):
-        rewritten = self.CURRENT.replace("kind as u8 + 1", "if kind == 0 { 255 } else { kind as u8 + 1 }")
+        rewritten = self.CURRENT.replace(
+            "kind as u8 + 1", "if kind == 0 { 255 } else { kind as u8 + 1 }"
+        )
 
         body = infer_single_file(self._reply(rewritten), self.CURRENT)
 
@@ -13801,7 +13879,10 @@ class TestAWholeFileWithNoPathLineIsStillTheFile(unittest.TestCase):
         # The case that matters most. One real reply contained nothing but the
         # `color` function; writing it over the file would have deleted the
         # constants and `cells` with a successful apply and nothing in the log.
-        fragment = "pub fn color(kind: usize) -> u8 {\n    if kind == 0 { 255 } else { kind as u8 + 1 }\n}\n"
+        fragment = (
+            "pub fn color(kind: usize) -> u8 {\n"
+            "    if kind == 0 { 255 } else { kind as u8 + 1 }\n}\n"
+        )
 
         self.assertEqual(infer_single_file(self._reply(fragment), self.CURRENT), "")
 
@@ -14206,16 +14287,28 @@ class TestScopeMatchingIsLanguageAgnostic(unittest.TestCase):
     # (name, diagnostic, the repo-relative file it is about)
     DIALECTS = [
         ("rustc", "error[E0603]: module is private\n  --> src/board.rs:21:19", "src/board.rs"),
-        ("javac", "src/main/java/com/p/Scanner.java:33: error: cannot find symbol", "src/main/java/com/p/Scanner.java"),
+        (
+            "javac",
+            "src/main/java/com/p/Scanner.java:33: error: cannot find symbol",
+            "src/main/java/com/p/Scanner.java",
+        ),
         ("tsc", "src/app/main.ts(33,7): error TS2345: Argument of type 'x'", "src/app/main.ts"),
         ("gcc", "src/main.c:44:9: error: 'foo' undeclared", "src/main.c"),
         ("go", "./internal/scan/scan.go:18:2: undefined: Foo", "internal/scan/scan.go"),
-        ("pytest", "E   AssertionError: assert 1 == 2\ntests/test_scan.py:12: in <module>", "tests/test_scan.py"),
+        (
+            "pytest",
+            "E   AssertionError: assert 1 == 2\ntests/test_scan.py:12: in <module>",
+            "tests/test_scan.py",
+        ),
         ("eslint", "src/index.js:7:1: error  Unexpected var", "src/index.js"),
         ("dotnet", "src/Program.cs(15,20): error CS0103: The name 'x'", "src/Program.cs"),
         ("kotlin", "e: file:///repo/src/Main.kt:9:5 Unresolved reference", "/repo/src/Main.kt"),
         ("swift", "Sources/App/main.swift:22:9: error: cannot find 'x'", "Sources/App/main.swift"),
-        ("scala", "src/main/scala/Main.scala:14:20: not found: value x", "src/main/scala/Main.scala"),
+        (
+            "scala",
+            "src/main/scala/Main.scala:14:20: not found: value x",
+            "src/main/scala/Main.scala",
+        ),
         ("msvc", "src/main.cpp(120): error C2065: undeclared identifier", "src/main.cpp"),
     ]
 
@@ -14407,7 +14500,10 @@ class TestWhatIsKeptOfAnOverlongStep(unittest.TestCase):
         # down its renderer — *after* the run's verdict. The summary sits 29%
         # of the way in with half a megabyte of that couplet behind it, so a
         # head cut misses it and so does a tail cut.
-        noise = "ERROR: Condition is true. Returning: ERR_CANT_CREATE\n   at: swap_chain_resize (drivers/d3d12/rd.cpp:2837)\n"
+        noise = (
+            "ERROR: Condition is true. Returning: ERR_CANT_CREATE\n"
+            "   at: swap_chain_resize (drivers/d3d12/rd.cpp:2837)\n"
+        )
         text = "GdUnit4 Comandline Tool\n" + "filler\n" * 200 + (
             "Overall Summary: 403 test cases | 2 failures\n"
         ) + noise * 3_000
@@ -15893,6 +15989,7 @@ class TestATicketVerifiedByNothingEndsTheRun(unittest.TestCase):
         ]
         self.assertFalse(started, "no ticket may run after the tree stopped building")
 
+
 class TestABrokenToolchainIsNotATicketsFault(unittest.TestCase):
     """A verify command that never reaches the code produces no diagnostic and
     no location, so `signatures` finds nothing to attribute, the baseline
@@ -16364,7 +16461,6 @@ class TestRedLeftBehindEndsTheRunWhereItHappened(unittest.TestCase):
             tickets.append(Ticket("TT-002", allowed_files=["src/next.py"]))
         orch.store.add_tickets(run_id, tickets)
         return orch, run_id, failed
-
 
 
 class TestThePathTheModelPutInsideTheFence(unittest.TestCase):
@@ -17603,7 +17699,9 @@ class TestAReproductionIsFiledWhereItsLanguageCanCompileIt(unittest.TestCase):
 
     def test_a_java_reproduction_is_named_for_its_class(self):
         orch, _root, _run_id = self._orch(".java", "gradle test")
-        ticket = Ticket("BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/main/java/A.java"])
+        ticket = Ticket(
+            "BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/main/java/A.java"]
+        )
 
         path, why_not = orch._repro_target(ticket)
 
@@ -17614,7 +17712,9 @@ class TestAReproductionIsFiledWhereItsLanguageCanCompileIt(unittest.TestCase):
         # `tests/` is a fine guess in most ecosystems and an invisible one in
         # the JVM's, where a file outside the fixed source set is never run.
         orch, _root, _run_id = self._orch(".java", "gradle test")
-        ticket = Ticket("BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/main/java/A.java"])
+        ticket = Ticket(
+            "BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/main/java/A.java"]
+        )
 
         path, _ = orch._repro_target(ticket)
 
@@ -17635,7 +17735,9 @@ class TestAReproductionIsFiledWhereItsLanguageCanCompileIt(unittest.TestCase):
         # reclaim: verification runs over the whole project, and a test file no
         # ticket owns fails every ticket in the backlog.
         orch, _root, _run_id = self._orch(".java", "gradle test")
-        ticket = Ticket("BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/main/java/A.java"])
+        ticket = Ticket(
+            "BUG-002", kind=TICKET_BUG, spec="s", allowed_files=["src/main/java/A.java"]
+        )
 
         repro, _ = orch._repro_target(ticket)
 
@@ -17827,6 +17929,7 @@ class TestAProofIsWorthNothingWithoutItsFile(unittest.TestCase):
         orch._work_ticket(run_id, orch.store.list_tickets(run_id)[0])
 
         self.assertNotIn("tester", seen)
+
 
 class TestReadingASignOff(unittest.TestCase):
     """`parse_ratify` decides whether a role agreed, and it is fail-closed.
@@ -18097,7 +18200,10 @@ class TestTheSignOffPass(unittest.TestCase):
         # defect the pass exists to remove.
         script = {
             "planner": ["SIGNOFF: yes", json.dumps({"spec": "Revised once."}), "SIGNOFF: yes"],
-            "executor": ["SIGNOFF: no\nBLOCKING:\n- unclear", "SIGNOFF: no\nBLOCKING:\n- still unclear"],
+            "executor": [
+                "SIGNOFF: no\nBLOCKING:\n- unclear",
+                "SIGNOFF: no\nBLOCKING:\n- still unclear",
+            ],
             "tester": ["SIGNOFF: yes", "SIGNOFF: yes"],
             "reviewer": ["SIGNOFF: yes", "SIGNOFF: yes"],
         }
@@ -18113,8 +18219,14 @@ class TestTheSignOffPass(unittest.TestCase):
                 json.dumps({"spec": "Still two things."}),
                 "SIGNOFF: no\nBLOCKING:\n- the plan asks for two things",
             ],
-            "executor": ["SIGNOFF: no\nBLOCKING:\n- no scope for the second", "SIGNOFF: no\nBLOCKING:\n- no scope for the second"],
-            "tester": ["SIGNOFF: no\nBLOCKING:\n- untestable", "SIGNOFF: no\nBLOCKING:\n- untestable"],
+            "executor": [
+                "SIGNOFF: no\nBLOCKING:\n- no scope for the second",
+                "SIGNOFF: no\nBLOCKING:\n- no scope for the second",
+            ],
+            "tester": [
+                "SIGNOFF: no\nBLOCKING:\n- untestable",
+                "SIGNOFF: no\nBLOCKING:\n- untestable",
+            ],
             "reviewer": ["SIGNOFF: yes", "SIGNOFF: yes"],
         }
         result = self._ratify(script)
@@ -18195,7 +18307,10 @@ class TestTheSignOffPass(unittest.TestCase):
                     "SIGNOFF: yes",
                 ],
                 "executor": ["SIGNOFF: yes", "SIGNOFF: yes"],
-                "tester": ["SIGNOFF: no\nBLOCKING:\n- 'it parses' is not measurable", "SIGNOFF: yes"],
+                "tester": [
+                    "SIGNOFF: no\nBLOCKING:\n- 'it parses' is not measurable",
+                    "SIGNOFF: yes",
+                ],
                 "reviewer": ["SIGNOFF: yes", "SIGNOFF: yes"],
             }
         )
@@ -18521,7 +18636,10 @@ class TestACompileFailureGoesBackWithoutSpendingAnAttempt(unittest.TestCase):
         orch, _root, run_id = self._orch()
         asked: list[str] = []
         replies = _replies(*([self._reply("BROKEN = 1")] * 6
-                             + ["tests/t_test.py\n```python\ndef test_x():\n    assert True\n```"] * 4
+                             + [
+                                 "tests/t_test.py\n```python\n"
+                                 "def test_x():\n    assert True\n```"
+                             ] * 4
                              + ["REJECT\nno"] * 4))
 
         def call(run_id_, role, messages, **kwargs):
@@ -19053,7 +19171,8 @@ class TestAFixerAndAFormatterBothGetTheFiles(unittest.TestCase):
             "    target = pathlib.Path(argument)\n"
             "    text = target.read_text(encoding='utf-8')\n"
             "    target.write_text(\n"
-            "        chr(10).join(l.rstrip() for l in text.splitlines()) + chr(10), encoding='utf-8')\n",
+            "        chr(10).join(l.rstrip() for l in text.splitlines()) + chr(10), "
+            "encoding='utf-8')\n",
             encoding="utf-8",
         )
 
@@ -21095,7 +21214,6 @@ class TestTheSignOffPassDoesNotAskForAReview(unittest.TestCase):
         self.assertIn(RATIFY_QUESTIONS["tester"], tester)
 
 
-
 class TestAnEvictionIsWaitedForBeforeTheSlotIsClaimed(unittest.TestCase):
     """`/models/unload` answers before the checkpoint has gone.
 
@@ -21319,7 +21437,6 @@ class TestAnEvictionIsWaitedForBeforeTheSlotIsClaimed(unittest.TestCase):
             provider._ensure_loaded()
 
         self.assertEqual(asked, [("unload", "nemo-a")])
-
 
 
 class TestThePresetIsWrittenFromTheConfigThatPlansAgainstIt(unittest.TestCase):
@@ -21608,7 +21725,6 @@ class TestTheCloudAdapterNoLongerGuessesAWindow(unittest.TestCase):
         self.assertEqual(self._provider().base_url, "https://api.openai.com/v1")
 
 
-
 class TestTheBackendIsPickedRatherThanLandedOn(unittest.TestCase):
     """A Vulkan build is not an error, it is twenty hours.
 
@@ -21864,8 +21980,11 @@ class TestWhichServerRuns(unittest.TestCase):
 
     def test_a_fetched_build_is_preferred_over_path(self):
         expected = self._install(llama.PINNED_BUILD)
-        with unittest.mock.patch.object(llama, "install_root", lambda base=None: self.root), \
-                unittest.mock.patch.object(llama.shutil, "which", lambda _: "/usr/bin/llama-server"):
+        with unittest.mock.patch.object(
+            llama, "install_root", lambda base=None: self.root
+        ), unittest.mock.patch.object(
+            llama.shutil, "which", lambda _: "/usr/bin/llama-server"
+        ):
             binary, source = llama.resolve_server(llama.PINNED_BUILD)
 
         self.assertEqual(binary, expected)
@@ -21874,8 +21993,11 @@ class TestWhichServerRuns(unittest.TestCase):
     def test_path_is_a_fallback_and_not_an_error(self):
         # Someone who built from source for a backend nobody publishes has done
         # the right thing and should not be told to undo it.
-        with unittest.mock.patch.object(llama, "install_root", lambda base=None: self.root), \
-                unittest.mock.patch.object(llama.shutil, "which", lambda _: "/usr/bin/llama-server"):
+        with unittest.mock.patch.object(
+            llama, "install_root", lambda base=None: self.root
+        ), unittest.mock.patch.object(
+            llama.shutil, "which", lambda _: "/usr/bin/llama-server"
+        ):
             binary, source = llama.resolve_server(llama.PINNED_BUILD)
 
         self.assertEqual(binary, Path("/usr/bin/llama-server"))
@@ -21991,7 +22113,6 @@ class TestResolvingAgainstARelease(unittest.TestCase):
             assets = llama.resolve("b10687", target)
 
         self.assertEqual(len(assets), 1)
-
 
 
 class TestATicketCanReadTheFilesItsOwnSpecNames(unittest.TestCase):
@@ -22321,7 +22442,6 @@ class TestAPromptThatOverranIsNotSentAgain(unittest.TestCase):
         loaded = {t.ticket_id: t for t in reopened.list_tickets(run_id)}
 
         self.assertEqual(loaded["PF-009"].ratify_overrun, "abc123")
-
 
 
 class TestARouteNamesTheObjectionNotTheDecider(unittest.TestCase):

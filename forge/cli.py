@@ -33,6 +33,7 @@ import argparse
 import json
 import re
 import shutil
+import subprocess
 import sys
 import time
 import webbrowser
@@ -390,6 +391,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if report.startswith("FAIL"):
             failures += 1
 
+    _report_version_control(config)
+
     uncovered = _report_coverage(config)
 
     print()
@@ -400,6 +403,49 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             f"Work in them can only be checked by reading."
         )
     return 1 if failures else 0
+
+
+def _report_version_control(config: Config) -> bool:
+    """Whether the project is a git repository, said out loud when it is not.
+
+    Not counted as a failure — a tree without git still runs — but it is not a
+    detail either, and the loop currently only mentions it *after* the first
+    ticket has already failed. What stops working:
+
+    `_snapshot` writes the tree through a throwaway index and returns `""` when
+    git is unavailable, so `baseline_tree` is never recorded. `_quarantine`
+    refuses to revert without one — deleting on a guess could take a
+    hand-written file — so a failed ticket's work stays on disk. The next
+    cycle's baseline then reads that work as pre-existing and excuses it for
+    every ticket after, which is how a run reaches the end with tickets `done`
+    over a tree that does not build.
+
+    Nine runs of `examples/sample-project` went that way before anybody read
+    the warning, which is the argument for printing it here instead.
+    """
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed arguments, no shell
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=config.root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        inside = result.returncode == 0 and result.stdout.strip() == "true"
+    except (FileNotFoundError, OSError):
+        inside = False
+
+    if not inside:
+        print(
+            "\n  version control: not a git repository, so a failed ticket's "
+            "files cannot be reverted"
+        )
+        print(
+            "      They stay in the tree, the next cycle reads them as "
+            "pre-existing, and whatever they break is excused for every "
+            "ticket after rather than fixed. `git init` here fixes it."
+        )
+    return inside
 
 
 def _report_coverage(config: Config) -> list[str]:
@@ -1782,7 +1828,10 @@ def _write_command(
     succeeded, printed a confirmation, and changed no behaviour at all.
     """
     existing = workspace.commands.get(kind, "")
-    block = {ANY_LANGUAGE: existing} if isinstance(existing, str) and existing else dict(existing or {})
+    if isinstance(existing, str) and existing:
+        block = {ANY_LANGUAGE: existing}
+    else:
+        block = dict(existing or {})
     for key in suffixes or (language,):
         if key != ANY_LANGUAGE:
             block[key] = command

@@ -1,0 +1,24 @@
+[flake8]
+# 100 rather than 79. The prose in this codebase lives in comments and
+# docstrings and is wrapped at 79 by hand; the code around it is not, and
+# forcing it there would break argument lists that read better whole.
+max-line-length = 100
+
+# E203 is whitespace before `:`, which black deliberately emits in slices.
+# Keeping it on would mean choosing between two formatters' opinions rather
+# than catching anything.
+extend-ignore = E203
+
+exclude =
+    .git,
+    __pycache__,
+    .pytest_cache,
+    build,
+    hybrid_forge.egg-info
+
+# The fixture is graded by its own `.flake8` and its own workspace command, so
+# a run inside a copy of it meets the same rules a reader of the committed tree
+# does. Its suites shadow names on purpose and its spec files are the input to
+# that grading, not code this project styles.
+per-file-ignores =
+    examples/sample-project/tests/*:F811

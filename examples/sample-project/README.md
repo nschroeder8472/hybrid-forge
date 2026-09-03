@@ -27,19 +27,30 @@ It prints the path it wrote and the first command to run there.
 ```
 wordcount/counter.py        count_words — the root build's code
 tests/counter_test.py       its suite, green, punctuation-free on purpose
+.flake8                     the root build's grading, max-line-length 88
 plugin/histogram/bars.py    a second build, its own manifest, its own suite
 plugin/tests/bars_test.py
+plugin/.flake8              its own copy, resolvable from its own root
 SPEC.md                     three tickets for `forge ingest`
+HARD.md                     one exacting ticket that lands first try
 STALL.md                    one ticket that cannot succeed, for the brakes
+GRIND.md                    two tickets aimed at the middle; both land, and
+                            one is refused by ratify before it is built
 BUG.md                      one report for `forge bug`
 .hybridforge/config.json    two workspaces, per-language commands
 ```
 
-The two builds are the point of the layout. `plugin/` has its own manifest and
-its own tests directory, so the loop has to resolve each ticket to the build
-that owns it and run that build's command from that build's directory. A
-change that breaks workspace resolution shows up here as a command run from the
-wrong place, not as a subtle test failure.
+The two builds are the point of the layout. `plugin/` has its own manifest, its
+own tests directory and its own linter config, so the loop has to resolve each
+ticket to the build that owns it and run that build's commands from that
+build's directory. A change that breaks workspace resolution shows up here as a
+command run from the wrong place, not as a subtle test failure.
+
+The linter is why each build carries a `.flake8` of its own rather than sharing
+one above them. `toolchain_context` resolves a config by walking from a
+writable file up to its *workspace* root, so a shared file outside that root is
+one the roles working in the build are graded against and never shown — which
+is the exact failure Feature 1 of `docs/CONVERGENCE.md` exists to stop.
 
 ## The four things to run
 
@@ -53,11 +64,23 @@ forge bug --file BUG.md    the reproduce-before-fix path
 `forge doctor` is the one to run first after any change to coverage,
 workspaces, or the canary: it prints the matrix without spending a token.
 
-`STALL.md` is ingested *instead of* `SPEC.md`, in its own copy, when a change
-touches retries, respec, convergence or how a ticket is parked. It must end
-**blocked**, and the note it leaves has to name the real problem — its first
-two runs ended `done` over a criterion nobody had met, which is what the three
-guards in `CONVERGENCE.md` were written from.
+`STALL.md`, `HARD.md` and `GRIND.md` are each ingested *instead of* `SPEC.md`,
+in their own copy, when a change touches retries, respec, convergence or how a
+ticket is parked.
+
+- `STALL.md` must end **blocked**, and the note it leaves has to name the real
+  problem — its first two runs ended `done` over a criterion nobody had met,
+  which is what the three guards in `CONVERGENCE.md` were written from.
+- `HARD.md` must end **done**, and on the first attempt. It is the control
+  case: a well-specified ticket needs none of the convergence machinery, and a
+  change that makes this one take two attempts is the change to look at.
+- `GRIND.md` must end **done**, both tickets, on the first attempt each — and
+  the sign-off pass must refuse `GR-002` on its first pass, over a rounding
+  rule that cannot produce one of its own criteria. Two runs, and the second
+  reproduced the first down to three of four delivered files byte-identical. It
+  was written to reach the middle of `CONVERGENCE.md` and did not: the defect it
+  carries is one ratification repairs before a build call is spent. Read the
+  ratify notes rather than the verdict.
 
 `forge ingest` should report **parsed**, not planned. If it says planned, the
 spec grammar changed and `SPEC.md` no longer matches it — which is itself the
@@ -80,10 +103,15 @@ fixture cannot rot quietly:
 - **`count_words` still mishandles punctuation.** That is the seeded defect
   `BUG.md` reports, and it is deliberately not fixed. Fix it in your copy, not
   here.
+- **Both builds lint clean, by their own configured command.** `lint` was
+  `skip` for `.py` in both workspaces until 2026-09-01, which meant nothing the
+  loop generated here was ever graded mechanically — and the run every
+  convergence feature was derived from failed overwhelmingly on lint output.
+  A fixture that cannot fail that way cannot exercise the brakes.
 
 ## Keeping it clean
 
-The fixture is 15 files and nothing else. A run writes several more —
+The fixture is 20 files and nothing else. A run writes several more —
 `wordcount/report.py`, two test files, a database, a tickets directory, an
 artifact tree — and every one of them is ignored rather than named, by an
 allow-list in the repository's `.gitignore`:

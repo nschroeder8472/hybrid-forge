@@ -173,7 +173,13 @@ class RateLimited(ProviderError):
 
     retryable = True
 
-    def __init__(self, message: str, *, reset_at: float | None = None, retry_after: float | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        reset_at: float | None = None,
+        retry_after: float | None = None,
+    ):
         super().__init__(message)
         if reset_at is None and retry_after is not None:
             reset_at = time.time() + retry_after
@@ -372,7 +378,10 @@ class Provider(ABC):
                 timeout=60,
             )
         except ProviderError as exc:
-            return f"FAIL name={self.name} kind={self.kind} model={self.model} error={type(exc).__name__}: {exc}"
+            return (
+                f"FAIL name={self.name} kind={self.kind} model={self.model} "
+                f"error={type(exc).__name__}: {exc}"
+            )
 
         text = reply.text.strip()
         if not text:

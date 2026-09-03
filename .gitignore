@@ -45,6 +45,8 @@ examples/sample-project/**
 !examples/sample-project/**/
 !examples/sample-project/*.md
 !examples/sample-project/pyproject.toml
+!examples/sample-project/.flake8
+!examples/sample-project/plugin/.flake8
 !examples/sample-project/.hybridforge/.gitignore
 !examples/sample-project/.hybridforge/config.json
 !examples/sample-project/wordcount/__init__.py

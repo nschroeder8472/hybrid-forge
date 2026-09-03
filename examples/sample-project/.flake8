@@ -1,0 +1,13 @@
+[flake8]
+# The root build's grading. `plugin/` carries its own copy, because a build
+# owns its commands and a config a role cannot resolve from its own workspace
+# root is a config it never sees.
+max-line-length = 88
+
+# `plugin/` is the other build and is graded by its own command from its own
+# directory. Without this, a root-build ticket fails on a file it may not open.
+exclude =
+    .git,
+    __pycache__,
+    .hybridforge,
+    plugin

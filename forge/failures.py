@@ -23,6 +23,13 @@ import re
 from collections import Counter
 from pathlib import Path
 
+# A file extension, for every pattern here that needs to recognise one. The
+# lookahead requires a letter in it: an all-digit suffix is not an extension,
+# and without that `'127.0.0.1:0'` is the file `127.0.0.1` at line 0. Godot
+# prints that when it cannot reach its debugger — on every run — and it was
+# recorded as one of the top failure classes of a ticket, 37 times over.
+_EXTENSION = r"\.(?=[A-Za-z0-9]{0,4}[A-Za-z])[A-Za-z0-9]{1,5}"
+
 # Start of a diagnostic block. Deliberately broad — this runs over cargo, tsc,
 # pytest, eslint, go vet, and whatever a user configures, and a pattern that
 # misses simply falls back to the tail rather than losing the output.
@@ -76,18 +83,24 @@ _ERROR = re.compile(
     # Without it every vitest failure parsed to a diagnostic nothing could
     # attribute, on top of being invisible behind its own colour codes.
     r"|\s*(?:FAIL\b|✗|×)"                        # assorted test runners
+    # `path:line:col: E501 message` — flake8, ruff, pycodestyle, pylint. The
+    # word `error` appears nowhere on the line, so every pattern above missed
+    # it and a whole lint run parsed to zero diagnostic blocks. `signatures`
+    # then returned the empty set, which this module's own contract says means
+    # *cannot attribute* — and its callers were reading it as *no errors*: the
+    # compile gate announced `0 compile error(s) to answer` about 24 findings
+    # and charged the attempt on the next turn for failing to reduce a count it
+    # had never been able to take. Baseline amnesty was equally blind, so no
+    # lint failure anywhere could be told from a pre-existing one.
+    # `(?-i:...)` against this module's `IGNORECASE`: a code is upper-case, and
+    # without the guard `list.py:1:1: ab12 whatever` is a diagnostic.
+    r"|.*" + _EXTENSION + r":\d+(?::\d+)?:\s+(?-i:[A-Z]{1,4}\d{2,4})\b"
     r")",
     re.IGNORECASE,
 )
 
 _WARNING = re.compile(r"^\s*warning\s*[:\[]", re.IGNORECASE)
 
-# A file extension, for every pattern here that needs to recognise one. The
-# lookahead requires a letter in it: an all-digit suffix is not an extension,
-# and without that `'127.0.0.1:0'` is the file `127.0.0.1` at line 0. Godot
-# prints that when it cannot reach its debugger — on every run — and it was
-# recorded as one of the top failure classes of a ticket, 37 times over.
-_EXTENSION = r"\.(?=[A-Za-z0-9]{0,4}[A-Za-z])[A-Za-z0-9]{1,5}"
 
 # Continuation of a diagnostic that is not indented. rustc renders source
 # snippets with the line number in column zero (`77 |     .board`), and tsc and

@@ -715,7 +715,8 @@ _NORMALIZER_INLINE: tuple[tuple[str, str], ...] = (
     # `function u32(n) { return n >>> 0; }` on one line, and the Rust `fn`
     # spelling of the same.
     (
-        r"^\s*(?:export\s+|pub\s+)?(?:function|fn)\s+([A-Za-z_$][\w$]*)\s*\(\s*([A-Za-z_$][\w$]*)\s*"
+        r"^\s*(?:export\s+|pub\s+)?(?:function|fn)\s+([A-Za-z_$][\w$]*)\s*"
+        r"\(\s*([A-Za-z_$][\w$]*)\s*"
         r"(?::[^),]*)?\)\s*(?::[^{]*|->[^{]*)?\{\s*return\s+(.+?)\s*;?\s*\}\s*$",
         "function",
     ),
