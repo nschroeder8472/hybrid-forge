@@ -1,0 +1,33 @@
+{
+  "note": "arm-blind, 2026-09-03: flake8 graded against a max-line-length the executor was never shown. 24 findings, then 7, then a build that returned nothing and the same 7 again.",
+  "steps": [
+    {
+      "step": 11,
+      "ticket": "GR-001",
+      "name": "lint",
+      "status": "failed",
+      "detail": ".\\tests\\stream_test.py:10:51: E501 line too long (71 > 50 characters)\n.\\tests\\stream_test.py:15:51: E501 line too long (71 > 50 characters)\n.\\tests\\stream_test.py:24:51: E501 line too long (61 > 50 characters)\n.\\tests\\stream_test.py:27:51: E501 line too long (52 > 50 characters)\n.\\tests\\stream_test.py:32:51: E501 line too long (61 > 50 characters)\n.\\tests\\stream_test.py:35:51: E501 line too long (56 > 50 characters)\n.\\tests\\stream_test.py:39:51: E501 line too long (51 > 50 characters)\n.\\tests\\stream_test.py:41:51: E501 line too long (61 > 50 characters)\n.\\tests\\stream_test.py:50:51: E501 line too long (51 > 50 characters)\n.\\tests\\stream_test.py:57:51: E501 line too long (51 > 50 characters)\n.\\tests\\stream_test.py:62:51: E501 line too long (71 > 50 characters)\n.\\tests\\stream_test.py:63:51: E501 line too long (61 > 50 characters)\n.\\tests\\stream_test.py:68:51: E501 line too long (51 > 50 characters)\n.\\tests\\stream_test.py:80:51: E501 line too long (52 > 50 characters)\n.\\tests\\stream_test.py:85:51: E501 line too long (61 > 50 characters)\n.\\wordcount\\stream.py:7:51: E501 line too long (59 > 50 characters)\n.\\wordcount\\stream.py:11:51: E501 line too long (55 > 50 characters)\n.\\wordcount\\stream.py:17:51: E501 line too long (73 > 50 characters)\n.\\wordcount\\stream.py:24:51: E501 line too long (73 > 50 characters)\n.\\wordcount\\stream.py:27:51: E501 line too long (84 > 50 characters)\n.\\wordcount\\stream.py:31:51: E501 line too long (63 > 50 characters)\n.\\wordcount\\stream.py:35:51: E501 line too long (60 > 50 characters)\n.\\wordcount\\stream.py:36:51: E501 line too long (66 > 50 characters)\n.\\wordcount\\stream.py:39:51: E501 line too long (60 > 50 characters)"
+    },
+    {
+      "step": 14,
+      "ticket": "GR-001",
+      "name": "lint",
+      "status": "failed",
+      "detail": ".\\tests\\stream_test.py:35:51: E501 line too long (52 > 50 characters)\n.\\tests\\stream_test.py:45:51: E501 line too long (56 > 50 characters)\n.\\tests\\stream_test.py:49:51: E501 line too long (51 > 50 characters)\n.\\tests\\stream_test.py:62:51: E501 line too long (51 > 50 characters)\n.\\tests\\stream_test.py:69:51: E501 line too long (51 > 50 characters)\n.\\tests\\stream_test.py:84:51: E501 line too long (51 > 50 characters)\n.\\tests\\stream_test.py:96:51: E501 line too long (52 > 50 characters)"
+    },
+    {
+      "step": 15,
+      "ticket": "GR-001",
+      "name": "build",
+      "status": "ok",
+      "detail": ""
+    },
+    {
+      "step": 16,
+      "ticket": "GR-001",
+      "name": "lint",
+      "status": "failed",
+      "detail": ".\\tests\\stream_test.py:35:51: E501 line too long (52 > 50 characters)\n.\\tests\\stream_test.py:45:51: E501 line too long (56 > 50 characters)\n.\\tests\\stream_test.py:49:51: E501 line too long (51 > 50 characters)\n.\\tests\\stream_test.py:62:51: E501 line too long (51 > 50 characters)\n.\\tests\\stream_test.py:69:51: E501 line too long (51 > 50 characters)\n.\\tests\\stream_test.py:84:51: E501 line too long (51 > 50 characters)\n.\\tests\\stream_test.py:96:51: E501 line too long (52 > 50 characters)"
+    }
+  ]
+}
