@@ -198,6 +198,28 @@ part carries, with an unmeasured image charged what a provider's maximum
 resize (about 1568px on the longest edge) would cost. The estimate for a
 string-content message is unchanged to the token.
 
+**And the loop builds one.** A reference file that is a picture used to reach
+the prompt the way every other reference file did: read as UTF-8 with
+`errors="replace"` and pasted into a fenced block under its own path, so what
+the model saw as the contents of `assets/hero.png` was several thousand
+replacement characters. `_sources_for` now leaves images out of the text it
+returns and `_reference_images` reads them from the same scope as
+`ImagePart`s, which `_call` attaches for the executor, the tester and the
+reviewer — the three roles that read reference files.
+
+`_call` is where it happens because whether an image can be attached at all is
+a fact about the role's provider, and that is the only place that knows which
+provider a role has. A role whose model cannot see is told the files exist,
+named, and told why they are not attached; raising there would end a code
+ticket over a screenshot nobody needed. The message carries its own heading and
+is the first thing the budget gate drops, because an image is priced by area
+and a ticket that cannot fit should lose the screenshot rather than the
+criteria. One file over 4.5 MB, or past the fourth image, is named rather than
+sent — silence would leave the role to fill the gap in.
+
+`.svg` stays text on purpose: it is XML, a role that can read it can edit it,
+and it is the one image format the executor can actually write.
+
 Two things the sketch did not mention and the code needed. `ratify`'s prompt
 fingerprint hashes each image's digest alongside the text, because two prompts
 differing only in the picture they carry are two different questions and
@@ -544,7 +566,8 @@ generation anywhere: a reviewer can be handed a screenshot on a code ticket.*
 Tests in `tests/test_multimodal.py`: every adapter still sends the body it sent
 for a string prompt, each wire format decodes back to the original bytes, a
 blind model is refused before the request is made, an image-carrying prompt is
-priced above zero, and no record holds the bytes.
+priced above zero, no record holds the bytes, a reference `.png` is never read
+as text, and an `_attempt` over a ticket carrying one shows it to the executor.
 
 **2 — `ImageProvider` and accounting.** Base class, one adapter, registry,
 `usage.images`, `images_per_window`, `forge doctor` probing it. *Tests: a

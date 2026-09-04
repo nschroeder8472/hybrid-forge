@@ -33,6 +33,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from forge.artifacts import Artifacts  # noqa: E402
+from forge.config import Config, LoopSettings  # noqa: E402
+from forge.loop import Orchestrator, _droppable  # noqa: E402
+from forge.prompts import reference_images_message  # noqa: E402
+from forge.providers import Completion, Usage  # noqa: E402
+from forge.state import Store, Ticket  # noqa: E402
 from forge.providers.anthropic_api import AnthropicProvider  # noqa: E402
 from forge.providers.anthropic_api import _turn as anthropic_turn  # noqa: E402
 from forge.providers.base import (  # noqa: E402
@@ -65,6 +70,33 @@ def image(**overrides) -> ImagePart:
 
 def with_image(text: str = "does this match the criteria?") -> Message:
     return Message(role="user", content=[TextPart(text), image()])
+
+
+def orchestrator(**model):
+    """A real `Orchestrator` over a temp repo, with every command disabled.
+
+    `model` overrides the model block, so a test decides whether the role's
+    provider can see — which is the only thing the attachment path branches on.
+    """
+    root = Path(tempfile.mkdtemp(prefix="forge-images-"))
+    config = Config(
+        root=root,
+        models={
+            "m": {
+                "kind": "openai",
+                "baseUrl": "http://127.0.0.1:1/v1",
+                "model": "stub",
+                "contextWindow": 32768,
+                "maxOutputTokens": 1024,
+                **model,
+            }
+        },
+        roles={role: "m" for role in ("planner", "executor", "tester", "reviewer")},
+        commands={"lint": "", "typecheck": "", "test": ""},
+        loop=LoopSettings(ratify_passes=0, executor_turns=0),
+    )
+    store = Store(root / "t.db")
+    return Orchestrator(config, store), root, store.create_run("goal")
 
 
 class TestAStringIsStillAString(unittest.TestCase):
@@ -400,6 +432,260 @@ class TestAPromptFingerprintSeesThePicture(unittest.TestCase):
 
         self.assertTrue(digest)
         self.assertNotEqual(digest, self._digest(image()))
+
+
+class TestAPictureIsNotSource(unittest.TestCase):
+    """`_sources_for` read every file in a ticket's scope as UTF-8 with
+    `errors="replace"` and pasted it into a fenced block under its own path. A
+    reference `.png` reached the prompt as thousands of replacement characters
+    presented as the contents of that file, and a role told it may not write a
+    file it cannot read still has to work against it."""
+
+    def setUp(self):
+        self.orchestrator, self.root, self.run_id = orchestrator()
+        (self.root / "assets").mkdir()
+        (self.root / "src").mkdir()
+        (self.root / "assets" / "hero.png").write_bytes(PIXELS)
+        (self.root / "src" / "page.py").write_text("layout = 1\n", encoding="utf-8")
+
+    def _ticket(self, *reference: str) -> Ticket:
+        return Ticket(
+            "T-1", allowed_files=["src/page.py"], reference_files=list(reference)
+        )
+
+    def test_the_image_is_not_read_as_text(self):
+        sources, _oversized = self.orchestrator._sources_for(
+            self._ticket("assets/hero.png")
+        )
+
+        self.assertEqual(list(sources), ["src/page.py"])
+
+    def test_nothing_it_would_have_pasted_reaches_a_prompt(self):
+        sources, _oversized = self.orchestrator._sources_for(
+            self._ticket("assets/hero.png")
+        )
+
+        self.assertNotIn("�", "".join(sources.values()))
+
+    def test_it_comes_back_as_something_to_look_at_instead(self):
+        images, withheld = self.orchestrator._reference_images(
+            self._ticket("assets/hero.png")
+        )
+
+        self.assertEqual(withheld, [])
+        self.assertEqual([part.path for part in images], ["assets/hero.png"])
+        self.assertEqual(images[0].media_type, "image/png")
+        self.assertEqual(images[0].data, PIXELS)
+
+    def test_every_extension_the_providers_take(self):
+        for name, media_type in (
+            ("a.png", "image/png"),
+            ("b.jpg", "image/jpeg"),
+            ("c.jpeg", "image/jpeg"),
+            ("d.gif", "image/gif"),
+            ("e.webp", "image/webp"),
+        ):
+            with self.subTest(name=name):
+                (self.root / "assets" / name).write_bytes(PIXELS)
+
+                images, _withheld = self.orchestrator._reference_images(
+                    self._ticket(f"assets/{name}")
+                )
+
+                self.assertEqual([part.media_type for part in images], [media_type])
+
+    def test_an_svg_is_still_text(self):
+        # XML, readable, and editable by a role that can read it. Making it a
+        # picture would take away the one image format the executor can write.
+        (self.root / "assets" / "icon.svg").write_text("<svg/>\n", encoding="utf-8")
+        ticket = self._ticket("assets/icon.svg")
+
+        sources, _oversized = self.orchestrator._sources_for(ticket)
+        images, _withheld = self.orchestrator._reference_images(ticket)
+
+        self.assertIn("assets/icon.svg", sources)
+        self.assertEqual(images, [])
+
+    def test_a_writable_image_is_not_offered_as_a_file_to_rewrite(self):
+        # The executor returns whole files as text. An image in `allowed_files`
+        # has no text to return, and showing it as one spends an attempt on a
+        # model rewriting a picture.
+        ticket = Ticket("T-1", allowed_files=["assets/hero.png", "src/page.py"])
+
+        sources, oversized = self.orchestrator._sources_for(
+            ticket, whole=ticket.allowed_files
+        )
+
+        self.assertEqual(list(sources), ["src/page.py"])
+        self.assertEqual(oversized, [])
+
+    def test_a_file_that_is_not_there_is_not_invented(self):
+        images, withheld = self.orchestrator._reference_images(
+            self._ticket("assets/missing.png")
+        )
+
+        self.assertEqual((images, withheld), ([], []))
+
+    def test_one_file_named_twice_is_one_image(self):
+        ticket = Ticket(
+            "T-1",
+            allowed_files=["assets/hero.png"],
+            reference_files=["assets/hero.png"],
+        )
+
+        images, _withheld = self.orchestrator._reference_images(ticket)
+
+        self.assertEqual(len(images), 1)
+
+    def test_a_path_outside_the_repository_is_refused(self):
+        images, withheld = self.orchestrator._reference_images(
+            self._ticket("../secrets/hero.png")
+        )
+
+        self.assertEqual((images, withheld), ([], []))
+
+
+class TestAnImageTooBigToSendIsNamedNotSent(unittest.TestCase):
+    """Withholding is not silence. A role not shown a file that is in its own
+    reading scope has to be told the file exists, or it fills the gap in."""
+
+    def setUp(self):
+        self.orchestrator, self.root, self.run_id = orchestrator()
+        (self.root / "assets").mkdir()
+
+    def _write(self, name: str, size: int = len(PIXELS)) -> None:
+        padding = b"\0" * max(0, size - len(PIXELS))
+        (self.root / "assets" / name).write_bytes(PIXELS + padding)
+
+    def test_a_file_over_the_ceiling_is_withheld_with_its_size(self):
+        self._write("huge.png", Orchestrator._IMAGE_CEILING + 1)
+
+        images, withheld = self.orchestrator._reference_images(
+            Ticket("T-1", reference_files=["assets/huge.png"])
+        )
+
+        self.assertEqual(images, [])
+        self.assertEqual(len(withheld), 1)
+        self.assertIn("assets/huge.png", withheld[0])
+        self.assertIn("too large", withheld[0])
+
+    def test_past_the_count_one_prompt_carries_the_rest_are_named(self):
+        names = [f"shot{index}.png" for index in range(Orchestrator._IMAGE_LIMIT + 2)]
+        for name in names:
+            self._write(name)
+
+        images, withheld = self.orchestrator._reference_images(
+            Ticket("T-1", reference_files=[f"assets/{name}" for name in names])
+        )
+
+        self.assertEqual(len(images), Orchestrator._IMAGE_LIMIT)
+        self.assertEqual(len(withheld), 2)
+        self.assertIn("limit", withheld[0])
+
+
+class TestWhatTheRoleIsActuallySent(unittest.TestCase):
+    """The message the pictures arrive in, through `_call` — the only place
+    that knows which provider a role has."""
+
+    def _sent(self, orchestra, run_id, **kwargs) -> list[Message]:
+        seen: list[list[Message]] = []
+
+        def complete(_self, messages, **_kwargs):
+            seen.append(messages)
+            return Completion(text="ok", usage=Usage(), finish_reason="stop")
+
+        with unittest.mock.patch.object(OpenAICompatProvider, "complete", complete):
+            orchestra._call(
+                run_id,
+                "reviewer",
+                [Message(role="user", content="judge this")],
+                max_tokens=64,
+                **kwargs,
+            )
+        return seen[0]
+
+    def test_a_model_that_can_see_is_sent_the_image(self):
+        orchestra, _root, run_id = orchestrator(multimodal=True)
+
+        messages = self._sent(orchestra, run_id, images=[image(path="a.png")])
+
+        attached = messages[-1]
+        self.assertEqual([part.data for part in attached.images], [PIXELS])
+        self.assertIn("a.png", attached.text)
+
+    def test_a_model_that_cannot_is_told_the_file_exists(self):
+        # Not raised on: a code ticket must not die because a screenshot was
+        # attached to a role pointed at a text-only model.
+        orchestra, _root, run_id = orchestrator()
+
+        messages = self._sent(orchestra, run_id, images=[image(path="a.png")])
+
+        attached = messages[-1]
+        self.assertEqual(attached.images, [])
+        self.assertIn("a.png", attached.text)
+        self.assertIn("cannot be shown an image", attached.text)
+
+    def test_a_withheld_file_is_named_even_with_nothing_attached(self):
+        orchestra, _root, run_id = orchestrator(multimodal=True)
+
+        messages = self._sent(
+            orchestra, run_id, images_withheld=["assets/huge.png (too large to send)"]
+        )
+
+        self.assertIn("assets/huge.png", messages[-1].text)
+
+    def test_a_prompt_with_no_images_is_the_prompt_it_always_was(self):
+        orchestra, _root, run_id = orchestrator(multimodal=True)
+
+        messages = self._sent(orchestra, run_id)
+
+        self.assertEqual(messages, [Message(role="user", content="judge this")])
+
+    def test_the_executor_building_the_ticket_is_shown_them(self):
+        # End to end through `_attempt`, because the attachment is wired per
+        # role at the call site: a helper nothing calls is the failure mode
+        # this whole change is most likely to end in.
+        orchestra, root, run_id = orchestrator(multimodal=True)
+        (root / "assets").mkdir()
+        (root / "assets" / "hero.png").write_bytes(PIXELS)
+        ticket = Ticket(
+            "T-1",
+            allowed_files=["src/page.py"],
+            reference_files=["assets/hero.png"],
+            criteria=["the page matches the mock"],
+        )
+        seen: list[list[Message]] = []
+
+        def complete(_self, messages, **_kwargs):
+            seen.append(messages)
+            return Completion(
+                text="src/page.py\n```python\nlayout = 1\n```",
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        with unittest.mock.patch.object(OpenAICompatProvider, "complete", complete):
+            orchestra._attempt(run_id, ticket, "")
+
+        # The first prompt of the attempt is the build. Later ones are the
+        # roles that follow it, which carry the same scope for the same reason.
+        attached = [message for message in seen[0] if message.images]
+        self.assertEqual(len(attached), 1, "the executor was not shown the image")
+        self.assertEqual(attached[0].images[0].path, "assets/hero.png")
+        self.assertTrue(
+            all(any(m.images for m in prompt) for prompt in seen),
+            "a role in this attempt was left to guess at the image",
+        )
+
+    def test_the_pictures_are_what_the_budget_gate_drops_first(self):
+        # The most expensive thing in the prompt and the least essential: an
+        # image is priced by area, and a ticket that cannot fit should lose the
+        # screenshot rather than the criteria.
+        message = reference_images_message(
+            [image(path="a.png")], can_see=True, withheld=[]
+        )
+
+        self.assertTrue(_droppable(message))
 
 
 if __name__ == "__main__":

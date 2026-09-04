@@ -15,7 +15,7 @@ from collections import Counter
 from typing import Any, Sequence
 
 from .failures import distill
-from .providers import Message
+from .providers import ImagePart, Message, TextPart
 from .state import TICKET_BUG, Ticket
 
 # The prefixes that mark a message as droppable to the budget gate. Memory and
@@ -55,6 +55,13 @@ RATIFICATION_HEADING = "## Settled before any code was written"
 # failures is exactly what one run spent 512 attempts doing — see
 # docs/CONVERGENCE.md.
 TOOLCHAIN_HEADING = "## How this project checks the code you write"
+
+# Reference files that are pictures rather than text. Droppable for the same
+# reason the toolchain block is, and ahead of it in cost: an image is priced by
+# area and a screenshot is worth thousands of tokens, so a prompt that has to
+# lose something should lose the picture before it loses the rule it could have
+# inferred from a failure.
+REFERENCE_IMAGES_HEADING = "## Reference images for this ticket"
 
 # The path root every format example in this module uses. A small model shown a
 # worked example will sometimes return the example along with its answer, and
@@ -580,6 +587,64 @@ and they are not in your scope.
 {_sources_block(toolchain)}
 """,
     )
+
+
+def reference_images_message(
+    images: Sequence[ImagePart],
+    *,
+    can_see: bool,
+    withheld: Sequence[str] = (),
+) -> Message | None:
+    """The ticket's reference images, as a message the role can look at.
+
+    A reference file that is a picture used to reach the prompt the way every
+    other reference file did: read as UTF-8 with `errors="replace"` and pasted
+    into a fenced block. What the model was shown was several thousand
+    replacement characters presented as the contents of `assets/hero.png`, and
+    a role that is told it may not write a file it cannot read still has to
+    work against it.
+
+    `can_see` is the provider's own answer, not a guess from the model name. A
+    role whose model is text-only is told the files exist, named, and told why
+    they are not here — which is the difference between a reviewer that knows
+    it is judging without them and one that believes it has seen them.
+
+    `withheld` names images that exist and are not attached for a reason other
+    than blindness: too large to send, or beyond the count this prompt carries.
+    """
+    if not images and not withheld:
+        return None
+
+    shown = [part for part in images if part.path]
+    lines = [REFERENCE_IMAGES_HEADING]
+    if can_see and shown:
+        lines.append(
+            "These files are part of this ticket's reading scope and are shown "
+            "below, in this order. They are read-only: nothing here asks you to "
+            "produce an image."
+        )
+        lines.extend(f"- {part.path}" for part in shown)
+    elif shown:
+        lines.append(
+            "This ticket's reading scope includes these image files. The model "
+            "answering this prompt cannot be shown an image, so they are named "
+            "rather than attached — do not guess at what they contain, and say "
+            "so if the answer depends on seeing them."
+        )
+        lines.extend(f"- {part.path}" for part in shown)
+    if withheld:
+        lines.append(
+            "These are in scope and are not attached:"
+            if shown
+            else "This ticket's reading scope includes image files that are not "
+            "attached:"
+        )
+        lines.extend(f"- {entry}" for entry in withheld)
+
+    text = "\n".join(lines) + "\n"
+    if not can_see or not shown:
+        return Message(role="user", content=text)
+    return Message(role="user", content=[TextPart(text), *shown])
 
 
 def _classes_message(classes: Sequence[dict]) -> Message | None:

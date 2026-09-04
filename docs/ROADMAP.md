@@ -337,10 +337,13 @@ adds `forge toolchain` to set one up. Five phases, each landing on its own.
 **Status:** phase 1 built, the rest designed — [IMAGE-LOOP.md](IMAGE-LOOP.md).
 Multimodal messages landed on their own: a prompt may carry an `ImagePart`, a
 provider declares whether it can see one, and a model that cannot is refused
-before the request rather than shown a question with the image removed. That is
-useful with no image generation anywhere — a reviewer handed a screenshot on an
-ordinary code ticket — and it is the only part of this entry that does not
-depend on the spec below surviving contact with a model.
+before the request rather than shown a question with the image removed. The
+loop builds them from a ticket's own reading scope, so a reference `.png` now
+reaches the executor, the tester and the reviewer as something to look at —
+where it used to arrive as several thousand replacement characters labelled
+with the file's name. That is useful with no image generation anywhere, and it
+is the only part of this entry that does not depend on the spec below
+surviving contact with a model.
 
 The loop's steps are named after code, but only two of them are about code. The
 rest is a shape: produce an artifact under a scope, check it mechanically, have
