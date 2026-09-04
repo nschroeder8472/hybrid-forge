@@ -95,6 +95,7 @@ class TestTheFixtureIsOnlyTheFixture(unittest.TestCase):
         "README.md",
         "GRIND.md",
         "HARD.md",
+        "OPAQUE.md",
         "SPEC.md",
         "STALL.md",
         "plugin/.flake8",
@@ -599,6 +600,114 @@ class TestTheGrindBacklogReachesTheMiddleOfTheLoop(unittest.TestCase):
                 any("test" in path for path in ticket.allowed_files),
                 f"{ticket.ticket_id} has no test file in its allowed files",
             )
+
+
+class TestTheOpaqueBacklogWithholdsTheRule(unittest.TestCase):
+    """Eleven runs of this fixture have landed and none has asked the
+    escalation ladder a question. The reading in `docs/ROADMAP.md` is that
+    every mechanism below the ladder absorbs the failure it exists to escalate,
+    and that what none of them can absorb is a failure whose *text does not
+    describe its cause* — `TS2532 object is possibly undefined` against
+    `E501 line too long (52 > 50 characters)`.
+
+    `OPAQUE.md` is written to produce failures of the first kind: the rule that
+    decides a bar's length lives in a file the ticket may not read or call, and
+    what a failing attempt is shown is one character of difference in an
+    assertion."""
+
+    def setUp(self):
+        self.tickets, self.how, _derived = ingest(
+            (SAMPLE / "OPAQUE.md").read_text(encoding="utf-8")
+        )
+        self.ticket = self.tickets[0]
+
+    def _bars(self):
+        sys.path.insert(0, str(SAMPLE / "plugin"))
+        written = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        try:
+            from histogram.bars import bars
+        finally:
+            sys.dont_write_bytecode = written
+            sys.path.pop(0)
+        return bars
+
+    def test_it_is_one_parsed_ticket(self):
+        self.assertEqual(self.how, "parsed")
+        self.assertEqual([t.ticket_id for t in self.tickets], ["OP-001"])
+
+    def test_it_runs_in_the_second_build(self):
+        config = Config.load(SAMPLE)
+        builds = {
+            config.workspace_for(path).root for path in self.ticket.allowed_files
+        }
+
+        self.assertEqual(builds, {"plugin"})
+
+    def test_the_file_that_decides_the_answer_is_not_in_the_prompt(self):
+        # The whole mechanism. `bars.py` carries `count * width // tallest`,
+        # and a ticket that could read it would be a ticket whose failures
+        # name their own cause.
+        scope = self.ticket.allowed_files + self.ticket.reference_files
+
+        self.assertNotIn("plugin/histogram/bars.py", scope)
+
+    def test_but_the_ordering_rule_is(self):
+        # The ticket is not a guessing game: everything except the scaling
+        # arithmetic is in the prompt, and `bars_test.py` is where the ordering
+        # and full-width rules come from.
+        self.assertIn("plugin/tests/bars_test.py", self.ticket.reference_files)
+
+    def test_the_criteria_name_what_decides_the_answer(self):
+        # Satisfiable, and mechanically so: the tester can import `bars` and
+        # compare. A criterion nobody can check is what parks `STALL.md`, and
+        # this backlog is meant to end done.
+        comparison = [c for c in self.ticket.criteria if "bars(" in c]
+
+        self.assertEqual(len(comparison), 1)
+        self.assertIn("may not", comparison[0])
+
+    def test_the_mappings_it_names_really_do_separate_the_rules(self):
+        # The guard against quiet rot, and the same one `STALL.md` has: if
+        # somebody changes `bars` to round, this backlog stops testing anything
+        # and every run of it lands on the first attempt for the wrong reason.
+        bars = self._bars()
+        for counts in ({"a": 3, "b": 2}, {"a": 5, "b": 3, "c": 1}, {"a": 3, "b": 1, "c": 2}):
+            tallest = max(counts.values())
+            ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+            rounded = [
+                f"{word} {'#' * round(count / tallest * 4)}" for word, count in ranked
+            ]
+
+            self.assertNotEqual(bars(counts, width=4), rounded, counts)
+
+    def test_one_of_them_catches_a_bar_clamped_to_a_single_character(self):
+        # The repair a wrong implementation reaches for first: a word with a
+        # count "should" show something. The rule says it shows nothing.
+        bars = self._bars()
+
+        self.assertEqual(bars({"a": 5, "b": 3, "c": 1}, width=4)[-1].strip(), "c")
+
+    def test_the_criteria_it_states_outright_are_what_the_rule_produces(self):
+        # Every stated criterion has to be true of the code being compared
+        # against, or the ticket is unsatisfiable and this is `STALL.md` again.
+        bars = self._bars()
+
+        self.assertEqual(bars({"a": 2}, width=4), ["a ####"])
+        self.assertEqual(bars({"b": 1, "a": 1}, width=1), ["a #", "b #"])
+        self.assertEqual(bars({"a": 4, "b": 2}, width=4), ["a ####", "b ##"])
+
+    def test_it_writes_files_the_other_specs_do_not(self):
+        mine = set(self.ticket.allowed_files)
+        for name in ("SPEC.md", "HARD.md", "STALL.md", "GRIND.md"):
+            other, _how, _derived = ingest((SAMPLE / name).read_text(encoding="utf-8"))
+            theirs = {path for ticket in other for path in ticket.allowed_files}
+            self.assertEqual(theirs & mine, set(), name)
+        for path in mine:
+            self.assertFalse((SAMPLE / path).exists(), path)
+
+    def test_it_names_its_own_test_file(self):
+        self.assertTrue(any("test" in path for path in self.ticket.allowed_files))
 
 
 class TestTheSeededDefectIsStillThere(unittest.TestCase):

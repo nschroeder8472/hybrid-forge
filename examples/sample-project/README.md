@@ -36,6 +36,8 @@ HARD.md                     one exacting ticket that lands first try
 STALL.md                    one ticket that cannot succeed, for the brakes
 GRIND.md                    two tickets aimed at the middle; both land, and
                             one is refused by ratify before it is built
+OPAQUE.md                   one ticket whose failures do not name their cause,
+                            written for the ladder nothing has reached yet
 BUG.md                      one report for `forge bug`
 .hybridforge/config.json    two workspaces, per-language commands
 ```
@@ -64,9 +66,9 @@ forge bug --file BUG.md    the reproduce-before-fix path
 `forge doctor` is the one to run first after any change to coverage,
 workspaces, or the canary: it prints the matrix without spending a token.
 
-`STALL.md`, `HARD.md` and `GRIND.md` are each ingested *instead of* `SPEC.md`,
-in their own copy, when a change touches retries, respec, convergence or how a
-ticket is parked.
+`STALL.md`, `HARD.md`, `GRIND.md` and `OPAQUE.md` are each ingested *instead
+of* `SPEC.md`, in their own copy, when a change touches retries, respec,
+convergence or how a ticket is parked.
 
 - `STALL.md` must end **blocked**, and the note it leaves has to name the real
   problem — its first two runs ended `done` over a criterion nobody had met,
@@ -81,6 +83,13 @@ ticket is parked.
   was written to reach the middle of `CONVERGENCE.md` and did not: the defect it
   carries is one ratification repairs before a build call is spent. Read the
   ratify notes rather than the verdict.
+- `OPAQUE.md` must end **done**, and should not manage it on the first attempt.
+  It is the one backlog here whose failures do not describe their own cause:
+  the rule that decides its answer lives in a file the ticket may neither read
+  nor call, so what a failing attempt is shown is one character of difference
+  in an assertion. **It has never been run.** Everything the document claims
+  about it is derived from reading the loop, which is the weak kind of argument
+  — the first run is the evidence. Read the attempt count first.
 
 `forge ingest` should report **parsed**, not planned. If it says planned, the
 spec grammar changed and `SPEC.md` no longer matches it — which is itself the

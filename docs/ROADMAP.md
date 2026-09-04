@@ -164,8 +164,30 @@ ratification answers a defective spec before a build call is spent. What would
 reach the ladder is a defect whose *failure text does not describe it* — the
 reference run's `TS2532 object is possibly undefined` names a symptom whose
 cause is a compiler flag two files away, where `E501 line too long (52 > 50
-characters)` hands over the rule. That is the fixture's next ticket, if there
-is one.
+characters)` hands over the rule.
+
+**That ticket now exists and has not been run.**
+`examples/sample-project/OPAQUE.md` asks for a second renderer in the plugin
+build whose bars must match the ones `histogram.bars` already draws. It may not
+call `bars` and `bars.py` is not in its reading scope, so the rule that decides
+a bar's length — `count * width // tallest`, multiply then floor — is nowhere
+in the prompt. Every natural alternative agrees with it on most inputs, and the
+criteria name three mappings where it does not; on one of them the rule renders
+a word with no bar at all, which an implementation will read as a bug of its
+own and repair the wrong way. What a failing attempt is shown is
+`AssertionError: 'c  x1' != 'c # x1'`: one character, no rule, and no file it
+can open to find one.
+
+It is meant to end **done**, which is what separates it from `STALL.md` — the
+executor can converge on the rule from its own failures, and the guard suite
+pins that the three mappings really do separate flooring from rounding so the
+trap cannot rot. What the run answers is how many attempts that takes, whether
+`_measure_cycle` is reached at all, whether a cycle that fixes two of three
+disagreements reads `descending` now that volume is measured, and what the
+learning slot recorded. Everything in this paragraph is derived from reading
+the loop rather than from watching it, which is the argument §9 of
+[LOOP-INVARIANTS.md](LOOP-INVARIANTS.md) exists to distrust. The first run is
+the evidence.
 
 ---
 
