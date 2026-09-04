@@ -10,6 +10,7 @@ so it does not end up in server access logs.
 
 from __future__ import annotations
 
+import base64
 import os
 from typing import Any
 
@@ -18,6 +19,7 @@ from .base import (
     DERIVE_TIMEOUT,
     Capabilities,
     Completion,
+    ImagePart,
     Message,
     Provider,
     ProviderAuthError,
@@ -34,6 +36,21 @@ _CONTEXT_WINDOWS = {
     "gemini-2.0-flash": 1_048_576,
 }
 _DEFAULT_CONTEXT = 32_768
+
+
+def _parts(message: Message) -> list[dict[str, Any]]:
+    """One turn's `parts`. An image travels as `inline_data`."""
+    return [
+        {
+            "inline_data": {
+                "mime_type": part.media_type,
+                "data": base64.b64encode(part.data).decode("ascii"),
+            }
+        }
+        if isinstance(part, ImagePart)
+        else {"text": part.text}
+        for part in message.parts
+    ]
 
 
 class GeminiProvider(Provider):
@@ -66,13 +83,14 @@ class GeminiProvider(Provider):
         # Zero means the caller did not care; the budget decides. An
         # explicit timeout is always truthy and passes through.
         timeout = timeout or self.request_timeout(max_tokens)
+        self._require_vision(messages)
         system, turns = split_system(messages)
         payload: dict[str, Any] = {
             "contents": [
                 {
                     # Gemini calls the assistant role "model".
                     "role": "model" if m.role == "assistant" else "user",
-                    "parts": [{"text": m.content}],
+                    "parts": _parts(m),
                 }
                 for m in turns
             ],
@@ -135,4 +153,7 @@ class GeminiProvider(Provider):
         return Capabilities(
             context_window=context_window,
             max_output_tokens=int(self.config.get("maxOutputTokens", 8192)),
+            # Every Gemini model on this surface takes images; `vision: false`
+            # is the operator's off switch, as on the Anthropic adapter.
+            supports_images=bool(self.config.get("vision", True)),
         )

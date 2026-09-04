@@ -1,6 +1,10 @@
 # Image generation loop — design spec
 
-**Status:** designed, not built. Nothing in this document exists in the code.
+**Status:** phase 1 built; phases 2-6 designed, not built. Multimodal messages
+ship on their own — a reviewer can be handed a screenshot on an ordinary code
+ticket, with no image generation anywhere in the picture. Nothing else in this
+document exists in the code: there is no image provider, no `kind: image`, and
+no image ticket has ever run.
 
 The loop's steps are named after code — build, apply, verify, review — but only
 two of them are actually about code. The rest is a shape: *produce an artifact
@@ -113,10 +117,10 @@ is a language with a runner, and `python tools/check_IMG-001.py` is that runner.
 
 ---
 
-## Problem 1 — `Message.content` is a `str`
+## Problem 1 — `Message.content` is a `str` — built
 
-A reviewer that cannot see the image is not a reviewer. `Message.content` is
-typed `str` and every adapter formats it as one.
+A reviewer that cannot see the image is not a reviewer. `Message.content` was
+typed `str` and every adapter formatted it as one.
 
 The change is to make content a sequence of parts:
 
@@ -169,6 +173,61 @@ role needs a capability most of the adapters lack.
 **Artifacts must not inline megabytes.** `Artifacts.write` records step detail as
 readable text. An `ImagePart` is recorded as a path into the run's artifact
 directory plus its digest, never as base64 in the step record.
+
+### What was built, and where it differs from the sketch above
+
+`TextPart`, `ImagePart` and a `Message.content` of `str | list[Part]`, with
+`Message.parts`, `.text` and `.images` in `providers/base.py`. A string is read
+as one `TextPart`, so every prompt the loop builds produces the request body it
+produced before — checked per adapter rather than asserted, because that is the
+regression this change was most likely to cause.
+
+`Capabilities.supports_images` defaults to `False` and each adapter declares
+it: the Anthropic and Gemini adapters report `True` unless the model block says
+`vision: false`, the OpenAI-compatible and llamacpp adapters report `False`
+unless it says `multimodal: true` — the same key `presets` already reads to
+decide whether to write `mmproj-auto = false` — and `claude-cli` reports
+`False` and cannot be talked out of it.
+
+The refusal is `ProviderCannotSee`, raised by `Provider._require_vision` at the
+top of every adapter's `complete`, before the request is built. Not retryable:
+a checkpoint does not grow a projector between attempts.
+
+Pricing is in `tokens.py`: `(width x height) / 750`, from the dimensions the
+part carries, with an unmeasured image charged what a provider's maximum
+resize (about 1568px on the longest edge) would cost. The estimate for a
+string-content message is unchanged to the token.
+
+**And the loop builds one.** A reference file that is a picture used to reach
+the prompt the way every other reference file did: read as UTF-8 with
+`errors="replace"` and pasted into a fenced block under its own path, so what
+the model saw as the contents of `assets/hero.png` was several thousand
+replacement characters. `_sources_for` now leaves images out of the text it
+returns and `_reference_images` reads them from the same scope as
+`ImagePart`s, which `_call` attaches for the executor, the tester and the
+reviewer — the three roles that read reference files.
+
+`_call` is where it happens because whether an image can be attached at all is
+a fact about the role's provider, and that is the only place that knows which
+provider a role has. A role whose model cannot see is told the files exist,
+named, and told why they are not attached; raising there would end a code
+ticket over a screenshot nobody needed. The message carries its own heading and
+is the first thing the budget gate drops, because an image is priced by area
+and a ticket that cannot fit should lose the screenshot rather than the
+criteria. One file over 4.5 MB, or past the fourth image, is named rather than
+sent — silence would leave the role to fill the gap in.
+
+`.svg` stays text on purpose: it is XML, a role that can read it can edit it,
+and it is the one image format the executor can actually write.
+
+Two things the sketch did not mention and the code needed. `ratify`'s prompt
+fingerprint hashes each image's digest alongside the text, because two prompts
+differing only in the picture they carry are two different questions and
+"have we asked this before" would otherwise answer yes to the second. And
+`Artifacts.record` reduces any part-like or `bytes` value in a payload to
+media type, size and digest on the way to disk, rather than trusting callers
+not to hand it bytes — `json.dumps(default=str)` would have written the repr of
+the image into the one file whose purpose is being read by eye.
 
 ---
 
@@ -500,13 +559,15 @@ command instead of a review.
 
 Each lands on its own, with tests, in this order.
 
-**1 — Multimodal messages.** `TextPart`/`ImagePart`, `str` still legal,
+**1 — Multimodal messages — built.** `TextPart`/`ImagePart`, `str` still legal,
 `supports_images` on `Capabilities`, image-aware `count_tokens`, all five
 adapters, artifact recording by path-and-digest. *Ships useful with no image
-generation anywhere: a reviewer can be handed a screenshot on a code ticket.
-Tests: every existing prompt builds byte-identical messages; a tool-less
-`claude-cli` reports `supports_images` false; an image-carrying prompt is priced
-above zero.*
+generation anywhere: a reviewer can be handed a screenshot on a code ticket.*
+Tests in `tests/test_multimodal.py`: every adapter still sends the body it sent
+for a string prompt, each wire format decodes back to the original bytes, a
+blind model is refused before the request is made, an image-carrying prompt is
+priced above zero, no record holds the bytes, a reference `.png` is never read
+as text, and an `_attempt` over a ticket carrying one shows it to the executor.
 
 **2 — `ImageProvider` and accounting.** Base class, one adapter, registry,
 `usage.images`, `images_per_window`, `forge doctor` probing it. *Tests: a

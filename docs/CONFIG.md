@@ -195,6 +195,7 @@ wire. It does not reach a local server any more — a GGUF belongs to
 | `headers` | `{}` | Extra request headers, merged over the `Authorization` header. |
 | `extraBody` | `{}` | Fields merged into the request body, for a gateway's own knobs (OpenRouter routing preferences and the like). |
 | `supportsTemperature` | `true` | Set false for endpoints that reject the field outright. |
+| `multimodal` | `false` | Whether the model behind this endpoint can be shown an image. Off by default: "OpenAI-compatible" describes the request shape, not the model, and nothing here can ask. A prompt carrying an image to a model without it is refused before the request. |
 | `topP`, `topK`, `minP`, `presencePenalty`, `frequencyPenalty` | unset | Sent only when set, so a model's own shipped recipe still applies. |
 
 `contextWindow` is not discovered here and cannot be: a hosted endpoint does not
@@ -240,7 +241,7 @@ numbers in step by hand.
 | `cacheTypeK`, `cacheTypeV` | `cache-type-k`, `cache-type-v` | KV quantization. `q8_0` on both roughly halves the cache, which is most of the VRAM at a large `ctx-size`. |
 | `parallel` | `parallel` | |
 | `mainGpu`, `splitMode` | `main-gpu`, `split-mode` | |
-| `multimodal` | `mmproj-auto` | Default false. A projector beside the `.gguf` is loaded automatically and costs VRAM no text-only role will use. |
+| `multimodal` | `mmproj-auto` | Default false. A projector beside the `.gguf` is loaded automatically and costs VRAM no text-only role will use. It is also what tells the loop this checkpoint can be shown an image: seeing is a property of the checkpoint, not of the adapter, and a prompt carrying one to a model without it is refused before the request. `forge doctor` reports both halves of the contradiction — a projector loaded for a role that does not want one, and a role that says `multimodal: true` whose child server was started without one. |
 | `presetFlags` | — | An object merged in last, for any flag not listed above. |
 
 Two roles naming the same `model` are one child server and collapse into one
@@ -392,6 +393,7 @@ alternates roles.
 | `apiKey` | `""` |
 | `model` | `claude-opus-5` |
 | `effort` | unset — sent as the reply's effort setting when present |
+| `vision` | `true` — every Claude model here takes images; set false to refuse them instead |
 
 ### `kind: "gemini"`
 
@@ -401,6 +403,7 @@ alternates roles.
 | `apiKeyEnv` | `GEMINI_API_KEY` |
 | `apiKey` | `""` |
 | `maxOutputTokens` | `8192` |
+| `vision` | `true` — as on the Anthropic adapter |
 
 ### `kind: "claude-cli"`
 
@@ -415,6 +418,10 @@ subscription rather than an API key.
 | `tools` | `""` | **Empty means no tools**, which is what makes this adapter behave like the completion endpoint the loop assumes. Set `"default"` to get the agent back, or name the tools it may use. |
 | `allowAllTools` | `false` | Skips permission prompts. Required for genuinely unattended runs, and a real grant of authority — hence opt-in. |
 | `contextWindow` / `maxOutputTokens` | `200000` / `32000` | |
+
+This adapter cannot be shown an image and has no key for it. The prompt reaches
+the CLI as text on stdin, and naming a file path instead would not help: with
+no tools it cannot open one, so the reviewer would be ruling on a filename.
 
 `tools` deserves the warning it gets. `claude -p` with tools is an agent, not a
 completion call: it reads files on its own and bills for every turn. One

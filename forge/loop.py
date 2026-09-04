@@ -85,6 +85,7 @@ from .patch import (
 from .providers import (
     Completion,
     ContextOverflow,
+    ImagePart,
     Message,
     ProviderError,
     RateLimited,
@@ -98,6 +99,7 @@ from .prompts import (
     PRIOR_FAILURES_HEADING,
     PRIOR_VERDICTS_HEADING,
     RATIFICATION_HEADING,
+    REFERENCE_IMAGES_HEADING,
     TOOLCHAIN_HEADING,
     build_prompt,
     STUCK_UNCLEAR,
@@ -110,6 +112,7 @@ from .prompts import (
     parse_bug,
     parse_scope_argument,
     record_prompt,
+    reference_images_message,
     rediagnose_prompt,
     repro_prompt,
     review_prompt,
@@ -154,6 +157,7 @@ _DROPPABLE_HEADINGS = (
     PRIOR_ATTEMPT_HEADING,
     LEARNED_HEADING,
     RATIFICATION_HEADING,
+    REFERENCE_IMAGES_HEADING,
     TOOLCHAIN_HEADING,
 )
 
@@ -255,7 +259,7 @@ def _droppable(message: Message) -> bool:
     """
     if message.role == "assistant":
         return True
-    return message.role == "user" and message.content.startswith(_DROPPABLE_HEADINGS)
+    return message.role == "user" and message.text.startswith(_DROPPABLE_HEADINGS)
 
 
 CONTROL_KEY = "command"
@@ -695,15 +699,32 @@ class Orchestrator:
         *,
         max_tokens: int,
         temperature: float = 0.2,
+        images: Sequence[ImagePart] = (),
+        images_withheld: Sequence[str] = (),
     ) -> Completion:
         """One model call, with the budget gate wrapped around it.
 
         Waiting happens here rather than at the call site so every role gets
         the same treatment: a limited planner parks the run exactly like a
         limited executor does.
+
+        `images` are attached here for the same reason: whether they can be
+        attached at all is a fact about the role's provider, and this is the
+        only place that knows which provider a role has. A model that cannot
+        see is told the files exist and named rather than sent them — raising
+        would end a code ticket over a screenshot nobody needed.
         """
         provider = self.config.provider_for(role)
         model_name = self.config.model_name_for(role)
+
+        if images or images_withheld:
+            attached = reference_images_message(
+                images,
+                can_see=provider.capabilities().supports_images,
+                withheld=images_withheld,
+            )
+            if attached is not None:
+                messages = [*messages, attached]
 
         messages = self.gate.fit(
             provider,
@@ -3995,6 +4016,33 @@ class Orchestrator:
     # ticket blocks instead. Saying "split this ticket" is a worse outcome than
     # succeeding and a far better one than silent data loss.
     _WRITABLE_CEILING = 200_000
+
+    # Reference files that are pictures rather than text, by extension, with
+    # the media type each is sent as. A reference `.png` used to be read as
+    # UTF-8 with `errors="replace"` and pasted into a fenced block, so what the
+    # model saw as the contents of `assets/hero.png` was several thousand
+    # replacement characters.
+    #
+    # `.svg` is deliberately absent: it is XML, it is readable, and a role that
+    # can read it can also edit it. It stays text.
+    _IMAGE_TYPES = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+    }
+
+    # What one image may weigh before it is named rather than attached. The
+    # providers refuse a larger one anyway — 5 MB is the smallest of their
+    # documented limits — and a prompt that is refused after the bytes have
+    # been uploaded costs the attempt.
+    _IMAGE_CEILING = 4_500_000
+
+    # How many images one prompt carries. Every one of them is priced by area,
+    # so an unbounded reading scope full of screenshots is a context window
+    # spent before the ticket is read.
+    _IMAGE_LIMIT = 4
     # Fallback for a caller with no config in hand. The number that governs a
     # run is `loop.priorFailures` — see `_prior_failures`.
     _PRIOR_FAILURES = 8
@@ -4839,7 +4887,8 @@ class Orchestrator:
 
         Returns `(sources, oversized)`. `oversized` names files the caller must
         not proceed with: too large to reproduce, and too dangerous to show in
-        part.
+        part. Images are not sources and are not returned here — see
+        `_reference_images`, which reads them from the same scope.
         """
         sources: dict[str, str] = {}
         oversized: list[str] = []
@@ -4851,6 +4900,12 @@ class Orchestrator:
             if any(ch in path for ch in "*?["):
                 continue
             if not is_safe_path(self.config.root, path):
+                continue
+            # A picture has no text to show. Decoding one produces thousands of
+            # replacement characters under a heading that says this is the file
+            # — which is worse than not showing it, because the role has no way
+            # to tell the difference.
+            if Path(path).suffix.lower() in self._IMAGE_TYPES:
                 continue
             candidate = (self.config.root / path).resolve()
             try:
@@ -4871,6 +4926,67 @@ class Orchestrator:
                 text = self._trim_reference(path, text)
             sources[path] = text
         return sources, oversized
+
+    def _reference_images(
+        self, ticket: Ticket, extra: list[str] | None = None
+    ) -> tuple[list[ImagePart], list[str]]:
+        """The pictures in this ticket's reading scope. Never raises.
+
+        Read from the same scope `_sources_for` reads, and separately from it,
+        because they are not sources: the executor returns whole files as text
+        and there is no text here to return. What a role does with one is look
+        at it.
+
+        Returns `(images, withheld)`. `withheld` names files in scope that
+        exist and are not attached — too large for a provider to accept, or
+        past the count one prompt carries — so the role is told they exist
+        rather than left to wonder what it was not shown.
+        """
+        images: list[ImagePart] = []
+        withheld: list[str] = []
+        wanted = list(ticket.allowed_files) + list(ticket.reference_files)
+        wanted += list(extra or [])
+        seen: set[str] = set()
+        for path in wanted:
+            if any(ch in path for ch in "*?["):
+                continue
+            media_type = self._IMAGE_TYPES.get(Path(path).suffix.lower())
+            if not media_type or not is_safe_path(self.config.root, path):
+                continue
+            normalized = normalize_path(path)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            candidate = (self.config.root / path).resolve()
+            try:
+                if not candidate.is_file():
+                    continue
+                size = candidate.stat().st_size
+                if size > self._IMAGE_CEILING:
+                    withheld.append(f"{path} ({size:,} bytes, too large to send)")
+                    continue
+                if len(images) >= self._IMAGE_LIMIT:
+                    withheld.append(f"{path} (over the {self._IMAGE_LIMIT}-image limit)")
+                    continue
+                data = candidate.read_bytes()
+            except OSError:
+                continue
+            images.append(ImagePart(media_type=media_type, data=data, path=path))
+        return images, withheld
+
+    @staticmethod
+    def _attachments(
+        images: Sequence[ImagePart], withheld: Sequence[str]
+    ) -> dict[str, Any]:
+        """`_call` keywords for a ticket that has pictures, and none for one
+        that does not.
+
+        Spread rather than passed as empty defaults so a call with nothing to
+        attach is the call it has always been — which is nearly all of them.
+        """
+        if not images and not withheld:
+            return {}
+        return {"images": images, "images_withheld": withheld}
 
     # Extensions whose content is prose, where an excerpt with a marked gap in
     # it is legible. Code is not on this list on purpose: a source file spliced
@@ -4976,6 +5092,12 @@ class Orchestrator:
             extra=[repro[0]] if repro else None,
             whole=ticket.allowed_files,
         )
+        # The same reading scope, in the form a picture survives. A reference
+        # `.png` has no text to show, so it reaches the prompt as something to
+        # look at or as a named file the model is told it cannot see.
+        images, images_withheld = self._reference_images(
+            ticket, extra=[repro[0]] if repro else None
+        )
         if oversized:
             detail = (
                 "This ticket cannot be delegated as written. It authorises "
@@ -5039,6 +5161,7 @@ class Orchestrator:
                         malformed=malformed,
                         prior_turns=prior_turns,
                     ),
+                    **self._attachments(images, images_withheld),
                     max_tokens=self._output_budget("executor"),
                     # Stated rather than left to `_call`'s default, which is
                     # how the executor came to sample at 0.2 — the highest in
@@ -5363,6 +5486,11 @@ class Orchestrator:
             try:
                 rejected_bindings: list[str] = []
                 laundered: list[str] = []
+                # The tester is graded on criteria that may be about what an
+                # image contains, and it has no filesystem either.
+                images, images_withheld = self._reference_images(
+                    ticket, extra=list(written)
+                )
                 for remaining in (1, 0):
                     completion = self._call(
                         run_id,
@@ -5411,6 +5539,7 @@ class Orchestrator:
                                 failure_context, test_path
                             ),
                         ),
+                        **self._attachments(images, images_withheld),
                         max_tokens=self._output_budget("tester"),
                         temperature=0.1,
                     )
@@ -5821,6 +5950,8 @@ class Orchestrator:
                 data={"files": sorted(invisible)},
             )
 
+        images, images_withheld = self._reference_images(ticket)
+
         step_id = self.store.start_step(run_id, ticket.ticket_id, "review")
         try:
             completion = self._call(
@@ -5840,6 +5971,7 @@ class Orchestrator:
                     reproduced=repro,
                     unchecked=unchecked,
                 ),
+                **self._attachments(images, images_withheld),
                 max_tokens=self._output_budget("reviewer"),
                 temperature=0.0,
             )

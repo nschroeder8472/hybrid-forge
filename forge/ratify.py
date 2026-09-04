@@ -249,9 +249,16 @@ def _prompt_digest(prompt) -> str:
 
     Over the messages' text, so a prompt rebuilt from the same ticket and the
     same objections fingerprints the same across cycles and across a restart.
+    An image is hashed by its digest rather than skipped: two prompts differing
+    only in the picture they carry are two different questions.
     """
     try:
-        body = chr(0).join(f"{m.role}:{m.content}" for m in prompt)
+        separator = chr(0)
+        body = separator.join(
+            f"{m.role}:{m.text}"
+            + "".join(f"{separator}image:{part.digest}" for part in m.images)
+            for m in prompt
+        )
     except (AttributeError, TypeError):
         return ""
     return hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()

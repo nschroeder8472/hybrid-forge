@@ -20336,6 +20336,41 @@ class TestLlamaCppReportsAProjectorNothingUses(unittest.TestCase):
 
         self.assertEqual(provider.diagnostics(), [])
 
+    def test_a_role_that_wants_vision_is_not_told_to_turn_it_off(self):
+        # `multimodal: true` is the operator asking for the projector. Warning
+        # about VRAM there is forge arguing with a decision it was told, and it
+        # is how a note that is usually right teaches people to skip all of it.
+        provider = self._provider(
+            ["--ctx-size", "32768", "--mmproj", "p.gguf"], multimodal=True
+        )
+
+        self.assertEqual(provider.diagnostics(), [])
+
+    def test_claiming_vision_without_a_projector_is_reported(self):
+        # The expensive direction. `multimodal` is what tells the loop this
+        # role can be shown an image, so a checkpoint started without a
+        # projector is a reviewer being sent pictures it cannot decode —
+        # discovered at review time, on a ticket already built.
+        provider = self._provider(
+            ["--ctx-size", "32768", "--model", "x.gguf"], multimodal=True
+        )
+
+        notes = " ".join(provider.diagnostics())
+
+        self.assertIn("multimodal: true", notes)
+        self.assertIn("loads no projector", notes)
+
+    def test_the_preset_turning_it_off_under_a_vision_role_is_reported(self):
+        provider = self._provider(
+            ["--ctx-size", "32768", "--hf-repo", "r", "--no-mmproj-auto"],
+            multimodal=True,
+        )
+
+        notes = " ".join(provider.diagnostics())
+
+        self.assertIn("--no-mmproj", notes)
+        self.assertIn("multimodal: true", notes)
+
 
 class TestRatifyOrderIsTheOperatorsToChoose(unittest.TestCase):
     """Which order the roles vote in, and why it is not cosmetic.

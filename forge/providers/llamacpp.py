@@ -362,6 +362,12 @@ class LlamaCppProvider(OpenAICompatProvider):
             context_window=int(self.config.get("contextWindow", 0) or 0),
             max_output_tokens=int(self.config.get("maxOutputTokens", 4096)),
             supports_temperature=bool(self.config.get("supportsTemperature", True)),
+            # A property of the checkpoint, not of the adapter: a GGUF with a
+            # projector beside it can see and one without cannot. `multimodal`
+            # is the same key `presets` reads to decide whether to write
+            # `mmproj-auto = false`, so a model declared blind here is one the
+            # router was told not to load a projector for.
+            supports_images=bool(self.config.get("multimodal", False)),
         )
         if not caps.context_window:
             # The preset's own `-c`, when it pins one. Never the trained
@@ -485,7 +491,8 @@ class LlamaCppProvider(OpenAICompatProvider):
         # `no-mmproj = true` in a preset reaches the child as the canonical
         # `--no-mmproj-auto`; `--no-mmproj` is the alias an operator types.
         disabled = any(a in _NO_PROJECTOR for a in args)
-        if (projector or implicit) and not disabled:
+        wanted = bool(self.config.get("multimodal", False))
+        if (projector or implicit) and not disabled and not wanted:
             how = (
                 "loads a multimodal projector (--mmproj)"
                 if projector
@@ -495,5 +502,22 @@ class LlamaCppProvider(OpenAICompatProvider):
             notes.append(
                 f"{self.model!r} {how}, which costs VRAM no text-only role uses. "
                 f"Add `no-mmproj = true` to its --models-preset entry."
+            )
+        elif wanted and (disabled or not (projector or implicit)):
+            # The opposite mistake, and the more expensive one. `multimodal`
+            # is what tells the loop this role can be shown an image, so a
+            # model that claims it and is started without a projector is a
+            # reviewer being sent pictures the server cannot decode — found at
+            # review time, on a ticket that has already been built.
+            why = (
+                "starts it with --no-mmproj"
+                if disabled
+                else "loads no projector for it"
+            )
+            notes.append(
+                f"{self.model!r} is configured `multimodal: true`, so this role "
+                f"will be sent images, but the router {why}. Either the preset "
+                f"needs a projector for this checkpoint, or the model block "
+                f"should drop `multimodal`."
             )
         return notes
