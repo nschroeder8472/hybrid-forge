@@ -36,8 +36,8 @@ HARD.md                     one exacting ticket that lands first try
 STALL.md                    one ticket that cannot succeed, for the brakes
 GRIND.md                    two tickets aimed at the middle; both land, and
                             one is refused by ratify before it is built
-OPAQUE.md                   one ticket whose failures do not name their cause,
-                            written for the ladder nothing has reached yet
+OPAQUE.md                   one ticket that withholds the rule deciding its
+                            answer, and the two ways the loop restores it
 BUG.md                      one report for `forge bug`
 .hybridforge/config.json    two workspaces, per-language commands
 ```
@@ -83,13 +83,12 @@ convergence or how a ticket is parked.
   was written to reach the middle of `CONVERGENCE.md` and did not: the defect it
   carries is one ratification repairs before a build call is spent. Read the
   ratify notes rather than the verdict.
-- `OPAQUE.md` must end **done**, and should not manage it on the first attempt.
-  It is the one backlog here whose failures do not describe their own cause:
-  the rule that decides its answer lives in a file the ticket may neither read
-  nor call, so what a failing attempt is shown is one character of difference
-  in an assertion. **It has never been run.** Everything the document claims
-  about it is derived from reading the loop, which is the weak kind of argument
-  — the first run is the evidence. Read the attempt count first.
+- `OPAQUE.md` must end **done**, and the sign-off pass must refuse it on its
+  first pass, naming the rule the ticket withholds. It was written to fail
+  *slowly*, by keeping the rule that decides its answer out of the prompt — and
+  three runs say the loop will not have it: `reading_scope` hands over the
+  neighbouring file, and when it cannot, ratification blocks and asks for it in
+  writing. Read `ratify_notes`, not the verdict.
 
 `forge ingest` should report **parsed**, not planned. If it says planned, the
 spec grammar changed and `SPEC.md` no longer matches it — which is itself the

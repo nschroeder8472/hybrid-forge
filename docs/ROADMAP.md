@@ -166,7 +166,7 @@ reference run's `TS2532 object is possibly undefined` names a symptom whose
 cause is a compiler flag two files away, where `E501 line too long (52 > 50
 characters)` hands over the rule.
 
-**That ticket now exists and has not been run.**
+**That ticket now exists, and three runs of it answered a different question.**
 `examples/sample-project/OPAQUE.md` asks for a second renderer in the plugin
 build whose bars must match the ones `histogram.bars` already draws. It may not
 call `bars` and `bars.py` is not in its reading scope, so the rule that decides
@@ -178,16 +178,30 @@ own and repair the wrong way. What a failing attempt is shown is
 `AssertionError: 'c  x1' != 'c # x1'`: one character, no rule, and no file it
 can open to find one.
 
-It is meant to end **done**, which is what separates it from `STALL.md` — the
-executor can converge on the rule from its own failures, and the guard suite
-pins that the three mappings really do separate flooring from rounding so the
-trap cannot rot. What the run answers is how many attempts that takes, whether
-`_measure_cycle` is reached at all, whether a cycle that fixes two of three
-disagreements reads `descending` now that volume is measured, and what the
-learning slot recorded. Everything in this paragraph is derived from reading
-the loop rather than from watching it, which is the argument §9 of
-[LOOP-INVARIANTS.md](LOOP-INVARIANTS.md) exists to distrust. The first run is
-the evidence.
+**It never produced that failure, and why is the finding.** Three runs, all
+2026-09-03:
+
+| | outcome | what happened |
+|---|---|---|
+| 1 | done, 1 attempt, 7 calls | `reading_scope` adds the source siblings of every writable file, so `bars.py` arrived beside a `legend.py` written in the same directory. The delivered file carried `bars.py`'s own docstring. |
+| 2 | failed, 2 cycles, 27 calls | Module moved to a package of its own. Ratification then **blocked on pass 1**, naming the missing rule, and the repair added `bars.py` to the reading scope. The run itself died on a defect of the spec's own making — it asked for an *empty* `__init__.py`, which is `W391` when written as a blank line and "not empty" when written as a docstring. |
+| 3 | done, 1 attempt, 12 calls | Trap removed. Ratify blocked on pass 1 again and carried pass 2 on a majority, the reviewer dissenting that the rule is unpinned outside the listed mappings. Every criterion verified independently against the delivered file. |
+
+So the loop has **two independent ways of refusing a ticket whose failures
+could not describe their own cause**: sibling expansion hands the neighbouring
+file over silently, and the sign-off pass demands it in writing. Neither is a
+defect. That is a better answer than the stall the backlog was aiming for, and
+it narrows this entry further: reaching the ladder live now means turning
+ratification off *and* placing the module where sibling expansion cannot see
+it — a fixture arguing with two of its own safety mechanisms. The replay in
+`tests/test_recorded_output.py` exercises the ladder directly and costs
+nothing.
+
+Two things the runs produced along the way. `_measure_cycle` ran on a live run
+for the first time, recorded `cycle_volume` and carried it across a requeue.
+And the learning slot recorded a **misgeneralisation** — *"a file must not end
+with a trailing newline"*, from a `W391` about a blank line — which travels
+with every later attempt on that ticket.
 
 ---
 

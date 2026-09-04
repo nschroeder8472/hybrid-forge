@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from forge import toolchain  # noqa: E402
 from forge.config import Config  # noqa: E402
+from forge.evidence import reading_scope  # noqa: E402
 from forge.ingest import ingest  # noqa: E402
 import sample_workspace  # noqa: E402
 from sample_workspace import copy_sample  # noqa: E402
@@ -645,12 +646,33 @@ class TestTheOpaqueBacklogWithholdsTheRule(unittest.TestCase):
         self.assertEqual(builds, {"plugin"})
 
     def test_the_file_that_decides_the_answer_is_not_in_the_prompt(self):
-        # The whole mechanism. `bars.py` carries `count * width // tallest`,
-        # and a ticket that could read it would be a ticket whose failures
-        # name their own cause.
-        scope = self.ticket.allowed_files + self.ticket.reference_files
+        # Checked against the code that decides a read scope rather than
+        # against the spec that declares one. Run 1 of this backlog landed in a
+        # single attempt because `reading_scope` widens a ticket with the
+        # *source siblings of every writable file* — correctly, and for a
+        # documented reason — so `bars.py` arrived in the prompt beside a
+        # `legend.py` written in the same directory, and the delivered file
+        # carried `bars.py`'s own docstring. A ticket cannot withhold a
+        # same-directory sibling; it can only be written somewhere else.
+        #
+        # This is the scope at ingest. Runs 2 and 3 show the sign-off pass
+        # putting `bars.py` back a step later, deliberately and in writing —
+        # that is the loop's second refusal, and it is not something a fixture
+        # can or should pin here.
+        scope = reading_scope(
+            SAMPLE, self.ticket.allowed_files, self.ticket.reference_files
+        )
 
         self.assertNotIn("plugin/histogram/bars.py", scope)
+        self.assertNotIn("plugin/histogram/bars.py", self.ticket.allowed_files)
+
+    def test_no_file_it_may_write_sits_beside_the_rule(self):
+        # The property that makes the assertion above hold, stated so a future
+        # edit that moves the module back is refused here rather than in a run.
+        for path in self.ticket.allowed_files:
+            self.assertNotEqual(
+                Path(path).parent.as_posix(), "plugin/histogram", path
+            )
 
     def test_but_the_ordering_rule_is(self):
         # The ticket is not a guessing game: everything except the scaling
