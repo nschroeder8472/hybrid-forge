@@ -241,7 +241,7 @@ numbers in step by hand.
 | `cacheTypeK`, `cacheTypeV` | `cache-type-k`, `cache-type-v` | KV quantization. `q8_0` on both roughly halves the cache, which is most of the VRAM at a large `ctx-size`. |
 | `parallel` | `parallel` | |
 | `mainGpu`, `splitMode` | `main-gpu`, `split-mode` | |
-| `multimodal` | `mmproj-auto` | Default false. A projector beside the `.gguf` is loaded automatically and costs VRAM no text-only role will use. It is also what tells the loop this checkpoint can be shown an image: seeing is a property of the checkpoint, not of the adapter, and a prompt carrying one to a model without it is refused before the request. |
+| `multimodal` | `mmproj-auto` | Default false. A projector beside the `.gguf` is loaded automatically and costs VRAM no text-only role will use. It is also what tells the loop this checkpoint can be shown an image: seeing is a property of the checkpoint, not of the adapter, and a prompt carrying one to a model without it is refused before the request. `forge doctor` reports both halves of the contradiction — a projector loaded for a role that does not want one, and a role that says `multimodal: true` whose child server was started without one. |
 | `presetFlags` | — | An object merged in last, for any flag not listed above. |
 
 Two roles naming the same `model` are one child server and collapse into one
