@@ -3,4 +3,3 @@ run.db-wal
 run.db-shm
 artifacts/
 abandoned/
-tickets/
