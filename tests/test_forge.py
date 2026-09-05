@@ -16,6 +16,7 @@ import hashlib
 import io
 import itertools
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -2669,6 +2670,101 @@ class TestRetiringAnAssertionNeedsAnArgument(unittest.TestCase):
         self.assertNotIn("tests/tt_001_test.rs", store.list_tickets(run_id)[0].allowed_files)
         # The rest of the revision still lands; only the gated file is held.
         self.assertEqual(store.list_tickets(run_id)[0].spec, "new")
+
+
+class TestTheRepoConfigFallsBackToTheMachineProfile(unittest.TestCase):
+    """The two-layer split, at load time rather than only at `forge init`.
+
+    The profile holds the endpoints and who plays which role; the repo config
+    holds what only this repository can answer. Nothing read the profile when a
+    config was *loaded*, so a committed config had to restate one machine's
+    `127.0.0.1` and checkpoint names to be loadable at all — and every clone
+    then inherited them."""
+
+    PROFILE = {
+        "models": {
+            "house": {"kind": "openai", "model": "h", "contextWindow": 8192},
+            "spare": {"kind": "openai", "model": "s", "contextWindow": 8192},
+        },
+        "roles": {r: "house" for r in ROLES},
+    }
+
+    @contextlib.contextmanager
+    def _machine(self, profile: dict | None):
+        """Run with `profile` as this machine's, or with none at all.
+
+        Pointed at a temporary file through `FORGE_PROFILE` rather than left to
+        find the developer's own: a suite that reads `%APPDATA%` passes or
+        fails by what is installed on the machine running it.
+        """
+        root = Path(tempfile.mkdtemp())
+        path = root / "profile.json"
+        if profile is not None:
+            path.write_text(json.dumps(profile), encoding="utf-8")
+        with unittest.mock.patch.dict(os.environ, {"FORGE_PROFILE": str(path)}):
+            yield
+
+    def _load(self, config: dict):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+        return Config.load(root)
+
+    def test_a_config_naming_no_models_gets_the_machines(self):
+        with self._machine(self.PROFILE):
+            config = self._load({"commands": {"test": "pytest"}})
+
+        self.assertEqual(sorted(config.models), ["house", "spare"])
+        self.assertEqual(config.roles["executor"], "house")
+        # And the repository still answers what only it can.
+        self.assertEqual(config.command_for("test", "a.py"), "pytest")
+
+    def test_the_repo_wins_for_the_keys_it_declares(self):
+        # Merged per key, not wholesale: a repository that genuinely needs a
+        # different reviewer says so and keeps the machine's executor.
+        with self._machine(self.PROFILE):
+            config = self._load({"roles": {"reviewer": "spare"}})
+
+        self.assertEqual(config.roles["reviewer"], "spare")
+        self.assertEqual(config.roles["executor"], "house")
+
+    def test_a_model_declared_in_both_is_the_repos(self):
+        with self._machine(self.PROFILE):
+            config = self._load(
+                {"models": {"house": {"kind": "openai", "model": "overridden"}}}
+            )
+
+        self.assertEqual(config.models["house"]["model"], "overridden")
+        # Declaring one model does not discard the rest of the machine's.
+        self.assertIn("spare", config.models)
+
+    def test_with_no_profile_a_modelless_config_still_fails_loudly(self):
+        # The fallback must not turn "you have configured nothing" into a
+        # config that loads and then cannot call anybody.
+        with self._machine(None):
+            with self.assertRaises(ConfigError) as caught:
+                # `Config.load` validates as it loads, so this raises there
+                # rather than on a later call.
+                self._load({"commands": {"test": "pytest"}})
+
+        self.assertIn("no models", str(caught.exception))
+
+    def test_a_corrupt_profile_is_treated_as_absent(self):
+        root = Path(tempfile.mkdtemp())
+        path = root / "profile.json"
+        path.write_text("{not json", encoding="utf-8")
+
+        with unittest.mock.patch.dict(os.environ, {"FORGE_PROFILE": str(path)}):
+            config = self._load(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x"}},
+                    "roles": {r: "m" for r in ROLES},
+                }
+            )
+
+        self.assertEqual(sorted(config.models), ["m"])
 
 
 class TestRespecKeepsTheTicketsOwnTestFileWritable(unittest.TestCase):

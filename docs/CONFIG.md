@@ -26,6 +26,22 @@ it deliberately does **not** carry is anything the repo decides — `commands`,
 loudly; it fails `maxAttempts` times per ticket and parks the whole backlog,
 which looks like a model problem and is not.
 
+**A repo config may leave `models` and `roles` out entirely.** When it does,
+they come from the machine profile at load time, merged per key — so a
+repository that needs a different reviewer declares that one role and keeps the
+machine's executor. This is what lets `config.json` be committed without
+carrying one machine's `127.0.0.1` and checkpoint names into everybody else's
+clone. With no profile and no models declared, loading still fails loudly with
+`config declares no models`.
+
+**Check which profile you are actually reading.** `forge doctor` prints its path
+and the models it supplied. On Windows those can disagree with what a file
+manager shows: a Microsoft Store Python has `%APPDATA%` redirected into its own
+package's `LocalCache`, so a profile edited at the visible path is read by
+nobody. Two profiles on one machine, one of them naming an endpoint that had
+been dead for days, is what put this line here — the symptom is a `profile:`
+line listing models the run is not using.
+
 **No credentials, ever.** Providers resolve keys through `apiKeyEnv` — the
 *name* of an environment variable — and the profile strips an inline `apiKey`
 on the way in rather than copying it somewhere you did not know existed. An

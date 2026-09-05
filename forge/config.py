@@ -42,6 +42,7 @@ from .budget import RateLimitPolicy
 # spellings of "these paths, please" behave identically. `patch` imports
 # nothing from this package, so this cannot cycle.
 from .patch import matches_any
+from .profile import Profile
 from .providers import Provider, build_provider
 
 CONFIG_DIR = ".hybridforge"
@@ -955,6 +956,41 @@ def _workspace_from(block: Any, index: int) -> Workspace:
     return Workspace(root=root, commands=commands, excludes=list(excludes))
 
 
+def _with_profile(data: dict[str, Any]) -> dict[str, Any]:
+    """Fill `models` and `roles` from the machine profile where the repo omits them.
+
+    The two-layer split this implements is stated in the `workspace-layout`
+    skill and was, until now, only a description of what `forge init` writes:
+    the profile holds the endpoints and who plays which role, the repo config
+    holds what only this repository can answer — `commands`, `room`,
+    `neverDelegate`, `loop`. Nothing read the profile at *load* time, so a
+    committed config had to restate the machine's endpoints to be loadable at
+    all, and every clone then carried one machine's `127.0.0.1` and its
+    checkpoint names into everybody else's tree.
+
+    Merged per key, never wholesale, because the skill's rule is that the repo
+    config wins for the keys it declares. A repository that genuinely needs a
+    different reviewer says so and keeps the machine's executor; one that says
+    nothing gets the machine's answer for both. Wholesale replacement would
+    make declaring one model silently discard the other three.
+
+    Absent, unreadable or empty profile: the data is returned untouched and a
+    config that declares no models fails `validate()` exactly as before. The
+    profile holds preferences, not state, and a missing one must not turn a
+    working repository into an error.
+    """
+    profile = Profile.load()
+    if profile.is_empty and not profile.roles:
+        return data
+
+    merged = dict(data)
+    if profile.models:
+        merged["models"] = {**profile.models, **(data.get("models") or {})}
+    if profile.roles:
+        merged["roles"] = {**profile.roles, **(data.get("roles") or {})}
+    return merged
+
+
 @dataclass
 class Config:
     root: Path
@@ -1043,6 +1079,8 @@ class Config:
             data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise ConfigError(f"{path} is not valid JSON: {exc}") from exc
+
+        data = _with_profile(data)
 
         config = cls(
             root=root,

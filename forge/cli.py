@@ -343,7 +343,24 @@ def _report_llama_build(config: Config) -> None:
 def cmd_doctor(args: argparse.Namespace) -> int:
     config = _load(args.root)
     print(f"project: {config.root}")
-    print(f"roles:   {json.dumps(config.roles)}\n")
+    print(f"roles:   {json.dumps(config.roles)}")
+    # Named, because a repo config may now leave `models` and `roles` to the
+    # machine profile — and because the path is not always the one a person
+    # would find in their file manager. A Microsoft Store Python has `%APPDATA%`
+    # redirected into its package's `LocalCache`, so a profile edited at the
+    # visible path is read by nobody, and a run silently uses whatever the
+    # redirected copy last said. Seen on this machine: two profiles, one
+    # llama.cpp and one naming an endpoint that had been dead for days.
+    #
+    # The models it supplied are printed beside the path, not just the path:
+    # `profile_path()` builds the visible `%APPDATA%` location while the OS
+    # redirects the *open* underneath it, so naming the path alone would point
+    # at a file whose contents are not what was read. A profile listing models
+    # the run is not using is the symptom, and it is legible here.
+    profile = Profile.load()
+    if not profile.is_empty:
+        print(f"profile: {profile.path} (models: {', '.join(sorted(profile.models))})")
+    print()
     _report_llama_build(config)
 
     failures = 0
