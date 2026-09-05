@@ -1,48 +1,39 @@
 {
   "room": "",
-  "models": {
-    "nemotron": {
-      "kind": "llamacpp",
-      "baseUrl": "http://127.0.0.1:8080/v1",
-      "model": "nemotron-3-nano",
-      "contextWindow": 131072,
-      "maxOutputTokens": 32768
-    },
-    "qwen": {
-      "kind": "llamacpp",
-      "baseUrl": "http://127.0.0.1:8080/v1",
-      "model": "qwen3.8",
-      "contextWindow": 131072,
-      "maxOutputTokens": 16384
-    },
-    "claude": {
-      "kind": "claude-cli",
-      "model": "opus"
-    }
-  },
-  "roles": {
-    "planner": "nemotron",
-    "executor": "qwen",
-    "tester": "qwen",
-    "reviewer": "nemotron"
-  },
   "commands": {
-    "lint": { ".py": "python -m flake8 .", ".html": "skip" },
-    "typecheck": { ".py": "skip", ".html": "skip" },
+    "lint": {
+      ".py": "python -m flake8 .",
+      ".html": "skip"
+    },
+    "typecheck": {
+      ".py": "skip",
+      ".html": "skip"
+    },
     "test": "python -m unittest discover tests"
   },
   "neverDelegate": [],
   "memory": {
     "command": [
-      "docker", "run", "--rm", "-i",
-      "-v", "mempalace-data:/data",
+      "docker",
+      "run",
+      "--rm",
+      "-i",
+      "-v",
+      "mempalace-data:/data",
       "ghcr.io/mempalace/mempalace:latest",
-      "mcp", "--palace", "/data/palace"
+      "mcp",
+      "--palace",
+      "/data/palace"
     ],
     "room": "",
-    "arguments": { "wing": "hybrid-forge" },
+    "arguments": {
+      "wing": "hybrid-forge"
+    },
     "writeTool": "mempalace_add_drawer",
-    "writeArguments": { "room": "decisions", "added_by": "hybrid-forge-daemon" },
+    "writeArguments": {
+      "room": "decisions",
+      "added_by": "hybrid-forge-daemon"
+    },
     "write": true,
     "dryRun": true,
     "timeout": 120
