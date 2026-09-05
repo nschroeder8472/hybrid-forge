@@ -20,7 +20,9 @@ a fact rather than a best effort.
 from __future__ import annotations
 
 import base64
+import json
 import os
+from collections.abc import Sequence
 from typing import Any
 
 from ._http import post_json
@@ -33,6 +35,8 @@ from .base import (
     Provider,
     ProviderBadResponse,
     ProviderError,
+    ToolCall,
+    ToolSpec,
     Usage,
     strip_reasoning,
 )
@@ -43,6 +47,54 @@ from .base import (
 DEFAULT_CONTEXT_WINDOW = 8192
 
 
+def _tool(spec: ToolSpec) -> dict[str, Any]:
+    """One tool in the chat-completions shape."""
+    return {
+        "type": "function",
+        "function": {
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": spec.parameters,
+        },
+    }
+
+
+def _tool_calls(message: dict[str, Any]) -> list[ToolCall]:
+    """Every tool call in one reply, in the order the model asked for them.
+
+    `arguments` arrives as a JSON *string* on every server that speaks this
+    wire, and arrives malformed often enough that it cannot be trusted: a
+    truncated reply cuts it mid-object. A call whose arguments do not parse is
+    kept rather than dropped, with empty arguments — the tool layer refuses it
+    by name and tells the model what it should have sent, which is a better
+    turn than a call that silently never happened.
+
+    An id is invented when the server issues none. Some local builds do, and
+    the pairing of call to result cannot be positional once a model asks for
+    two files at once.
+    """
+    calls = []
+    for index, raw in enumerate(message.get("tool_calls") or []):
+        function = raw.get("function") or {}
+        name = str(function.get("name") or "")
+        if not name:
+            continue
+        try:
+            arguments = json.loads(function.get("arguments") or "{}")
+        except (TypeError, ValueError):
+            arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        calls.append(
+            ToolCall(
+                call_id=str(raw.get("id") or f"call_{index}"),
+                name=name,
+                arguments=arguments,
+            )
+        )
+    return calls
+
+
 def _turn(message: Message) -> dict[str, Any]:
     """One turn in the chat-completions shape.
 
@@ -50,7 +102,35 @@ def _turn(message: Message) -> dict[str, Any]:
     every OpenAI-compatible server that accepts images accepts, with the image
     inlined as a `data:` URL rather than fetched from one — the server would
     be reaching back out over the network for a file only the daemon has.
+
+    A tool exchange is two shapes this wire already defines: an assistant turn
+    carrying `tool_calls`, and a `tool` turn carrying one result against the
+    id it answers. Arguments go back as the JSON string the API expects rather
+    than as an object — servers differ on whether they will accept the object,
+    and none of them refuses the string.
     """
+    if message.tool_result is not None:
+        return {
+            "role": "tool",
+            "tool_call_id": message.tool_result.call_id,
+            "content": message.tool_result.content,
+        }
+    if message.tool_calls:
+        return {
+            "role": message.role,
+            "content": message.text or None,
+            "tool_calls": [
+                {
+                    "id": call.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": json.dumps(call.arguments),
+                    },
+                }
+                for call in message.tool_calls
+            ],
+        }
     if isinstance(message.content, str):
         return {"role": message.role, "content": message.content}
     return {
@@ -127,6 +207,7 @@ class OpenAICompatProvider(Provider):
         max_tokens: int,
         temperature: float = 0.2,
         timeout: int = DERIVE_TIMEOUT,
+        tools: Sequence[ToolSpec] = (),
     ) -> Completion:
         # Zero means the caller did not care; the budget decides. An
         # explicit timeout is always truthy and passes through.
@@ -140,6 +221,8 @@ class OpenAICompatProvider(Provider):
             # Last, so a hand-written body can still override anything above it.
             **self.extra_body,
         }
+        if tools and self.capabilities().supports_tools:
+            payload["tools"] = [_tool(spec) for spec in tools]
         if self.capabilities().supports_temperature:
             payload["temperature"] = self.temperature(temperature)
 
@@ -195,6 +278,7 @@ class OpenAICompatProvider(Provider):
             model=data.get("model", self.model),
             raw=data,
             recovered=recovered,
+            tool_calls=_tool_calls(message),
         )
 
     def _without_thinking(
@@ -282,6 +366,14 @@ class OpenAICompatProvider(Provider):
             # claim about the request shape, not about the model behind it, and
             # nothing here can ask an arbitrary endpoint whether it can see.
             supports_images=bool(self.config.get("multimodal", False)),
+            # On unless the operator says otherwise, which is the opposite of
+            # the image rule above and for a reason: `tools` is part of the
+            # wire shape this adapter is named after, an endpoint that ignores
+            # it answers normally, and the fallback for a model that never
+            # calls one is the prompt every role used before tools existed. A
+            # checkpoint whose template cannot encode them is turned off with
+            # `"tools": false` rather than discovered — nothing here can ask.
+            supports_tools=bool(self.config.get("tools", True)),
         )
         if not caps.context_window:
             caps.context_window = DEFAULT_CONTEXT_WINDOW

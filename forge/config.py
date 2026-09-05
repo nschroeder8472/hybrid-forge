@@ -756,6 +756,29 @@ class LoopSettings:
     # characters a call and the budget gate may drop it first. See
     # docs/CONVERGENCE.md.
     toolchain_context: bool = True
+    # Whether roles whose provider can take tools are given the read-only ones
+    # in `forge.tools` — grep, read_file, list_dir, outline — and allowed to
+    # assemble their own context instead of being handed a scope guessed before
+    # the ticket was read.
+    #
+    # On, because the alternative was measured and it is worse in both
+    # directions at once. Run 1 of HANDBACK-DASHBOARD.md pasted 156k characters
+    # of a test suite the ticket never mentioned, left out the one file its
+    # spec named, and ended blocked after nine attempts having written nothing:
+    # the executor spent every one of them asking for a shell it did not have.
+    # See docs/CONTEXT-TOOLS.md.
+    read_tools: bool = True
+    # Tool calls one role may make before it has to answer. A model that has
+    # not answered after this many has stopped converging on the ticket, and
+    # the last turn is taken with the tools withdrawn and an instruction to
+    # answer from what it has.
+    tool_turns: int = 8
+    # Whether the repository map — every source file and what it declares,
+    # without the bodies — is carried in the stable prefix. Roughly 9k tokens
+    # on this repository against the 470k a full paste would be, and it is what
+    # makes a read tool cheap: a model that can see where a name is defined
+    # reads one file instead of grepping four times to find it.
+    repo_map: bool = True
     # Earlier failures carried into the executor's prompt alongside the newest
     # one, deduplicated by failure class rather than by text.
     #
@@ -1084,6 +1107,9 @@ class Config:
             review_when_stuck=int(loop.get("reviewWhenStuck", 2)),
             freeze_tests=bool(loop.get("freezeTests", True)),
             toolchain_context=bool(loop.get("toolchainContext", True)),
+            read_tools=bool(loop.get("readTools", True)),
+            tool_turns=int(loop.get("toolTurns", 8)),
+            repo_map=bool(loop.get("repoMap", True)),
             bug_hypotheses=int(loop.get("bugHypotheses", 3)),
             ratify_passes=int(loop.get("ratifyPasses", 2)),
             ratify_order=tuple(loop.get("ratifyOrder", ROLES) or ROLES),
@@ -1147,6 +1173,12 @@ class Config:
                 f"loop.executorTurns is {self.loop.executor_turns}; expected 0 "
                 f"(the single-message prompt) or the number of prior attempts "
                 f"to replay to the executor as conversation turns."
+            )
+        if self.loop.tool_turns < 1:
+            raise ConfigError(
+                f"loop.toolTurns is {self.loop.tool_turns}; expected 1 or more. "
+                f"Turn the tools off with `loop.readTools: false` rather than "
+                f"leaving a role tools it has no turn to call."
             )
         if self.loop.inner_turns < 0:
             raise ConfigError(

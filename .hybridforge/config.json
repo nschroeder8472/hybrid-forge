@@ -1,26 +1,19 @@
 {
   "room": "",
   "models": {
-    "local": {
-      "kind": "openai",
-      "baseUrl": "http://127.0.0.1:11434/v1",
-      "model": "forge-exec",
-      "contextWindow": 32768,
-      "maxOutputTokens": 24576
+    "nemotron": {
+      "kind": "llamacpp",
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "model": "nemotron-3-nano",
+      "contextWindow": 131072,
+      "maxOutputTokens": 32768
     },
-    "localAlt": {
-      "kind": "openai",
-      "baseUrl": "http://127.0.0.1:11434/v1",
-      "model": "forge-alt",
-      "contextWindow": 32768,
-      "maxOutputTokens": 24576
-    },
-    "localTest": {
-      "kind": "openai",
-      "baseUrl": "http://127.0.0.1:11434/v1",
-      "model": "forge-test",
-      "contextWindow": 32768,
-      "maxOutputTokens": 8192
+    "qwen": {
+      "kind": "llamacpp",
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "model": "qwen3.8",
+      "contextWindow": 131072,
+      "maxOutputTokens": 16384
     },
     "claude": {
       "kind": "claude-cli",
@@ -28,14 +21,14 @@
     }
   },
   "roles": {
-    "planner": "claude",
-    "executor": "local",
-    "tester": "local",
-    "reviewer": "claude"
+    "planner": "nemotron",
+    "executor": "qwen",
+    "tester": "qwen",
+    "reviewer": "nemotron"
   },
   "commands": {
-    "lint": "",
-    "typecheck": "",
+    "lint": { ".py": "python -m flake8 .", ".html": "skip" },
+    "typecheck": { ".py": "skip", ".html": "skip" },
     "test": "python -m unittest discover tests"
   },
   "neverDelegate": [],

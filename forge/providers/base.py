@@ -24,6 +24,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from collections.abc import Sequence
 from typing import Any, Literal
 
 Role = Literal["planner", "executor", "tester", "reviewer"]
@@ -91,6 +92,53 @@ Part = TextPart | ImagePart
 
 
 @dataclass
+class ToolSpec:
+    """A tool a role may call, as the model is told about it.
+
+    `parameters` is a JSON Schema object. It is written once, here on the
+    caller's side, and handed to whichever provider the role has — the wire
+    encoding differs between backends and the declaration does not.
+    """
+
+    name: str
+    description: str
+    parameters: dict[str, Any]
+
+
+@dataclass
+class ToolCall:
+    """One tool invocation a model asked for.
+
+    `call_id` is the backend's own identifier and is echoed back with the
+    result. A backend that issues none gets one derived from the position, so
+    the pairing of call to result is never ambiguous — a model shown two
+    results in the wrong order reads the second file's contents as the first
+    file's.
+    """
+
+    call_id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class ToolResult:
+    """What a tool answered, on its way back into the conversation.
+
+    `ok` is not a wire field. It is here because a tool that refused — a path
+    outside the repository, a file that does not exist — must read as a
+    refusal the model can act on rather than as content, and because the loop
+    counts refusals: a role that spends four turns being refused is a role
+    whose next turn should be its last.
+    """
+
+    call_id: str
+    name: str
+    content: str
+    ok: bool = True
+
+
+@dataclass
 class Message:
     """One turn of a prompt.
 
@@ -100,10 +148,19 @@ class Message:
     cannot carry. A reviewer that cannot see the image is not a reviewer —
     which is true of a screenshot attached to an ordinary code ticket, with no
     image generation anywhere in the picture.
+
+    Two fields carry a tool exchange, and both are empty on every prompt built
+    before tools existed. An assistant turn that asked for tools carries
+    `tool_calls`; a `tool` turn carries the `tool_result` that answers one.
+    They are separate fields rather than a content part because no provider
+    encodes them as content, and flattening them into text is how a model
+    comes to read its own tool call as prose it once wrote.
     """
 
-    role: Literal["system", "user", "assistant"]
+    role: Literal["system", "user", "assistant", "tool"]
     content: str | list[Part]
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_result: ToolResult | None = None
 
     @property
     def parts(self) -> list[Part]:
@@ -177,6 +234,10 @@ class Completion:
     finish_reason: str = "stop"
     model: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
+    # Tools the model asked for instead of, or alongside, answering. Empty on
+    # every call made without `tools`, which is every call the loop made before
+    # this existed.
+    tool_calls: list[ToolCall] = field(default_factory=list)
     # What a provider had to do to get an answer at all. Empty on the ordinary
     # path. Recorded and logged by the caller rather than raised, because the
     # answer arrived — but a run whose planner is being silently downgraded is
@@ -214,6 +275,14 @@ class Capabilities:
     # because it costs VRAM no text-only role uses. A blind model handed an
     # image is not a slower reviewer, it is a reviewer ruling on a filename.
     supports_images: bool = False
+    # Whether this model can be handed tools and asked to call them. Declared
+    # per provider, never assumed: a role whose provider cannot take them is
+    # not broken and is not refused — it falls back to the pasted-sources
+    # prompt, which is what every role did before tools existed. Assuming the
+    # capability instead would turn a working local checkpoint into a role
+    # that answers every ticket with a tool call nothing will execute, which
+    # is the failure docs/CONTEXT-TOOLS.md is written from.
+    supports_tools: bool = False
     # Reserved headroom so a slightly-off token estimate does not overflow.
     safety_margin_tokens: int = 512
 
@@ -372,11 +441,19 @@ class Provider(ABC):
         max_tokens: int,
         temperature: float = 0.2,
         timeout: int = DERIVE_TIMEOUT,
+        tools: Sequence[ToolSpec] = (),
     ) -> Completion:
         """Send a completion request. Raises a ProviderError subclass on failure.
 
         `timeout` defaults to whatever `request_timeout` derives from
         `max_tokens`; pass one only to be less patient than that.
+
+        `tools` are offered, never required. A provider whose `capabilities()`
+        report `supports_tools` false ignores them rather than raising: the
+        caller has already decided the role can work without them, and a
+        refusal here would end a ticket over a capability the prompt did not
+        need. Every provider still accepts the argument so a caller does not
+        have to ask which kind it is holding.
         """
 
     def request_timeout(self, max_tokens: int) -> int:

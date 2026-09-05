@@ -1,12 +1,30 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "hybrid-forge"
 version = "0.2.0"
 description = "Autonomous plan-and-execute coding loop over any models you bring."
+readme = "README.md"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["llm", "agent", "codegen", "llama.cpp", "claude", "automation"]
+authors = [{ name = "Nik" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Quality Assurance",
+]
 # No runtime dependencies on purpose. The daemon has to start on every machine
 # a run might live on, and a failed `pip install` is a bad way to find out that
 # an overnight run never began.
@@ -18,6 +36,11 @@ dependencies = []
 # the same reason: the suite is how any of this is checked.
 [project.optional-dependencies]
 dev = ["flake8>=7", "pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/nschroeder8472/hybrid-forge"
+Repository = "https://github.com/nschroeder8472/hybrid-forge"
+Issues = "https://github.com/nschroeder8472/hybrid-forge/issues"
 
 [project.scripts]
 forge = "forge.cli:main"

@@ -19,9 +19,11 @@ import shutil
 import subprocess
 import time
 from datetime import datetime, timedelta
+from collections.abc import Sequence
 from typing import Any
 
 from .base import (
+    ToolSpec,
     DERIVE_TIMEOUT,
     Capabilities,
     Completion,
@@ -153,6 +155,11 @@ class ClaudeCLIProvider(Provider):
         max_tokens: int,
         temperature: float = 0.2,
         timeout: int = DERIVE_TIMEOUT,
+        # Accepted and ignored: `capabilities().supports_tools` is false here,
+        # so the caller has already built a prompt that does not need them.
+        # Taking the argument anyway means no call site has to ask which kind
+        # of provider a role happens to have.
+        tools: Sequence[ToolSpec] = (),
     ) -> Completion:
         # Zero means the caller did not care; the budget decides. An
         # explicit timeout is always truthy and passes through.

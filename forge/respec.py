@@ -22,7 +22,14 @@ from typing import Callable, Sequence
 
 from .evidence import MAX_LOCATE, locate_named, repo_files
 from .ingest import derive_needs, plan_decisions, whole_file_claims
-from .patch import _flatten, _states, is_safe_path, normalize_path, pinned_values
+from .patch import (
+    _flatten,
+    _states,
+    is_safe_path,
+    is_test_path,
+    normalize_path,
+    pinned_values,
+)
 from .prompts import parse_respec, respec_prompt
 from .providers import Completion, Message, ProviderError
 from .state import Store, Ticket, _criterion_key
@@ -1031,6 +1038,53 @@ def revise(
                 level="warn",
                 kind="ticket",
                 data={"ticket": ticket.ticket_id, "refused": strayed},
+            )
+
+    # A revision may narrow the scope, but not out of the ticket's own test
+    # file. That one is not scope in the ordinary sense: `_test_target` reads
+    # it to decide where the tester writes, and a ticket that no longer
+    # declares one gets an invented `tests/<id>_test.py` instead — outside its
+    # own writable scope, where the executor cannot repair a line of it.
+    #
+    # The failure is silent and total. On run 1 of HANDBACK-DASHBOARD.md the
+    # ticket declared `tests/test_handback_ui.py`, a respec cycle returned an
+    # `allowed_files` without it, and the next run put three E501s in the
+    # invented file. Three attempts hit the identical three lines, because
+    # nothing in the ticket's scope could touch them. The implementation was
+    # finished and lint-clean the whole time.
+    #
+    # The same argument as the criteria ratchet, applied to scope: the party
+    # that has just exhausted its attempts does not get to remove the file it
+    # is repaired through. Narrowing anywhere else stands — a ticket that
+    # genuinely no longer writes a module should stop claiming it.
+    # Which is a rule about the *count*, not about the path. A revision that
+    # swaps one test file for another leaves the ticket repairable and stands;
+    # only one that leaves it with none is refused, because that is the state
+    # `_test_target` answers by inventing a path outside the scope.
+    if "allowed_files" in revision:
+        owned_tests = {
+            normalize_path(path)
+            for path in ticket.allowed_files
+            if is_test_path(path)
+        }
+        proposed_tests = {
+            normalize_path(path)
+            for path in revision["allowed_files"]
+            if is_test_path(path)
+        }
+        dropped = sorted(owned_tests) if owned_tests and not proposed_tests else []
+        if dropped:
+            revision["allowed_files"] = list(revision["allowed_files"]) + dropped
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: respec proposed dropping "
+                f"{', '.join(dropped)} from the writable scope. That is the "
+                f"ticket's own test file — the tester writes there, and the "
+                f"executor repairs what it writes — so it was kept. The rest "
+                f"of the revision stands.",
+                level="warn",
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "kept": dropped},
             )
 
     # A revision that re-proposes a cause the loop already disproved by running
