@@ -2672,6 +2672,80 @@ class TestRetiringAnAssertionNeedsAnArgument(unittest.TestCase):
         self.assertEqual(store.list_tickets(run_id)[0].spec, "new")
 
 
+class TestACharacterAModelWroteCannotKillACommand(unittest.TestCase):
+    """`forge status` died on a Windows console with
+
+        UnicodeEncodeError: 'charmap' codec can't encode character '\\u2011'
+
+    A reviewer had written a non-breaking hyphen into `blocked_note` — cp1252
+    has an em dash and not that — so the command exited non-zero without
+    printing the backlog. The run was fine; reading it was impossible."""
+
+    def _narrow(self):
+        """A console that speaks cp1252 and raises on anything else."""
+        return io.TextIOWrapper(io.BytesIO(), encoding="cp1252", newline="")
+
+    def test_the_streams_substitute_rather_than_raise(self):
+        console = self._narrow()
+
+        with unittest.mock.patch.object(sys, "stdout", console):
+            cli.survive_a_narrow_console()
+            print("not‑in")
+            console.flush()
+
+        written = console.buffer.getvalue().decode("cp1252")
+        self.assertIn("not?in", written)
+
+    def test_a_console_that_can_show_it_still_shows_it(self):
+        # `errors="replace"` only touches what cp1252 could not have rendered.
+        # An em dash is 0x97 there and must survive intact.
+        console = self._narrow()
+
+        with unittest.mock.patch.object(sys, "stdout", console):
+            cli.survive_a_narrow_console()
+            print("done — all tickets complete")
+            console.flush()
+
+        self.assertIn("—", console.buffer.getvalue().decode("cp1252"))
+
+    def test_a_stream_that_cannot_be_reconfigured_is_left_alone(self):
+        # Under pytest capture, or a StringIO in a test, there is nothing to
+        # fix — and failing to start over an encoding preference would be
+        # worse than the crash it avoids.
+        with unittest.mock.patch.object(sys, "stdout", io.StringIO()):
+            cli.survive_a_narrow_console()
+
+    def test_status_prints_a_note_carrying_one(self):
+        root = Path(tempfile.mkdtemp())
+        (root / ".hybridforge").mkdir()
+        (root / ".hybridforge" / "config.json").write_text(
+            json.dumps(
+                {
+                    "models": {"m": {"kind": "openai", "model": "x"}},
+                    "roles": {r: "m" for r in ROLES},
+                    "commands": {"test": "pytest"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        config = Config.load(root)
+        store = Store(config.db_path)
+        run_id = store.create_run("narrow console")
+        store.add_tickets(run_id, [Ticket("T-1", title="wire it", status="blocked")])
+        ticket = store.list_tickets(run_id)[0]
+        ticket.blocked_note = "review rejected: `status` is not‑in RETRYABLE"
+        store.update_ticket(run_id, ticket)
+
+        console = self._narrow()
+        with unittest.mock.patch.object(sys, "stdout", console):
+            cli.survive_a_narrow_console()
+            code = cli.cmd_status(argparse.Namespace(root=str(root)))
+            console.flush()
+
+        self.assertEqual(code, 0)
+        self.assertIn("not?in RETRYABLE", console.buffer.getvalue().decode("cp1252"))
+
+
 class TestTheRepoConfigFallsBackToTheMachineProfile(unittest.TestCase):
     """The two-layer split, at load time rather than only at `forge init`.
 

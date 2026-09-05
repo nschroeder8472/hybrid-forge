@@ -2644,7 +2644,50 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def survive_a_narrow_console() -> None:
+    """Stop a character a model wrote from killing a command that prints it.
+
+    Every command here prints text the daemon did not author — a ticket title,
+    a `blocked_note`, a reviewer's rejection, a model's reply. Those arrive as
+    whatever the model felt like emitting, and a Windows console defaults to a
+    legacy code page: `cp1252` has an em dash and no non-breaking hyphen, so
+
+        exhausted 3 attempts; last failure: review rejected the diff:
+        - The evidence function returns `None` when `ticket.status` is not‑in …
+
+    ended as `UnicodeEncodeError: 'charmap' codec can't encode character
+    '\\u2011' in position 194`, and `forge status` exited non-zero without
+    printing the backlog. The run was fine. Reading it was impossible.
+
+    So the streams are told to substitute rather than raise. Applied once, at
+    the entry point, because the alternative is remembering it at every
+    `print` that might carry model output — which is nearly all of them, and
+    the one that gets forgotten is the one a person hits at the worst moment.
+
+    The console's own encoding is kept. Forcing UTF-8 onto a legacy code page
+    trades a crash for mojibake on characters that would otherwise have
+    rendered correctly; `errors="replace"` only touches what could not have
+    been shown anyway, and everything cp1252 can display still displays.
+
+    A stream that cannot be reconfigured is left alone: under `pytest`'s
+    capture, or piped into a file, or replaced by a `StringIO` in a test,
+    there is nothing to fix and nothing to fail over.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (OSError, ValueError):
+            # Detached, closed, or a wrapper that will not take the argument.
+            # Printing is still the caller's business; refusing to start over
+            # an encoding preference would be worse than the crash it avoids.
+            continue
+
+
 def main(argv: list[str] | None = None) -> int:
+    survive_a_narrow_console()
     parser = build_parser()
     args = parser.parse_args(argv)
     return int(args.func(args) or 0)
