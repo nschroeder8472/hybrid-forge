@@ -59,6 +59,7 @@ large `maxOutputTokens`.
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from typing import Any
 
 from ._http import get_json, post_json
@@ -70,6 +71,7 @@ from .base import (
     ProviderBadResponse,
     ProviderError,
     ProviderUnreachable,
+    ToolSpec,
 )
 from .openai_compat import OpenAICompatProvider
 
@@ -368,6 +370,15 @@ class LlamaCppProvider(OpenAICompatProvider):
             # `mmproj-auto = false`, so a model declared blind here is one the
             # router was told not to load a projector for.
             supports_images=bool(self.config.get("multimodal", False)),
+            # Whether the checkpoint's chat template can encode a tool call.
+            # llama-server needs `--jinja` for this and the template has to
+            # carry the grammar; both are properties of how the router was
+            # started and of the GGUF, neither of which is published. So it is
+            # declared, and declared on by default: a model that never calls a
+            # tool costs only the definitions, while a model that wanted one
+            # and had none spent nine attempts asking for a shell that was
+            # never there. See docs/CONTEXT-TOOLS.md.
+            supports_tools=bool(self.config.get("tools", True)),
         )
         if not caps.context_window:
             # The preset's own `-c`, when it pins one. Never the trained
@@ -398,6 +409,7 @@ class LlamaCppProvider(OpenAICompatProvider):
         max_tokens: int,
         temperature: float = 0.2,
         timeout: int = DERIVE_TIMEOUT,
+        tools: Sequence[ToolSpec] = (),
     ) -> Completion:
         # Before every call, not once at startup. The loop alternates roles and
         # each role is its own provider instance, so what is resident is decided
@@ -409,6 +421,7 @@ class LlamaCppProvider(OpenAICompatProvider):
             max_tokens=max_tokens,
             temperature=temperature,
             timeout=timeout,
+            tools=tools,
         )
 
     # -- what doctor can see -------------------------------------------

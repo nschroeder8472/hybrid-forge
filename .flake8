@@ -14,7 +14,18 @@ exclude =
     __pycache__,
     .pytest_cache,
     build,
-    hybrid_forge.egg-info
+    hybrid_forge.egg-info,
+    # The daemon's own working directory: run databases, artifact trees, and
+    # `abandoned/`, where `_discard_tests` quarantines a failed ticket's
+    # unverified test file rather than deleting it.
+    #
+    # Not excluded, that quarantine breaks the rule it exists to enforce. A
+    # discarded file is kept precisely because nobody owns it any more, and a
+    # linter that still reads it fails every later run's baseline on code no
+    # ticket has in scope to repair — which is the orphan-test failure
+    # `_discard_tests` was written to prevent. Seen on run 1 of
+    # HANDBACK-DASHBOARD.md: three E501s in a reclaimed tester file.
+    .hybridforge
 
 # The fixture is graded by its own `.flake8` and its own workspace command, so
 # a run inside a copy of it meets the same rules a reader of the committed tree

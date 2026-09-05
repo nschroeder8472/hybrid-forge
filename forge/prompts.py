@@ -56,6 +56,33 @@ RATIFICATION_HEADING = "## Settled before any code was written"
 # docs/CONVERGENCE.md.
 TOOLCHAIN_HEADING = "## How this project checks the code you write"
 
+# The repository map: every source file and the definitions in it, without the
+# bodies. Sits in the stable prefix ahead of everything a ticket changes, so a
+# run pays for it once and reads it from the provider's cache on every later
+# call. Droppable, and last to go of the stable blocks — a role that loses it
+# can still find a file with `grep`, where a role that loses the ticket has
+# nothing to do.
+REPO_MAP_HEADING = "## What is in this repository"
+
+# What a role with read tools is told about them. Its own message rather than a
+# paragraph in the system prompt, because whether a role has tools is a fact
+# about the provider it happens to have and the system prompt is shared by
+# every role on every provider.
+TOOLS_HEADING = "## You can read this repository"
+TOOLS_NOTE = f"""{TOOLS_HEADING}
+Anything not shown below, you can go and read. Use the tools rather than
+assuming an API: `grep` to find where a name is defined, `outline` to see what
+is in a file, `read_file` to read it or a range of it, `list_dir` to see what
+is in a directory. The map above lists every file and what it declares.
+
+Read what you need before you answer. Do not guess at a signature, an export
+name, or an enum order that you could look up in one call — and do not ask for
+a file in prose. A tool call is the only way to read; prose asking for one is
+read by nobody.
+
+Reading is unrestricted. Writing is not: your reply may still only change the
+files listed under the allowed scope."""
+
 # Reference files that are pictures rather than text. Droppable for the same
 # reason the toolchain block is, and ahead of it in cost: an image is priced by
 # area and a screenshot is worth thousands of tokens, so a prompt that has to
@@ -556,6 +583,46 @@ def _sources_block(sources: dict[str, str]) -> str:
     return "\n\n".join(parts)
 
 
+def stable_prefix(
+    repository_map: str,
+    toolchain: dict[str, str] | None,
+    *,
+    can_read: bool = False,
+) -> list[Message]:
+    """The blocks that are identical for every ticket in a run.
+
+    Shared by every role that takes one, and returned as a list so the caller
+    puts it in one place: directly after the system message and ahead of
+    anything the ticket owns. That ordering is the whole point — a prefix is
+    only cached while it is a prefix, and one block of ticket text in front of
+    the map costs the cache on every call behind it.
+
+    Ordered cheapest-to-lose last, matching the droppable markers: the map goes
+    before the toolchain because a role that loses the map can still `grep`,
+    while a role that loses the toolchain rules relearns them from failures —
+    which is what one run spent 512 attempts doing.
+    """
+    messages: list[Message] = []
+    if repository_map:
+        messages.append(
+            Message(
+                role="user",
+                content=f"""{REPO_MAP_HEADING}
+Every source file, and what each one declares. Bodies are not shown — this is
+an index of where things are, not the code itself.
+
+{repository_map}
+""",
+            )
+        )
+    if can_read:
+        messages.append(Message(role="user", content=TOOLS_NOTE))
+    rules = _toolchain_message(toolchain)
+    if rules is not None:
+        messages.append(rules)
+    return messages
+
+
 def _toolchain_message(toolchain: dict[str, str] | None) -> Message | None:
     """The configuration the verify commands enforce, as its own message.
 
@@ -930,6 +997,8 @@ def build_prompt(
     prior_failures: Sequence[str] = (),
     malformed: str = "",
     prior_turns: Sequence[tuple[str, str]] = (),
+    repository_map: str = "",
+    can_read: bool = False,
 ) -> list[Message]:
     """The executor's prompt, in one of two shapes.
 
@@ -947,13 +1016,20 @@ def build_prompt(
     """
     messages = [Message(role="system", content=EXECUTOR_SYSTEM)]
 
+    # The stable prefix, in front of everything a ticket changes.
+    #
+    # Models are stateless; there is nothing to carry between calls except the
+    # tokens you send again, and both Anthropic and llama.cpp reuse a KV cache
+    # for an identical prefix. So the blocks that are the same for every ticket
+    # and every attempt go first and in a fixed order — system prompt, map,
+    # toolchain — and everything the ticket moves goes after them. Interleaved
+    # the way this builder used to be, nothing caches: run 1 of
+    # HANDBACK-DASHBOARD.md rebuilt a 47k-token prompt 44 times.
+    messages.extend(stable_prefix(repository_map, toolchain, can_read=can_read))
+
     context = _context_message(ticket, retrieved)
     if context is not None:
         messages.append(context)
-
-    rules = _toolchain_message(toolchain)
-    if rules is not None:
-        messages.append(rules)
 
     # After the toolchain settings and before the ticket: these are usually
     # conclusions *about* those settings, and they read as a gloss on them.
@@ -1025,7 +1101,27 @@ Return the complete file. Preserve everything you are not changing.
 
 {_sources_block(current)}
 """
-        if reference:
+        # A role that can read does not get the reference pile. Those files
+        # were chosen before anyone had read a line of the ticket, and the
+        # guess is expensive in both directions at once: run 1 of
+        # HANDBACK-DASHBOARD.md pasted 156k characters of test suite the
+        # ticket never mentioned and left out the one file its spec named.
+        # Named as a starting point, and read on demand, is strictly better —
+        # the model finds what the guess missed and pays for nothing else.
+        #
+        # The writable files above stay pasted whatever the role can do. The
+        # executor is asked to return them complete, and a file it has to
+        # reproduce from a tool call it might not make is a file that comes
+        # back with its untouched half missing.
+        if reference and can_read:
+            body += f"""
+## Where to start reading
+These look relevant to this ticket. They are a starting point, not a limit —
+read them with `read_file`, and read anything else you need.
+
+{chr(10).join('- ' + path for path in sorted(reference))}
+"""
+        elif reference:
             body += f"""
 ## Reference — read only; leave these out of your reply
 This is the real source. Take export names, signatures, and enum order from
@@ -1112,6 +1208,8 @@ def write_tests_prompt(
     rejected_bindings: list[str] | None = None,
     laundered: list[str] | None = None,
     own_file_errors: list[str] | None = None,
+    repository_map: str = "",
+    can_read: bool = False,
 ) -> list[Message]:
     """Ask the tester for assertions, with the evidence to match the repo.
 
@@ -1278,13 +1376,12 @@ report — not something to correct on the way to the comparison.
 """
 
     messages = [Message(role="system", content=TESTER_SYSTEM)]
-    # The tester is graded by the same lint and type checks as the executor,
-    # and on one run it was the tester's file that carried 117 of the 160 lint
-    # failures — every one of them trailing whitespace, against a config it had
+    # The stable prefix, ahead of anything this ticket owns — see
+    # `stable_prefix`. It carries the toolchain rules the tester is graded by:
+    # on one run it was the tester's file that carried 117 of the 160 lint
+    # failures, every one of them trailing whitespace, against a config it had
     # never been shown.
-    rules = _toolchain_message(toolchain)
-    if rules is not None:
-        messages.append(rules)
+    messages.extend(stable_prefix(repository_map, toolchain, can_read=can_read))
     # The tester rediscovers a convention as readily as the executor does, and
     # on one run it was the tester's file that kept breaking the linter.
     established = learned_message(ticket, learned_limit)
@@ -1722,8 +1819,17 @@ def review_prompt(
     unchanged: dict[str, str] | None = None,
     reproduced: tuple[str, str] | None = None,
     unchecked: str = "",
+    toolchain: dict[str, str] | None = None,
+    repository_map: str = "",
+    can_read: bool = False,
 ) -> list[Message]:
     messages = [Message(role="system", content=REVIEWER_SYSTEM)]
+    # A reviewer that can read is the one role where it changes what a verdict
+    # is worth rather than only what it costs. Run 1 of HANDBACK-DASHBOARD.md
+    # produced nine rejections quoting an `evidence` function that had never
+    # been written: the diff was empty, and nothing in the prompt could have
+    # told it otherwise. A reviewer that can open the file checks instead.
+    messages.extend(stable_prefix(repository_map, toolchain, can_read=can_read))
 
     # The reviewer is asked to check that nothing contradicts established
     # conventions, which it cannot do without being told what they are.

@@ -205,6 +205,38 @@ with every later attempt on that ticket.
 
 ---
 
+## Context by retrieval — built, no live run
+
+**Status:** built, phases 1-5 —
+[CONTEXT-TOOLS.md](CONTEXT-TOOLS.md). Read-only tools (`grep`, `read_file`,
+`list_dir`, `outline`), a generated repository map, a stable cached prefix,
+reading granted rather than limited, and no silent truncation for a role that
+can read. The executor, tester and reviewer all go through
+`Orchestrator._converse`, which is a bounded conversation rather than one call.
+
+The problem it solves is the first run this loop ever made against
+hybrid-forge's own tree rather than against `examples/sample-project`. Run 1 of
+`HANDBACK-DASHBOARD.md` ended blocked after 3 cycles, 9 attempts and 2.3M
+tokens **having written no files at all**: 83% of its prompt was a test suite
+the ticket never mentioned, five files of it cut mid-line, the one file its
+spec named was absent, and every executor reply was a hallucinated tool call
+asking for a shell.
+
+Both halves of that are the same mistake. `evidence.reading_scope` computes a
+scope before anyone has read a line, and relevance is a function of the task —
+so it pasted 156k characters nobody needed and omitted the file the spec named.
+The rule that would have saved that run is real, cheap, and would have been the
+third such rule; the next one is already waiting behind it.
+
+**What it has not done is convince a model.** Every number in that document is
+a measurement of the prompt — 47k tokens to 16k on the same ticket, 9k of the
+remainder cached across the run — and none of it is evidence about behaviour.
+The measurement that matters is HD-001 rerun with the tools on: if the executor
+reads `forge/state.py`, writes the patch and lands, the argument holds. If it
+reads twelve files and still writes nothing, the problem was never context.
+
+---
+
 ## Adaptive ticket loop — specified, not built
 
 **Status:** specified in [ADAPTIVE-TICKET-LOOP.md](ADAPTIVE-TICKET-LOOP.md).

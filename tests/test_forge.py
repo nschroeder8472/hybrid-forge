@@ -2671,6 +2671,84 @@ class TestRetiringAnAssertionNeedsAnArgument(unittest.TestCase):
         self.assertEqual(store.list_tickets(run_id)[0].spec, "new")
 
 
+class TestRespecKeepsTheTicketsOwnTestFileWritable(unittest.TestCase):
+    """A revision may narrow the scope, but not out of the ticket's own test
+    file. `_test_target` reads that path to decide where the tester writes; a
+    ticket that stops declaring one gets an invented `tests/<id>_test.py`
+    outside its own scope, and the executor cannot repair a line of it.
+
+    Run 1 of HANDBACK-DASHBOARD.md: the ticket declared
+    `tests/test_handback_ui.py`, a respec cycle returned an `allowed_files`
+    without it, and the rerun put three E501s in the invented file. Three
+    attempts hit the identical three lines. The implementation was finished and
+    lint-clean throughout."""
+
+    def _revise(self, proposed):
+        root = Path(tempfile.mkdtemp())
+        store = Store(root / "t.db")
+        run_id = store.create_run("scope")
+        store.add_tickets(
+            run_id,
+            [
+                Ticket(
+                    "HD-001",
+                    spec="old",
+                    allowed_files=["forge/ui/server.py", "tests/test_handback_ui.py"],
+                    status="failed",
+                )
+            ],
+        )
+        step = store.start_step(run_id, "HD-001", "verify-lint")
+        store.end_step(step, "failed", "E501 line too long")
+
+        def call(_messages, _budget):
+            return Completion(
+                text=json.dumps({"spec": "new", "allowed_files": proposed}),
+                usage=Usage(),
+            )
+
+        respec.revise(
+            store, run_id, store.list_tickets(run_id)[0], call=call, budget=1024
+        )
+        return store.list_tickets(run_id)[0], store
+
+    def test_a_dropped_test_file_is_put_back(self):
+        ticket, _ = self._revise(["forge/ui/server.py"])
+
+        self.assertIn("tests/test_handback_ui.py", ticket.allowed_files)
+
+    def test_the_rest_of_the_revision_still_lands(self):
+        # Put back, not refused whole. The narrowing may be right about
+        # everything else it says.
+        ticket, _ = self._revise(["forge/ui/server.py"])
+
+        self.assertEqual(ticket.spec, "new")
+
+    def test_putting_it_back_is_reported(self):
+        _, store = self._revise(["forge/ui/server.py"])
+
+        logged = " ".join(row["message"] for row in store.events_after(0))
+        self.assertIn("tests/test_handback_ui.py", logged)
+        self.assertIn("writable scope", logged)
+
+    def test_narrowing_anything_else_is_left_alone(self):
+        # A ticket that genuinely no longer writes a module should stop
+        # claiming it; this guard is about the one path the loop repairs
+        # through, not about scope in general.
+        ticket, _ = self._revise(["tests/test_handback_ui.py"])
+
+        self.assertNotIn("forge/ui/server.py", ticket.allowed_files)
+
+    def test_swapping_one_test_file_for_another_stands(self):
+        # The rule is about the count, not the path: a ticket left with some
+        # test file in scope is still repairable, and a revision that renames
+        # one has not taken anything away.
+        ticket, _ = self._revise(["forge/ui/server.py", "tests/test_other.py"])
+
+        self.assertIn("tests/test_other.py", ticket.allowed_files)
+        self.assertNotIn("tests/test_handback_ui.py", ticket.allowed_files)
+
+
 class TestReadingScopeIsWiderThanWritingScope(unittest.TestCase):
     """A ticket that may write one file was shown that one file, so the role
     holding it could not check a call against what it calls, and could not tell
@@ -16806,7 +16884,11 @@ class TestTheExecutorSamplesAtAChosenTemperature(unittest.TestCase):
         orch, root, run_id = _stub_orchestrator()
         seen: list[float] = []
 
-        def call(_run, role, _messages, *, max_tokens, temperature=0.2):
+        def call(_run, role, _messages, *, max_tokens, temperature=0.2, **_rest):
+            # `**_rest` absorbs the keywords the build call now carries — the
+            # read tools among them. This test is about the temperature the
+            # call site states, and a stub that has to be updated whenever a
+            # keyword is added is a stub testing the wrong thing.
             seen.append(temperature)
             return Completion(
                 text="src/game.py\n```python\nx = 1\n```", usage=Usage(),

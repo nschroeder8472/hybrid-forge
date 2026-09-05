@@ -31,7 +31,8 @@ from ..loop import (
     CONTROL_STOP,
     CURRENT_RUN_KEY,
 )
-from ..state import Store
+from ..routes import REASONS, describe, reason_of
+from ..state import Store, Ticket
 from ..tokens import format_tokens
 
 INDEX = Path(__file__).with_name("index.html")
@@ -62,6 +63,37 @@ def _live_run(store: Store) -> Any:
     if run is None or run["status"] in _TERMINAL:
         return None
     return run
+
+
+def evidence(ticket: Ticket) -> dict[str, Any] | None:
+    """The evidence a parked ticket already has, or None when it is not parked.
+
+    Parked means one of the four statuses a retry reopens — `Store.RETRYABLE` —
+    read rather than restated so the two lists cannot drift. Every value is
+    already on the ticket; this only shapes it for the page. The lists are
+    capped and their text cut here rather than in the page, because `learned`
+    and `human_note` are append-only by design and `/api/state` is polled for
+    the life of a run, so an uncapped payload grows without bound on the one
+    ticket that is stuck longest.
+    """
+    if ticket.status not in Store.RETRYABLE:
+        return None
+    reason = reason_of(ticket.route)
+    return {
+        "route": describe(ticket.route),
+        "reason": REASONS[reason] if reason else "",
+        "learned": [
+            {"text": entry["text"][:400], "count": entry["count"]}
+            for entry in ticket.learned[:5]
+        ],
+        "notes": [
+            {"text": entry["text"][:400], "at": entry["at"]}
+            for entry in ticket.human_note[-5:]
+        ],
+        "classes": list(ticket.cycle_classes),
+        "volume": ticket.cycle_volume,
+        "flat_cycles": ticket.flat_cycles,
+    }
 
 
 def snapshot(store: Store, config: Config) -> dict[str, Any]:
@@ -115,6 +147,7 @@ def snapshot(store: Store, config: Config) -> dict[str, Any]:
                 "files": t.allowed_files,
                 "criteria": t.criteria,
                 "note": t.blocked_note,
+                **({"evidence": ev} if (ev := evidence(t)) is not None else {}),
             }
             for t in tickets
         ],

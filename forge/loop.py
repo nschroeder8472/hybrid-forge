@@ -89,7 +89,10 @@ from .providers import (
     Message,
     ProviderError,
     RateLimited,
+    ToolSpec,
 )
+from .repomap import repo_map
+from .tools import TOOLS, Toolbox
 from .prompts import (
     CONTEXT_HEADING,
     EXAMPLE_PATH_PREFIX,
@@ -100,6 +103,7 @@ from .prompts import (
     PRIOR_VERDICTS_HEADING,
     RATIFICATION_HEADING,
     REFERENCE_IMAGES_HEADING,
+    REPO_MAP_HEADING,
     TOOLCHAIN_HEADING,
     build_prompt,
     STUCK_UNCLEAR,
@@ -158,6 +162,7 @@ _DROPPABLE_HEADINGS = (
     LEARNED_HEADING,
     RATIFICATION_HEADING,
     REFERENCE_IMAGES_HEADING,
+    REPO_MAP_HEADING,
     TOOLCHAIN_HEADING,
 )
 
@@ -403,6 +408,9 @@ class Orchestrator:
         # Provider notes already reported. A model that reasons past its budget
         # does it on every call, and the remedy is one configuration change.
         self._recovered: set[str] = set()
+        # The repository map, built on first use and held for the run. See
+        # `_repo_map` for why a landed ticket does not invalidate it.
+        self._repo_map_cache: str | None = None
         self._impossible_claims: dict[str, str] = {}
         # Why the run gave up on verifying anything, once it has. Set when a
         # ticket's every verify step was excused, which means the project no
@@ -701,6 +709,7 @@ class Orchestrator:
         temperature: float = 0.2,
         images: Sequence[ImagePart] = (),
         images_withheld: Sequence[str] = (),
+        tools: Sequence[ToolSpec] = (),
     ) -> Completion:
         """One model call, with the budget gate wrapped around it.
 
@@ -751,7 +760,10 @@ class Orchestrator:
 
             try:
                 completion = provider.complete(
-                    messages, max_tokens=max_tokens, temperature=temperature
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    tools=tools,
                 )
             except RateLimited as exc:
                 reset_at = exc.reset_at or (time.time() + exc.seconds_remaining)
@@ -789,6 +801,148 @@ class Orchestrator:
                     kind="usage",
                 )
             return completion
+
+    def _can_read(self, role: str) -> bool:
+        """Whether this role gets read tools.
+
+        Two facts, and both are checked rather than assumed: the operator left
+        them on, and the provider this role happens to have can encode a tool
+        call. A role whose provider cannot is not broken and is not refused —
+        it gets the pasted-sources prompt every role got before tools existed,
+        which is why `build_prompt` still takes `sources` at all.
+        """
+        if not self.config.loop.read_tools:
+            return False
+        return self.config.provider_for(role).capabilities().supports_tools
+
+    def _repo_map(self) -> str:
+        """The repository map, computed once per run.
+
+        Cached on the orchestrator rather than recomputed per call: it walks
+        the tree and parses every Python file, and it is the same answer for
+        every ticket. The cache is not invalidated when a ticket writes a file
+        — deliberately. The map is an index of where things are, a landed
+        ticket moves nothing, and a map that changed under the roles mid-run
+        would cost the cached prefix its identity on every call after the first
+        commit. What a role needs to see fresh, it reads.
+        """
+        if not self.config.loop.repo_map:
+            return ""
+        if self._repo_map_cache is None:
+            self._repo_map_cache = repo_map(self.config.root)
+        return self._repo_map_cache
+
+    def _converse(
+        self,
+        run_id: int,
+        role: str,
+        messages: list[Message],
+        *,
+        max_tokens: int,
+        temperature: float = 0.2,
+        images: Sequence[ImagePart] = (),
+        images_withheld: Sequence[str] = (),
+    ) -> Completion:
+        """One role's turn, with read tools, until it answers.
+
+        The unit above `_call`. A role that can read is not one call any more:
+        it asks for a file, is given it, asks for another, and answers when it
+        has what it needs. Every turn is a `_call`, so the budget gate, the
+        rate-limit park, the usage record and the truncation warning all still
+        happen per turn and none of them learned anything new.
+
+        Three limits, all of them set rather than discovered:
+
+        - **`loop.toolTurns`** caps the conversation. The last turn is taken
+          with the tools withdrawn and an instruction to answer from what it
+          has, because a model that has spent eight turns reading and has not
+          answered will not answer on the ninth either — and an attempt that
+          ends with no reply at all is worse than one that ends with a reply
+          built on a partial read.
+        - **`Toolbox` caps each result** at `MAX_RESULT_CHARS`. A role that
+          reads a 200k file gets a slice and is told how to ask for the rest.
+        - **The tool ledger is recorded** on the step, so a ticket that failed
+          for want of context can be told apart from one that failed in spite
+          of having read the right file. That distinction is the whole reason
+          the run this replaces could not be diagnosed from its own artifacts.
+
+        A reply that carries both text and tool calls is treated as a request
+        to read: the text is kept in the thread as the model's own turn, and
+        the calls are answered. Models narrate before they call, and reading
+        that narration as the answer throws the work away.
+        """
+        # Spread rather than passed as empty defaults, for the reason
+        # `_attachments` gives: a call with nothing to attach and no tools to
+        # offer stays the call it has always been.
+        attachments = self._attachments(images, images_withheld)
+        if not self._can_read(role):
+            return self._call(
+                run_id, role, messages, **attachments,
+                max_tokens=max_tokens, temperature=temperature,
+            )
+
+        toolbox = Toolbox(self.config.root)
+        thread = list(messages)
+        turns = max(1, self.config.loop.tool_turns)
+        completion = None
+
+        for remaining in range(turns, 0, -1):
+            last = remaining == 1
+            completion = self._call(
+                run_id,
+                role,
+                thread,
+                # Only on the opening turn: the images belong to the question,
+                # and re-attaching them to every turn of a conversation prices
+                # one screenshot eight times.
+                **(attachments if len(thread) == len(messages) else {}),
+                max_tokens=max_tokens,
+                temperature=temperature,
+                # Withdrawn on the final turn. Offering tools while saying
+                # "answer now" is a contradiction, and the models that lose
+                # that argument lose it by calling one more tool.
+                **({} if last else {"tools": TOOLS}),
+            )
+            if not completion.tool_calls:
+                break
+
+            thread.append(
+                Message(
+                    role="assistant",
+                    content=completion.text,
+                    tool_calls=completion.tool_calls,
+                )
+            )
+            for call in completion.tool_calls:
+                result = toolbox.run(call)
+                thread.append(Message(role="tool", content="", tool_result=result))
+
+            if remaining == 2:
+                # One turn left. Said plainly, and before the turn rather than
+                # after it, so the model spends it answering.
+                thread.append(
+                    Message(
+                        role="user",
+                        content=(
+                            "That was your last read. Answer the ticket now, "
+                            "in the format asked for, from what you have."
+                        ),
+                    )
+                )
+
+        if toolbox.ledger:
+            self.store.log(
+                run_id,
+                f"{role} read {len(toolbox.ledger)} time(s): "
+                + ", ".join(
+                    f"{name}({summary})" + ("" if ok else " — refused")
+                    for name, summary, ok in toolbox.ledger[:12]
+                ),
+                kind="tools",
+                data={"role": role, "calls": len(toolbox.ledger)},
+            )
+        assert completion is not None  # the loop runs at least once
+        return completion
 
     def _sleep_for_window(self, run_id: int, wait: Wait) -> None:
         """Park the run until a usage window reopens.
@@ -5144,7 +5298,7 @@ class Orchestrator:
         malformed = ""
         for remaining in (1, 0):
             try:
-                completion = self._call(
+                completion = self._converse(
                     run_id,
                     "executor",
                     build_prompt(
@@ -5160,6 +5314,8 @@ class Orchestrator:
                         prior_failures=prior_failures,
                         malformed=malformed,
                         prior_turns=prior_turns,
+                        repository_map=self._repo_map(),
+                        can_read=self._can_read("executor"),
                     ),
                     **self._attachments(images, images_withheld),
                     max_tokens=self._output_budget("executor"),
@@ -5492,12 +5648,14 @@ class Orchestrator:
                     ticket, extra=list(written)
                 )
                 for remaining in (1, 0):
-                    completion = self._call(
+                    completion = self._converse(
                         run_id,
                         "tester",
                         write_tests_prompt(
                             ticket,
                             written,
+                            repository_map=self._repo_map(),
+                            can_read=self._can_read("tester"),
                             # One fixed path per ticket. A tester free to name its
                             # own file renames it on every retry and leaves the
                             # previous one running forever.
@@ -5954,13 +6112,16 @@ class Orchestrator:
 
         step_id = self.store.start_step(run_id, ticket.ticket_id, "review")
         try:
-            completion = self._call(
+            completion = self._converse(
                 run_id,
                 "reviewer",
                 review_prompt(
                     ticket,
                     diff,
                     retrieved,
+                    toolchain=self._toolchain_for(ticket),
+                    repository_map=self._repo_map(),
+                    can_read=self._can_read("reviewer"),
                     # Its own earlier rejections of this same ticket. Without
                     # them a reviewer can object to X, get X fixed, then object
                     # to Y it never raised — three attempts, three unrelated

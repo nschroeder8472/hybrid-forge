@@ -69,6 +69,10 @@ ul { list-style: none; margin: 0; padding: 0; }
 .ticket .id { font-family: var(--mono); font-size: 12px; color: var(--accent); min-width: 74px; }
 .ticket .title { flex: 1; }
 .ticket .note { display: block; color: var(--warn); font-size: 12px; }
+/* The evidence a parked ticket already has, under its title. Muted and
+   indented so it reads as a footnote to the ticket rather than a second title. */
+.evidence { display: block; margin-left: 12px; }
+.evidence-line { display: block; color: var(--muted); font-size: 12px; }
 .pill { font-size: 11px; font-family: var(--mono); padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
 .pill.done, .pill.ok { color: var(--ok); } .pill.running { color: var(--accent); }
 .pill.blocked, .pill.failed { color: var(--err); } .pill.skipped { color: var(--wait); }
@@ -192,9 +196,44 @@ function renderTickets(tickets) {
   return tickets.map(t => `
     <li class="ticket">
       <span class="id">${esc(t.id)}</span>
-      <span class="title">${esc(t.title)}${t.note ? `<span class="note">${esc(t.note)}</span>` : ""}</span>
+      <span class="title">${esc(t.title)}${t.note ? `<span class="note">${esc(t.note)}</span>` : ""}${renderEvidence(t.evidence)}</span>
       <span class="pill ${esc(t.status)}">${esc(t.status)}${t.attempts > 1 ? ` ×${t.attempts}` : ""}</span>
     </li>`).join("");
+}
+
+// The evidence a parked ticket already has, shaped by `evidence()` in
+// server.py. Only the parts that have something to say are rendered, in the
+// order a reader wants them: why it was withheld, what the cycles found, what
+// was learned, and what a human said. A ticket with no evidence renders
+// nothing, so the title is exactly what it was before this existed.
+function renderEvidence(e) {
+  if (!e) return "";
+  const lines = [];
+  if (e.route && e.route !== "delegate") {
+    lines.push(e.reason ? `${esc(e.route)} — ${esc(e.reason)}` : esc(e.route));
+  }
+  if (e.classes && e.classes.length) {
+    lines.push(`classes: ${e.classes.map(esc).join(", ")}`);
+  }
+  if (e.volume > 0) {
+    lines.push(`findings: ${e.volume}`);
+  }
+  if (e.flat_cycles > 0) {
+    lines.push(`flat cycles: ${e.flat_cycles}`);
+  }
+  if (e.learned && e.learned.length) {
+    for (const entry of e.learned) {
+      lines.push(`${esc(entry.text)} ×${entry.count}`);
+    }
+  }
+  if (e.notes && e.notes.length) {
+    lines.push("notes");
+    for (const entry of e.notes) {
+      lines.push(`${esc(entry.at)}: ${esc(entry.text)}`);
+    }
+  }
+  if (!lines.length) return "";
+  return `<div class="evidence">${lines.map(l => `<div class="evidence-line">${l}</div>`).join("")}</div>`;
 }
 
 // Steps whose detail is a model's reply rather than a tool's output. Worth
