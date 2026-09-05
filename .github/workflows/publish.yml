@@ -1,0 +1,198 @@
+# Publish a tagged version: TestPyPI always, PyPI only after a person approves.
+#
+# A PyPI filename is permanent. It cannot be replaced, and deleting a release
+# does not free it — a mistake in 0.2.0 is fixed by shipping 0.2.1 and living
+# with the bad one forever. So every upload here is rehearsed against TestPyPI
+# and installed back out of it before the real index is touched, and the real
+# upload waits behind a human.
+#
+# The gate is the `pypi` environment. Add required reviewers to it in
+# Settings → Environments → pypi; without that rule the job runs unattended and
+# this file's whole point is gone. GitHub shows it as "Review deployments" on
+# the run.
+#
+# Tokens are read from repository secrets, complete with their `pypi-` prefix:
+#
+#   TEST_PYPI_API_TOKEN   a token from test.pypi.org (a separate account)
+#   PYPI_API_TOKEN        a token from pypi.org
+#
+# Trusted publishing would remove both — PyPI mints a short-lived credential
+# from the workflow's OIDC identity and there is no long-lived token to leak.
+# It needs a publisher configured on each index and `id-token: write` here.
+# Worth doing later; nothing below depends on the choice.
+
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  # For re-running a publish whose TestPyPI half succeeded and whose PyPI half
+  # was rejected, without moving a tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish, e.g. v0.2.1"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  # One publish of one version at a time. Two runs racing to claim the same
+  # filename end with one of them failing on a conflict, which reads as a
+  # broken pipeline rather than as the duplicate it is.
+  group: publish-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both, because the suite has only ever been run on Windows and the
+        # runner is Linux. A platform assumption that reaches PyPI is a
+        # platform assumption every user inherits.
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the checks
+        run: python -m pip install --upgrade pip flake8
+
+      - name: Lint
+        run: python -m flake8 .
+
+      - name: Test
+        run: python -m unittest discover tests
+
+  build:
+    name: Build and check
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the build tools
+        run: python -m pip install --upgrade pip build twine
+
+      - name: The tag and the version must agree
+        id: version
+        # Tagging v0.3.0 against a pyproject that still says 0.2.0 publishes
+        # 0.2.0 — a filename that may already exist, or worse, may not. Caught
+        # here, before anything is uploaded, because afterwards it cannot be.
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          version="$(python -c 'import tomllib,pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          echo "tag=$tag version=$version"
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::tag $tag does not match pyproject version $version (expected v$version)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: python -m build
+
+      - name: Check the metadata renders
+        run: python -m twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+  testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/hybrid-forge/
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          password: ${{ secrets.TEST_PYPI_API_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install it back out of TestPyPI
+        # The rehearsal is only worth something if the artifact is installed
+        # from the index rather than from the directory that just built it.
+        # TestPyPI takes a moment to serve a new file, so this waits rather
+        # than failing on the first miss.
+        run: |
+          version="${{ needs.build.outputs.version }}"
+          for attempt in 1 2 3 4 5 6; do
+            if pip install --index-url https://test.pypi.org/simple/ \
+                 --no-deps "hybrid-forge==$version"; then
+              break
+            fi
+            echo "not served yet; attempt $attempt"
+            sleep 15
+          done
+          pip show hybrid-forge
+          forge --help > /dev/null
+          python -c "import forge.tools, forge.repomap, forge.cli; print('imports ok')"
+
+  pypi:
+    name: Publish to PyPI
+    needs: [build, testpypi]
+    runs-on: ubuntu-latest
+    # The manual gate. Required reviewers on this environment are what make
+    # the job wait; see the note at the top of this file.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/hybrid-forge/
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install it back out of PyPI
+        run: |
+          version="${{ needs.build.outputs.version }}"
+          for attempt in 1 2 3 4 5 6; do
+            if pip install "hybrid-forge==$version"; then
+              break
+            fi
+            echo "not served yet; attempt $attempt"
+            sleep 15
+          done
+          pip show hybrid-forge
+          forge --help > /dev/null
