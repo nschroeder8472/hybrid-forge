@@ -574,6 +574,12 @@ class LoopSettings:
     # `retryCycles` with a respec between cycles is the tool for that, not more
     # attempts against the same words.
     max_attempts: int = 5
+    # How long any one of the project's own commands may run before it is
+    # killed, along with everything it started. The default is the value this
+    # was hard-coded to, so no repository changes behaviour by upgrading. Raise
+    # it for a suite that is genuinely slow; lower it to find out sooner that
+    # one has wedged.
+    command_timeout_seconds: int = 1800
     # Commit each verified ticket. Off by default — the first runs of an
     # autonomous loop should leave their work in the tree for inspection.
     auto_commit: bool = False
@@ -1127,6 +1133,7 @@ class Config:
         loop = data.get("loop", {}) or {}
         config.loop = LoopSettings(
             max_attempts=int(loop.get("maxAttempts", 5)),
+            command_timeout_seconds=int(loop.get("commandTimeoutSeconds", 1800)),
             auto_commit=bool(loop.get("autoCommit", False)),
             stop_on_blocked=bool(loop.get("stopOnBlocked", False)),
             retry_cycles=int(loop.get("retryCycles", -1)),
@@ -1563,6 +1570,7 @@ class Config:
             "memory": self.memory,
             "loop": {
                 "maxAttempts": self.loop.max_attempts,
+                "commandTimeoutSeconds": self.loop.command_timeout_seconds,
                 "autoCommit": self.loop.auto_commit,
                 "stopOnBlocked": self.loop.stop_on_blocked,
                 "retryCycles": self.loop.retry_cycles,

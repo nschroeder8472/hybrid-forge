@@ -152,19 +152,25 @@ file>, timed_out=False)`.
 - `run_command` with a `cwd` of a temporary directory containing a file named
   `marker.txt`, and a command whose script prints `os.listdir(".")`, returns an
   `Outcome` whose `output` contains `marker.txt`.
-- Given a script that prints `working`, spawns a detached grandchild with
-  `subprocess.Popen`, and then sleeps 30 seconds — where the grandchild writes
-  `started.txt` into `cwd` at once, sleeps 30 seconds, and then writes
-  `survived.txt` — `run_command` on that script with a timeout of 3 returns
-  within 25 seconds of being called, with `timed_out` equal to `True` and
-  `output` containing `working`.
-- After that call returns, `started.txt` exists in `cwd`, which is what shows
-  the grandchild really ran; and five seconds later `survived.txt` still does
-  not exist, which is what shows the tree was killed rather than the shell
-  alone.
-- `run_command` on a script that sleeps 30 seconds, with a timeout of 3,
+- Given a script that prints `working`, spawns a grandchild with
+  `subprocess.Popen`, and then sleeps 120 seconds — where the grandchild writes
+  `started.txt` into `cwd` at once, sleeps 11 seconds, and then writes
+  `survived.txt` — `run_command` on that script with a `timeout` of 6 returns
+  within 50 seconds, with `timed_out` equal to `True` and `output` containing
+  `working`. It returns at about the 6-second mark because the timeout is what
+  ends it; the 120 seconds are how long it would run unbounded, and the rest is
+  slack for a cold interpreter on a loaded machine.
+- After that call returns, `started.txt` exists in `cwd`: the grandchild really
+  ran and really outlived its shell being killed.
+- Then, 14 seconds after that same call returned — about 20 seconds after the
+  grandchild began, against its own 11-second sleep — `survived.txt` does not
+  exist in `cwd`. The 11 seconds sit past the 6-second bound on purpose, so a
+  living grandchild writes that file only after the kill was due: seeing it
+  means the kill missed, and not seeing it cannot be explained by nobody having
+  waited long enough.
+- `run_command` on a script that sleeps 120 seconds, with a `timeout` of 6,
   returns an `Outcome` whose `timed_out` is `True` and whose `returncode` is
-  not `0`.
+  not `0`, within 50 seconds.
 
 ## Context
 
@@ -174,11 +180,35 @@ own lint is `python -m flake8 .` with a 100-character line limit.
 
 ## Notes
 
-The grandchild criterion is the one the whole ticket exists for, and it is the
-one whose phrasing could hide the bug. `survived.txt` asserts an absence, which
-an implementation that never starts anything also satisfies — that is why
-`started.txt` is asserted beside it, and why the output has to contain
-`working`. All three together say the command ran, produced output, spawned
+**Landed by hand on 2026-09-06** as `forge/processes.py`, with its criteria in
+`tests/test_processes.py`. Two rounds of ratification each rejected these
+criteria on their timings — correctly — and the planner could not respec the
+ticket, because re-emitting a Spec containing a fenced `python` block inside
+JSON exhausts its output budget every time. `forge discharge HT-001` records
+it.
+
+The grandchild criteria are what the whole ticket exists for, and their timing
+is load-bearing rather than incidental. It has to clear two bars at once, and
+the rejected drafts each missed one. The grandchild must sleep *longer* than
+the timeout, or it writes `survived.txt` before the kill is due and fails a
+working implementation. And the check must happen *later* than that sleep, or
+its absence proves nothing, since a living grandchild would not have written it
+yet either. 11 seconds against a 6-second bound, checked at 14 seconds after
+the call returns, satisfies both with room on each side.
+
+The 6-second bound is itself the answer to the second rejection: a 3-second one
+raced Python's own start, so on a loaded machine `working` or `started.txt`
+might not exist before the kill and the suite would fail intermittently against
+correct code. Six is around twenty times the headroom a start actually needs.
+
+Every number is the smallest that keeps both margins. These tests run on every
+verify step of every ticket, and the first version of them added 68 seconds to
+a 135-second suite; sharing one wedged call per class and trimming the waits
+brought that to 33.
+
+`started.txt` is asserted beside it, and the output has to contain `working`,
+because an absence is also satisfied by an implementation that never starts
+anything. The three together say the command ran, produced output, spawned
 something that outlived its shell, and was stopped anyway.
 
 Write the child and grandchild as `.py` files into the temporary directory and
@@ -186,9 +216,14 @@ invoke them as `f'"{sys.executable}" child.py'` rather than building a `-c`
 string. Quoting a multi-statement `-c` argument that works in both `cmd.exe`
 and `sh` is its own puzzle, and it is not this ticket's puzzle.
 
-Twenty-five seconds of slack on a three-second timeout is deliberate: a cold
-interpreter start on a loaded CI box is slow, and a criterion that fails
-intermittently teaches the loop nothing.
+The slack on every elapsed-time assertion is deliberate: a cold interpreter
+start on a loaded box is slow, and a criterion that fails intermittently
+teaches the loop nothing.
+
+The expensive call is made once for the whole class and each assertion reads
+the result, rather than each test running its own. This suite runs on every
+verify step of every ticket, and paying a timeout plus a settle window twice to
+assert two things about one event buys nothing.
 
 ---
 
@@ -264,6 +299,9 @@ leaves the executor with a failure it cannot read.
   records a step whose status is `ok`.
 
 ## Notes
+
+**Landed by hand on 2026-09-06**, alongside HT-001, whose blocking left this
+ticket skipped. `forge discharge HT-002` records it.
 
 `tests/test_forge.py` has `_stub_orchestrator`, which builds an `Orchestrator`
 over a temporary repository with the project commands blanked out; the last

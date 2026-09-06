@@ -85,6 +85,7 @@
   },
   "loop": {
     "maxAttempts": 5,
+    "commandTimeoutSeconds": 1800,
     "autoCommit": false,
     "stopOnBlocked": false,
     "retryCycles": -1,

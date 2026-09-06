@@ -762,6 +762,7 @@ run some context, never the run.
 | Key | Default | What it changes |
 |---|---|---|
 | `maxAttempts` | `5` | Rework attempts per ticket before it parks as blocked. Three absorbs a lint error and a shallow test failure; five also absorbs the one a local executor actually produces, which is a correct implementation arriving in a shape the parser cannot read — an attempt spent teaching the ticket nothing. Past five the failure is a spec problem no amount of retrying fixes, and `retryCycles` with a respec between cycles is the tool for that rather than more attempts against the same words. |
+| `commandTimeoutSeconds` | `1800` | How long any one of the project's own commands may run before it is killed, along with every process it started. The bound is enforced by killing the process group rather than the shell leading it, and output is collected through a file rather than a pipe, because a wedged test runner that outlives its shell holds the pipe open and blocks the daemon reading it — one verify step stayed open for eight hours that way. Raise it for a suite that is genuinely slow; lower it to learn sooner that one has wedged. |
 | `autoCommit` | `false` | Commit each verified ticket. Off so the first unattended runs leave their work in the tree for you to read. |
 | `stopOnBlocked` | `false` | Stop the whole run when a ticket blocks, instead of moving on. On means a blocker gets attention; off means the backlog keeps making progress elsewhere. |
 | `retryCycles` | `-1` | Whole-backlog retry cycles after a run ends anything but done. `-1` keeps going until the backlog is clean or you stop it; `0` hands back to a human after the first pass. Anything below `-1` is a typo and is rejected.<br><br>`-1` is the default only because a cycle can now be *measured* rather than counted: `flatCycles` ends the retries when a cycle fails in exactly the way the one before it did, so an unattended run converges or stops on its own. Both have been observed — one backlog stopped itself after a single repeated cycle, and the next landed a ticket on the cycle after the one that gave up on it. **If you turn `flatCycles` off, set this back to `0` or a small number in the same edit**: without the detector this is the 18-hour run in [CONVERGENCE](CONVERGENCE.md). |
@@ -948,6 +949,7 @@ the reviewer to it is a one-line edit in `roles`.
   },
   "loop": {
     "maxAttempts": 5,
+    "commandTimeoutSeconds": 1800,
     "autoCommit": false,
     "stopOnBlocked": false,
     "retryCycles": -1,
