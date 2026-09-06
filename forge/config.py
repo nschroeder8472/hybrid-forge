@@ -923,6 +923,11 @@ class UISettings:
     # Binding beyond loopback exposes pause/stop controls with no auth, so it
     # stays an explicit choice — same posture as the executor host itself.
     enabled: bool = True
+    # The per-ticket write endpoints — a note, a criterion, a release — serve
+    # to loopback only until this says otherwise. Off by default because those
+    # writes reach an executor prompt, which is a larger surface than the four
+    # enumerated commands the warning above covers.
+    allow_remote_writes: bool = False
 
 
 def _workspace_from(block: Any, index: int) -> Workspace:
@@ -1158,6 +1163,7 @@ class Config:
             host=ui.get("host", "127.0.0.1"),
             port=int(ui.get("port", 8799)),
             enabled=bool(ui.get("enabled", True)),
+            allow_remote_writes=bool(ui.get("allowRemoteWrites", False)),
         )
 
         config.validate()
@@ -1582,7 +1588,12 @@ class Config:
                 "ratifyPasses": self.loop.ratify_passes,
                 "ratifyOrder": list(self.loop.ratify_order),
             },
-            "ui": {"host": self.ui.host, "port": self.ui.port, "enabled": self.ui.enabled},
+            "ui": {
+                "host": self.ui.host,
+                "port": self.ui.port,
+                "enabled": self.ui.enabled,
+                "allowRemoteWrites": self.ui.allow_remote_writes,
+            },
         }
         if self._explicit_workspaces:
             # Written only when the file said so. A repository that declares

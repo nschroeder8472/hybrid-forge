@@ -6681,6 +6681,78 @@ class TestStaleDependentsAreReopened(unittest.TestCase):
         self.assertIn("TT-001", messages)
 
 
+class TestEveryPassIsStampedTheSameWay(unittest.TestCase):
+    """A ticket that reaches `done` by hand is stamped like one the loop passed.
+
+    `forge discharge` used to set the status and write the row without
+    recording what the ticket had passed on top of. An empty `dep_stamp` is not
+    a neutral value — it differs from every real fingerprint — so the next
+    `forge go` reopened the discharged ticket, skipped everything behind it,
+    and discharging it again wrote the same unstamped row. Two hand-discharged
+    tickets in a chain reproduced it exactly.
+    """
+
+    def _pair(self):
+        orch, _root, run_id = _stub_orchestrator()
+        orch.store.add_tickets(
+            run_id,
+            [
+                Ticket("TT-001", position=0, status=TICKET_DONE, spec="a"),
+                Ticket(
+                    "TT-002", position=1, status=TICKET_DONE, needs=["TT-001"], spec="b"
+                ),
+            ],
+        )
+        return orch, run_id
+
+    def _dependent(self, orch, run_id):
+        return [t for t in orch.store.list_tickets(run_id) if t.ticket_id == "TT-002"][0]
+
+    def test_an_unstamped_pass_is_reopened(self):
+        orch, run_id = self._pair()
+
+        self.assertEqual(orch._reopen_stale(run_id), ["TT-002"])
+
+    def test_stamping_it_the_way_discharge_does_leaves_it_done(self):
+        orch, run_id = self._pair()
+        ticket = self._dependent(orch, run_id)
+
+        orch.store.stamp_dependencies(run_id, ticket)
+        orch.store.update_ticket(run_id, ticket)
+
+        self.assertEqual(orch._reopen_stale(run_id), [])
+        self.assertEqual(self._dependent(orch, run_id).status, TICKET_DONE)
+
+    def test_the_stamp_names_each_dependency_by_its_fingerprint(self):
+        orch, run_id = self._pair()
+        ticket = self._dependent(orch, run_id)
+        dependency = orch.store.list_tickets(run_id)[0]
+
+        stamp = orch.store.stamp_dependencies(run_id, ticket)
+
+        self.assertEqual(stamp, {"TT-001": dependency.fingerprint})
+        self.assertEqual(ticket.dep_stamp, stamp)
+
+    def test_a_ticket_that_depends_on_nothing_stamps_empty(self):
+        orch, run_id = self._pair()
+        independent = orch.store.list_tickets(run_id)[0]
+
+        self.assertEqual(orch.store.stamp_dependencies(run_id, independent), {})
+
+    def test_a_stamped_ticket_still_reopens_when_its_dependency_moves(self):
+        """The stamp records a version, not a permission to skip the check."""
+        orch, run_id = self._pair()
+        ticket = self._dependent(orch, run_id)
+        orch.store.stamp_dependencies(run_id, ticket)
+        orch.store.update_ticket(run_id, ticket)
+
+        dependency = orch.store.list_tickets(run_id)[0]
+        dependency.spec = "a, revised"
+        orch.store.update_ticket(run_id, dependency)
+
+        self.assertEqual(orch._reopen_stale(run_id), ["TT-002"])
+
+
 class TestTheTesterIsPointedAtItsOwnErrors(unittest.TestCase):
     """The tester's file is outside every other role's scope, so a style error
     in it fails the ticket for as long as the tester keeps reproducing it. One

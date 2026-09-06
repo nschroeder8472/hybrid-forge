@@ -2057,6 +2057,12 @@ def cmd_discharge(args: argparse.Namespace) -> int:
 
     ticket.status = TICKET_DONE
     ticket.blocked_note = ""
+    # What it passed on top of, recorded the way the loop records its own
+    # passes. Without it the row reads as a pass against no dependency at all,
+    # and `_stale_dependents` reopens the ticket on the next `forge go` —
+    # which is what happened to every discharged ticket carrying a `Needs:`
+    # line, discharging it a second time included.
+    store.stamp_dependencies(run_id, ticket)
     store.update_ticket(run_id, ticket)
     if note:
         store.advise(run_id, ticket, f"Discharged by hand: {note}")

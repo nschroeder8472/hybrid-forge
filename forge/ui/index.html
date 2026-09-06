@@ -73,6 +73,18 @@ ul { list-style: none; margin: 0; padding: 0; }
    indented so it reads as a footnote to the ticket rather than a second title. */
 .evidence { display: block; margin-left: 12px; }
 .evidence-line { display: block; color: var(--muted); font-size: 12px; }
+/* The controls a parked ticket carries: a note, a criterion, and a release
+   for a withheld one. Indented like the evidence so both read as footnotes
+   to the ticket, and the fields share the muted voice of the evidence lines. */
+.writes { display: block; margin-left: 12px; margin-top: 6px; }
+.writes textarea, .writes input {
+  font: inherit; font-size: 12px; color: var(--text); background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px;
+}
+.writes textarea { width: 100%; min-height: 34px; resize: vertical; }
+.writes input { flex: 1; min-width: 0; }
+.writes button { padding: 4px 10px; font-size: 12px; }
+.write-status { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; }
 .pill { font-size: 11px; font-family: var(--mono); padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
 .pill.done, .pill.ok { color: var(--ok); } .pill.running { color: var(--accent); }
 .pill.blocked, .pill.failed { color: var(--err); } .pill.skipped { color: var(--wait); }
@@ -196,7 +208,7 @@ function renderTickets(tickets) {
   return tickets.map(t => `
     <li class="ticket">
       <span class="id">${esc(t.id)}</span>
-      <span class="title">${esc(t.title)}${t.note ? `<span class="note">${esc(t.note)}</span>` : ""}${renderEvidence(t.evidence)}</span>
+      <span class="title">${esc(t.title)}${t.note ? `<span class="note">${esc(t.note)}</span>` : ""}${renderEvidence(t.evidence)}${renderWriteControls(t)}</span>
       <span class="pill ${esc(t.status)}">${esc(t.status)}${t.attempts > 1 ? ` ×${t.attempts}` : ""}</span>
     </li>`).join("");
 }
@@ -234,6 +246,90 @@ function renderEvidence(e) {
   }
   if (!lines.length) return "";
   return `<div class="evidence">${lines.map(l => `<div class="evidence-line">${l}</div>`).join("")}</div>`;
+}
+
+// The controls a parked ticket carries: a note for the executor, a criterion
+// for the plan, and a release for a ticket a person withheld. Only a parked
+// ticket has evidence, so only one carries controls — a done ticket's title
+// is exactly what it was before this existed. The id is interpolated into
+// element ids and into onclick attributes, so it goes through `esc` first,
+// exactly as `renderEvidence` does with the strings it renders.
+function renderWriteControls(t) {
+  if (!t.evidence) return "";
+  const id = esc(t.id);
+  const release = t.evidence.route && t.evidence.route.startsWith("withheld")
+    ? `<input id="release-${id}" placeholder="Why the objection is answered"><button onclick="releaseTicket('${id}')">Release</button>`
+    : "";
+  return `<div class="writes">
+    <textarea id="note-${id}" placeholder="Tell the loop something it cannot see"></textarea><button onclick="writeNote('${id}')">Add note</button>
+    <input id="criterion-${id}" placeholder="State a criterion the plan should have had"><button onclick="writeCriterion('${id}')">Add criterion</button>
+    ${release}
+    <span class="write-status" id="status-${id}"></span>
+  </div>`;
+}
+
+// The three writes a parked ticket accepts. Each reads its field, posts it
+// with the run the page is showing — `state.run && state.run.id` is what
+// makes the server's 409 possible, a write aimed at a run that is no longer
+// the one being shown — and writes the outcome into the ticket's status
+// span. On success the field is cleared and the page refreshes; on an error
+// the span shows the server's words and the field keeps what was typed, so a
+// refused note is not lost.
+async function writeNote(id) {
+  const field = $(`note-${id}`);
+  const status = $(`status-${id}`);
+  const text = field.value;
+  const response = await fetch("/api/ticket/" + encodeURIComponent(id) + "/note", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, run: state.run && state.run.id }),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (body.error) {
+    status.textContent = body.error;
+    return;
+  }
+  status.textContent = "noted";
+  field.value = "";
+  refresh();
+}
+
+async function writeCriterion(id) {
+  const field = $(`criterion-${id}`);
+  const status = $(`status-${id}`);
+  const text = field.value;
+  const response = await fetch("/api/ticket/" + encodeURIComponent(id) + "/criterion", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, run: state.run && state.run.id }),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (body.error) {
+    status.textContent = body.error;
+    return;
+  }
+  status.textContent = body.adopted && body.adopted.length ? "criterion added" : "already a criterion";
+  field.value = "";
+  refresh();
+}
+
+async function releaseTicket(id) {
+  const field = $(`release-${id}`);
+  const status = $(`status-${id}`);
+  const text = field.value;
+  const response = await fetch("/api/ticket/" + encodeURIComponent(id) + "/route", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ route: "delegate", text, run: state.run && state.run.id }),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (body.error) {
+    status.textContent = body.error;
+    return;
+  }
+  status.textContent = "released";
+  field.value = "";
+  refresh();
 }
 
 // Steps whose detail is a model's reply rather than a tool's output. Worth
@@ -325,10 +421,16 @@ setInterval(() => {
   });
 }, 1000);
 
+// The state the page last rendered. The write handlers read `state.run` to
+// name the run they are aimed at, so a write made while the page shows one
+// run is refused by the server if the loop has moved to another.
+let state = {};
+
 async function refresh() {
-  let state;
-  try { state = await (await fetch("/api/state")).json(); }
+  let next;
+  try { next = await (await fetch("/api/state")).json(); }
   catch { $("status").textContent = "disconnected"; $("status").className = "status failed"; return; }
+  state = next;
 
   const run = state.run;
   const status = run ? run.status : "idle";
