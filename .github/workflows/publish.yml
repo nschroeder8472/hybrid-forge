@@ -144,6 +144,14 @@ jobs:
         with:
           repository-url: https://test.pypi.org/legacy/
           password: ${{ secrets.TEST_PYPI_API_TOKEN }}
+          # A rehearsal gets re-run: the PyPI half is rejected, a check is
+          # fixed, somebody retries the tag. Without this, every one of those
+          # dies on a 409 for a file already sitting there and perfectly
+          # correct — the rehearsal blocking the release it exists to protect.
+          # 0.2.1 is in that state on TestPyPI right now. The real index below
+          # keeps the opposite rule: a duplicate there is a mistake, and it
+          # must be loud.
+          skip-existing: true
 
       - uses: actions/setup-python@v5
         with:
@@ -156,13 +164,25 @@ jobs:
         # than failing on the first miss.
         run: |
           version="${{ needs.build.outputs.version }}"
-          for attempt in 1 2 3 4 5 6; do
-            if pip install --index-url https://test.pypi.org/simple/ \
+          for attempt in 1 2 3 4 5 6 7 8; do
+            # `--no-cache-dir` is the point of this line rather than tidiness.
+            # pip caches the index page it fetches, so the first attempt —
+            # made seconds after the upload, before the file is listed —
+            # poisons every retry behind it with its own stale answer. That is
+            # how 0.2.1, which had uploaded perfectly well, failed every check
+            # for not existing while sitting on the index the whole time.
+            if pip install --no-cache-dir \
+                 --index-url https://test.pypi.org/simple/ \
                  --no-deps "hybrid-forge==$version"; then
+              echo "served on attempt $attempt"
               break
             fi
+            if [ "$attempt" = "8" ]; then
+              echo "::error::$version never appeared on TestPyPI"
+              exit 1
+            fi
             echo "not served yet; attempt $attempt"
-            sleep 15
+            sleep $(( attempt * 15 ))
           done
           pip show hybrid-forge
           forge --help > /dev/null
@@ -194,12 +214,17 @@ jobs:
       - name: Install it back out of PyPI
         run: |
           version="${{ needs.build.outputs.version }}"
-          for attempt in 1 2 3 4 5 6; do
-            if pip install "hybrid-forge==$version"; then
+          for attempt in 1 2 3 4 5 6 7 8; do
+            if pip install --no-cache-dir "hybrid-forge==$version"; then
+              echo "served on attempt $attempt"
               break
             fi
+            if [ "$attempt" = "8" ]; then
+              echo "::error::$version never appeared on PyPI"
+              exit 1
+            fi
             echo "not served yet; attempt $attempt"
-            sleep 15
+            sleep $(( attempt * 15 ))
           done
           pip show hybrid-forge
           forge --help > /dev/null
