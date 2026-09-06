@@ -34,6 +34,7 @@ from ..loop import (
 from ..routes import REASONS, describe, reason_of
 from ..state import Store, Ticket
 from ..tokens import format_tokens
+from . import writes
 
 INDEX = Path(__file__).with_name("index.html")
 
@@ -239,8 +240,29 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, b"not found", "text/plain")
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if self.path != "/api/control":
-            self._send(404, b"not found", "text/plain")
+        if self.path == "/api/control":
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid JSON"}, code=400)
+                return
+
+            requested = str(payload.get("command", "")).lower()
+            command = _ALLOWED_COMMANDS.get(requested)
+            if command is None:
+                self._send_json(
+                    {
+                        "error": f"unknown command {requested!r}",
+                        "allowed": sorted(_ALLOWED_COMMANDS),
+                    },
+                    code=400,
+                )
+                return
+
+            self.store.set_control(CONTROL_KEY, command)
+            self.store.log(None, f"Dashboard requested: {requested}", kind="control")
+            self._send_json({"ok": True, "control": command})
             return
 
         length = int(self.headers.get("Content-Length") or 0)
@@ -250,18 +272,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "invalid JSON"}, code=400)
             return
 
-        requested = str(payload.get("command", "")).lower()
-        command = _ALLOWED_COMMANDS.get(requested)
-        if command is None:
-            self._send_json(
-                {"error": f"unknown command {requested!r}", "allowed": sorted(_ALLOWED_COMMANDS)},
-                code=400,
-            )
-            return
-
-        self.store.set_control(CONTROL_KEY, command)
-        self.store.log(None, f"Dashboard requested: {requested}", kind="control")
-        self._send_json({"ok": True, "control": command})
+        peer = self.client_address[0] if self.client_address else ""
+        status, body = writes.apply_write(self.store, self.config, self.path, payload, peer)
+        self._send_json(body, code=status)
 
     # ------------------------------------------------------------------
 
@@ -344,13 +357,22 @@ def exposure_warning(config: Config) -> str:
     )
 
 
+def bound_handler(config: Config, store: Store) -> type[Handler]:
+    """The handler class with this run's store and config bound in.
+
+    `serve` builds it this way, and a test can build the same class against a
+    fixture store and bind it to an ephemeral port without starting a daemon.
+    """
+    return type("BoundHandler", (Handler,), {"store": store, "config": config})
+
+
 def serve(config: Config, store: Store) -> ThreadingHTTPServer:
     """Start the dashboard on a background thread and return the server."""
     warning = exposure_warning(config)
     if warning:
         print(warning, file=sys.stderr)
 
-    handler = type("BoundHandler", (Handler,), {"store": store, "config": config})
+    handler = bound_handler(config, store)
     server = ThreadingHTTPServer((config.ui.host, config.ui.port), handler)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True, name="forge-ui").start()

@@ -1774,15 +1774,13 @@ class Orchestrator:
             return RUN_FAILED
 
     def _dep_stamp(self, run_id: int, ticket: Ticket) -> dict[str, str]:
-        """Fingerprint every dependency of `ticket` as it stands right now."""
-        if not ticket.needs:
-            return {}
-        current = {t.ticket_id: t for t in self.store.list_tickets(run_id)}
-        return {
-            dep: current[dep].fingerprint
-            for dep in ticket.needs
-            if dep in current
-        }
+        """Fingerprint every dependency of `ticket` as it stands right now.
+
+        `Store.stamp_dependencies` is the definition, so the loop's path to
+        `done` and `forge discharge` record the same thing. Kept as a method
+        because this is where the loop asks for it.
+        """
+        return self.store.stamp_dependencies(run_id, ticket)
 
     def _stale_dependents(self, run_id: int) -> dict[str, list[str]]:
         """Done tickets whose dependencies have been rewritten since they passed.

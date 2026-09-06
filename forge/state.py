@@ -932,6 +932,34 @@ class Store:
                 {**ticket.as_row(), "run_id": run_id, "now": time.time()},
             )
 
+    def stamp_dependencies(self, run_id: int, ticket: Ticket) -> dict[str, str]:
+        """Record what `ticket` is passing on top of, on the ticket itself.
+
+        Every way a ticket reaches `done` has to leave this behind, which is
+        why it lives here rather than beside one of them. `_stale_dependents`
+        reads `dep_stamp` against each dependency's current fingerprint and
+        reopens whatever no longer matches — so a pass recorded without a stamp
+        is not neutral, it is a pass against `{}`, which differs from every
+        real fingerprint and reopens the ticket on the next start.
+
+        That is what a hand-discharged ticket used to be. `forge discharge` set
+        the status and wrote the row, the loop's own path stamped and wrote the
+        row, and a discharged ticket with a `Needs:` line was therefore
+        reopened by the next `forge go`, its dependents skipped behind it, and
+        discharging it again produced the same unstamped row.
+
+        Assigns onto the ticket and returns the mapping; the caller persists it
+        with `update_ticket`, which does name this column.
+        """
+        if not ticket.needs:
+            ticket.dep_stamp = {}
+            return ticket.dep_stamp
+        current = {t.ticket_id: t for t in self.list_tickets(run_id)}
+        ticket.dep_stamp = {
+            dep: current[dep].fingerprint for dep in ticket.needs if dep in current
+        }
+        return ticket.dep_stamp
+
     def advise(self, run_id: int, ticket: Ticket, text: str) -> dict:
         """Record what a person said about this ticket. Append-only.
 
