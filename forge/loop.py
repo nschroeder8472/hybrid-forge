@@ -41,6 +41,7 @@ from typing import Any, NamedTuple, Sequence
 
 from . import imports
 from . import manifests
+from . import processes
 from . import toolchain
 from . import ratify as ratification
 from . import respec
@@ -1019,25 +1020,18 @@ class Orchestrator:
 
         workspace = workspace or self.config.root_workspace
         step_id = self.store.start_step(run_id, ticket_id, name)
-        try:
-            result = subprocess.run(  # noqa: S602 - user-authored command from their own config
-                command,
-                shell=True,
-                cwd=workspace.path(self.config.root),
-                capture_output=True,
-                text=True,
-                # A test suite that prints a non-ASCII character must not crash
-                # the daemon decoding its own verify step. `replace` keeps the
-                # output readable enough to feed back to the executor, which is
-                # all this text is for.
-                encoding="utf-8",
-                errors="replace",
-                timeout=1800,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            self.store.end_step(step_id, "failed", f"{name} timed out after 1800s")
-            return StepResult(ok=False, detail=f"{name} timed out", step_id=step_id)
+        limit = self.config.loop.command_timeout_seconds
+        # `processes.run_command` rather than `subprocess.run`, because the
+        # bound this line is asking for is not one `subprocess.run` can keep:
+        # `shell=True` means its timeout kills a shell, and the wedged test
+        # runner underneath keeps both its life and the pipes it inherited. One
+        # verify step stayed open for eight hours against a 1,800-second
+        # timeout that way. Non-ASCII output is decoded with `replace` there
+        # for the same reason it was here — a suite that prints one must not
+        # crash the daemon reading its own step.
+        result = processes.run_command(
+            command, workspace.path(self.config.root), limit
+        )
 
         # Stripped before anything reads it, for the same reason it is rerooted
         # here rather than at each reader: every pattern in `failures` is
@@ -1048,11 +1042,18 @@ class Orchestrator:
         # falling through to the run banner, which is what the executor was
         # shown as the failure it had to fix.
         output = reroot(
-            strip_ansi(f"{result.stdout}\n{result.stderr}").strip(),
+            strip_ansi(result.output).strip(),
             workspace.prefix,
             self.config.root,
         )
-        ok = result.returncode == 0
+        if result.timed_out:
+            # What it printed before it was killed, kept and put in front of
+            # the executor. A timeout used to record one sentence and discard
+            # the rest, which left whoever read the step — a person or a model
+            # — a failure with no evidence in it, on the one kind of failure
+            # where the last thing printed is the whole clue.
+            output = f"{name} was killed after {limit}s\n\n{output}".strip()
+        ok = result.returncode == 0 and not result.timed_out
         self.store.end_step(step_id, "ok" if ok else "failed", output)
         return StepResult(ok=ok, detail=output, step_id=step_id)
 

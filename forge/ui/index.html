@@ -21,6 +21,12 @@
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
 * { box-sizing: border-box; }
+/* iOS Safari inflates text block by block, sizing each one by its own width
+   and how much it holds. On a phone that renders a log line long enough to
+   wrap larger than the short lines beside it — same CSS, same font, different
+   glyphs — while every desktop browser shows them identically. These sizes are
+   meant as written. */
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 body {
   margin: 0; background: var(--bg); color: var(--text);
   font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -94,6 +100,13 @@ ul { list-style: none; margin: 0; padding: 0; }
 #log div { padding: 3px 0; border-top: 1px solid var(--line); display: flex; gap: 10px; }
 #log div:first-child { border-top: 0; }
 #log time { color: var(--muted); flex-shrink: 0; }
+/* A message is one flex child beside its timestamp, and a flex child sizes
+   itself to its content unless told otherwise — so a `grep(...)` pattern or a
+   long path, which carries no space to break at, pushed the row wider than the
+   panel and put a scrollbar under the whole log. `min-width: 0` lets the
+   message narrow to the column, and `anywhere` lets it break inside a token
+   when there is nowhere else to break. Same pair `.snip` uses for step output. */
+#log div > span { min-width: 0; overflow-wrap: anywhere; }
 #log .warn { color: var(--warn); } #log .error { color: var(--err); }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px; padding-bottom: 6px; }
