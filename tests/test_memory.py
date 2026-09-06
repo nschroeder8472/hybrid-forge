@@ -265,7 +265,7 @@ class TestLoopIntegration(unittest.TestCase):
         from forge.loop import Orchestrator
         from forge.state import Store, Ticket
 
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(
             json.dumps(
@@ -644,7 +644,7 @@ class TestStdioTransport(unittest.TestCase):
     a process does."""
 
     def _script(self, body: str) -> str:
-        path = Path(tempfile.mkdtemp()) / "server.py"
+        path = Path(tempfile.mkdtemp()).resolve() / "server.py"
         path.write_text(body, encoding="utf-8")
         return str(path)
 

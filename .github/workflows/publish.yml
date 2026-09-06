@@ -26,13 +26,17 @@ name: Publish
 on:
   push:
     tags:
-      - "v*"
+      # Both spellings. This project's first tag was `0.2.1`, and a release
+      # that silently does not fire is worse than one that fires on a name
+      # somebody did not expect.
+      - "v[0-9]*"
+      - "[0-9]*"
   # For re-running a publish whose TestPyPI half succeeded and whose PyPI half
   # was rejected, without moving a tag.
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to publish, e.g. v0.2.1"
+        description: "Existing tag to publish, e.g. 0.2.1 or v0.2.1"
         required: true
 
 permissions:
@@ -97,10 +101,13 @@ jobs:
         # here, before anything is uploaded, because afterwards it cannot be.
         run: |
           tag="${{ github.event.inputs.tag || github.ref_name }}"
+          # A leading `v` is optional, so `0.2.1` and `v0.2.1` both name the
+          # same release. Everything after it must match exactly.
+          tag_version="${tag#v}"
           version="$(python -c 'import tomllib,pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
           echo "tag=$tag version=$version"
-          if [ "$tag" != "v$version" ]; then
-            echo "::error::tag $tag does not match pyproject version $version (expected v$version)"
+          if [ "$tag_version" != "$version" ]; then
+            echo "::error::tag $tag does not match pyproject version $version"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"

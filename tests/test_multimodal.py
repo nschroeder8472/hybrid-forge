@@ -370,7 +370,7 @@ class TestARecordNeverInlinesAnImage(unittest.TestCase):
     place whose entire purpose is being readable."""
 
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp())
+        self.root = Path(tempfile.mkdtemp()).resolve()
         self.artifacts = Artifacts(self.root, 1)
 
     def _written(self) -> str:

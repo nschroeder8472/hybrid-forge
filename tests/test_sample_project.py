@@ -764,7 +764,7 @@ class TestTheSampleIsCopiedBeforeItIsRun(unittest.TestCase):
     def test_a_copy_is_a_complete_runnable_project(self):
         import tempfile
 
-        target = Path(tempfile.mkdtemp()) / "copy"
+        target = Path(tempfile.mkdtemp()).resolve() / "copy"
         copied = copy_sample(target)
 
         Config.load(copied).validate()
@@ -777,12 +777,12 @@ class TestTheSampleIsCopiedBeforeItIsRun(unittest.TestCase):
         # time it fails partway through.
         import tempfile
 
-        used = copy_sample(Path(tempfile.mkdtemp()) / "used")
+        used = copy_sample(Path(tempfile.mkdtemp()).resolve() / "used")
         (used / ".hybridforge" / "run.db").write_bytes(b"")
         (used / ".hybridforge" / "tickets").mkdir()
         (used / ".hybridforge" / "tickets" / "SP-001.md").write_text("x", encoding="utf-8")
 
-        again = _copy_tree(used, Path(tempfile.mkdtemp()) / "again")
+        again = _copy_tree(used, Path(tempfile.mkdtemp()).resolve() / "again")
 
         self.assertFalse((again / ".hybridforge" / "run.db").exists())
         self.assertFalse((again / ".hybridforge" / "tickets").exists())
@@ -793,7 +793,7 @@ class TestTheSampleIsCopiedBeforeItIsRun(unittest.TestCase):
         # exists to avoid, so it is an error rather than a silent overwrite.
         import tempfile
 
-        existing = Path(tempfile.mkdtemp())
+        existing = Path(tempfile.mkdtemp()).resolve()
 
         with self.assertRaises(FileExistsError):
             copy_sample(existing)

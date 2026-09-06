@@ -2466,7 +2466,10 @@ class Orchestrator:
         owners: dict[str, str] = {}
         for ticket in waiting:
             scope = list(ticket.allowed_files) + self._reproduction_of(ticket)
-            patterns = [pattern.lower() for pattern in scope]
+            # Passed as written. `matches_any` folds case itself, on every
+            # host; lowercasing here as well was what made the mismatch above
+            # invisible on Windows and fatal on Linux.
+            patterns = list(scope)
             if not patterns:
                 continue
             for path in paths:

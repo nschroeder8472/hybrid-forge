@@ -462,7 +462,7 @@ class TestAManifestRewriteKeepsItsDependencies(unittest.TestCase):
         self.assertEqual(manifests.dropped("a", "b", "viewport.ts"), [])
 
     def test_losses_reads_the_tree_against_the_snapshot(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / "tools").mkdir()
         target = root / "tools" / "package.json"
         target.write_text(self.BEFORE, encoding="utf-8")
@@ -477,7 +477,7 @@ class TestAManifestRewriteKeepsItsDependencies(unittest.TestCase):
         )
 
     def test_an_untouched_manifest_reports_nothing(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         target = root / "package.json"
         target.write_text(self.BEFORE, encoding="utf-8")
         before = manifests.snapshot(root, ["package.json"])
@@ -598,7 +598,7 @@ class TestClaudeCliUsage(unittest.TestCase):
 
 class TestBudgetGate(unittest.TestCase):
     def setUp(self):
-        self.store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        self.store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
 
     def test_proactive_window_limit(self):
         gate = BudgetGate(
@@ -849,7 +849,7 @@ class TestATicketHasSomewhereToPutItsTests(unittest.TestCase):
 
 class TestStoreResume(unittest.TestCase):
     def test_stopped_run_with_work_left_is_resumable(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [Ticket("T-1"), Ticket("T-2")])
         store.set_run_status(run_id, "stopped")
@@ -865,13 +865,13 @@ class TestStoreResume(unittest.TestCase):
         self.assertIsNone(store.resumable_run())
 
     def test_next_ticket_picks_up_one_left_running_by_a_crash(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [Ticket("T-1", status="running", position=0)])
         self.assertEqual(store.next_ticket(run_id).ticket_id, "T-1")
 
     def test_the_open_backlog_is_the_newest_run_nothing_has_been_spent_on(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         older = store.create_run("older")
         store.add_tickets(older, [Ticket("T-1")])
         newer = store.create_run("newer")
@@ -888,7 +888,7 @@ class TestStoreResume(unittest.TestCase):
         self.assertEqual(int(store.unstarted_run()["id"]), older)
 
     def test_there_is_no_open_backlog_when_every_run_has_started(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [Ticket("T-1")])
         store.set_run_status(run_id, "running")
@@ -896,7 +896,7 @@ class TestStoreResume(unittest.TestCase):
         self.assertIsNone(store.unstarted_run())
 
     def test_an_appended_ticket_goes_last_in_the_reading_order(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [Ticket("T-1"), Ticket("T-2")])
 
@@ -907,7 +907,7 @@ class TestStoreResume(unittest.TestCase):
         )
 
     def test_the_first_position_on_an_empty_run_is_zero(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         self.assertEqual(store.next_position(store.create_run("goal")), 0)
 
     def test_a_retried_run_is_not_an_open_backlog(self):
@@ -915,7 +915,7 @@ class TestStoreResume(unittest.TestCase):
         # back to idle, so by status alone it looks untouched. It is not — that
         # backlog has already been through the loop once, and new work filed
         # into it would join a retry cycle rather than start clean.
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [Ticket("T-1", status="failed", attempts=2)])
         store.reset_tickets(run_id, statuses=("failed",))
@@ -924,7 +924,7 @@ class TestStoreResume(unittest.TestCase):
         self.assertIsNone(store.unstarted_run())
 
     def test_every_run_with_work_left_is_queued_oldest_first(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         first = store.create_run("first")
         store.add_tickets(first, [Ticket("T-1")])
         second = store.create_run("second")
@@ -937,7 +937,7 @@ class TestStoreResume(unittest.TestCase):
         self.assertEqual([int(r["id"]) for r in store.resumable_runs()], [first, second, third])
 
     def test_a_blocked_run_does_not_hide_the_work_queued_behind_it(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         blocked = store.create_run("blocked")
         store.add_tickets(blocked, [Ticket("T-1", status="blocked")])
         store.set_run_status(blocked, "blocked", "1 ticket(s) need a human")
@@ -950,7 +950,7 @@ class TestStoreResume(unittest.TestCase):
         self.assertEqual([int(r["id"]) for r in store.resumable_runs()], [later])
 
     def test_a_stopped_run_keeps_its_place_in_the_queue(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         stopped = store.create_run("stopped")
         store.add_tickets(stopped, [Ticket("T-1")])
         store.set_run_status(stopped, "stopped")
@@ -960,7 +960,7 @@ class TestStoreResume(unittest.TestCase):
         self.assertEqual([int(r["id"]) for r in store.resumable_runs()], [stopped, later])
 
     def test_done_and_failed_runs_are_never_queued(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         for status in ("done", "failed"):
             run_id = store.create_run(status)
             store.add_tickets(run_id, [Ticket(f"T-{status}")])
@@ -979,7 +979,7 @@ class TestForgeGoDrainsEveryQueuedRun(unittest.TestCase):
     noticed."""
 
     def _project(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(
             json.dumps(
@@ -1163,7 +1163,7 @@ class TestTheDashboardFollowsTheRunTheLoopIsIn(unittest.TestCase):
         )
 
     def test_the_live_run_outranks_a_newer_one_waiting_its_turn(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         store = Store(root / "t.db")
         working = store.create_run("being worked")
         store.create_run("still queued")
@@ -1178,7 +1178,7 @@ class TestTheDashboardFollowsTheRunTheLoopIsIn(unittest.TestCase):
         # The key is written when a run is entered and never cleared, so after
         # the drain it names history. A stale pointer must not outrank the run
         # someone has just filed.
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         store = Store(root / "t.db")
         worked = store.create_run("worked last time")
         store.set_run_status(worked, "done")
@@ -1192,7 +1192,7 @@ class TestTheDashboardFollowsTheRunTheLoopIsIn(unittest.TestCase):
     def test_a_blocked_run_still_loses_to_the_one_that_succeeded_after_it(self):
         # The original bug this rule was written for: a backlog that had gone
         # six-for-six reported `run 7: blocked`, naming a run two days stale.
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         store = Store(root / "t.db")
         old = store.create_run("older")
         store.set_run_status(old, "blocked", "6 ticket(s) need a human")
@@ -1213,7 +1213,7 @@ class TestTheDashboardSharesTheStoreWithTheLoop(unittest.TestCase):
     misuse` and killed a run fifteen retry cycles in."""
 
     def test_reads_from_other_threads_do_not_disturb_the_writer(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [Ticket("T-1")])
         failures: list[Exception] = []
@@ -1249,7 +1249,7 @@ class TestRetry(unittest.TestCase):
     """A blocked run must be continuable, not only re-ingestible."""
 
     def _store_with_exhausted_run(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(
             run_id,
@@ -1311,7 +1311,7 @@ class TestRetry(unittest.TestCase):
         self.assertEqual(store.list_tickets(run_id)[0].status, "pending")
 
     def test_retry_is_a_no_op_when_nothing_is_exhausted(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [Ticket("T-1", status="done", attempts=1)])
         self.assertEqual(store.reset_tickets(run_id), [])
@@ -1336,7 +1336,7 @@ class TestRespec(unittest.TestCase):
     """A retry that re-runs the spec that already failed is just a slower failure."""
 
     def _store_with_a_rejected_ticket(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [Ticket("T-1", status="failed", attempts=3)])
         for detail in ("REJECT first", "REJECT second", "REJECT third"):
@@ -1416,7 +1416,7 @@ class TestAutomaticRetryCycles(unittest.TestCase):
     """
 
     def _orchestrator(self, tickets=None, **loop_settings):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         config = Config(
             root=root,
             models={
@@ -1815,7 +1815,7 @@ class TestTheSampleConfigStaysHonest(unittest.TestCase):
     SAMPLE = Path(__file__).resolve().parents[1] / "templates" / "config.sample.json"
 
     def _loaded(self) -> Config:
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(
             self.SAMPLE.read_text(encoding="utf-8"), encoding="utf-8"
@@ -1878,7 +1878,7 @@ class TestCommandsAreKeyedByLanguage(unittest.TestCase):
     ran."""
 
     def _config(self, commands) -> Config:
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(
             json.dumps(
@@ -2023,7 +2023,7 @@ class TestRetryCycleConfig(unittest.TestCase):
     """The knob is read from config, and a typo in it must not run forever."""
 
     def _load(self, loop_block: dict) -> Config:
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(
             json.dumps(
@@ -2216,7 +2216,7 @@ class TestRespecCannotReviveARuledOutCause(unittest.TestCase):
 
     def _store(self, rediagnosed=True):
         """A bug ticket whose first hypothesis was tested and disproved."""
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("bug: level starts at 0", source="the game starts at level 0")
         store.add_tickets(
             run_id,
@@ -2368,7 +2368,7 @@ class TestAnOlderTestMayAssertTheBugItself(unittest.TestCase):
     )
 
     def _orchestrator(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / "src").mkdir()
         (root / "tests").mkdir()
         (root / "src" / "piece.rs").write_text(
@@ -2550,7 +2550,7 @@ class TestRetiringAnAssertionNeedsAnArgument(unittest.TestCase):
     )
 
     def _orchestrator(self, reply):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / "tests").mkdir()
         (root / "src").mkdir()
         (root / "src" / "piece.rs").write_text(
@@ -2632,7 +2632,7 @@ class TestRetiringAnAssertionNeedsAnArgument(unittest.TestCase):
         self.assertIn("the assertion encodes the defect".lower(), logged.lower())
 
     def test_respec_proposes_the_scope_but_does_not_take_it(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("bug", source="the I piece renders black")
         store.add_tickets(
             run_id,
@@ -2670,6 +2670,58 @@ class TestRetiringAnAssertionNeedsAnArgument(unittest.TestCase):
         self.assertNotIn("tests/tt_001_test.rs", store.list_tickets(run_id)[0].allowed_files)
         # The rest of the revision still lands; only the gated file is held.
         self.assertEqual(store.list_tickets(run_id)[0].spec, "new")
+
+
+class TestScopeMatchingAnswersTheSameOnEveryHost(unittest.TestCase):
+    """`matches_any` used `fnmatch.fnmatch`, which runs its arguments through
+    `os.path.normcase` — case-folding on Windows, identity on POSIX. The same
+    call answered differently depending on the machine.
+
+    `_owners_in_backlog` compared a lowercased pattern against a path as the
+    compiler spelled it, so on Linux a ticket did not own
+    `src/main/java/A.java` even when that was the only file it listed, and the
+    run refused to start over red the backlog existed to clear. It passed on
+    Windows for every run this project has made, and failed the first time the
+    suite ran on a Linux runner."""
+
+    def test_a_capitalised_name_matches_a_lowercased_pattern(self):
+        self.assertTrue(matches_any("src/main/java/A.java", ["src/main/java/a.java"]))
+
+    def test_a_lowercased_name_matches_a_capitalised_pattern(self):
+        self.assertTrue(matches_any("src/main/java/a.java", ["src/main/java/A.java"]))
+
+    def test_globs_fold_case_too(self):
+        self.assertTrue(matches_any("src/App.tsx", ["src/*.TSX"]))
+        self.assertTrue(matches_any("src/auth/Token.java", ["src/AUTH/**"]))
+
+    def test_it_does_not_depend_on_the_host(self):
+        # The assertion the old code could not make. `fnmatch` would answer
+        # True here on Windows and False on Linux; `matches_any` must answer
+        # the same on both, so it is compared against the case-sensitive
+        # primitive rather than against the platform-dependent one.
+        import fnmatch
+
+        self.assertFalse(fnmatch.fnmatchcase("src/A.java", "src/a.java"))
+        self.assertTrue(matches_any("src/A.java", ["src/a.java"]))
+
+    def test_a_different_name_still_does_not_match(self):
+        # Folding case must not widen anything else.
+        self.assertFalse(matches_any("src/B.java", ["src/a.java"]))
+        self.assertFalse(matches_any("/etc/passwd", ["etc/passwd"]))
+
+    def test_a_ticket_owns_its_capitalised_file(self):
+        # The failure as the loop met it, one level up from the matcher.
+        orch, _root, run_id = _stub_orchestrator(
+            {"lint": "", "typecheck": "javac", "test": ""}
+        )
+        orch.store.add_tickets(
+            run_id,
+            [Ticket("T-1", spec="s", allowed_files=["src/main/java/A.java"])],
+        )
+
+        owners = orch._owners_in_backlog(run_id, ["src/main/java/A.java"])
+
+        self.assertEqual(owners, {"src/main/java/A.java": "T-1"})
 
 
 class TestACharacterAModelWroteCannotKillACommand(unittest.TestCase):
@@ -2716,7 +2768,7 @@ class TestACharacterAModelWroteCannotKillACommand(unittest.TestCase):
             cli.survive_a_narrow_console()
 
     def test_status_prints_a_note_carrying_one(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(
             json.dumps(
@@ -2771,7 +2823,7 @@ class TestTheRepoConfigFallsBackToTheMachineProfile(unittest.TestCase):
         find the developer's own: a suite that reads `%APPDATA%` passes or
         fails by what is installed on the machine running it.
         """
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         path = root / "profile.json"
         if profile is not None:
             path.write_text(json.dumps(profile), encoding="utf-8")
@@ -2779,7 +2831,7 @@ class TestTheRepoConfigFallsBackToTheMachineProfile(unittest.TestCase):
             yield
 
     def _load(self, config: dict):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(
             json.dumps(config), encoding="utf-8"
@@ -2826,7 +2878,7 @@ class TestTheRepoConfigFallsBackToTheMachineProfile(unittest.TestCase):
         self.assertIn("no models", str(caught.exception))
 
     def test_a_corrupt_profile_is_treated_as_absent(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         path = root / "profile.json"
         path.write_text("{not json", encoding="utf-8")
 
@@ -2854,7 +2906,7 @@ class TestRespecKeepsTheTicketsOwnTestFileWritable(unittest.TestCase):
     lint-clean throughout."""
 
     def _revise(self, proposed):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         store = Store(root / "t.db")
         run_id = store.create_run("scope")
         store.add_tickets(
@@ -2930,7 +2982,7 @@ class TestReadingScopeIsWiderThanWritingScope(unittest.TestCase):
     ... outside the allowed scope I'm permitted to modify"."""
 
     def _crate(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / "src").mkdir()
         (root / "src" / "lib.rs").write_text(
             "pub mod board;\npub mod game;\npub mod piece;\n", encoding="utf-8"
@@ -2961,7 +3013,7 @@ class TestReadingScopeIsWiderThanWritingScope(unittest.TestCase):
         # The cost of widening every ticket's read scope, on the case where it
         # buys nothing: an empty repository has no siblings to add, and only
         # files that exist are kept.
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
 
         self.assertEqual(evidence.reading_scope(root, ["src/game.rs"], []), [])
 
@@ -2997,7 +3049,7 @@ class TestABlockedTicketIsGrantedTheFileItNamed(unittest.TestCase):
     the block being read by nobody."""
 
     def _orchestrator(self, never_delegate=()):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / "src").mkdir()
         (root / "src" / "lib.rs").write_text("pub mod game;\n", encoding="utf-8")
         (root / "src" / "game.rs").write_text("pub struct Game;\n", encoding="utf-8")
@@ -3078,7 +3130,7 @@ class TestCriteriaAreScopedByProvenance(unittest.TestCase):
     """
 
     def _store(self, criteria=("the plan's bar",), added=()):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(
             run_id, [Ticket("T-1", spec="old", criteria=list(criteria), status="failed")]
@@ -3248,7 +3300,7 @@ class TestAnImpossibleTicketParksInsteadOfRetrying(unittest.TestCase):
     what made rewriting the spec the only available move."""
 
     def _store(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(
             run_id,
@@ -3295,7 +3347,7 @@ class TestAnImpossibleTicketParksInsteadOfRetrying(unittest.TestCase):
         ticket.status = "failed"
         store.update_ticket(run_id, ticket)
 
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         config = Config(
             root=root,
             models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
@@ -3322,7 +3374,7 @@ class TestTheOriginalTicketIsAnAnchor(unittest.TestCase):
     left to what a human asked for."""
 
     def _store(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(
             run_id, [Ticket("T-1", spec="as ingested", criteria=["as ingested too"])]
@@ -3359,7 +3411,7 @@ class TestTheOriginalTicketIsAnAnchor(unittest.TestCase):
     def test_a_database_from_before_the_column_still_opens(self):
         # Older runs must keep working: the column is added by migration, and
         # tickets ingested before it have no anchor to report.
-        path = Path(tempfile.mkdtemp()) / "old.db"
+        path = Path(tempfile.mkdtemp()).resolve() / "old.db"
         store = Store(path)
         store._connection.execute("ALTER TABLE tickets DROP COLUMN original_spec")
         store._connection.commit()
@@ -3371,7 +3423,7 @@ class TestTheOriginalTicketIsAnAnchor(unittest.TestCase):
         self.assertEqual(reopened.list_tickets(run_id)[0].original_spec, "s")
 
     def test_the_context_is_anchored_too(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [Ticket("T-1", spec="s", context="the plan's rule")])
 
@@ -3386,7 +3438,7 @@ class TestTheOriginalTicketIsAnAnchor(unittest.TestCase):
         )
 
     def test_a_context_only_change_counts_as_drift(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [Ticket("T-1", spec="s", context="the plan's rule")])
 
@@ -3410,7 +3462,7 @@ class TestThePlansContextSurvivesARespec(unittest.TestCase):
     PLAN_CONTEXT = "Write each file as a bare path line, then the contents."
 
     def _store(self, context=PLAN_CONTEXT):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(
             run_id, [Ticket("T-1", spec="old", context=context, status="failed")]
@@ -3516,7 +3568,7 @@ class TestADecisionInSpecProseIsProtected(unittest.TestCase):
     )
 
     def _store(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(
             run_id, [Ticket("T-1", spec=self.SPEC, criteria=["ticks"], status="failed")]
@@ -3606,7 +3658,7 @@ class TestADecisionInSpecProseIsProtected(unittest.TestCase):
     def test_unmarked_prose_stays_freely_revisable(self):
         # This protects what the plan labelled, not prose in general. A spec
         # with no decisions section is revised exactly as before.
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(
             run_id, [Ticket("T-1", spec="Implement Game::tick.", status="failed")]
@@ -3763,7 +3815,7 @@ class TestExecutorSeesSource(unittest.TestCase):
         self.assertNotIn("Reference —", build_prompt(ticket)[-1].content)
 
     def test_reference_files_round_trip_through_the_store(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [Ticket("T-1", reference_files=["src/wasm.rs"])])
         self.assertEqual(store.list_tickets(run_id)[0].reference_files, ["src/wasm.rs"])
@@ -3835,7 +3887,7 @@ class TestUiHostAndPortFlags(unittest.TestCase):
         return parsed
 
     def _project(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(
             json.dumps(
@@ -3924,7 +3976,7 @@ class TestProviderWorkingDirectory(unittest.TestCase):
         )
 
     def test_project_root_becomes_the_default_cwd(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         config = self._config(root, {"kind": "claude-cli", "model": "opus"})
 
         self.assertEqual(config.model_block("m")["cwd"], str(root))
@@ -3934,13 +3986,15 @@ class TestProviderWorkingDirectory(unittest.TestCase):
         # A deliberate override — pointing the planner at a sibling checkout —
         # has to survive the default.
         config = self._config(
-            Path(tempfile.mkdtemp()),
+            Path(tempfile.mkdtemp()).resolve(),
             {"kind": "claude-cli", "model": "opus", "cwd": "/elsewhere"},
         )
         self.assertEqual(config.model_block("m")["cwd"], "/elsewhere")
 
     def test_model_block_does_not_mutate_the_stored_config(self):
-        config = self._config(Path(tempfile.mkdtemp()), {"kind": "claude-cli", "model": "opus"})
+        config = self._config(
+            Path(tempfile.mkdtemp()).resolve(), {"kind": "claude-cli", "model": "opus"}
+        )
         config.model_block("m")
         self.assertNotIn("cwd", config.models["m"])
 
@@ -3951,7 +4005,7 @@ class TestTesterEvidence(unittest.TestCase):
     it. A pytest file under `unittest discover` collects zero tests."""
 
     def _orchestrator(self, test_command: str = "python -m unittest discover tests"):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         config = Config(
             root=root,
             models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
@@ -4042,7 +4096,7 @@ class TestTheBaselineIsAnchoredToTheTicket(unittest.TestCase):
     across nine cycles that way, on an implementation that was fine."""
 
     def _repo(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         for args in (
             ["init", "-q"],
             ["config", "user.email", "t@t.local"],
@@ -4201,7 +4255,7 @@ class TestTicketScopedDiff(unittest.TestCase):
     blaming the executor for work it did not do."""
 
     def _repo(self) -> Orchestrator:
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         for args in (
             ["init", "-q"],
             ["config", "user.email", "t@t.local"],
@@ -4287,7 +4341,7 @@ class TestWorkAlreadyOnDiskIsStillShown(unittest.TestCase):
     """
 
     def _repo(self) -> Orchestrator:
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         for args in (
             ["init", "-q"],
             ["config", "user.email", "t@t.local"],
@@ -4355,7 +4409,7 @@ class TestSamplingOverride(unittest.TestCase):
 
     def _provider(self, block: dict):
         config = Config(
-            root=Path(tempfile.mkdtemp()),
+            root=Path(tempfile.mkdtemp()).resolve(),
             models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192, **block}},
             roles={role: "m" for role in ("planner", "executor", "tester", "reviewer")},
         )
@@ -4378,7 +4432,7 @@ class TestArtifacts(unittest.TestCase):
     reviewer is about to be shown."""
 
     def _artifacts(self) -> tuple[Artifacts, Path]:
-        config_dir = Path(tempfile.mkdtemp()) / ".hybridforge"
+        config_dir = Path(tempfile.mkdtemp()).resolve() / ".hybridforge"
         return Artifacts(config_dir, 1), config_dir
 
     def test_writes_envelope_and_raw_side_by_side(self):
@@ -4425,7 +4479,7 @@ class TestArtifacts(unittest.TestCase):
         self.assertIn("artifacts/", ignored)
 
     def test_an_older_gitignore_is_repaired_not_replaced(self):
-        config_dir = Path(tempfile.mkdtemp()) / ".hybridforge"
+        config_dir = Path(tempfile.mkdtemp()).resolve() / ".hybridforge"
         config_dir.mkdir(parents=True)
         (config_dir / ".gitignore").write_text("run.db\nrun.db-wal\nrun.db-shm\n", "utf-8")
 
@@ -4459,7 +4513,7 @@ class TestArtifacts(unittest.TestCase):
         self.assertTrue(artifacts.failure)
 
     def test_disabled_artifacts_write_nothing(self):
-        config_dir = Path(tempfile.mkdtemp()) / ".hybridforge"
+        config_dir = Path(tempfile.mkdtemp()).resolve() / ".hybridforge"
         artifacts = Artifacts(config_dir, 1, enabled=False)
 
         artifacts.record("SL-001", 1, "build", {"status": "ok"})
@@ -4513,7 +4567,7 @@ class TestTruncatedResponses(unittest.TestCase):
     half-written file from a deliberate one."""
 
     def _orchestrator(self) -> tuple[Orchestrator, Path, int]:
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         config = Config(
             root=root,
             models={
@@ -4682,7 +4736,7 @@ class TestOneTestFilePerTicket(unittest.TestCase):
     how one run reached 17 test files for 6 tickets and blocked all of them."""
 
     def _orchestrator(self, test_command: str = "cargo test"):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         config = Config(
             root=root,
             models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
@@ -5066,7 +5120,7 @@ class TestRespecMayWidenScopeButNotTheGraph(unittest.TestCase):
     goes first."""
 
     def _store(self, first_files=("src/game.rs",), second_files=("src/wasm.rs",)):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(
             run_id,
@@ -5192,7 +5246,7 @@ class TestRespecMayNotWidenIntoASecondBuild(unittest.TestCase):
     )
 
     def _store(self, allowed=("tools/dump.gd", "tests/theme/test_decor.gd")):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(
             run_id,
@@ -5338,7 +5392,7 @@ class TestRespecMayNotRaiseTheBar(unittest.TestCase):
     blocking it at the end had been invented two cycles earlier."""
 
     def _store(self, criteria=("a", "b"), added=()):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [
             Ticket("T-1", spec="old", criteria=list(criteria), status="failed",
@@ -5460,7 +5514,7 @@ class TestACriterionTheSpecAlreadyStatesIsNotARatchet(unittest.TestCase):
     STATED = "build.sh must start with #!/usr/bin/env sh and set -eu"
 
     def _store(self, spec=SPEC, original_spec=""):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         ticket = Ticket(
             "T-1",
@@ -5567,7 +5621,7 @@ class TestSettingUpARunnerForALanguage(unittest.TestCase):
             return Capabilities(context_window=32768, max_output_tokens=8192)
 
     def _project(self, commands=None):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(
             json.dumps(
@@ -5710,7 +5764,7 @@ class TestFilingABugFromTheCommandLine(unittest.TestCase):
             return Capabilities(context_window=32768, max_output_tokens=8192)
 
     def _project(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(
             json.dumps(
@@ -5959,7 +6013,7 @@ class TestAdoptingACriterionRespecWasRefused(unittest.TestCase):
     PROPOSED = "clearing four lines at once scores 800"
 
     def _project(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(
             json.dumps(
@@ -6095,7 +6149,7 @@ class TestRespecCannotPinASharedFile(unittest.TestCase):
     criterion is dropped and the rest of the revision stands."""
 
     def _store(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(
             run_id,
@@ -7012,7 +7066,7 @@ class TestTheTestCommandDecidesTheLanguage(unittest.TestCase):
     had the skip logged as routine."""
 
     def _orch(self, test_command="cargo test"):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         config = Config(
             root=root,
             models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
@@ -7263,7 +7317,7 @@ class TestEvidenceForABugReport(unittest.TestCase):
     )
 
     def _repo(self) -> Path:
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / "src").mkdir()
         (root / "src" / "game.rs").write_text(
             "pub fn tick() {}\n// SoftDrop locks the piece\n", encoding="utf-8"
@@ -7303,7 +7357,7 @@ class TestEvidenceForABugReport(unittest.TestCase):
         nothing about it, and the first bug report against fresh work reached
         the planner with an empty file list and came back "no repository
         evidence was provided". The report was fine; the search never looked."""
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / "src").mkdir()
         (root / "src" / "game.rs").write_text("fn soft_drop() {}\n", encoding="utf-8")
         subprocess.run(["git", "init", "-q"], cwd=root, capture_output=True, check=False)
@@ -7314,7 +7368,7 @@ class TestEvidenceForABugReport(unittest.TestCase):
         self.assertIn("soft_drop", gathered)
 
     def test_a_project_without_git_is_still_searched(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / "game.py").write_text("def soft_drop():\n    pass\n", encoding="utf-8")
 
         gathered = evidence.gather(root, "`soft_drop` locks too early")
@@ -7325,7 +7379,7 @@ class TestEvidenceForABugReport(unittest.TestCase):
     def test_the_walk_skips_what_a_gitignore_would_have(self):
         # A listing of node_modules is not evidence, and it would crowd out
         # everything that is.
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / "node_modules" / "dep").mkdir(parents=True)
         (root / "node_modules" / "dep" / "index.js").write_text("x", encoding="utf-8")
         (root / "app.js").write_text("function draw() {}\n", encoding="utf-8")
@@ -7338,7 +7392,7 @@ class TestEvidenceForABugReport(unittest.TestCase):
     def test_an_empty_directory_yields_nothing(self):
         # An honest empty block. A planner told "here is the evidence" over an
         # invented tree scopes a ticket to files that do not exist.
-        self.assertEqual(evidence.gather(Path(tempfile.mkdtemp()), self.REPORT), "")
+        self.assertEqual(evidence.gather(Path(tempfile.mkdtemp()).resolve(), self.REPORT), "")
 
 
 class TestLocatingAVagueReport(unittest.TestCase):
@@ -7349,7 +7403,7 @@ class TestLocatingAVagueReport(unittest.TestCase):
     VAGUE = "The score sometimes stops updating after I clear a line."
 
     def _repo(self) -> Path:
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / "src").mkdir()
         (root / "src" / "scoring.py").write_text(
             "def commit_lines(count):\n    return count * 100\n", encoding="utf-8"
@@ -7492,7 +7546,7 @@ def _stub_orchestrator(commands: dict[str, str] | None = None):
     the shipped defaults in makes an unrelated feature eat the first answers.
     The tests that do cover them set them explicitly.
     """
-    root = Path(tempfile.mkdtemp())
+    root = Path(tempfile.mkdtemp()).resolve()
     config = Config(
         root=root,
         models={
@@ -7599,7 +7653,7 @@ class TestHistoryIsTrimmedRatherThanBlocking(unittest.TestCase):
             return sum(len(m.content) for m in messages)
 
     def _fit(self, messages, window):
-        gate = BudgetGate(Store(Path(tempfile.mkdtemp()) / "t.db"), {})
+        gate = BudgetGate(Store(Path(tempfile.mkdtemp()).resolve() / "t.db"), {})
         return gate.fit(
             self._Model(window),
             messages,
@@ -7754,7 +7808,7 @@ class TestTurnsAreRebuiltFromTheStepLog(unittest.TestCase):
     stateless and a retry cycle inherits the thread."""
 
     def _store(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         return store, store.create_run("goal")
 
     def _attempt(self, store, run_id, reply, failure, *, name="review"):
@@ -8484,7 +8538,7 @@ class TestEveryLanguageIsVerified(unittest.TestCase):
 
 def _workspace_repo(workspaces, files=(), commands=None):
     """A temp repo whose config declares `workspaces`, plus the files named."""
-    root = Path(tempfile.mkdtemp())
+    root = Path(tempfile.mkdtemp()).resolve()
     (root / ".hybridforge").mkdir()
     payload = {
         "models": {"m": {"kind": "openai", "model": "x"}},
@@ -8761,7 +8815,7 @@ class TestTheCanaryMeasuresCoverageInsteadOfGuessing(unittest.TestCase):
     def _orch(
         self, commands, files=("a.py",), workspaces=None, loop=None, tickets=None
     ):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         payload = {
             "models": {"m": {"kind": "openai", "model": "x"}},
@@ -9171,7 +9225,7 @@ class TestTheCanaryAgainstRealToolchains(unittest.TestCase):
     )
 
     def _repo(self, command, tests_dir="tests"):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / "pkg.py").write_text("VALUE = 1\n", encoding="utf-8")
         (root / tests_dir).mkdir(parents=True, exist_ok=True)
@@ -9260,7 +9314,7 @@ class TestAFailureKeepsItsAddress(unittest.TestCase):
     fix for it."""
 
     def _repo(self) -> Path:
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / "tools" / "path-forge" / "src").mkdir(parents=True)
         (root / "tools" / "path-forge" / "src" / "level.ts").write_text(
             "x\n", encoding="utf-8"
@@ -9656,7 +9710,7 @@ class TestDiscoveringTheBuildsInATree(unittest.TestCase):
     have to write by hand — and proposes it, never decides it."""
 
     def _tree(self, *paths):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         for name in paths:
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -9858,7 +9912,7 @@ class TestFindingImportsThatPointAtNothing(unittest.TestCase):
     sixteen imports and eight invented module paths."""
 
     def _tree(self, files: dict[str, str]) -> Path:
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         for name, body in files.items():
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -11635,7 +11689,7 @@ class TestATicketKeepsWhatItsAttemptsEstablished(unittest.TestCase):
     exchanged a word. See docs/CONVERGENCE.md."""
 
     def _store(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [Ticket("T-1")])
         return store, run_id, store.list_tickets(run_id)[0]
@@ -11790,7 +11844,7 @@ class TestRespecCannotQuietlyWalkAConstant(unittest.TestCase):
     )
 
     def _walked(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         ticket = Ticket("PF-005", spec=self.SPECS[0], criteria=["state is 9335332574048425045n"])
         store.add_tickets(run_id, [ticket])
@@ -11852,7 +11906,7 @@ class TestRespecCannotQuietlyWalkAConstant(unittest.TestCase):
     def test_the_list_is_append_only_and_deduplicated(self):
         # `learn`'s invariant, for the same reason: a field any caller can
         # shorten is not append-only.
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         ticket = Ticket("T-1")
         store.add_tickets(run_id, [ticket])
@@ -11893,7 +11947,7 @@ class TestRespecCanWriteDownWhatItWorkedOut(unittest.TestCase):
     field is read by every later attempt and never revised away."""
 
     def _revised(self, reply: dict, ticket: Ticket | None = None):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(run_id, [ticket or Ticket("T-1", spec="Write a parser.")])
         step = store.start_step(run_id, "T-1", "typecheck")
@@ -12087,7 +12141,7 @@ class TestTheLoopCountsWhatKeepsFailing(unittest.TestCase):
     mistake. Counting is what makes the paragraph true."""
 
     def _store(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         return store, store.create_run("goal")
 
     def _fail(self, store, run_id, name, detail, ticket="T-1"):
@@ -12246,7 +12300,7 @@ class TestTheLoopCountsHowMuchKeepsFailing(unittest.TestCase):
     findings off one at a time reads as one that has done nothing."""
 
     def _store(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         return store, store.create_run("goal")
 
     def _fail(self, store, run_id, name, detail, ticket="T-1"):
@@ -12393,7 +12447,7 @@ class TestTheFormatterRunsBeforeAnythingJudges(unittest.TestCase):
         # whitespace from every file named on its command line and touches
         # nothing else. Written to disk rather than inlined so the test
         # exercises the argument-appending contract the config documents.
-        self.tool = Path(tempfile.mkdtemp()) / "strip_trailing.py"
+        self.tool = Path(tempfile.mkdtemp()).resolve() / "strip_trailing.py"
         self.tool.write_text(
             "import pathlib, sys\n"
             "for argument in sys.argv[1:]:\n"
@@ -12607,7 +12661,7 @@ class TestTheRulesTheCodeIsGradedByReachTheRoles(unittest.TestCase):
     See docs/CONVERGENCE.md."""
 
     def _repo(self, files: dict[str, str], workspaces=None):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         payload = {
             "models": {"m": {"kind": "openai", "model": "x"}},
@@ -13017,7 +13071,7 @@ class TestTheSpecificationReachesTheExecutor(unittest.TestCase):
     of them — and every ticket in that backlog had `reference_files: []`."""
 
     def _repo(self) -> Path:
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / "Docs").mkdir()
         (root / "Docs" / "spec.md").write_text("# Spec\n", encoding="utf-8")
@@ -13059,7 +13113,7 @@ class TestTheSpecificationReachesTheExecutor(unittest.TestCase):
 
     def test_a_document_outside_the_repository_cannot_be_pasted_from_one(self):
         root = self._repo()
-        elsewhere = Path(tempfile.mkdtemp()) / "spec.md"
+        elsewhere = Path(tempfile.mkdtemp()).resolve() / "spec.md"
         elsewhere.write_text("# Spec\n", encoding="utf-8")
 
         self.assertEqual(
@@ -13356,7 +13410,7 @@ class TestTheCollectionCheckAgainstARealRunner(unittest.TestCase):
     )
 
     def _repo(self, discover_dir: str):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / "suite").mkdir()
         (root / "suite" / "existing_test.py").write_text(
@@ -13601,10 +13655,10 @@ class TestABacklogThatIsAFileListRatherThanAPlan(unittest.TestCase):
     imported a file nothing would ever write."""
 
     def _greenfield(self) -> Path:
-        return Path(tempfile.mkdtemp())
+        return Path(tempfile.mkdtemp()).resolve()
 
     def _existing(self, count: int) -> Path:
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         for index in range(count):
             path = root / "src" / f"mod_{index}.py"
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -13987,7 +14041,7 @@ class TestReplayingWhatARunRecorded(unittest.TestCase):
     against the first real recording they met."""
 
     def _project(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(
             json.dumps(
@@ -15378,7 +15432,7 @@ class TestStatusShowsTheNewestRun(unittest.TestCase):
     reported `run 7: blocked` right after run 8 went six-for-six."""
 
     def test_a_finished_run_is_not_hidden_by_an_older_blocked_one(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         config = Config(
             root=root,
             models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
@@ -15452,7 +15506,7 @@ class TestAnImpossibleBudgetBlamesTheConfig(unittest.TestCase):
             return sum(len(m.content) for m in messages)
 
     def _fit(self, window, output, text="x" * 400, droppable=None):
-        gate = BudgetGate(Store(Path(tempfile.mkdtemp()) / "t.db"), {})
+        gate = BudgetGate(Store(Path(tempfile.mkdtemp()).resolve() / "t.db"), {})
         return gate.fit(
             self._Model(window, output),
             [Message(role="user", content=text)],
@@ -15511,7 +15565,7 @@ class TestTheLoopProbesBeforeItSpends(unittest.TestCase):
     than the cause."""
 
     def _orchestrator(self, preflight=True, model="stub"):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         config = Config(
             root=root,
             models={"m": {"kind": "openai", "baseUrl": "http://127.0.0.1:1/v1",
@@ -15884,7 +15938,7 @@ class TestARevisedReadScopeMustExist(unittest.TestCase):
     package the paths implied, and javac said the symbol does not exist."""
 
     def _store(self, reference=("src/main/java/com/app/domain/Scanner.java",)):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(
             run_id,
@@ -15903,7 +15957,7 @@ class TestARevisedReadScopeMustExist(unittest.TestCase):
         return store, run_id
 
     def _repo(self) -> Path:
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / "src" / "main" / "java" / "com" / "app" / "domain").mkdir(parents=True)
         (root / "src" / "main" / "java" / "com" / "app" / "domain" / "Scanner.java").write_text(
             "package com.app.domain;\n", encoding="utf-8"
@@ -16088,7 +16142,7 @@ class TestRespecMayNotExcuseAFailingCheck(unittest.TestCase):
         # inserted with, so the plan's paragraph goes in at ingest and anything
         # a revision wrote arrives afterwards, by update. Building it any other
         # way records the waiver as the human's own.
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(
             run_id,
@@ -18423,7 +18477,7 @@ class TestTheSignOffPass(unittest.TestCase):
     """The pass itself: votes, the planner's revision, and what it settles."""
 
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp())
+        self.root = Path(tempfile.mkdtemp()).resolve()
         self.store = Store(self.root / "run.db")
         self.run_id = self.store.create_run("goal")
         self.store.add_tickets(
@@ -18671,7 +18725,7 @@ class TestRatificationInTheLoop(unittest.TestCase):
     """Where the pass sits, and what the rest of the loop does about it."""
 
     def _orchestrator(self, passes=1, tickets=None, never_delegate=()):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / "src").mkdir()
         (root / "src" / "a.rs").write_text("fn main() {}\n", encoding="utf-8")
         config = Config(
@@ -18873,7 +18927,7 @@ class TestACompileFailureGoesBackWithoutSpendingAnAttempt(unittest.TestCase):
     )
 
     def setUp(self):
-        self.tool = Path(tempfile.mkdtemp()) / "checker.py"
+        self.tool = Path(tempfile.mkdtemp()).resolve() / "checker.py"
         self.tool.write_text(self.CHECKER, encoding="utf-8")
 
     def _orch(self, inner_turns=2, kind="typecheck"):
@@ -19053,7 +19107,7 @@ class TestTheCompileGateNeverLoopsOnSomebodyElsesFailure(unittest.TestCase):
         self.assertNotIn("test", Orchestrator._COMPILE_GATE)
 
     def test_a_red_suite_is_left_to_verify(self):
-        failing = Path(tempfile.mkdtemp()) / "always_red.py"
+        failing = Path(tempfile.mkdtemp()).resolve() / "always_red.py"
         failing.write_text(
             "import sys\nprint('t_test.py:1:1: error: assertion failed')\n"
             "sys.exit(1)\n",
@@ -19071,7 +19125,7 @@ class TestTheCompileGateNeverLoopsOnSomebodyElsesFailure(unittest.TestCase):
         )
 
     def test_a_failure_that_pre_dates_the_ticket_is_not_the_executors(self):
-        checker = Path(tempfile.mkdtemp()) / "checker.py"
+        checker = Path(tempfile.mkdtemp()).resolve() / "checker.py"
         checker.write_text(
             "import sys\nprint('src/old.py:1:1: error: broken')\nsys.exit(1)\n",
             encoding="utf-8",
@@ -19098,7 +19152,7 @@ class TestTheCompileGateNeverLoopsOnSomebodyElsesFailure(unittest.TestCase):
         )
 
     def test_an_attempt_that_wrote_nothing_is_never_gated(self):
-        checker = Path(tempfile.mkdtemp()) / "checker.py"
+        checker = Path(tempfile.mkdtemp()).resolve() / "checker.py"
         checker.write_text(
             "import sys\nprint('src/a.py:1:1: error: broken')\nsys.exit(1)\n",
             encoding="utf-8",
@@ -19213,7 +19267,7 @@ class TestWhatTheFormatterCouldNotReadReachesTheNextAttempt(unittest.TestCase):
     )
 
     def setUp(self):
-        self.tool = Path(tempfile.mkdtemp()) / "refusing_formatter.py"
+        self.tool = Path(tempfile.mkdtemp()).resolve() / "refusing_formatter.py"
         self.tool.write_text(
             "import pathlib, sys\n"
             "refused = []\n"
@@ -19417,7 +19471,7 @@ class TestAFormatChainSurvivesValidation(unittest.TestCase):
     loop would have run correctly."""
 
     def _config(self, commands):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(
             json.dumps({
@@ -19477,7 +19531,7 @@ class TestAFormatChainSurvivesValidation(unittest.TestCase):
 
     def test_the_shipped_sample_still_loads(self):
         sample = Path(__file__).resolve().parents[1] / "templates" / "config.sample.json"
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(
             sample.read_text(encoding="utf-8"), encoding="utf-8"
@@ -19495,7 +19549,7 @@ class TestAFixerAndAFormatterBothGetTheFiles(unittest.TestCase):
     first would run over the whole tree."""
 
     def setUp(self):
-        home = Path(tempfile.mkdtemp())
+        home = Path(tempfile.mkdtemp()).resolve()
         # Stands in for `ruff check --fix`: deletes lines marked UNUSED.
         self.fixer = home / "fixer.py"
         self.fixer.write_text(
@@ -19563,7 +19617,7 @@ class TestAFixerAndAFormatterBothGetTheFiles(unittest.TestCase):
         # A fixer exiting non-zero because it found something is the normal
         # case for `eslint --fix` and `ruff check --fix`. Refusing to run the
         # formatter after it would leave the file worse than either tool alone.
-        loud = Path(tempfile.mkdtemp()) / "loud_fixer.py"
+        loud = Path(tempfile.mkdtemp()).resolve() / "loud_fixer.py"
         loud.write_text(
             "import pathlib, sys\n"
             "for argument in sys.argv[1:]:\n"
@@ -19586,7 +19640,7 @@ class TestAFixerAndAFormatterBothGetTheFiles(unittest.TestCase):
 
     def test_a_chain_can_be_declared_per_language(self):
         config = Config(
-            root=Path(tempfile.mkdtemp()),
+            root=Path(tempfile.mkdtemp()).resolve(),
             models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
             roles={r: "m" for r in ("planner", "executor", "tester", "reviewer")},
             commands={
@@ -19615,7 +19669,7 @@ class TestAFormatterThatDidHalfTheJobIsNotAFailedOne(unittest.TestCase):
         # Strips trailing whitespace from every file it can, refuses any file
         # whose first line is `NOPARSE`, and exits non-zero if it refused one —
         # which is what gdformat does with a file it cannot parse.
-        self.tool = Path(tempfile.mkdtemp()) / "half_formatter.py"
+        self.tool = Path(tempfile.mkdtemp()).resolve() / "half_formatter.py"
         self.tool.write_text(
             "import pathlib, sys\n"
             "refused = []\n"
@@ -19709,7 +19763,7 @@ class TestTheFormattersReportIsNotAFailureClass(unittest.TestCase):
     changed was which file the formatter had got to."""
 
     def _store(self):
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         return store, store.create_run("goal")
 
     def _failed(self, store, run_id, name, detail):
@@ -20011,7 +20065,7 @@ class TestRatifyRefusesTheShorterListInTheLoop(unittest.TestCase):
     PLAN = ["it parses the header", "`cargo clippy` exits 0 with the new file present"]
 
     def _orchestrator(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / "src").mkdir()
         (root / "src" / "a.rs").write_text("fn main() {}\n", encoding="utf-8")
         config = Config(
@@ -20644,7 +20698,7 @@ class TestRatifyOrderIsTheOperatorsToChoose(unittest.TestCase):
     }
 
     def _config(self, loop):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(
             json.dumps({**self.BASE, "loop": loop}), encoding="utf-8"
@@ -20762,7 +20816,7 @@ class TestATicketCanReadWhatItsDependenciesWrote(unittest.TestCase):
         return loop
 
     def _root(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(
             json.dumps(
@@ -21201,7 +21255,7 @@ class TestRatifyMayRewordACriterionButNotItsValue(unittest.TestCase):
     def test_the_refusal_is_reported_and_the_criteria_kept(self):
         from forge.ratify import _apply
 
-        store = Store(Path(tempfile.mkdtemp()) / "t.db")
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
         run_id = store.create_run("goal")
         ticket = Ticket("ST-001", criteria=self.PLAN)
         store.add_tickets(run_id, [ticket])
@@ -21833,7 +21887,7 @@ class TestThePresetIsWrittenFromTheConfigThatPlansAgainstIt(unittest.TestCase):
     """
 
     def _config(self, models):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         return Config(
             root=root,
@@ -22234,7 +22288,7 @@ class TestAnUnverifiedBinaryIsNotInstalled(unittest.TestCase):
     """
 
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp())
+        self.root = Path(tempfile.mkdtemp()).resolve()
         self.payload = b"#!/bin/sh\necho llama\n" * 64
         self.digest = hashlib.sha256(self.payload).hexdigest()
 
@@ -22297,7 +22351,7 @@ class TestAnArchiveDoesNotGetToWriteWhereverItLikes(unittest.TestCase):
     """
 
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp())
+        self.root = Path(tempfile.mkdtemp()).resolve()
 
     def test_a_member_climbing_out_is_refused(self):
         with self.assertRaises(llama.LlamaError) as caught:
@@ -22348,7 +22402,7 @@ class TestWhichServerRuns(unittest.TestCase):
     """
 
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp())
+        self.root = Path(tempfile.mkdtemp()).resolve()
 
     def _install(self, tag, name="llama-server"):
         directory = self.root / tag
@@ -22515,7 +22569,7 @@ class TestATicketCanReadTheFilesItsOwnSpecNames(unittest.TestCase):
     """
 
     def _root(self, files):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         for path in files:
             target = root / path
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -22809,7 +22863,7 @@ class TestAPromptThatOverranIsNotSentAgain(unittest.TestCase):
     def test_the_mark_survives_a_restart(self):
         # Cycles are separated by a run that may have been stopped and resumed,
         # so this has to be on the ticket rather than in the daemon.
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         store = Store(root / "run.db")
         run_id = store.create_run("t", "spec.md")
         ticket = Ticket(ticket_id="PF-009", spec="dump", criteria=["c"])
@@ -22890,7 +22944,7 @@ class TestSkippedStopsMeaningTwoThings(unittest.TestCase):
     def _orchestrator(self, ticket):
         import types as _types
 
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / ".hybridforge").mkdir()
         (root / ".hybridforge" / "config.json").write_text(json.dumps({
             "models": {"a": {"kind": "openai", "model": "m"}},
@@ -22950,7 +23004,7 @@ class TestTheLoopCanBeHandedSomethingBack(unittest.TestCase):
     """
 
     def _store(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         store = Store(root / "run.db")
         run_id = store.create_run("t", "spec.md")
         ticket = Ticket(ticket_id="PF-009", spec="dump fixtures", criteria=["it works"])
@@ -23045,7 +23099,7 @@ class TestAWithheldTicketHasAWayBack(unittest.TestCase):
     """
 
     def _store(self, route="withheld:security", status=None):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         store = Store(root / "run.db")
         run_id = store.create_run("t", "spec.md")
         ticket = Ticket(
