@@ -63,7 +63,7 @@ def _project(root: Path) -> Path:
 
 class TestTheToolsAnswerWhatARoleAsks(unittest.TestCase):
     def setUp(self):
-        self.root = _project(Path(tempfile.mkdtemp()))
+        self.root = _project(Path(tempfile.mkdtemp()).resolve())
         self.box = Toolbox(self.root)
 
     def _run(self, name, **arguments):
@@ -162,7 +162,7 @@ class TestTheToolsAnswerWhatARoleAsks(unittest.TestCase):
 
 class TestTheRepositoryMap(unittest.TestCase):
     def setUp(self):
-        self.root = _project(Path(tempfile.mkdtemp()))
+        self.root = _project(Path(tempfile.mkdtemp()).resolve())
 
     def test_it_carries_paths_and_definitions_but_not_bodies(self):
         text = repo_map(self.root)
@@ -225,7 +225,7 @@ class TestTheConversation(unittest.TestCase):
     """`Orchestrator._converse`: the unit above one call."""
 
     def setUp(self):
-        self.root = _project(Path(tempfile.mkdtemp()))
+        self.root = _project(Path(tempfile.mkdtemp()).resolve())
         self.store = Store(self.root / "t.db")
         self.run_id = self.store.create_run("tools")
 

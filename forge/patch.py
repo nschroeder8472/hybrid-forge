@@ -539,10 +539,32 @@ def repo_relative(path: str, root: Path | str | None = None) -> str:
 
 
 def matches_any(path: str, patterns: list[str]) -> bool:
-    normalized = normalize_path(path)
+    """Whether `path` matches any scope pattern, the same way on every host.
+
+    Case is folded explicitly, and that is the whole point of not calling
+    `fnmatch.fnmatch` here. `fnmatch` runs its arguments through
+    `os.path.normcase`, which lowercases on Windows and does nothing on POSIX
+    — so this function silently answered differently depending on the machine
+    the daemon happened to be running on.
+
+    It was not a cosmetic difference. `_owners_in_backlog` compares a
+    lowercased pattern against a path as the compiler spelled it, so on Linux
+    a ticket did not own `src/main/java/A.java` even when it was the only file
+    it listed, and the run refused to start over red the backlog was there to
+    clear. Every capitalised filename was affected — `A.java`, `App.tsx`,
+    `README.md`. It passed on Windows for four hundred runs because Windows
+    folded the case for it, and surfaced the first time the suite ran on a
+    Linux runner.
+
+    Folding rather than respecting case is the direction that keeps Windows
+    behaving as it always has, and it matches what the rest of this module
+    already does: `repo_relative` folds case for the same reason, and
+    `signatures` lowercases before comparing.
+    """
+    normalized = normalize_path(path).lower()
     for pattern in patterns:
-        pattern = normalize_path(pattern)
-        if fnmatch.fnmatch(normalized, pattern):
+        pattern = normalize_path(pattern).lower()
+        if fnmatch.fnmatchcase(normalized, pattern):
             return True
         # `src/auth/**` should match `src/auth/x.py` under fnmatch too, which
         # treats `**` as a single `*` — check the directory prefix explicitly.

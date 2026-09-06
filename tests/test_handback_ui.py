@@ -111,7 +111,7 @@ class TestTheSnapshotCarriesEvidenceOnlyForParkedTickets(unittest.TestCase):
         )
 
     def test_parked_ticket_carries_evidence_and_done_does_not(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         store = Store(root / "t.db")
         run_id = store.create_run("goal")
         store.add_tickets(

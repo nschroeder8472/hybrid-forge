@@ -32,7 +32,7 @@ def scripted(answers: list[str]):
 
 
 def temp_repo(marker: str = "", body: str = "") -> Path:
-    root = Path(tempfile.mkdtemp()) / "repo"
+    root = Path(tempfile.mkdtemp()).resolve() / "repo"
     root.mkdir(parents=True)
     if marker:
         (root / marker).write_text(body or "x", encoding="utf-8")
@@ -60,7 +60,7 @@ class TestProfileSecrets(unittest.TestCase):
         self.assertIn("ANTHROPIC_API_KEY", flat)
 
     def test_saving_a_profile_never_writes_a_key(self):
-        path = Path(tempfile.mkdtemp()) / "profile.json"
+        path = Path(tempfile.mkdtemp()).resolve() / "profile.json"
         Profile(
             models={"claude": {"kind": "anthropic", "apiKey": "sk-ant-LEAKED"}},
             roles={"planner": "claude"},
@@ -70,7 +70,7 @@ class TestProfileSecrets(unittest.TestCase):
     def test_corrupt_profile_reads_as_empty_rather_than_raising(self):
         # It holds preferences, not state. Re-asking four questions beats
         # refusing to initialize the repo.
-        path = Path(tempfile.mkdtemp()) / "profile.json"
+        path = Path(tempfile.mkdtemp()).resolve() / "profile.json"
         path.write_text("{not json", encoding="utf-8")
         self.assertTrue(Profile.load(path).is_empty)
 
@@ -79,7 +79,7 @@ class TestProfileSecrets(unittest.TestCase):
             self.assertEqual(profile_path(), Path("/tmp/custom.json"))
 
     def test_round_trip_preserves_models_roles_memory_and_port(self):
-        path = Path(tempfile.mkdtemp()) / "profile.json"
+        path = Path(tempfile.mkdtemp()).resolve() / "profile.json"
         Profile(
             models={"local": {"kind": "openai", "baseUrl": "http://h:11434/v1"}},
             roles={"executor": "local"},
@@ -468,7 +468,7 @@ class TestWizardFlow(unittest.TestCase):
              mock.patch.object(wizard, "detect_commands", return_value=found):
             return wizard.run(
                 root,
-                profile or Profile(path=Path(tempfile.mkdtemp()) / "profile.json"),
+                profile or Profile(path=Path(tempfile.mkdtemp()).resolve() / "profile.json"),
                 wizard.Prompter(enabled=True, reader=scripted(answers)),
             )
 
@@ -505,7 +505,7 @@ class TestWizardFlow(unittest.TestCase):
 
     def test_project_scope_never_reaches_the_next_repo(self):
         root = temp_repo("pyproject.toml")
-        path = Path(tempfile.mkdtemp()) / "profile.json"
+        path = Path(tempfile.mkdtemp()).resolve() / "profile.json"
         _, profile = self._run(root, [
             "http://gpu:11434/v1", "qwen3.6:35b-a3b", "",
             "1", "opus",
@@ -545,7 +545,7 @@ class TestWizardFlow(unittest.TestCase):
              mock.patch.object(wizard, "detect_commands", detect):
             config, _ = wizard.run(
                 root,
-                Profile(path=Path(tempfile.mkdtemp()) / "profile.json"),
+                Profile(path=Path(tempfile.mkdtemp()).resolve() / "profile.json"),
                 wizard.Prompter(enabled=True, reader=scripted([
                     "http://gpu:11434/v1", "m", "", "1", "opus", "",
                     "r", "n", "", "", "", "", "", "y",
@@ -578,7 +578,7 @@ class TestWizardFlow(unittest.TestCase):
             roles={"planner": "claude", "executor": "local",
                    "tester": "local", "reviewer": "claude"},
             memory={"url": "http://gpu:8787/mcp"},
-            path=Path(tempfile.mkdtemp()) / "profile.json",
+            path=Path(tempfile.mkdtemp()).resolve() / "profile.json",
         )
         # Every answer blank: the second repo is Enter-through except its own
         # room and commands, which is the whole point of saving the profile.
@@ -647,7 +647,7 @@ class TestWizardFlow(unittest.TestCase):
              mock.patch.object(wizard, "detect_commands", return_value=found):
             config, _ = wizard.run(
                 root,
-                Profile(path=Path(tempfile.mkdtemp()) / "profile.json"),
+                Profile(path=Path(tempfile.mkdtemp()).resolve() / "profile.json"),
                 wizard.Prompter(enabled=False, reader=explode),
             )
         config.validate()
@@ -698,7 +698,7 @@ class TestSetupProposesTheBuildsItFinds(unittest.TestCase):
     Discovery proposes; nothing is written without the answer."""
 
     def _repo(self, *paths) -> Path:
-        root = Path(tempfile.mkdtemp()) / "repo"
+        root = Path(tempfile.mkdtemp()).resolve() / "repo"
         root.mkdir(parents=True)
         for name in paths:
             path = root / name
@@ -719,7 +719,7 @@ class TestSetupProposesTheBuildsItFinds(unittest.TestCase):
              mock.patch.object(wizard, "detect_commands", return_value=found):
             return wizard.run(
                 root,
-                Profile(path=Path(tempfile.mkdtemp()) / "profile.json"),
+                Profile(path=Path(tempfile.mkdtemp()).resolve() / "profile.json"),
                 wizard.Prompter(enabled=True, reader=scripted(answers)),
             )
 
@@ -799,7 +799,7 @@ class TestSetupProposesTheBuildsItFinds(unittest.TestCase):
              mock.patch.object(wizard, "detect_commands", detect):
             wizard.run(
                 root,
-                Profile(path=Path(tempfile.mkdtemp()) / "profile.json"),
+                Profile(path=Path(tempfile.mkdtemp()).resolve() / "profile.json"),
                 wizard.Prompter(
                     enabled=True,
                     reader=scripted(
@@ -840,14 +840,14 @@ class TestDeclaringBuildsAfterTheFact(unittest.TestCase):
         )
 
     def test_a_root_that_does_not_exist_is_refused(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         config = self._config(root)
 
         with self.assertRaises(ConfigError):
             config.declare_workspaces([Workspace(root="nope", commands={})])
 
     def test_declaring_beside_a_top_level_block_is_refused(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / "web").mkdir()
         config = self._config(root)
         config.commands = {"test": "pytest"}
@@ -856,7 +856,7 @@ class TestDeclaringBuildsAfterTheFact(unittest.TestCase):
             config.declare_workspaces([Workspace(root="web", commands={})])
 
     def test_declaring_none_puts_it_back_to_one_implicit_build(self):
-        root = Path(tempfile.mkdtemp())
+        root = Path(tempfile.mkdtemp()).resolve()
         (root / "web").mkdir()
         config = self._config(root)
         config.declare_workspaces([Workspace(root="web", commands={"test": "npm test"})])
