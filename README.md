@@ -385,6 +385,12 @@ never from raw output. Each was learned by breaking it.
 [docs/ROADMAP.md](docs/ROADMAP.md) holds what is not built yet and why — the
 bug-report loop first among it.
 
+[docs/shipped/](docs/shipped/) keeps the backlogs that have landed, unedited,
+each with the run that built it. A spec beside the commit that implemented it
+is the only place you can see which criteria survived contact with a model and
+which the sign-off pass rewrote before any code existed. A spec still being
+worked on lives in the repository root, where `forge ingest <file>` finds it.
+
 ## Layout
 
 ```
@@ -410,6 +416,7 @@ forge/profile.py          machine-level endpoints, reused by the next repo
 forge/ui/                 dashboard
 plugins/forge-setup/      Claude Code plugin: machine + repository setup
 plugins/forge-spec/       Claude Code plugin: spec authoring, triage, memory
+docs/shipped/             backlogs that landed, kept as the record
 examples/sample-project/  the fixture a loop change is run against
 scripts/sample_workspace.py  copies that fixture somewhere a run may write
 tests/                    python -m unittest discover tests

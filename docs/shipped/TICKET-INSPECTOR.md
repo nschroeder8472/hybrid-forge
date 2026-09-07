@@ -16,7 +16,7 @@ is the better design and the one that shipped. And that same pass trimmed
 `tests/test_inspector_render.py` out of `allowed_files`, so nothing was ever
 asked to write tests and the criteria were settled by a reviewer reading the
 diff. The assertions were written by hand afterwards, and ratification is now
-held to the rule respec already had — see [RATIFY.md](docs/RATIFY.md).
+held to the rule respec already had — see [RATIFY.md](../RATIFY.md).
 
 The dashboard's backlog row is one line per ticket, and everything a person
 needs in order to decide what to do with a parked one has been added to that

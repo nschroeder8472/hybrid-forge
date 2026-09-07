@@ -3,8 +3,9 @@
 **Status:** phases 1-5 built and run live twice, on 2026-09-04. The falsifying
 measurement this document pre-registered came back in favour of the design; the
 section at the end is what it actually said. Written against run 1 of
-`HANDBACK-DASHBOARD.md`, 2026-09-04, which is the first time this loop was run
-against hybrid-forge's own tree rather than against `examples/sample-project`.
+[HANDBACK-DASHBOARD.md](shipped/HANDBACK-DASHBOARD.md), 2026-09-04, which is
+the first time this loop was run against hybrid-forge's own tree rather than
+against `examples/sample-project`.
 
 Every prior run in this repository was against a fixture with eleven Python
 files. The first run against a real one — 59 Python files, a 1,815-line

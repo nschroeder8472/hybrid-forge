@@ -92,8 +92,9 @@ unlocks it.
 has been held to that since run 1 of `HANDBACK-DASHBOARD.md`; this pass was
 not, and it does the same thing one step earlier, where the loss is quieter.
 
-TI-002 of `TICKET-INSPECTOR.md` is what it looks like. The pass revised
-`allowed_files` down to `forge/ui/index.html` alone, before any code existed.
+TI-002 of [TICKET-INSPECTOR.md](shipped/TICKET-INSPECTOR.md) is what it looks
+like. The pass revised `allowed_files` down to `forge/ui/index.html` alone,
+before any code existed.
 `_test_target` reads that list to decide where the tester writes, found no test
 path in it, and declined to invent one — the ticket writes only `.html` and
 this project's test command collects `.py` — so nothing was ever asked to write

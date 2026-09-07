@@ -1,7 +1,7 @@
 # Handback stage 6: the evidence a parked ticket already has
 
-`docs/HANDBACK.md` §7 orders the handback work in seven stages. One through five
-shipped — `forge advise`, `forge criteria --add`, `forge release`,
+[HANDBACK.md](../HANDBACK.md) §7 orders the handback work in seven stages. One
+through five shipped — `forge advise`, `forge criteria --add`, `forge release`,
 `forge discharge`, and `withheld:<reason>` as a route distinct from `skipped`.
 Stage 6 is the dashboard's read side, and stage 7 is the write endpoints behind
 the localhost rule.
