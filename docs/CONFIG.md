@@ -790,6 +790,10 @@ run some context, never the run.
 | `freezeTests` | `true` | Keep a ticket's tests while the criteria they encode are unchanged, instead of re-deriving them on every attempt. The tests are a function of the criteria, so an unchanged fingerprint — criteria, spec, scope, test command — produces the same file at the price of the loop's most expensive role, and gives the executor a target that stops moving under it. Rewritten when any of those changes, when the file is not on disk, or when the last failure was in the test file itself. See [CONVERGENCE](CONVERGENCE.md). |
 | `ratifyPasses` | `2` | Sign-off passes over a ticket before its first attempt. Every role is asked whether it can do its part as written, the planner rewrites the ticket from what they say, and the pass repeats. A ticket ships when everyone signs off, when a majority does, or when the planner and one other do; below that it parks with the objections recorded. Costs `roles × passes` calls per ticket before any code exists, one of them on the reviewer. See [RATIFY.md](RATIFY.md). |
 | `ratifyOrder` | all four, in the order above | The order the roles vote in, within a pass. A permutation of the four — it sets the order they vote, not which of them vote, and an order omitting one is refused because sign-off is counted over all four. Two things ride on it. Votes accumulate as they are cast and every role sees the ones before it, so the first votes blind and the last answers three arguments. And on a backend serving one checkpoint at a time (`llamacpp` with `exclusive`, or a router started with `--models-max 1`), two roles sharing a model are free when adjacent and cost a reload when not — see below. |
+| `participationWindow` | `20` | How many ratified tickets `forge signoff` reads before it is willing to say a role has never blocked anything. Report only: nothing in the loop reads it, and no behaviour changes on a role that signs everything. Below the window the report stays silent, because a role that has seen three good tickets and blocked none of them has done nothing wrong. See [ADAPTIVE-TICKET-LOOP](ADAPTIVE-TICKET-LOOP.md) §8.2. |
+| `volumeThreshold` | `0` (off) | Distinct kinds of failure a ticket must have produced before the loop considers decomposing it into children. Off, and measured rather than cautious: on the only run whose numbers exist, the drafted value of 8 splits the two tickets that went on to pass — 10 and 32 classes — and leaves alone the one that was genuinely unsatisfiable, at 7. No value separates those cases, and the error decomposes work that was about to land. The counters it would read are recorded and shown either way, on the dashboard and in the log. See [ADAPTIVE-TICKET-LOOP](ADAPTIVE-TICKET-LOOP.md) §4.1 and §6. |
+| `maxChildren` | `8` | More proposed children than this and the parent is escalated rather than split. A ticket that needs nine pieces was mis-scoped when it was planned, and decomposing it hides that instead of fixing it. |
+| `maxSplitDepth` | `2` | How deep decomposition may go. A child that fails at the limit fails its parent: it does not split again, and it does not partially complete. Unreachable while `volumeThreshold` is `0`. |
 
 ---
 
@@ -975,7 +979,11 @@ the reviewer to it is a one-line edit in `roles`.
     "flatCycles": 0,
     "reviewWhenStuck": 2,
     "freezeTests": true,
-    "ratifyPasses": 2
+    "ratifyPasses": 2,
+    "participationWindow": 20,
+    "volumeThreshold": 0,
+    "maxChildren": 8,
+    "maxSplitDepth": 2
   },
   "ui": {
     "host": "127.0.0.1",

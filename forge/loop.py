@@ -94,6 +94,7 @@ from .providers import (
 )
 from .repomap import repo_map
 from .tools import TOOLS, Toolbox
+from . import split
 from .prompts import (
     CONTEXT_HEADING,
     EXAMPLE_PATH_PREFIX,
@@ -110,6 +111,8 @@ from .prompts import (
     STUCK_UNCLEAR,
     STUCK_UNWINNABLE,
     convention_prompt,
+    criteria_audit_prompt,
+    parse_criteria_audit,
     parse_record,
     parse_stuck_review,
     stuck_review_prompt,
@@ -122,6 +125,7 @@ from .prompts import (
     repro_prompt,
     review_prompt,
     scope_argument_prompt,
+    split_prompt,
     strip_prompt_echo,
     write_tests_prompt,
 )
@@ -142,6 +146,7 @@ from .state import (
     TICKET_PENDING,
     TICKET_RUNNING,
     TICKET_SKIPPED,
+    TICKET_SPLIT,
     TICKET_WITHHELD,
     Store,
     Ticket,
@@ -560,6 +565,82 @@ class Orchestrator:
             return
 
         self._remember(run_id, ticket, step_id, completion.text)
+
+    def _audit_criteria(self, run_id: int, ticket: Ticket) -> None:
+        """Check a passed ticket against the criteria it was originally given.
+
+        §8.1 of docs/ADAPTIVE-TICKET-LOOP.md. The forward half of criteria
+        drift is built and strict: `original_criteria` is frozen at ticket
+        creation, `contract_criteria` is what a revision may not walk back, and
+        `respec._merge_criteria` refuses both removals and additions. The
+        backward half is not. Completion is verified against the *current*
+        list, so a ticket that passes a respecced criterion while failing the
+        original one is recorded as a pass and nothing anywhere says otherwise.
+
+        Runs only on a ticket whose criteria actually moved. With
+        `loop.respecCriteria` at its default of `false` that is no tickets at
+        all, which is the point: this costs nothing on the default path and
+        turns the default into a decision with a number behind it rather than
+        a safety nobody may touch.
+
+        Reports and never acts. The verdict goes to the log and to
+        `ticket.scope_note`; the ticket stays `done`. A check that can
+        retroactively fail a merged ticket is a brake with no measured
+        threshold, which is the mistake §4.1 of that document is written
+        around — and this one would be firing on a model's reading of two
+        pieces of prose.
+        """
+        # Criteria drift specifically, rather than `Ticket.drifted`, which is
+        # true of a ticket whose spec paragraph was rewritten around criteria
+        # nobody touched. That is a revision doing its job, and auditing it
+        # spends a reviewer call to be told so.
+        if not ticket.original_criteria:
+            return
+        if ticket.criteria == ticket.original_criteria:
+            return
+
+        step_id = self.store.start_step(run_id, ticket.ticket_id, "audit")
+        try:
+            completion = self._converse(
+                run_id,
+                "reviewer",
+                criteria_audit_prompt(
+                    ticket,
+                    toolchain=self._toolchain_for(ticket),
+                    repository_map=self._repo_map(),
+                    can_read=self._can_read("reviewer"),
+                ),
+                max_tokens=self._output_budget("reviewer"),
+                temperature=0.0,
+            )
+        except ProviderError as exc:
+            # The ticket has passed. An audit that could not run is a missing
+            # note, not a reason to disturb it.
+            self.store.end_step(step_id, "failed", str(exc))
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: could not audit the original criteria "
+                f"({exc}).",
+                level="warn",
+                kind="ticket",
+            )
+            return
+
+        covered, note = parse_criteria_audit(completion.text)
+        self.store.end_step(step_id, "ok", clip(completion.text, DETAIL_CHARS))
+        if covered:
+            return
+
+        ticket.scope_note = clip(note, 2000)
+        self.store.update_ticket(run_id, ticket)
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: SCOPE-REDUCED — it passed the criteria it was "
+            f"judged on, and the criteria it was given have moved:\n{note[:1200]}",
+            level="warn",
+            kind="ticket",
+            data={"ticket": ticket.ticket_id, "scope": "reduced"},
+        )
 
     def _record_conventions(self, run_id: int, ticket: Ticket) -> None:
         """What a ticket that never passed established about the project.
@@ -1754,6 +1835,11 @@ class Orchestrator:
                     continue
 
                 self._work_ticket(run_id, ticket)
+                # A split parent is a gate rather than a work item, so nothing
+                # in `_work_ticket` can ever close one. Asked after every
+                # ticket because the child that finishes a parent is an
+                # ordinary ticket finishing ordinarily.
+                self._close_split_parents(run_id)
 
         except Stopped:
             self.store.set_run_status(run_id, RUN_STOPPED, "stopped by request")
@@ -2633,6 +2719,10 @@ class Orchestrator:
         return RUN_BLOCKED
 
     def _finish(self, run_id: int) -> str:
+        # Before the counts, and before parking: a parent whose children all
+        # landed is `done`, and one still holding a gate is not a ticket
+        # waiting on a dependency that failed.
+        self._close_split_parents(run_id)
         # Order matters here. Parking first turns "pending forever" into a
         # reported skip, so the counts below describe the run a human has to
         # act on rather than one that merely stopped.
@@ -2802,6 +2892,44 @@ class Orchestrator:
             return self.CHURNING, current, volume
         return (self.DESCENDING if gone else self.CHURNING), current, volume
 
+    def _volume(self, run_id: int, ticket: Ticket) -> tuple[int, list[str]]:
+        """The volume axis: how many kinds of failure this ticket has produced
+        in total, and which of them this cycle was the first to produce.
+
+        Recorded and acted on by nothing, which is deliberate. The draft this
+        comes from proposed splitting a ticket above eight distinct classes,
+        and against the reference run's own numbers that threshold decomposes
+        the two tickets that went on to pass and leaves the one unsatisfiable
+        ticket alone. No value on the only data available separates the cases,
+        and the direction of the error is the expensive one. So the signal is
+        recorded and the brake is not built — the same conclusion `flatCycles`
+        reached the expensive way. See §4.1 of docs/ADAPTIVE-TICKET-LOOP.md.
+
+        `new_classes` is the discriminator worth watching. A ticket that keeps
+        minting classes it has never seen is a different animal from one
+        cycling through the same forty, and the lifetime count cannot tell them
+        apart.
+
+        Counted over review points as well as tool classes. A rejection is one
+        class however many objections it carries, so a volume axis reading
+        classes alone is blind to the whole of review — and review is where
+        this repository's own run 1 spent nine failures on `["review reject"]`.
+        """
+        def names(entries: list[dict]) -> set[str]:
+            return {entry["name"] for entry in entries}
+
+        ticket_id = ticket.ticket_id
+        lifetime = names(self.store.ticket_classes(run_id, ticket_id))
+        lifetime |= names(self.store.ticket_points(run_id, ticket_id))
+        current = names(
+            self.store.ticket_classes(run_id, ticket_id, after=ticket.cycle_mark)
+        )
+        current |= names(
+            self.store.ticket_points(run_id, ticket_id, after=ticket.cycle_mark)
+        )
+        before = self.store.seen_classes(run_id, ticket_id, until=ticket.cycle_mark)
+        return len(lifetime), sorted(current - before)
+
     def _measure_cycle(self, run_id: int, ticket: Ticket) -> str:
         """Record where the ticket's cycle stands, and say so. Returns the state.
 
@@ -2815,11 +2943,15 @@ class Orchestrator:
         # Read before the assignments below overwrite them.
         before = len(ticket.cycle_classes)
         before_volume = ticket.cycle_volume
+        distinct, fresh = self._volume(run_id, ticket)
         ticket.flat_cycles = ticket.flat_cycles + 1 if state == self.FLAT else 0
         ticket.cycle_classes = current
         ticket.cycle_volume = volume
+        ticket.distinct_classes = distinct
+        ticket.new_classes = fresh
         ticket.cycle_mark = self.store.last_step_id(run_id, ticket.ticket_id)
         self.store.record_convergence(run_id, ticket)
+        self._say_volume(run_id, ticket, distinct, fresh)
 
         if state in (self.FIRST, self.CLEARED):
             return state
@@ -2887,6 +3019,234 @@ class Orchestrator:
             },
         )
         return state
+
+    def _consider_split(self, run_id: int, ticket: Ticket) -> bool:
+        """Decompose a ticket that will not land, or leave it alone.
+
+        §6 of docs/ADAPTIVE-TICKET-LOOP.md, and the only genuinely new remedy
+        in it. The loop's other three — another attempt, a respec, a park —
+        all keep the ticket whole, and a ticket that is too big for the
+        executor to hold at once is not made smaller by any of them.
+
+        What makes it safe where respec is not is `split.check`: the union of
+        the children's covered criteria must be the whole of the parent's
+        contract, so scope is conserved by construction rather than by a
+        model's judgement about what it is allowed to drop.
+
+        Off unless `loop.volumeThreshold` is set, and it ships `0`. §4.1 is the
+        argument, and it is a measurement: at the drafted threshold of eight
+        distinct classes, the two tickets that went on to pass are decomposed
+        and the one genuinely unsatisfiable ticket is left alone. Every new
+        brake ships off — that is what `flatCycles` paid for.
+
+        Returns whether the ticket was split. A split parent stops being a work
+        item: it holds the green-tree gate and completes when its children do.
+        """
+        threshold = self.config.loop.volume_threshold
+        if not threshold or ticket.distinct_classes < threshold:
+            return False
+
+        refusal = split.splittable(
+            ticket, max_depth=self.config.loop.max_split_depth
+        )
+        if refusal:
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: {ticket.distinct_classes} kinds of failure "
+                f"is past the split threshold, and it is not being split — "
+                f"{refusal}.",
+                level="warn",
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "split": "refused"},
+            )
+            return False
+
+        step_id = self.store.start_step(run_id, ticket.ticket_id, "split")
+        try:
+            completion = self._converse(
+                run_id,
+                "planner",
+                split_prompt(
+                    ticket,
+                    self.store.ticket_classes(run_id, ticket.ticket_id),
+                    max_children=self.config.loop.max_children,
+                    toolchain=self._toolchain_for(ticket),
+                    repository_map=self._repo_map(),
+                    can_read=self._can_read("planner"),
+                ),
+                max_tokens=self._output_budget("planner"),
+                temperature=0.0,
+            )
+        except ProviderError as exc:
+            self.store.end_step(step_id, "failed", str(exc))
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: could not ask for a decomposition ({exc}); "
+                f"the ticket keeps its place in the ladder.",
+                level="warn",
+                kind="ticket",
+            )
+            return False
+
+        try:
+            proposed = split.parse_split(completion.text)
+            split.check(
+                ticket, proposed, max_children=self.config.loop.max_children
+            )
+        except split.SplitRefused as exc:
+            # The failure mode this refuses is the expensive one: a
+            # decomposition that quietly drops the hard criterion, lands four
+            # green children, and reports the parent done over work nobody
+            # did. So a refused split escalates the parent rather than
+            # retrying the proposal — the ladder's next rung is the planner
+            # being asked whether the ticket is satisfiable at all, which is
+            # the better question once a decomposition has failed.
+            self.store.end_step(step_id, "failed", f"{exc}\n\n{completion.text}")
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: the proposed split was refused — {exc}. "
+                f"The ticket stays whole and stays on the ladder.",
+                level="warn",
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "split": "refused"},
+            )
+            return False
+
+        children = split.children_of(ticket, proposed)
+        existing = {t.ticket_id for t in self.store.list_tickets(run_id)}
+        clash = sorted(child.ticket_id for child in children if child.ticket_id in existing)
+        if clash:
+            self.store.end_step(
+                step_id, "failed", f"proposed ids already in this run: {clash}"
+            )
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: the proposed split reuses ticket id(s) "
+                f"{', '.join(clash)}; the ticket stays whole.",
+                level="warn",
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "split": "refused"},
+            )
+            return False
+
+        self.store.add_tickets(run_id, children)
+        ticket.status = TICKET_SPLIT
+        ticket.blocked_note = (
+            f"split into {len(children)} children after "
+            f"{ticket.distinct_classes} distinct kinds of failure: "
+            + ", ".join(child.ticket_id for child in children)
+            + ". Every criterion of this ticket is covered by at least one of "
+            "them, and this ticket completes when they all do."
+        )
+        self.store.update_ticket(run_id, ticket)
+        self.store.end_step(step_id, "ok", completion.text)
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: split into "
+            + ", ".join(child.ticket_id for child in children)
+            + f". Its {len(ticket.contract_criteria)} criteria are covered by "
+            f"the children; it now holds the gate rather than the work.",
+            level="warn",
+            kind="ticket",
+            data={
+                "ticket": ticket.ticket_id,
+                "children": [child.ticket_id for child in children],
+            },
+        )
+        return True
+
+    def _close_split_parents(self, run_id: int) -> None:
+        """Complete a split parent once every one of its children has landed.
+
+        The parent is a gate, and a gate that never opens is a backlog that
+        never finishes. A parent whose children are all `done` is done: its
+        contract is the union of theirs, which is what `split.check` refused to
+        let the decomposition break.
+
+        A child that ends parked leaves the parent parked with it, carrying the
+        child's own note. Nothing partially completes: a parent reported done
+        over three green children and one blocked one is exactly the outcome
+        the invariant exists to prevent, one level up.
+        """
+        tickets = self.store.list_tickets(run_id)
+        children: dict[str, list[Ticket]] = {}
+        for ticket in tickets:
+            if ticket.parent_ticket_id:
+                children.setdefault(ticket.parent_ticket_id, []).append(ticket)
+        for parent in tickets:
+            if parent.status != TICKET_SPLIT:
+                continue
+            mine = children.get(parent.ticket_id, [])
+            if not mine:
+                continue
+            if all(child.status == TICKET_DONE for child in mine):
+                parent.status = TICKET_DONE
+                parent.blocked_note = ""
+                parent.dep_stamp = self._dep_stamp(run_id, parent)
+                self.store.update_ticket(run_id, parent)
+                self.store.log(
+                    run_id,
+                    f"{parent.ticket_id}: done — every child of the split landed "
+                    f"({', '.join(child.ticket_id for child in mine)}).",
+                    kind="ticket",
+                    data={"ticket": parent.ticket_id},
+                )
+                continue
+            parked = [
+                child
+                for child in mine
+                if child.status in self.store.RETRYABLE
+            ]
+            if parked and all(
+                child.status in self.store.RETRYABLE or child.status == TICKET_DONE
+                for child in mine
+            ):
+                parent.status = TICKET_BLOCKED
+                parent.blocked_note = (
+                    "the split did not land: "
+                    + "; ".join(
+                        f"{child.ticket_id} {child.status}" for child in parked
+                    )
+                    + ". A parent does not partially complete — the criteria its "
+                    "children could not meet are still this ticket's."
+                )
+                self.store.update_ticket(run_id, parent)
+
+    def _say_volume(
+        self, run_id: int, ticket: Ticket, distinct: int, fresh: list[str]
+    ) -> None:
+        """Say how large this ticket's failure set is and how much of it is new.
+
+        Beside the convergence line rather than inside it, because the two
+        answer different questions and a person reading a long run needs both:
+        `descending` says the set is moving, and this says whether it is a set
+        of six or of thirty-eight, and whether the ticket is still discovering
+        material it has never seen.
+
+        Nothing branches on either number. This is a log line and a column, and
+        §4.1 of docs/ADAPTIVE-TICKET-LOOP.md is the argument for why it stays
+        one until a live run says which threshold, if any, separates a ticket
+        worth decomposing from one about to land.
+        """
+        if not distinct:
+            return
+        growth = (
+            f"{len(fresh)} of them first seen this cycle"
+            if fresh
+            else "none of them new this cycle"
+        )
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: volume — {distinct} kind(s) of failure over "
+            f"this ticket's life, {growth}."
+            + ("\n" + "\n".join(f"  + {name}" for name in fresh[:4]) if fresh else ""),
+            kind="ticket",
+            data={
+                "ticket": ticket.ticket_id,
+                "distinct_classes": distinct,
+                "new_classes": fresh,
+            },
+        )
 
     def _stuck_review(self, run_id: int, ticket: Ticket) -> tuple[str, str]:
         """Ask the reviewer whether a stalled ticket can be met at all.
@@ -3099,6 +3459,14 @@ class Orchestrator:
         for ticket_id in list(eligible):
             ticket = by_ticket[ticket_id]
             self._measure_cycle(run_id, ticket)
+            # Decomposition, before the rungs, and off unless somebody set
+            # `loop.volumeThreshold`. It is the one remedy that changes the
+            # shape of the work rather than asking for the same work again, so
+            # a ticket it takes leaves the ladder entirely: its children are
+            # ordinary pending tickets and the parent is a gate.
+            if self._consider_split(run_id, ticket):
+                eligible.remove(ticket_id)
+                continue
             # The ladder. One rung per flat cycle, cheapest first, and each
             # fires once rather than every cycle after it.
             rung = self.config.loop.review_when_stuck
@@ -4114,6 +4482,9 @@ class Orchestrator:
                     f"{ticket.ticket_id}: done in {ticket.attempts} attempt(s).",
                     kind="ticket",
                 )
+                # After the pass is recorded, and unable to disturb it. Only a
+                # ticket whose criteria moved is audited at all.
+                self._audit_criteria(run_id, ticket)
                 return
 
             # Newest last, so the executor reads them in the order they

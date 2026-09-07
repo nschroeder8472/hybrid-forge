@@ -94,6 +94,8 @@ def evidence(ticket: Ticket) -> dict[str, Any] | None:
         "classes": list(ticket.cycle_classes),
         "volume": ticket.cycle_volume,
         "flat_cycles": ticket.flat_cycles,
+        "distinct_classes": ticket.distinct_classes,
+        "new_classes": list(ticket.new_classes[:5]),
     }
 
 

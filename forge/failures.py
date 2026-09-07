@@ -494,6 +494,123 @@ def classify(step: str, output: str) -> set[str]:
     return {f"{step} {message}"} if message else set()
 
 
+# One rejection, split into the objections it actually carries.
+#
+# A model writes its points as a list far more often than as prose, and when it
+# does not, a blank line is the only other boundary it offers. Numbered forms
+# are included because the reviewer prompt asks for "shortest decisive point
+# first", which is an invitation to number them.
+_POINT = re.compile(r"^\s*(?:[-*\u2022\u2023\u25cf]|\(?\d{1,2}[.)])\s+")
+
+# A citation, as the reviewer's contract defines one: the line quoted, or the
+# exact text searched for and not found. Both reach the page as a quoted or
+# backticked span; a bare path is the third form, and `locations` finds those.
+_CITATION = re.compile(
+    r"`[^`]+`"
+    r"|\"[^\"]{3,}\""
+    r"|\u201c[^\u201d]{3,}\u201d"
+    r"|'[^']{3,}'"
+)
+
+
+def review_points(reason: str, *, step: str = "review") -> list[str]:
+    """The distinct objections one rejection carries, in reading order.
+
+    `classify` reduces a reviewer's `REJECT` to a single class, because the
+    reply parses as prose rather than as diagnostics: one review is one thing
+    however many complaints it makes. That is the hole under the volume axis —
+    a reviewer raising six objections and one raising a single objection are
+    indistinguishable to anything counting classes.
+
+    Splitting the body is cheaper than changing what the reviewer is asked to
+    produce. The module header of `forge/prompts.py` says the `REJECT` verdict
+    is what the loop branches on, and `parse_verdict` exists because models
+    decorate the one word it needs; wrapping the reasoning in JSON risks that
+    line for a signal with no consumer yet. So this reads the format the
+    contract already requires — "EVERY objection must cite what you looked at"
+    — and counts the citations.
+
+    A point carrying no citation is not counted, which is the rule the reviewer
+    is already held to: "an objection carrying neither is not a finding". That
+    makes the count conservative in the safe direction. Counting every sentence
+    instead reads a rejection's throat-clearing as objections and inflates
+    every review to the number of lines in it.
+
+    Keys are `(step, code-or-message, file)`, built by the same `_code_of`,
+    `_message_of` and `_file_of` that class a compiler diagnostic, so a review
+    point and a tool diagnostic never disagree about what one complaint is.
+
+    Takes the rejection *body* — `parse_verdict`'s second return value — rather
+    than a whole reply, because the verdict is that function's business and
+    this module cannot import prompts without a cycle. A leading verdict line
+    in the body is harmless: it cites nothing, so it counts as nothing.
+    """
+    lines = strip_ansi(reason or "").splitlines()
+    bulleted = any(_POINT.match(raw) for raw in lines)
+    points = _bulleted(lines) if bulleted else _paragraphs(lines)
+
+    found: list[str] = []
+    for block in points:
+        body = [line for line in block if line.strip()]
+        if not body:
+            continue
+        text = "\n".join(body)
+        if not _CITATION.search(text) and not locations(text):
+            continue
+        head = body[0].strip()
+        name = _code_of(head) or _message_of(head)
+        if not name:
+            continue
+        target = _file_of(body)
+        key = f"{step} {name} in {target}" if target else f"{step} {name}"
+        if key not in found:
+            found.append(key)
+    return found
+
+
+def _bulleted(lines: list[str]) -> list[list[str]]:
+    """A rejection written as a list, one block per item.
+
+    Anything before the first bullet is dropped: it is the verdict line and
+    whatever the model said before it started listing, and neither is an
+    objection. Continuation lines stay with the item they belong to, so a point
+    whose citation is on its second line still counts as cited.
+    """
+    blocks: list[list[str]] = []
+    current: list[str] | None = None
+    for raw in lines:
+        line = raw.rstrip()
+        if _POINT.match(line):
+            if current:
+                blocks.append(current)
+            current = [_POINT.sub("", line, count=1)]
+        elif current is not None:
+            current.append(line)
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def _paragraphs(lines: list[str]) -> list[list[str]]:
+    """A rejection written as prose, split on blank lines.
+
+    The fallback when nothing is bulleted. A verdict line standing alone is a
+    paragraph here and is meant to be: it carries no citation, so the caller
+    drops it without this function needing to know what a verdict looks like.
+    """
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for raw in lines:
+        if raw.strip():
+            current.append(raw.rstrip())
+        elif current:
+            blocks.append(current)
+            current = []
+    if current:
+        blocks.append(current)
+    return blocks
+
+
 def _file_of(block: list[str]) -> str:
     """The file this diagnostic is about, or "".
 

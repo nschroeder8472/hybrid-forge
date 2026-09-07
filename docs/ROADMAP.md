@@ -250,12 +250,13 @@ both runs used local models through a provider that reports no cache counters.
 
 ---
 
-## Adaptive ticket loop — specified, not built
+## Adaptive ticket loop — built, trigger off
 
-**Status:** specified in [ADAPTIVE-TICKET-LOOP.md](ADAPTIVE-TICKET-LOOP.md).
-Written before the convergence work landed and revised against it, so about
-half of the original draft is now a description of shipped behaviour rather
-than a proposal.
+**Status:** built 2026-09-06 —
+[ADAPTIVE-TICKET-LOOP.md](ADAPTIVE-TICKET-LOOP.md) §12 records what each step
+turned into. The volume counters, the criteria audit, the ratification report
+and ticket splitting all landed; `loop.volumeThreshold` ships `0`, so nothing
+is decomposed until somebody sets it.
 
 The problem it names is the half of churn the convergence work does not
 measure. `_convergence` compares this cycle's failure classes against the last
@@ -290,9 +291,37 @@ argument, each worth reading before picking the document up:
   ratchet refuses additions, because the party that has just exhausted its
   attempts does not get to raise the bar it is judged against.
 
-**What it asks for first is a live run**, not code. Building split on top of
-nine unvalidated features makes a second layer with no way to attribute a
-failure to either.
+**What it asked for first was a live run**, not code, and that run happened
+before any of this was written — two of them, on 2026-09-04, recorded in
+[CONTEXT-TOOLS.md](CONTEXT-TOOLS.md). Neither stalled, so the ladder was still
+never asked a question; what they establish is that the machinery underneath
+does not misfire on a run that is going well.
+
+**What landed, in the order §12 asked for it.** The objection splitter was
+replayed before it was trusted, over every recorded review in this repository
+and both evidence trees: 24 rejections carrying 61 objections, 23 of them
+carrying more than one. So the volume axis counts review points as well as
+tool classes, and `distinct_classes` and `new_classes` are recorded per cycle,
+logged beside the convergence line and shown on the dashboard — read by
+nothing. Completion is audited against the frozen criteria on any ticket whose
+criteria moved, and reports `scope-reduced` without touching the status.
+`forge signoff` counts what each role does in a sign-off pass and how much of
+what failed afterwards named a file the roles already had. And splitting is
+built to its invariant: the union of the children's covered criteria must be
+the whole of the parent's contract, checked mechanically before a child
+exists, with the parent becoming a gate that completes when its children do.
+
+**The trigger ships off, and that is the finding this entry keeps.** No value
+of `volumeThreshold` on the only data available separates a ticket worth
+decomposing from one about to land — at the drafted 8, the tickets with 10 and
+32 classes both passed and the one with 7 was the unsatisfiable one. The
+counters are now visible enough that the person who arms it can do so against
+their own numbers.
+
+Two things are deliberately not built. RESTART waits on a live run showing the
+ladder answering `winnable` on a ticket that then stays flat, which has not
+happened. Plan-time prediction waits on completed tickets across more than one
+repository, and its config key is absent rather than present-and-ignored.
 
 ---
 

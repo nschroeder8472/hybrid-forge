@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-from .failures import classify, clip, distill, signatures
+from .failures import classify, clip, distill, review_points, signatures
 
 # How much of a step's output is kept. Enough for any compiler's diagnostics
 # and for a runner's summary, and not so much that a backlog of gdUnit runs —
@@ -73,7 +73,7 @@ DETAIL_CHARS = 20_000
 # build rather than a run of the code, its pass is a non-zero exit, and the
 # deliberate garbage it fails over would otherwise contribute a syntax error
 # nobody wrote to whatever ticket was holding the run.
-NOT_ABOUT_THE_CODE = ("record", "stuck-review", "format", "canary")
+NOT_ABOUT_THE_CODE = ("record", "stuck-review", "format", "canary", "audit")
 
 
 def _placeholders(values: tuple[str, ...]) -> str:
@@ -235,6 +235,13 @@ TICKET_FAILED = "failed"
 # the dependency lands. `withheld` is the one that needs a person.
 TICKET_SKIPPED = "skipped"
 TICKET_WITHHELD = "withheld"
+# A ticket that was decomposed. It is no longer work — its children hold that —
+# and it is not parked either: nobody has to do anything about it, and it
+# completes on its own when every child does. Deliberately absent from
+# `Store.RETRYABLE`, because requeueing a parent would run the work its
+# children are already doing. See `Orchestrator._close_split_parents` and §6 of
+# docs/ADAPTIVE-TICKET-LOOP.md.
+TICKET_SPLIT = "split"
 
 
 @dataclass
@@ -433,6 +440,44 @@ class Ticket:
     # output no pattern in `failures` recognises has no findings to count, and
     # a comparison against it must not read as a descent.
     cycle_volume: int = 0
+    # The volume axis, recorded and acted on by nothing. See §4.2 of
+    # docs/ADAPTIVE-TICKET-LOOP.md.
+    #
+    # `cycle_classes` answers *is the set moving* and never *how big is the
+    # set*, so a ticket failing on 38 distinct classes and one failing on 7 are
+    # indistinguishable to every brake in the loop. `distinct_classes` is the
+    # ticket's lifetime count and `new_classes` are the ones this cycle was the
+    # first to produce — the discriminator worth watching, because a ticket
+    # minting classes it has never seen is a different animal from one cycling
+    # through the same forty and a lifetime count cannot tell them apart.
+    #
+    # Both count review points as well as tool diagnostics. A rejection classes
+    # as one thing however many complaints it makes, and replaying
+    # `failures.review_points` over 24 recorded rejections found 61 objections
+    # in them — 96% carried more than one. A volume axis blind to that is blind
+    # on the ticket most likely to need it. See `scripts/review_points.py`.
+    distinct_classes: int = 0
+    new_classes: list[str] = field(default_factory=list)
+    # What the criteria audit found on a ticket whose criteria moved while it
+    # was being worked on: empty when it was never audited or when every
+    # original criterion is still met, and the auditor's own note when they are
+    # not. A report, never a status: the ticket is `done` either way. See
+    # `Orchestrator._audit_criteria` and §8.1 of docs/ADAPTIVE-TICKET-LOOP.md.
+    scope_note: str = ""
+    # Decomposition. `parent_ticket_id` is the ticket this one is a piece of,
+    # `covers` the indices of the parent's contract criteria it is responsible
+    # for, and `split_depth` how many splits deep it sits. All three are empty
+    # on a ticket the plan wrote, which is every ticket until a split happens.
+    #
+    # The parent stops being a work item and becomes a gate: it holds the
+    # green-tree requirement and completes when every child does. What makes
+    # that safe is the invariant in `split.check` — the union of the children's
+    # `covers` is the whole of the parent's contract, so scope is conserved by
+    # construction rather than by a model's judgement. See §6 of
+    # docs/ADAPTIVE-TICKET-LOOP.md.
+    parent_ticket_id: str = ""
+    covers: list[int] = field(default_factory=list)
+    split_depth: int = 0
     # Distinctive constants this ticket's spec has stated and then dropped, in
     # the order it dropped them.
     #
@@ -534,6 +579,15 @@ class Ticket:
             "context": self.context,
             "blocked_note": self.blocked_note,
             "original_spec": self.original_spec,
+            "scope_note": self.scope_note,
+            "parent_ticket_id": self.parent_ticket_id,
+            "covers": json.dumps(self.covers),
+            "split_depth": self.split_depth,
+            # Read by `add_tickets` and by nothing else. `update_ticket` does
+            # not name this column: the field is append-only and merged by
+            # `Store.learn`, so a caller holding a stale copy must not be able
+            # to write it back.
+            "learned": json.dumps(self.learned),
             "original_criteria": json.dumps(self.original_criteria),
             "original_context": self.original_context,
             "ratify_status": self.ratify_status,
@@ -587,6 +641,12 @@ class Ticket:
             abandoned_values=json.loads(row["abandoned_values"] or "[]"),
             flat_cycles=row["flat_cycles"] or 0,
             cycle_volume=row["cycle_volume"] or 0,
+            scope_note=row["scope_note"] or "",
+            parent_ticket_id=row["parent_ticket_id"] or "",
+            covers=json.loads(row["covers"] or "[]"),
+            split_depth=row["split_depth"] or 0,
+            distinct_classes=row["distinct_classes"] or 0,
+            new_classes=json.loads(row["new_classes"] or "[]"),
         )
 
 
@@ -674,6 +734,13 @@ class Store:
         ("tickets", "tests_fingerprint", "TEXT NOT NULL DEFAULT ''"),
         ("tickets", "abandoned_values", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "impossible_fingerprint", "TEXT NOT NULL DEFAULT ''"),
+        ("steps", "points", "TEXT NOT NULL DEFAULT '[]'"),
+        ("tickets", "distinct_classes", "INTEGER NOT NULL DEFAULT 0"),
+        ("tickets", "new_classes", "TEXT NOT NULL DEFAULT '[]'"),
+        ("tickets", "scope_note", "TEXT NOT NULL DEFAULT ''"),
+        ("tickets", "parent_ticket_id", "TEXT NOT NULL DEFAULT ''"),
+        ("tickets", "covers", "TEXT NOT NULL DEFAULT '[]'"),
+        ("tickets", "split_depth", "INTEGER NOT NULL DEFAULT 0"),
     )
 
     def _migrate(self) -> None:
@@ -866,11 +933,17 @@ class Store:
                     "needs, dep_stamp, "
                     " baseline_tree, charged_failures, context, "
                     " blocked_note, original_spec, original_criteria, original_context, "
+                    # A ticket the plan wrote carries none of these. A split
+                    # child carries all four at creation and can be given them
+                    # nowhere else: `update_ticket` does not name `learned`, by
+                    # the same rule that keeps it from naming `original_spec`.
+                    " parent_ticket_id, covers, split_depth, learned, "
                     " updated_at) "
                     "VALUES (:run_id, :ticket_id, :title, :route, :kind, :status, :position, "
                     ":attempts, :attempt_base, :spec, :allowed_files, :reference_files, "
                     ":criteria, :needs, :dep_stamp, :baseline_tree, :charged_failures, :context, "
-                    ":blocked_note, :original_spec, :original_criteria, :original_context, :now)",
+                    ":blocked_note, :original_spec, :original_criteria, :original_context, "
+                    ":parent_ticket_id, :covers, :split_depth, :learned, :now)",
                     {**row, "run_id": run_id, "now": now},
                 )
 
@@ -925,7 +998,9 @@ class Store:
                 "criteria = :criteria, needs = :needs, dep_stamp = :dep_stamp, "
                 "baseline_tree = :baseline_tree, "
                 "charged_failures = :charged_failures, context = :context, "
-                "blocked_note = :blocked_note, "
+                "blocked_note = :blocked_note, scope_note = :scope_note, "
+                "parent_ticket_id = :parent_ticket_id, covers = :covers, "
+                "split_depth = :split_depth, "
                 "ratify_overrun = :ratify_overrun, "
                 "impossible_fingerprint = :impossible_fingerprint, updated_at = :now "
                 "WHERE run_id = :run_id AND ticket_id = :ticket_id",
@@ -1503,6 +1578,7 @@ class Store:
         would be counting the *clipped* copy, which is a different number.
         """
         classes: list[str] = []
+        points: list[str] = []
         findings = 0
         if status == "failed" and detail.strip():
             row = self._connection.execute(
@@ -1513,16 +1589,26 @@ class Store:
             if row is not None and _step_kind(row["name"]) not in NOT_ABOUT_THE_CODE:
                 classes = sorted(classify(row["name"], detail))
                 findings = len(signatures(detail))
+                # A rejection is prose, so `classify` reduces the whole of it
+                # to one class and `signatures` counts none of it. The
+                # objections inside it are countable — the reviewer's own
+                # contract requires each to cite what it looked at — and they
+                # are counted here, on write, for the reason the classes are:
+                # what is kept on disk is clipped, and a count taken from the
+                # clipped copy is a count of what fitted.
+                if _step_kind(row["name"]) == "review":
+                    points = review_points(detail, step=_step_kind(row["name"]))
         with self._write() as connection:
             connection.execute(
                 "UPDATE steps SET status = ?, ended_at = ?, detail = ?, classes = ?, "
-                "findings = ? WHERE id = ?",
+                "findings = ?, points = ? WHERE id = ?",
                 (
                     status,
                     time.time(),
                     clip(detail, DETAIL_CHARS),
                     json.dumps(classes),
                     findings,
+                    json.dumps(points),
                     step_id,
                 ),
             )
@@ -1623,13 +1709,17 @@ class Store:
             connection.execute(
                 "UPDATE tickets SET cycle_classes = :cycle_classes, "
                 "cycle_mark = :cycle_mark, flat_cycles = :flat_cycles, "
-                "cycle_volume = :cycle_volume, updated_at = :now "
+                "cycle_volume = :cycle_volume, "
+                "distinct_classes = :distinct_classes, "
+                "new_classes = :new_classes, updated_at = :now "
                 "WHERE run_id = :run_id AND ticket_id = :ticket_id",
                 {
                     "cycle_classes": json.dumps(sorted(ticket.cycle_classes)),
                     "cycle_mark": int(ticket.cycle_mark),
                     "flat_cycles": int(ticket.flat_cycles),
                     "cycle_volume": int(ticket.cycle_volume),
+                    "distinct_classes": int(ticket.distinct_classes),
+                    "new_classes": json.dumps(sorted(ticket.new_classes)),
                     "run_id": run_id,
                     "ticket_id": ticket.ticket_id,
                     "now": time.time(),
@@ -1664,6 +1754,88 @@ class Store:
         for position, row in enumerate(rows, start=1):
             try:
                 names = json.loads(row["classes"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            for name in names:
+                entry = seen.get(name)
+                if entry is None:
+                    seen[name] = {
+                        "name": name,
+                        "count": 1,
+                        "first_attempt": position,
+                        "last_attempt": position,
+                    }
+                    continue
+                entry["count"] += 1
+                entry["last_attempt"] = position
+        return sorted(
+            seen.values(), key=lambda entry: (-entry["count"], entry["name"])
+        )
+
+    def seen_classes(self, run_id: int, ticket_id: str, until: int = 0) -> set[str]:
+        """Every failure class and review point recorded up to `until`.
+
+        The other half of "which of this cycle's classes are new". Classes are
+        read forward from a mark everywhere else in this file, and a set read
+        forward cannot answer what came before it: a class present in both the
+        cycle and its history appears in the lifetime set and in the current
+        set, so subtracting one from the other loses it and calls a class the
+        ticket has produced fifty times brand new.
+
+        `until` of 0 means the ticket has no completed cycle yet, and the
+        answer is the empty set: everything the first cycle produced is seen
+        for the first time.
+        """
+        if until <= 0:
+            return set()
+        rows = self._connection.execute(
+            "SELECT classes, points FROM steps "
+            "WHERE run_id = ? AND ticket_id = ? AND status = 'failed' AND id <= ? "
+            f"AND {_STEP_KIND_SQL} NOT IN ({_placeholders(NOT_ABOUT_THE_CODE)})",
+            (run_id, ticket_id, until, *NOT_ABOUT_THE_CODE),
+        ).fetchall()
+        seen: set[str] = set()
+        for row in rows:
+            for column in ("classes", "points"):
+                try:
+                    seen.update(json.loads(row[column] or "[]"))
+                except (TypeError, ValueError):
+                    continue
+        return seen
+
+    def ticket_points(
+        self, run_id: int, ticket_id: str, after: int = 0
+    ) -> list[dict]:
+        """Every distinct objection this ticket's reviews raised, commonest
+        first.
+
+        The review half of `ticket_classes`, and separate from it on purpose.
+        A rejection reaches `classify` as prose and comes back as the single
+        class `review reject`, so a ticket rejected nine times over nine
+        different objections has one class and looks, to every comparison in
+        the loop, exactly like one rejected nine times over the same objection.
+        That is not hypothetical: run 1 of this repository's own
+        `HANDBACK-DASHBOARD.md` backlog recorded `["review reject"]` on all
+        nine of its failed reviews.
+
+        Recorded per step by `end_step` and only unioned here, so the count is
+        taken from what the reviewer actually wrote rather than from the copy
+        the detail column was clipped to.
+
+        Read by the volume axis and by nothing that decides anything. See §4.2
+        of docs/ADAPTIVE-TICKET-LOOP.md.
+        """
+        rows = self._connection.execute(
+            "SELECT id, points FROM steps "
+            "WHERE run_id = ? AND ticket_id = ? AND status = 'failed' AND id > ? "
+            "ORDER BY id",
+            (run_id, ticket_id, after),
+        ).fetchall()
+
+        seen: dict[str, dict] = {}
+        for position, row in enumerate(rows, start=1):
+            try:
+                names = json.loads(row["points"] or "[]")
             except (TypeError, ValueError):
                 continue
             for name in names:

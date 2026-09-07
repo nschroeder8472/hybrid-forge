@@ -920,6 +920,33 @@ class LoopSettings:
     # saves are worth. Reorder because it is free, not because it is the fix
     # for a slow ratify pass — that is `ratifyPasses` and the output budget.
     ratify_order: tuple[str, ...] = ROLES
+    # How many ratified tickets `forge signoff` reads before it is willing to
+    # call a role a rubber stamp. Report only: nothing in the loop reads this
+    # except that report, and no behaviour changes on a role that never
+    # blocks. A role signing everything is indistinguishable from a role that
+    # genuinely agrees, from inside the loop — which is exactly why it needs a
+    # counter a person can look at rather than a rule. See §8.2 of
+    # docs/ADAPTIVE-TICKET-LOOP.md.
+    participation_window: int = 20
+    # Distinct kinds of failure a ticket must have produced before the loop
+    # will consider decomposing it, and `0` never considers one.
+    #
+    # It ships off, and the reason is a measurement rather than caution. On the
+    # only run whose numbers exist, the drafted value of 8 splits the two
+    # tickets that went on to pass — 10 and 32 classes — and leaves alone the
+    # one that was genuinely unsatisfiable, which had 7. No value separates
+    # those cases, and the direction of the error is the expensive one: it
+    # decomposes work that was about to land. The mechanism is built so that
+    # whoever arms it can do so against numbers `forge status` now shows them.
+    # See §4.1 and §6 of docs/ADAPTIVE-TICKET-LOOP.md.
+    volume_threshold: int = 0
+    # More proposed children than this and the parent is escalated instead of
+    # split: a ticket that needs nine pieces was mis-scoped at plan time, and
+    # splitting it hides that rather than fixing it.
+    max_children: int = 8
+    # How deep decomposition may go. A child that fails at the limit fails its
+    # parent — it does not split again and it does not partially complete.
+    max_split_depth: int = 2
 
 
 @dataclass
@@ -1163,6 +1190,10 @@ class Config:
             bug_hypotheses=int(loop.get("bugHypotheses", 3)),
             ratify_passes=int(loop.get("ratifyPasses", 2)),
             ratify_order=tuple(loop.get("ratifyOrder", ROLES) or ROLES),
+            participation_window=int(loop.get("participationWindow", 20)),
+            volume_threshold=int(loop.get("volumeThreshold", 0)),
+            max_children=int(loop.get("maxChildren", 8)),
+            max_split_depth=int(loop.get("maxSplitDepth", 2)),
         )
 
         ui = data.get("ui", {}) or {}
@@ -1207,6 +1238,29 @@ class Config:
                 f"loop.flatCycles is {self.loop.flat_cycles}; expected 0 or "
                 f"more. 0 never parks a ticket for going nowhere, which is how "
                 f"the brake is turned off."
+            )
+        if self.loop.volume_threshold < 0:
+            raise ConfigError(
+                f"loop.volumeThreshold is {self.loop.volume_threshold}; expected "
+                f"0 or more. 0 never splits a ticket, which is how the brake is "
+                f"turned off — and how it ships."
+            )
+        if self.loop.max_children < 2:
+            raise ConfigError(
+                f"loop.maxChildren is {self.loop.max_children}; expected 2 or "
+                f"more. A split into one child is a respec under another name."
+            )
+        if self.loop.max_split_depth < 1:
+            raise ConfigError(
+                f"loop.maxSplitDepth is {self.loop.max_split_depth}; expected 1 "
+                f"or more. To stop splitting entirely, set loop.volumeThreshold "
+                f"to 0."
+            )
+        if self.loop.participation_window < 1:
+            raise ConfigError(
+                f"loop.participationWindow is {self.loop.participation_window}; "
+                f"expected 1 or more. It is how many ratified tickets the "
+                f"sign-off report reads before it says anything about a role."
             )
         if self.loop.learned_limit < 0:
             raise ConfigError(

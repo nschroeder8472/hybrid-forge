@@ -1,12 +1,20 @@
 # Adaptive Ticket Loop — Specification
 
-**Status:** revised 2026-08-28 against `main` at `91cb82e`. The original draft
-was written before the convergence work landed. Roughly half of what it
-specifies now exists under other names, one of its central mechanisms was built
-elsewhere and reverted on measured evidence, and two of its rules point the
-wrong way against what the loop now enforces. This revision keeps the draft's
-structure so the two can be read side by side, and rewrites each section to
-state only what is still owed.
+**Status:** built 2026-09-06, with its trigger off. Steps 1 through 6 of §12
+have landed: the live run the order was waiting on, the objection-splitter
+replay, the volume counters, completion against the frozen criteria, the
+ratification counters, and SPLIT itself behind `loop.volumeThreshold`, which
+ships `0`. Steps 7 (RESTART) and 8 (plan-time prediction) are deliberately not
+built and the section on each says why. What every section below now describes
+is either shipped code or a decision not to write it; the "owed" notes are kept
+where the thing is still owed.
+
+Revised 2026-08-28 against `main` at `91cb82e`. The original draft was written
+before the convergence work landed. Roughly half of what it specified already
+existed under other names, one of its central mechanisms had been built
+elsewhere and reverted on measured evidence, and two of its rules pointed the
+wrong way against what the loop enforces. That revision kept the draft's
+structure so the two could be read side by side.
 
 **Scope:** the code→review iteration loop in `forge go`, plus a small amount
 of plan-time work in `forge ingest`.
@@ -129,13 +137,18 @@ has no consumer yet.
    its citation anchors and class each point by `(review, cited-file,
    masked-head)`, reusing `failures._blocks` head parsing so review points and
    tool diagnostics never disagree about what one complaint is.
-2. **Replay it before trusting it.** Run the splitter over every recorded
-   `REJECT` in the `Puzzle-Path` and `plex-namer` artifact trees and report the
-   distribution of points per review. If most rejections carry one point, the
-   volume axis has nothing to read from review and §4 is built on tool classes
-   alone.
+2. **Replay it before trusting it.** ✅ Done — `scripts/review_points.py`, over
+   every recorded `*-review.md` in this repository and both `forge-evidence`
+   trees. 62 reviews, 24 of them rejections, and **61 objections inside them**:
+   2.54 per rejection, 23 of 24 carrying more than one, and the largest
+   carrying twelve — one per acceptance criterion, each quoting the string it
+   had searched for and not found. The volume axis reads review.
 3. **Only if step 2 shows real spread**, tighten the reviewer prompt to number
-   its points — a numbering instruction, not a format change.
+   its points — a numbering instruction, not a format change. Step 2 showed
+   the spread and this is still not done: the splitter reads bullets, numbers
+   and blank-line paragraphs already, and the recorded rejections are bulleted
+   without being asked. A prompt change here would be spending the loop's most
+   fragile contract on a format it is already producing.
 
 `criterion_ref` from the draft is worth keeping as a *request* in the reviewer
 prompt rather than a schema field: "name the criterion each point violates." It
@@ -325,7 +338,11 @@ one, which is what `unwinnable` asks for — in words rather than in a counter.
 
 ## 6. Ticket splitting
 
-The remaining new mechanism. Everything below is unbuilt.
+The remaining new mechanism, and now built — `forge/split.py`, with the trigger
+in `Orchestrator._consider_split` and the gate in `_close_split_parents`.
+`loop.volumeThreshold` ships `0`, so nothing below happens on a default
+configuration. What follows is the specification it was built to; where the
+code chose one of two readings, the choice is named.
 
 ### 6.1 The invariant
 
@@ -392,6 +409,11 @@ escalates the parent.
   mis-scoped at plan time; escalate rather than split.
 - **Depth.** `loop.maxSplitDepth`, default 2. A child that fails at max depth
   fails its parent — it does not split again and does not partially complete.
+- **Learnings are inherited as a snapshot**, not shared. §3.2's run-scoped
+  tier is not built, so a child reads what its *parent* established and not
+  what its siblings are establishing beside it. That is the cheaper half of
+  §13's open question, and the half that does not need a new tier in
+  `Store.learn`.
 - **Tests are not inherited.** `freezeTests` fingerprints criteria, spec, scope
   and test command. A child has different criteria and a narrower scope, so its
   fingerprint differs and its tests are written fresh. The parent's test file
@@ -613,37 +635,59 @@ brake).
 
 ## 12. Order of work
 
-The draft's order started with instrumentation that now exists. What replaces it
-starts with the thing nothing in CONVERGENCE.md has done.
+The draft's order started with instrumentation that now exists. What replaced
+it started with the thing nothing in CONVERGENCE.md had done. All six of the
+steps that were worth doing before a live run of the new machinery are built;
+what each one turned into is recorded beside it.
 
-1. **Run a backlog.** Nine shipped features, zero live runs. Watch the three
-   things CONVERGENCE names: `memory.write` in dry-run before trusting it,
-   whether the ladder parks tickets for the right reason, and whether the decile
-   curve descends. Until this exists, every item below is a second unvalidated
-   layer over a first.
-2. **Replay the objection splitter** (§3.1 step 2) over the recorded `REJECT`
-   bodies in both artifact trees, and report points per review. This decides
-   whether the volume axis reads review at all, and it is a script, not a
-   feature.
-3. **Record the volume counters** (§4.2) — `distinct_classes` and `new_classes`
-   per cycle, logged, acted on by nothing.
-4. **Completion against the frozen criteria** (§8.1). Report only. Cheap, and it
-   is the check that makes `respecCriteria: false` a default rather than a
-   load-bearing safety.
-5. **Ratification counters** (§8.2, §8.3). Report only, over data already
-   recorded, and they answer the question RATIFY.md has owed since it was
-   written.
-6. **SPLIT** (§6), gated behind `volumeThreshold`, which ships `0`. Build the
-   invariant and the schema first; the trigger is the last thing wired and the
-   first thing to be given a threshold nobody can defend.
-7. **RESTART** (§5.1), only if a live run shows the ladder answering `winnable`
-   on a ticket that then stays flat.
-8. **Plan-time prediction** (§9), once enough completed tickets exist across more
-   than one repository.
+1. **Run a backlog.** ✅ Done, and documented in
+   [CONTEXT-TOOLS.md](CONTEXT-TOOLS.md) rather than here: two runs of the
+   `HANDBACK-DASHBOARD.md` backlog on 2026-09-04, the first carrying the
+   pre-tools/post-tools comparison and the second landing both tickets. The
+   ladder was not asked a question on either — nothing stalled — so what it
+   establishes is a floor, not evidence about convergence.
+2. **Replay the objection splitter** (§3.1 step 2). ✅ Done, and it answered
+   the open question. `scripts/review_points.py` over every recorded
+   `*-review.md` in this repository and the two `forge-evidence` trees: 62
+   reviews, 24 rejections, **61 objections in them — 2.54 per rejection, and
+   23 of 24 carrying more than one**. The largest carried twelve, one per
+   acceptance criterion. So the volume axis does read review, and §3.1's
+   framing was not about diagnostics all along.
+3. **Record the volume counters** (§4.2). ✅ Built. `distinct_classes` and
+   `new_classes` per cycle, on the ticket, in the log line beside the
+   convergence one, and in the dashboard's evidence block. Review points count
+   towards both, which is what step 2 earned. Nothing branches on either.
+4. **Completion against the frozen criteria** (§8.1). ✅ Built as
+   `Orchestrator._audit_criteria`, on the reviewer, once per ticket, and only
+   for a ticket whose criteria actually moved — which at `respecCriteria:
+   false` is none of them. The verdict is a note on the ticket and a log line;
+   the ticket stays `done` either way.
+5. **Ratification counters** (§8.2, §8.3). ✅ Built as `forge signoff`, over
+   data already recorded. Participation per role, and the share of a ticket's
+   later failures that named a file the roles already had in front of them.
+   Report only.
+6. **SPLIT** (§6). ✅ Built: `forge/split.py`, the invariant, the schema, the
+   planner prompt, the parent as a gate. `loop.volumeThreshold` ships `0`, so
+   nothing splits until somebody sets it — and §4.1 is the argument for why
+   the person who sets it should look at their own numbers first.
+7. **RESTART** (§5.1), only if a live run shows the ladder answering
+   `winnable` on a ticket that then stays flat. **Not built**, and the
+   condition has not been met: no run has reached that state.
+8. **Plan-time prediction** (§9), once enough completed tickets exist across
+   more than one repository. **Not built.** `predictionMinSamples` is not in
+   the configuration either, because a key that names a feature nobody built
+   reads as configured behaviour and silently does nothing.
 
-Steps 2 through 5 are replays and reports. That is deliberate: this document was
-written from reasoning about the loop, and invariant 9 exists to distrust exactly
-that.
+Steps 2 through 5 were replays and reports. That was deliberate: this document
+was written from reasoning about the loop, and invariant 9 exists to distrust
+exactly that.
+
+**What is still owed, and knowingly.** §3.2's run-scoped learnings tier is not
+built: a split child inherits a snapshot of its parent's `learned` at creation,
+so it does not rediscover what the parent established, but siblings still
+cannot tell each other anything mid-run. §13's open question about that —
+shared tier or per-child snapshot — is therefore answered by the cheaper half
+and left open for the half that costs a new tier.
 
 ---
 

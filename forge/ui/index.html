@@ -246,6 +246,15 @@ function renderEvidence(e) {
   if (e.flat_cycles > 0) {
     lines.push(`flat cycles: ${e.flat_cycles}`);
   }
+  // The volume axis. `classes` above is the last cycle's set; this is how many
+  // kinds the ticket has produced in its whole life, and how much of that the
+  // newest cycle was the first to see. Nothing in the loop branches on either.
+  if (e.distinct_classes > 0) {
+    lines.push(`kinds of failure in total: ${e.distinct_classes}`);
+  }
+  if (e.new_classes && e.new_classes.length) {
+    lines.push(`new this cycle: ${e.new_classes.map(esc).join(", ")}`);
+  }
   if (e.learned && e.learned.length) {
     for (const entry of e.learned) {
       lines.push(`${esc(entry.text)} ×${entry.count}`);
