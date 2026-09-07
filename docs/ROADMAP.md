@@ -554,10 +554,60 @@ Found while reviewing the loop, judged not worth building yet.
   catch it without depending on the model noticing. Deferrable only while the
   terminating condition is a test result; an image ticket ends on an opinion, and
   the spec above treats stall detection as required rather than nice to have.
-- **Reviewer cost.** Review is ~100% of the money on a hybrid run and roughly
-  one call per ticket. Skipping review for tickets whose diff is trivial, or
-  batching several tickets into one review, would cut that — at the cost of the
-  thing that keeps a cheap executor honest. Needs evidence before it is worth
-  the risk. An image ticket makes it worse in the other direction — one vision
-  call per *attempt*, because every attempt produces something only a judge can
-  rule on.
+- **Reviewer cost — replayed, and the premise was wrong about which step.**
+  Review is the paid role on a hybrid run, and the two remedies this entry
+  named were skipping review for tickets whose diff is trivial and batching
+  several tickets into one review. It asked for evidence before either was
+  worth the risk. `scripts/review_cost.py` is that evidence, and it cost
+  nothing: every model call is recorded beside its step with its role, its
+  verdict and its exact usage, so a candidate rule can be priced against
+  reviews that already happened. Replayed 2026-09-07 over both evidence trees
+  — 27 reviews, 11 of them rejections.
+
+  **The money is not where the entry said.** `reviewer` is 18.9% of the 9.99M
+  recorded tokens, and it spends them on two steps rather than one: sign-off
+  takes 1,171,807 of them over 24 calls and the review step takes 721,683 over
+  27. Sign-off is the majority of the paid spend at two thirds the call count,
+  because its prompts are fatter — 48.8k a call against review's 26.7k. Both
+  are billed at the same rate for the same reason, that they are the same role.
+  So the lever this entry was written to justify building sits on the smaller
+  half, while the larger half is already a config knob: `loop.ratifyPasses`,
+  default 2, whose cost `docs/CONFIG.md` describes as a judgement rather than a
+  measurement.
+
+  **Skip-if-trivial buys nothing, and the replay says so without a threshold
+  argument.** A rule of the shape *skip review when `measure` < T* keeps every
+  rejection exactly while `T` is at or below the smallest value any rejection
+  took, so the script reports that ceiling rather than guessing a T. Over all
+  27 reviews the ceiling is the floor of the distribution on every measure:
+  rejections run down to 0 files written and 39 characters of executor output,
+  and the most any safe rule skips is 2 reviews and 1.4% of review spend.
+
+  The reason is the case the rule would skip first. Eight of the eleven
+  rejections are HD-001 attempts that wrote **no files at all** — the pre-tools
+  failure the *Context by retrieval* entry above is about. `Orchestrator`
+  reviews an empty diff on purpose: it cannot tell "already on disk" from
+  "never written", so it shows the reviewer the file state instead, after a
+  real verdict read *"No build.sh, build.ps1, README.md exist"* about a
+  repository where all three did.
+
+  **Dropping those does not rescue the rule.** On the 19 attempts that wrote
+  something, with 3 rejections left, the best safe rule is `files < 2`: 4
+  reviews skipped, 14.4% of review spend, no rejection silenced. That number is
+  not shippable and the script's own framing is why. The threshold was fitted
+  as the minimum over the same three rejections it is then scored against, so
+  it is safe by construction and says nothing about data it has not seen — and
+  it has no margin, because the nearest rejection sits at exactly 2 files while
+  four accepted reviews sit at 1. It is the *Adaptive ticket loop* entry's
+  finding in a second place: size does not separate the work that needs
+  judgement from the work that does not.
+
+  **What the replay leaves open.** Batching was not tested — nothing recorded
+  shows a reviewer holding several diffs at once, and the mechanical hazard is
+  visible without data, since approval is inferred from the absence of `REJECT`
+  and a batched verdict multiplies both the truncation risk the loop already
+  guards and the difficulty of attributing a rejection to a ticket. Every
+  recorded run used local models throughout, so `cost_usd` is 0 across both
+  trees and token share is the proxy for the bill. An image ticket still makes
+  this worse in the other direction — one vision call per *attempt*, because
+  every attempt produces something only a judge can rule on.
