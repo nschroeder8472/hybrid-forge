@@ -205,14 +205,14 @@ with every later attempt on that ticket.
 
 ---
 
-## Context by retrieval — built, no live run
+## Context by retrieval — built, run live twice
 
-**Status:** built, phases 1-5 —
-[CONTEXT-TOOLS.md](CONTEXT-TOOLS.md). Read-only tools (`grep`, `read_file`,
-`list_dir`, `outline`), a generated repository map, a stable cached prefix,
-reading granted rather than limited, and no silent truncation for a role that
-can read. The executor, tester and reviewer all go through
-`Orchestrator._converse`, which is a bounded conversation rather than one call.
+**Status:** built, phases 1-5, and run live twice on 2026-09-04 —
+[CONTEXT-TOOLS.md](CONTEXT-TOOLS.md), which now carries the result. Read-only
+tools (`grep`, `read_file`, `list_dir`, `outline`), a generated repository map,
+a stable cached prefix, reading granted rather than limited, and no silent
+truncation for a role that can read. The executor, tester and reviewer all go
+through `Orchestrator._converse`, a bounded conversation rather than one call.
 
 The problem it solves is the first run this loop ever made against
 hybrid-forge's own tree rather than against `examples/sample-project`. Run 1 of
@@ -228,12 +228,25 @@ so it pasted 156k characters nobody needed and omitted the file the spec named.
 The rule that would have saved that run is real, cheap, and would have been the
 third such rule; the next one is already waiting behind it.
 
-**What it has not done is convince a model.** Every number in that document is
-a measurement of the prompt — 47k tokens to 16k on the same ticket, 9k of the
-remainder cached across the run — and none of it is evidence about behaviour.
-The measurement that matters is HD-001 rerun with the tools on: if the executor
-reads `forge/state.py`, writes the patch and lands, the argument holds. If it
-reads twelve files and still writes nothing, the problem was never context.
+**It has now answered the question it posed, narrowly.** The measurement that
+mattered was HD-001 rerun with the tools on, and the tools shipped mid-run: the
+first nine attempts of run 1 are the pre-tools failure — 44 calls, 2.25M tokens,
+no files — and attempts 10-12 are the same ticket, spec, models and tree with
+one variable changed. The executor opened attempt 10 by reading
+`forge/ui/server.py`, `forge/routes.py` and four slices of `forge/state.py`,
+then wrote a diff. No hallucinated shell call appears anywhere after the tools
+became real, and every attempt from 10 on wrote files. Run 2, the same backlog
+re-ingested an hour later against a clean control, landed both tickets: 2
+attempts each, 80 calls, 3.94M tokens, `final-lint` and `final-test` green.
+
+What run 1 did *not* do is land — attempts 10-12 died on `E741` and then three
+cycles of `E501` in the tester's own file, which is the failure the convergence
+work is about rather than this one. So the claim this entry can now make is the
+smaller one: with the pile removed the executor reads the files the spec names
+and writes the patch, and what was left between it and a green ticket was line
+length in generated tests. The prompt-size numbers are still only prompt-size
+numbers, and one of them — the ~9k cached prefix — stays unmeasured, because
+both runs used local models through a provider that reports no cache counters.
 
 ---
 

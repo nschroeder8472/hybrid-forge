@@ -1,6 +1,8 @@
 # Context by retrieval, not by paste
 
-**Status:** phases 1-5 built, no live run yet. Written against run 1 of
+**Status:** phases 1-5 built and run live twice, on 2026-09-04. The falsifying
+measurement this document pre-registered came back in favour of the design; the
+section at the end is what it actually said. Written against run 1 of
 `HANDBACK-DASHBOARD.md`, 2026-09-04, which is the first time this loop was run
 against hybrid-forge's own tree rather than against `examples/sample-project`.
 
@@ -206,3 +208,47 @@ The measurement is HD-001, which failed nine times: reference files reduced to
 nothing, read tools on, one run. If the executor reads `forge/state.py`, writes
 the patch and lands, the argument holds. If it reads twelve files and still
 writes nothing, the problem was never context and this document is wrong.
+
+## What the live run answered
+
+The tools shipped mid-run, which is why there is a comparison here at all. Run
+1's first nine attempts are the ones described above: no tools, 44 calls, 2.25M
+tokens, no files written. The tools were built against that failure and the
+same run was retried at 13:55 the same day, so attempts 10-12 are as close to a
+controlled comparison as this loop is likely to produce — same ticket, same
+spec, same models, same tree, one variable changed.
+
+Attempt 10's executor opened with `read_file(forge/ui/server.py:1-329)`,
+`read_file(forge/routes.py:1-118)`, `grep(RETRYABLE|class Ticket|class Store in
+forge/state.py)` and four further slices of `state.py`: nine reads, then a
+diff. No hallucinated `<tool_call>` for a shell appears anywhere after the
+tools became real, and every attempt from 10 on wrote files.
+
+It did not land. Attempts 10-12 failed lint — `E741` in `server.py` once, then
+`E501` in the test file the tester had written, three cycles running, which is
+the flat-looking `E501` curve the convergence work is written around. The
+ticket ended `blocked`, its tree left in `.hybridforge/abandoned/run-1/HD-001`,
+having spent 42 calls and 2.20M tokens on the half of the run that had tools.
+
+Run 2 is the same backlog re-ingested against a clean control an hour later,
+and both tickets landed: HD-001 `done` in 2 attempts, HD-002 `done` in 2
+attempts, 80 calls, 3.94M tokens, 7,126 seconds of wall clock, `final-lint` and
+`final-test` green, no retry cycle on either ticket and `cycle_volume` 0 for
+both. The executor read 12, 11, 10, 7, 5 and 2 times across its attempts. The
+reviewer used the tools as well — six greps checking `reason_of`, `RETRYABLE`,
+`describe` and `REASONS` against the diff rather than taking the diff's word
+for them, which is the role this document did not argue for and which took to
+them anyway.
+
+So the criterion above is met, and the honest reading of it is narrower than
+"context was the problem". With the pile removed the executor reads the two
+files the spec names and writes the patch; what still stood between it and a
+green ticket was the line length of its own generated tests. That is a
+different failure and a cheaper one.
+
+One claim in this document remains unmeasured. The cached-prefix number — about
+9,000 of the 16,200 tokens identical across every ticket in a run — cannot be
+confirmed from either of these runs, because both ran on local models through a
+provider that reports no cache counters: every `cache_creation_tokens` and
+`cache_read_tokens` in `run.db` is zero. The prefix is stable by construction.
+Whether anything charges less for it is untested.
