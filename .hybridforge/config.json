@@ -46,8 +46,9 @@
     "maxRuntimeSeconds": 0
   },
   "ui": {
-    "host": "127.0.0.1",
+    "host": "0.0.0.0",
     "port": 8799,
-    "enabled": true
+    "enabled": true,
+    "allowRemoteWrites": true
   }
 }
