@@ -28,7 +28,7 @@ from pathlib import Path
 from . import routes
 from .patch import is_test_path, normalize_path
 from .providers import Message, Provider
-from .state import TICKET_FEATURE, Ticket
+from .state import TICKET_FEATURE, TICKET_SPLIT, Ticket
 
 # A ticket section: "## IM-014: Add PNG export" or "# IM-014 — Add PNG export".
 _TICKET_HEADER = re.compile(
@@ -280,8 +280,23 @@ def derive_needs(tickets: list[Ticket]) -> list[tuple[str, str, str]]:
     edges = {ticket.ticket_id: list(ticket.needs) for ticket in tickets}
     index = {ticket.ticket_id: ticket for ticket in tickets}
 
+    # A ticket that was split writes nothing further: its children hold the
+    # work and it holds the gate that closes when they finish. Leaving it in
+    # here derives the one edge that can never be satisfied — a child ordered
+    # after the parent that is waiting for the child — and it derives it every
+    # time, because a child writes its parent's files by construction.
+    #
+    # Observed live: `ST-001` split into two children, the first respec after
+    # the split ordered `ST-001-a` behind `ST-001`, both children parked as
+    # unreachable, and the parent's gate never closed.
+    gates = {
+        ticket.ticket_id for ticket in tickets if ticket.status == TICKET_SPLIT
+    }
+
     writers: dict[str, list[str]] = {}
     for ticket in by_position:
+        if ticket.ticket_id in gates:
+            continue
         for path in ticket.allowed_files:
             writers.setdefault(normalize_path(path), []).append(ticket.ticket_id)
 

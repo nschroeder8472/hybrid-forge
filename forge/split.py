@@ -188,6 +188,29 @@ def check(parent: Ticket, children: list[Child], *, max_children: int) -> None:
             f"child: {missing}"
         )
 
+    # Ordering among siblings only. A child that declares a need on anything
+    # else cannot be scheduled: the parent is a gate that closes when its
+    # children finish, so `needs: [parent]` is a cycle by construction, and a
+    # need on an unrelated ticket is a dependency the decomposition was never
+    # asked about.
+    #
+    # Observed live on the second split this mechanism ever made: the planner
+    # gave its first child `needs: ["ST-001"]`, its own parent. Both children
+    # skipped as unreachable, the parent never closed, and the run reported
+    # `done` over a deadlock.
+    ids = {child.ticket_id for child in children}
+    for child in children:
+        outside = sorted(set(child.needs) - ids)
+        if outside:
+            raise SplitRefused(
+                f"{child.ticket_id or 'a child'} declares a dependency on "
+                + ", ".join(outside)
+                + "; a child may only wait on one of its own siblings"
+            )
+        if child.ticket_id in child.needs:
+            raise SplitRefused(f"{child.ticket_id} declares a need on itself")
+    _refuse_cycles(children)
+
     seen: set[str] = set()
     for child in children:
         if not child.ticket_id:
@@ -207,6 +230,27 @@ def check(parent: Ticket, children: list[Child], *, max_children: int) -> None:
                 f"{child.ticket_id} claims files the parent may not write: "
                 + ", ".join(outside)
             )
+
+
+def _refuse_cycles(children: list[Child]) -> None:
+    """Refuse a sibling order that cannot be run in any sequence.
+
+    `ingest` validates the plan's own graph; nothing validated one a model
+    proposed mid-run, and a cycle among siblings parks every ticket in it as
+    unreachable while the parent waits for all of them.
+    """
+    pending = {child.ticket_id: set(child.needs) for child in children}
+    landed: set[str] = set()
+    while pending:
+        ready = [name for name, needs in pending.items() if needs <= landed]
+        if not ready:
+            raise SplitRefused(
+                "the proposed children depend on each other in a cycle: "
+                + ", ".join(sorted(pending))
+            )
+        for name in ready:
+            landed.add(name)
+            del pending[name]
 
 
 def splittable(parent: Ticket, *, max_depth: int) -> str:
@@ -258,9 +302,30 @@ def children_of(parent: Ticket, children: list[Child]) -> list[Ticket]:
     contract = parent.contract_criteria
     ordered: list[Ticket] = []
     for offset, child in enumerate(children):
-        covered = "\n".join(
-            f"- {contract[index - 1]}" for index in sorted(set(child.covers))
-        )
+        claimed = sorted(set(child.covers))
+        covered = "\n".join(f"- {contract[index - 1]}" for index in claimed)
+        # The child is judged against the parent's words, not against its own
+        # summary of them, and the first live split is why that is spelled out
+        # here. The planner claimed parent criterion 4 —
+        #
+        #   `count_words("Hello, world!")` returns `{"hello": 1, "world": 1}`,
+        #   so that `summarize(count_words("Hello, world!"))` returns
+        #   `2 word(s), 2 occurrence(s)`.
+        #
+        # — and wrote its own criterion as the second clause alone, dropping
+        # the half that could not hold without writing a file the ticket may
+        # not write. Both children passed, the parent's gate closed, and a
+        # backlog that exists to be unsatisfiable was reported done.
+        #
+        # Index coverage cannot catch that: `covers` is a claim, and a claim
+        # checked by counting is satisfied by any restatement of it. So a
+        # covered criterion comes across verbatim, and the planner's own
+        # criteria are kept after it — where they narrow the child's work
+        # without loosening the parent's contract.
+        inherited = [contract[index - 1] for index in claimed]
+        criteria = inherited + [
+            text for text in child.criteria if text not in inherited
+        ]
         ordered.append(
             Ticket(
                 ticket_id=child.ticket_id,
@@ -268,7 +333,7 @@ def children_of(parent: Ticket, children: list[Child]) -> list[Ticket]:
                 status=TICKET_PENDING,
                 position=parent.position * 100 + offset + 1,
                 spec=child.spec,
-                criteria=list(child.criteria),
+                criteria=list(criteria),
                 allowed_files=list(child.allowed_files),
                 reference_files=list(parent.reference_files),
                 needs=list(child.needs),
@@ -281,7 +346,10 @@ def children_of(parent: Ticket, children: list[Child]) -> list[Ticket]:
                 covers=sorted(set(child.covers)),
                 split_depth=parent.split_depth + 1,
                 original_spec=child.spec,
-                original_criteria=list(child.criteria),
+                # Frozen as the inherited list, so the criteria ratchet protects
+                # the parent's wording from a later respec exactly as it
+                # protects a plan's.
+                original_criteria=list(criteria),
                 original_context=(
                     f"{parent.context}\n\n"
                     f"This ticket is part of {parent.ticket_id}, which was split "

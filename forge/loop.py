@@ -2734,6 +2734,12 @@ class Orchestrator:
 
         counts = self.store.ticket_counts(run_id)
         blocked = counts.get(TICKET_BLOCKED, 0) + counts.get(TICKET_FAILED, 0)
+        # A parent still holding its gate is unfinished work, and it is the one
+        # unfinished state that carries no failure of its own: its children are
+        # what failed, and a child parked as unreachable is `skipped`, which
+        # nothing here counts. Observed live — a run reported `done` with two
+        # skipped children and a parent that never closed.
+        blocked += counts.get(TICKET_SPLIT, 0)
         if blocked:
             self.store.set_run_status(
                 run_id, RUN_BLOCKED, f"{blocked} ticket(s) need a human"
@@ -3450,6 +3456,15 @@ class Orchestrator:
         # position, taking a fresh attempt budget every cycle, while two others
         # were still landing work.
         by_ticket = {ticket.ticket_id: ticket for ticket in tickets}
+        # Whether this cycle decomposed anything. A split leaves the parent out
+        # of `eligible` — it is a gate now, not work — while putting its
+        # children on the backlog as pending tickets, so a cycle that splits
+        # the last eligible ticket ends with an empty eligible list and a
+        # backlog that just grew. The guard below reads an empty list as
+        # nothing to retry, which is right for every other way it can empty.
+        # Observed live: ST-001 split into two children and the run finished
+        # `blocked` with both of them pending and never worked.
+        decomposed = False
         stalled: list[str] = []
         # Rung one: ask the reviewer whether the ticket is winnable at all.
         escalate: list[str] = []
@@ -3466,6 +3481,7 @@ class Orchestrator:
             # ordinary pending tickets and the parent is a gate.
             if self._consider_split(run_id, ticket):
                 eligible.remove(ticket_id)
+                decomposed = True
                 continue
             # The ladder. One rung per flat cycle, cheapest first, and each
             # fires once rather than every cycle after it.
@@ -3537,6 +3553,26 @@ class Orchestrator:
                 data={"ticket": ticket_id, "classes": ticket.cycle_classes},
             )
             self._record_conventions(run_id, ticket)
+
+        if not eligible and decomposed:
+            # A split is the one way this list empties while the backlog gains
+            # work. The children are pending and eligible for the scheduler
+            # directly, so the cycle has produced something to do without
+            # requeueing anything: say so and let the run continue.
+            #
+            # The cycle is still counted. It cost a planner call and it is one
+            # of the `retryCycles` a person budgeted, and a cycle that produced
+            # work without spending one is a cycle the budget cannot see —
+            # which is how an unbounded run gets built out of bounded parts.
+            cycle = self._retries_spent(run_id) + 1
+            self.store.set_control(retries_key(run_id), str(cycle))
+            self.store.log(
+                run_id,
+                f"Retry cycle {cycle} decomposed a ticket rather than requeueing "
+                f"one; its children are on the backlog and the run continues.",
+                kind="lifecycle",
+            )
+            return True
 
         if not eligible:
             # Nothing here is the loop's to retry: either every ticket landed
