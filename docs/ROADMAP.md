@@ -530,6 +530,61 @@ spec does not survive contact.
 
 ---
 
+## Sign-off cost — replayed, and the knob is not free
+
+**Status:** measured 2026-09-07 by `scripts/ratify_cost.py`, nothing built. The
+*Reviewer cost* entry below found that sign-off rather than review holds most
+of the paid role's tokens, and pointed at `loop.ratifyPasses` as an existing
+knob rather than machinery anybody has to write. This is what turning it down
+would actually cost and buy.
+
+The counterfactual is computable rather than estimated, which is why this one
+needs no live run. A pass is every role voting; `ratify.resolve` decides the
+outcome from those votes alone; and a unanimous pass returns before any
+revision happens. So running the production `resolve` over the recorded pass-1
+votes *is* what `ratifyPasses: 1` would have decided for that ticket, and the
+recorded status is what it actually decided. 16 sign-off passes across both
+evidence trees, 8 of which reached a second vote — exactly the disputed half,
+because the second pass is never paid on a ticket everybody signed.
+
+**What it costs.** Sign-off is 55% of all 9.99M recorded tokens, the largest
+single line in either tree. Within it, pass 1 takes 3,163,600 tokens and the
+revision plus every later pass takes 2,114,032 — so 40.1% of sign-off, and
+roughly a fifth of everything, is what `ratifyPasses: 1` would not have spent.
+
+**What it buys, and the answer is not nothing.** Three of the eight second
+passes changed whether the ticket ships. Two are the same fixture in two runs:
+pass 1 returned `split`, which proceeds to build, and the second pass blocked a
+contract two of four roles had refused. One is a rescue in the other direction
+— `blocked` at pass 1, unanimous after the revision. Turning the knob to 1
+saves the 2.11M and builds that first contract twice while parking the ticket
+the revision saved, which is the trade the default was making all along. The
+difference is that it is now a number.
+
+**Where the waste is, is legible.** Pass-1 status predicts whether the second
+pass earns anything. Every outcome that moved started from `split` or
+`blocked`; all three tickets that reached pass 2 on a `majority` finished
+exactly where they started, at a cost of 730,005 tokens. A second pass made
+conditional on the pass-1 status — run it on `split` or `blocked`, skip it on
+`majority` — keeps all three outcome changes and returns a third of the extra
+spend. Unlike the diff-size threshold in the entry below, that rule has a
+mechanism behind it rather than a correlation: `majority` means more than half
+the roles have already signed, so a revision has fewer votes left to flip. It
+is still fitted on the same eight rows that score it, with three on the
+majority arm, and one counterexample would break it. What it is not is a
+threshold read off a distribution.
+
+**What the replay cannot see, and what would settle it.** `same` is not the
+same as wasted: four of the five unchanged outcomes still rewrote the ticket's
+`spec`, `context` or `criteria`, and a revised contract that ships anyway may
+build better. Measuring that means following those tickets into their attempts
+rather than reading the sign-off record, which is the obvious next replay and
+the one that would decide whether the conditional rule is worth building. The
+clearest waste needs no such argument: one ticket spent 265,747 tokens being
+revised from `blocked` to `blocked`.
+
+---
+
 ## Deferred from the review
 
 Found while reviewing the loop, judged not worth building yet.
@@ -573,7 +628,8 @@ Found while reviewing the loop, judged not worth building yet.
   So the lever this entry was written to justify building sits on the smaller
   half, while the larger half is already a config knob: `loop.ratifyPasses`,
   default 2, whose cost `docs/CONFIG.md` describes as a judgement rather than a
-  measurement.
+  measurement. That knob has since been replayed too — see *Sign-off cost*
+  above, which is where the remaining money in this entry went.
 
   **Skip-if-trivial buys nothing, and the replay says so without a threshold
   argument.** A rule of the shape *skip review when `measure` < T* keeps every
