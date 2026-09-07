@@ -189,7 +189,7 @@ td:last-child, th:last-child { text-align: right; }
     <h2>Token usage</h2>
     <div class="body">
       <table>
-        <thead><tr><th>Model</th><th>Calls</th><th>Tokens</th></tr></thead>
+        <thead><tr><th>Model</th><th>Calls</th><th>In</th><th>Out</th><th>Total</th></tr></thead>
         <tbody id="usage"></tbody>
       </table>
     </div>
@@ -475,8 +475,8 @@ async function refresh() {
   lastSteps = state.steps || [];
   $("steps").innerHTML = renderSteps(lastSteps);
   $("usage").innerHTML = (state.usage || [])
-    .map(u => `<tr><td>${esc(u.model)}</td><td>${u.calls}</td><td>${esc(u.display)}</td></tr>`)
-    .join("") || '<tr><td colspan="3" class="empty">No calls yet.</td></tr>';
+    .map(u => `<tr><td>${esc(u.model)}</td><td>${u.calls}</td><td>${esc(u.input_display)}</td><td>${esc(u.output_display)}</td><td>${esc(u.display)}</td></tr>`)
+    .join("") || '<tr><td colspan="5" class="empty">No calls yet.</td></tr>';
 }
 
 let lastEventId = 0;

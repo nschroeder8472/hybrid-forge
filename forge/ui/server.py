@@ -175,6 +175,18 @@ def snapshot(store: Store, config: Config) -> dict[str, Any]:
                 "cost_display": (
                     f"${row['cost_usd']:.2f}" if row["cost_usd"] else ""
                 ),
+                "input": (
+                    row["prompt_tokens"]
+                    + row["cache_creation_tokens"]
+                    + row["cache_read_tokens"]
+                ),
+                "output": row["completion_tokens"],
+                "input_display": format_tokens(
+                    row["prompt_tokens"]
+                    + row["cache_creation_tokens"]
+                    + row["cache_read_tokens"]
+                ),
+                "output_display": format_tokens(row["completion_tokens"]),
             }
             for row in store.usage_summary()
         ],
