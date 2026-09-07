@@ -88,6 +88,24 @@ trimmed: there is no reliable way to tell which of fourteen replaced which of
 ten, and keeping the ten a human wrote is the safe direction. `loop.respecCriteria`
 unlocks it.
 
+**It may narrow the scope, and not out of the ticket's own test file.** Respec
+has been held to that since run 1 of `HANDBACK-DASHBOARD.md`; this pass was
+not, and it does the same thing one step earlier, where the loss is quieter.
+
+TI-002 of [TICKET-INSPECTOR.md](shipped/TICKET-INSPECTOR.md) is what it looks
+like. The pass revised `allowed_files` down to `forge/ui/index.html` alone,
+before any code existed.
+`_test_target` reads that list to decide where the tester writes, found no test
+path in it, and declined to invent one — the ticket writes only `.html` and
+this project's test command collects `.py` — so nothing was ever asked to write
+tests at all. Thirteen criteria were settled by a reviewer reading the diff,
+and the ticket landed green on a suite that had never tested it.
+
+The rule is about the *count* rather than the path: a revision that swaps one
+test file for another leaves the ticket repairable and stands, and only one
+that leaves it with none is put back. Both revisers share
+`patch.keep_test_paths`, so the two cannot drift apart.
+
 **The spec has no equivalent ratchet, and this is a known gap.** The next run
 showed why it is hard rather than merely undone. On PF-009 a revision added one
 clause — the level texts "must be embedded as string literals" — that made the

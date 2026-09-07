@@ -7,6 +7,7 @@
     forge go --retries N           requeue what did not land, N more times
                                    (-1: until it is clean or you stop it)
     forge status                   one-shot summary
+    forge signoff                  what ratification caught, counted per role
     forge retry [--respec]         put failed tickets back on the backlog
     forge bug "<report>"           reproduce a bug, then fix it
     forge toolchain [--language X] what tests each language; set up what nothing does
@@ -40,7 +41,17 @@ import webbrowser
 from collections import Counter
 from pathlib import Path
 
-from . import evidence, llama, presets, replay, respec, routes, toolchain, wizard
+from . import (
+    evidence,
+    llama,
+    presets,
+    replay,
+    respec,
+    routes,
+    signoff,
+    toolchain,
+    wizard,
+)
 from .artifacts import ARTIFACTS_DIR, GITIGNORE_LINES
 from .config import (
     ANY_LANGUAGE,
@@ -984,9 +995,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"  tickets: {json.dumps(state['counts'])}\n")
 
     for ticket in state["tickets"]:
-        marker = {"done": "+", "blocked": "!", "failed": "!", "running": ">"}.get(
-            ticket["status"], "-"
-        )
+        marker = {
+            "done": "+",
+            "blocked": "!",
+            "failed": "!",
+            "running": ">",
+            # A gate rather than work: its children carry the criteria, and it
+            # completes when they do.
+            "split": "/",
+        }.get(ticket["status"], "-")
         print(f"  {marker} {ticket['id']:<10} {ticket['status']:<9} {ticket['title']}")
         if ticket["note"]:
             print(f"      {ticket['note']}")
@@ -2243,6 +2260,31 @@ def _print_pending(
     return 0
 
 
+def cmd_signoff(args: argparse.Namespace) -> int:
+    """What the sign-off pass has been doing, counted rather than read.
+
+    `ratifyPasses: 2` is a judgement about the cost of the failure it prevents
+    and not a measurement of the fix, and one run has been read by hand to try
+    to settle that — 3 of 5 tickets changed by the pass before any code
+    existed, and one role that had signed off on nothing across 16 passes.
+    Reading a run by hand is what this replaces.
+
+    Report only. Nothing here writes, and no behaviour anywhere changes on
+    what it prints. See docs/ADAPTIVE-TICKET-LOOP.md §8.2 and §8.3.
+    """
+    config = _load(args.root)
+    store = _store(config)
+    run = store.get_run(args.run) if args.run else store.latest_run()
+    if run is None:
+        sys.exit("error: no runs yet. Ingest a spec first:\n  forge ingest plan.md")
+    result = signoff.report(
+        store, int(run["id"]), window=config.loop.participation_window
+    )
+    print(f"run {int(run['id'])}")
+    print(signoff.render(result))
+    return 0
+
+
 def cmd_control(args: argparse.Namespace) -> int:
     config = _load(args.root)
     store = _store(config)
@@ -2378,6 +2420,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("status", help="one-shot summary of the current run")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser(
+        "signoff", help="what the ratification pass has caught, counted per role"
+    )
+    p.add_argument("--run", type=int, default=0, help="a run id; default is the latest")
+    p.set_defaults(func=cmd_signoff)
 
     p = sub.add_parser(
         "replay",

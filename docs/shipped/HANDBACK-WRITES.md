@@ -1,10 +1,10 @@
 # Handback stage 7: the write endpoints, behind the localhost rule
 
-`docs/HANDBACK.md` §7 orders the handback work in seven stages. One through six
-have shipped: `forge advise`, `forge criteria --add`, `forge release`,
-`forge discharge`, `withheld:<reason>` as a route distinct from `skipped`, and
-the dashboard's read side — the evidence block under a parked ticket, added by
-`HANDBACK-DASHBOARD.md`.
+[HANDBACK.md](../HANDBACK.md) §7 orders the handback work in seven stages. One
+through six have shipped: `forge advise`, `forge criteria --add`,
+`forge release`, `forge discharge`, `withheld:<reason>` as a route distinct
+from `skipped`, and the dashboard's read side — the evidence block under a
+parked ticket, added by `HANDBACK-DASHBOARD.md`.
 
 Stage 7 is the last one. A person reading a parked ticket on the dashboard can
 now see everything the ladder saw — the withheld reason, the repeated failure

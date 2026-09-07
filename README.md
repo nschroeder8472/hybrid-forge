@@ -268,10 +268,16 @@ asked again — the run parks the ticket and says what was ambiguous.
 ## Monitoring
 
 `forge go` serves a dashboard on `127.0.0.1:8799`: backlog with per-ticket
-status, live event stream, recent steps, per-model token usage, and
-pause/resume/stop. It reads the same SQLite the loop writes, so a crashed
-dashboard cannot take a run with it and a restarted one reattaches with no
-handshake.
+status, live event stream, recent steps, per-model token usage split into
+input and output, and pause/resume/stop. It reads the same SQLite the loop
+writes, so a crashed dashboard cannot take a run with it and a restarted one
+reattaches with no handshake.
+
+Clicking a parked ticket opens it in front of the page: what it was asked to
+build, the criteria it is judged against, and the whole text of every step that
+failed — rather than the 60-character failure *class* the row shows, which is
+an identity for counting. The note and the criterion a person can write back
+are at the bottom of that panel, as equals.
 
 It has no authentication and its stop button ends a run, so it binds to
 loopback and warns on startup if you point `ui.host` anywhere else. Tunnel in
@@ -288,6 +294,7 @@ forge go [--plan f] [--open]# run until done or stopped
 forge go --retries N        # requeue and respec what did not land, N more
                             # times; -1 = until clean or stopped
 forge status                # one-shot summary
+forge signoff               # what ratification caught, counted per role
 forge retry [--respec]      # requeue failed tickets, optionally re-specced
 forge bug "<report>"        # reproduce a bug, then fix it
 forge toolchain             # what tests each language; set up what nothing does
@@ -378,6 +385,12 @@ never from raw output. Each was learned by breaking it.
 [docs/ROADMAP.md](docs/ROADMAP.md) holds what is not built yet and why — the
 bug-report loop first among it.
 
+[docs/shipped/](docs/shipped/) keeps the backlogs that have landed, unedited,
+each with the run that built it. A spec beside the commit that implemented it
+is the only place you can see which criteria survived contact with a model and
+which the sign-off pass rewrote before any code existed. A spec still being
+worked on lives in the repository root, where `forge ingest <file>` finds it.
+
 ## Layout
 
 ```
@@ -403,6 +416,7 @@ forge/profile.py          machine-level endpoints, reused by the next repo
 forge/ui/                 dashboard
 plugins/forge-setup/      Claude Code plugin: machine + repository setup
 plugins/forge-spec/       Claude Code plugin: spec authoring, triage, memory
+docs/shipped/             backlogs that landed, kept as the record
 examples/sample-project/  the fixture a loop change is run against
 scripts/sample_workspace.py  copies that fixture somewhere a run may write
 tests/                    python -m unittest discover tests

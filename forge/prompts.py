@@ -2284,6 +2284,240 @@ context above already covers it, answer {NOTHING_SENTINEL}."""
     return messages
 
 
+SPLIT_PLANNER_SYSTEM = """You break one ticket that cannot be finished into
+children that can.
+
+You are not rewriting the ticket. Its acceptance criteria are a contract
+somebody signed, and your decomposition has to carry all of them: every
+numbered criterion you are shown must be claimed by at least one child, and a
+proposal that leaves one out is rejected without being read. You may not add
+criteria to the parent's contract, and you may not soften one — a child that
+covers criterion 3 is promising the whole of criterion 3.
+
+What you are given is evidence about *where* the work comes apart: the kinds
+of failure this ticket has produced, with counts, and each one names a file.
+That histogram is the seam. A decomposition along the files that keep failing
+is supported by what happened; a decomposition into "the model layer" and "the
+view layer" against a histogram that names one file is a story about the code
+rather than a reading of the evidence.
+
+Rules:
+
+- Every child leaves the tree green. Build, typecheck and tests pass when it
+  lands, because the next child starts from what it left behind. Work that
+  cannot be made to pass on its own is a seam in the wrong place.
+- Every child gets at least one acceptance criterion of its own and writes at
+  least one file. Below that the cost of loading context and reviewing a diff
+  exceeds anything the split buys.
+- A child may only write files the parent was allowed to write.
+- Order them. If child B needs what child A wrote, say so in `needs`.
+- Two children minimum. One child is the ticket again under a new name.
+
+Reply with one JSON object and nothing else:
+
+{
+  "children": [
+    {
+      "id": "<parent id>-a",
+      "title": "<what this child does>",
+      "spec": "<the whole instruction for this child, standing alone>",
+      "criteria": ["<acceptance criterion>", "..."],
+      "covers": [1, 2],
+      "allowed_files": ["path/one.py"],
+      "needs": []
+    }
+  ]
+}
+
+`covers` holds the numbers of the parent criteria this child is responsible
+for, as they are numbered in the prompt. `spec` is read by an executor that
+cannot see the parent's, so it stands on its own."""
+
+
+def split_prompt(
+    ticket: Ticket,
+    classes: Sequence[dict],
+    *,
+    max_children: int,
+    toolchain: dict[str, str] | None = None,
+    repository_map: str = "",
+    can_read: bool = False,
+) -> list[Message]:
+    """Ask the planner to decompose a ticket that will not land.
+
+    §6.3 of docs/ADAPTIVE-TICKET-LOOP.md. The planner proposes because the
+    planner is the role that wrote the contract, and it is shown three things:
+    the parent's contract criteria numbered, what its attempts established, and
+    the class histogram from `Store.ticket_classes`.
+
+    The histogram is the load-bearing part. A class carries a file, so it
+    offers a file-shaped seam and no other — and a proposal that comes back
+    feature-shaped against a file-shaped histogram is proposing something the
+    evidence does not support. Nothing here can enforce that; what is enforced
+    mechanically is the invariant, in `split.check`.
+
+    The criteria are numbered in this prompt and claimed by number in the
+    reply, because the invariant is a set comparison over indices. Asking for
+    the criterion's text back invites a paraphrase, and a paraphrase is exactly
+    the softening the whole mechanism exists to prevent.
+    """
+    messages = [Message(role="system", content=SPLIT_PLANNER_SYSTEM)]
+    messages.extend(stable_prefix(repository_map, toolchain, can_read=can_read))
+
+    contract = ticket.contract_criteria
+    numbered = "\n".join(
+        f"{index}. {text}" for index, text in enumerate(contract, start=1)
+    )
+    histogram = "\n".join(
+        f"- {entry['name']} ({entry['count']}×)" for entry in classes[:20]
+    )
+    messages.append(
+        Message(
+            role="user",
+            content=f"""Ticket: {ticket.ticket_id} — {ticket.title}
+
+This ticket has been through {ticket.attempts} attempt(s) and has not landed.
+
+## What it was asked to build
+{ticket.spec}
+
+## Its contract, numbered
+{numbered or "(none)"}
+
+## The files it may write
+{chr(10).join(f"- {path}" for path in ticket.allowed_files) or "(none)"}
+
+## The kinds of failure it has produced
+{histogram or "(none recorded)"}
+
+## What its attempts established
+{_learned_block(ticket) or "(nothing was recorded)"}
+
+Break this into at most {max_children} children. Every numbered criterion above
+must be claimed by at least one child.""",
+        )
+    )
+    return messages
+
+
+CRITERIA_AUDITOR_SYSTEM = """You check a finished ticket against the criteria it
+was originally given, not the ones it ended up being judged against.
+
+A ticket's acceptance criteria can be revised while it is being worked on. The
+revision is bounded — a criterion the plan wrote cannot be removed — but the
+wording can move, and wording is where a criterion quietly gets easier. The
+ticket has already passed its tests and its review against the current list.
+Your question is different and narrower: does the work that was accepted also
+satisfy the list the ticket started with?
+
+You are auditing, not reviewing. Nothing you say changes the ticket's status,
+reopens it, or asks anyone to write code. What you produce is a note for a
+person deciding whether the revision machinery is behaving.
+
+Answer only about the criteria in front of you:
+
+- A criterion whose meaning survived the rewrite is covered, however different
+  the words are.
+- A criterion whose *threshold*, *value* or *scope* changed is not covered.
+  "Handles the common case" does not cover "handles every case"; `>= 100` does
+  not cover `> 100`; "in the dashboard" does not cover "in the dashboard and
+  the CLI".
+- A criterion the current list simply dropped is not covered.
+
+Reply with exactly one of these two forms.
+
+COVERED
+  (on its own line, when every original criterion is still met)
+
+or
+
+SCOPE-REDUCED
+- <the original criterion, quoted>: <what the accepted work does instead>
+
+One bullet per uncovered criterion, quoting the original. No preamble, no
+recommendations, and no verdict on the code itself."""
+
+
+def criteria_audit_prompt(
+    ticket: Ticket,
+    *,
+    toolchain: dict[str, str] | None = None,
+    repository_map: str = "",
+    can_read: bool = False,
+) -> list[Message]:
+    """Ask whether a passed ticket still meets the criteria it was given.
+
+    §8.1 of docs/ADAPTIVE-TICKET-LOOP.md. `original_criteria` is frozen at
+    ticket creation and `contract_criteria` is what a revision may not walk
+    back, so the *forward* half of criteria drift is built: nothing can remove
+    a criterion the plan wrote. The backward half is not. Completion is
+    verified against the current list, and a ticket that passes its respecced
+    criteria while failing its original ones is recorded as a pass.
+
+    That has not bitten because `loop.respecCriteria` defaults `false` and the
+    two lists rarely diverge. This is what makes that default a *default*
+    rather than a load-bearing safety: with the check in place, turning respec
+    loose on criteria is a decision with a number behind it.
+
+    A model judgement rather than a test check, because criteria are prose and
+    the suite encodes the current ones — a suite written from the revised
+    wording cannot detect that the wording moved. The verdict is a report and
+    never a status change: a check that can retroactively fail a merged ticket
+    is a brake with no measured threshold, which is the mistake §4.1 names.
+    """
+    messages = [Message(role="system", content=CRITERIA_AUDITOR_SYSTEM)]
+    # The auditor is the one role asked to judge prose against prose, so the
+    # files matter more here than the diff does: what it needs to answer is
+    # whether the delivered behaviour meets the older wording.
+    messages.extend(stable_prefix(repository_map, toolchain, can_read=can_read))
+
+    original = "\n".join(f"- {text}" for text in ticket.original_criteria)
+    current = "\n".join(f"- {text}" for text in ticket.criteria)
+    messages.append(
+        Message(
+            role="user",
+            content=f"""Ticket: {ticket.ticket_id} — {ticket.title}
+
+This ticket has passed. Its tests are green and a reviewer accepted the diff,
+both against the criteria it was judged on.
+
+## The criteria it was originally given
+{original or "(none)"}
+
+## The criteria it was judged against
+{current or "(none)"}
+
+## What it was asked to build
+{ticket.spec}
+
+## The files it was allowed to write
+{chr(10).join(f"- {path}" for path in ticket.allowed_files) or "(none)"}
+
+Is every original criterion still met by what was accepted?""",
+        )
+    )
+    return messages
+
+
+def parse_criteria_audit(text: str) -> tuple[bool, str]:
+    """Read a scope audit as (covered, note).
+
+    Fail-*open*, which is the opposite of `parse_verdict` and deliberate. This
+    check cannot change a ticket's status, so an unreadable reply must not
+    manufacture a scope-reduction report about a ticket nobody has evidence
+    against — the cost of a false alarm here is a person re-reading a merged
+    ticket for nothing, and the cost of a missed one is a line in a log.
+    """
+    for raw in text.splitlines():
+        line = raw.strip().strip("*#`_ \t.:—-").upper()
+        if not line:
+            continue
+        if line.startswith("SCOPE-REDUCED") or line.startswith("SCOPE REDUCED"):
+            return False, text.strip()
+        return True, ""
+    return True, ""
+
+
 def convention_prompt(ticket: Ticket, retrieved: str = "") -> list[Message]:
     """Ask what a *failed* ticket established about the project, if anything.
 

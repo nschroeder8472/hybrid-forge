@@ -205,14 +205,14 @@ with every later attempt on that ticket.
 
 ---
 
-## Context by retrieval — built, no live run
+## Context by retrieval — built, run live twice
 
-**Status:** built, phases 1-5 —
-[CONTEXT-TOOLS.md](CONTEXT-TOOLS.md). Read-only tools (`grep`, `read_file`,
-`list_dir`, `outline`), a generated repository map, a stable cached prefix,
-reading granted rather than limited, and no silent truncation for a role that
-can read. The executor, tester and reviewer all go through
-`Orchestrator._converse`, which is a bounded conversation rather than one call.
+**Status:** built, phases 1-5, and run live twice on 2026-09-04 —
+[CONTEXT-TOOLS.md](CONTEXT-TOOLS.md), which now carries the result. Read-only
+tools (`grep`, `read_file`, `list_dir`, `outline`), a generated repository map,
+a stable cached prefix, reading granted rather than limited, and no silent
+truncation for a role that can read. The executor, tester and reviewer all go
+through `Orchestrator._converse`, a bounded conversation rather than one call.
 
 The problem it solves is the first run this loop ever made against
 hybrid-forge's own tree rather than against `examples/sample-project`. Run 1 of
@@ -228,21 +228,35 @@ so it pasted 156k characters nobody needed and omitted the file the spec named.
 The rule that would have saved that run is real, cheap, and would have been the
 third such rule; the next one is already waiting behind it.
 
-**What it has not done is convince a model.** Every number in that document is
-a measurement of the prompt — 47k tokens to 16k on the same ticket, 9k of the
-remainder cached across the run — and none of it is evidence about behaviour.
-The measurement that matters is HD-001 rerun with the tools on: if the executor
-reads `forge/state.py`, writes the patch and lands, the argument holds. If it
-reads twelve files and still writes nothing, the problem was never context.
+**It has now answered the question it posed, narrowly.** The measurement that
+mattered was HD-001 rerun with the tools on, and the tools shipped mid-run: the
+first nine attempts of run 1 are the pre-tools failure — 44 calls, 2.25M tokens,
+no files — and attempts 10-12 are the same ticket, spec, models and tree with
+one variable changed. The executor opened attempt 10 by reading
+`forge/ui/server.py`, `forge/routes.py` and four slices of `forge/state.py`,
+then wrote a diff. No hallucinated shell call appears anywhere after the tools
+became real, and every attempt from 10 on wrote files. Run 2, the same backlog
+re-ingested an hour later against a clean control, landed both tickets: 2
+attempts each, 80 calls, 3.94M tokens, `final-lint` and `final-test` green.
+
+What run 1 did *not* do is land — attempts 10-12 died on `E741` and then three
+cycles of `E501` in the tester's own file, which is the failure the convergence
+work is about rather than this one. So the claim this entry can now make is the
+smaller one: with the pile removed the executor reads the files the spec names
+and writes the patch, and what was left between it and a green ticket was line
+length in generated tests. The prompt-size numbers are still only prompt-size
+numbers, and one of them — the ~9k cached prefix — stays unmeasured, because
+both runs used local models through a provider that reports no cache counters.
 
 ---
 
-## Adaptive ticket loop — specified, not built
+## Adaptive ticket loop — built, armed once, trigger off
 
-**Status:** specified in [ADAPTIVE-TICKET-LOOP.md](ADAPTIVE-TICKET-LOOP.md).
-Written before the convergence work landed and revised against it, so about
-half of the original draft is now a description of shipped behaviour rather
-than a proposal.
+**Status:** built 2026-09-06 —
+[ADAPTIVE-TICKET-LOOP.md](ADAPTIVE-TICKET-LOOP.md) §12 records what each step
+turned into. The volume counters, the criteria audit, the ratification report
+and ticket splitting all landed; `loop.volumeThreshold` ships `0`, so nothing
+is decomposed until somebody sets it.
 
 The problem it names is the half of churn the convergence work does not
 measure. `_convergence` compares this cycle's failure classes against the last
@@ -277,9 +291,67 @@ argument, each worth reading before picking the document up:
   ratchet refuses additions, because the party that has just exhausted its
   attempts does not get to raise the bar it is judged against.
 
-**What it asks for first is a live run**, not code. Building split on top of
-nine unvalidated features makes a second layer with no way to attribute a
-failure to either.
+**What it asked for first was a live run**, not code, and that run happened
+before any of this was written — two of them, on 2026-09-04, recorded in
+[CONTEXT-TOOLS.md](CONTEXT-TOOLS.md). Neither stalled, so the ladder was still
+never asked a question; what they establish is that the machinery underneath
+does not misfire on a run that is going well.
+
+**What landed, in the order §12 asked for it.** The objection splitter was
+replayed before it was trusted, over every recorded review in this repository
+and both evidence trees: 24 rejections carrying 61 objections, 23 of them
+carrying more than one. So the volume axis counts review points as well as
+tool classes, and `distinct_classes` and `new_classes` are recorded per cycle,
+logged beside the convergence line and shown on the dashboard — read by
+nothing. Completion is audited against the frozen criteria on any ticket whose
+criteria moved, and reports `scope-reduced` without touching the status.
+`forge signoff` counts what each role does in a sign-off pass and how much of
+what failed afterwards named a file the roles already had. And splitting is
+built to its invariant: the union of the children's covered criteria must be
+the whole of the parent's contract, checked mechanically before a child
+exists, with the parent becoming a gate that completes when its children do.
+
+**The trigger ships off, and that is the finding this entry keeps.** No value
+of `volumeThreshold` on the only data available separates a ticket worth
+decomposing from one about to land — at the drafted 8, the tickets with 10 and
+32 classes both passed and the one with 7 was the unsatisfiable one. The
+counters are now visible enough that the person who arms it can do so against
+their own numbers.
+
+**It has now been armed, and that is where the value came from.** Five live
+splits at `volumeThreshold: 2` against the fixture written to be unsatisfiable,
+2026-09-07, and every one of them found a defect —
+[ADAPTIVE-TICKET-LOOP.md](ADAPTIVE-TICKET-LOOP.md) §6.6 has all four. None was
+in `split.py`. Each lived at a seam between the new mechanism and machinery
+that predates it: the retry cycle's eligibility guard, the criteria ratchet's
+notion of coverage, the scheduler's shared-file ordering rule, the finish
+tally. Unit tests calling `_consider_split` directly could not reach any of
+them, because each was in what a *caller* did with a correct return value.
+
+The expensive one is worth stating plainly. `covers` was honoured as an index
+and abandoned as an obligation: the planner claimed a parent criterion, restated
+it as the half that could be satisfied, and the invariant approved it by
+counting. Both children passed, the gate closed, and the backlog that exists to
+be unsatisfiable was reported **done** — a green ticket over a criterion nobody
+met, produced by the mechanism written to prevent exactly that. A covered
+criterion now crosses to the child verbatim.
+
+The fifth run is the one the fixture was written to produce, and it is better
+than what the loop did before splitting existed: three of four criteria landed
+on a child that passed, and the ticket parked naming the single obligation that
+could not be met.
+
+**What none of it says is where the threshold belongs.** A class is
+`(step, code, file)`, so the count tracks how many files a project has as much
+as how big a ticket is — 32 and 38 on the reference run's large two-language
+tree, never more than 2 across fourteen runs of a four-file fixture. The number
+is not comparable between repositories, which is a stronger reason to ship at
+`0` than the original one.
+
+Two things are deliberately not built. RESTART waits on a live run showing the
+ladder answering `winnable` on a ticket that then stays flat, which has not
+happened. Plan-time prediction waits on completed tickets across more than one
+repository, and its config key is absent rather than present-and-ignored.
 
 ---
 

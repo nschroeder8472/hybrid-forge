@@ -112,7 +112,11 @@
     "reviewWhenStuck": 2,
     "freezeTests": true,
     "ratifyPasses": 2,
-    "ratifyOrder": ["planner", "executor", "tester", "reviewer"]
+    "ratifyOrder": ["planner", "executor", "tester", "reviewer"],
+    "participationWindow": 20,
+    "volumeThreshold": 0,
+    "maxChildren": 8,
+    "maxSplitDepth": 2
   },
   "ui": {
     "host": "127.0.0.1",
