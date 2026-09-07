@@ -26,7 +26,7 @@ from .patch import (
     _flatten,
     _states,
     is_safe_path,
-    is_test_path,
+    keep_test_paths,
     normalize_path,
     pinned_values,
 )
@@ -1062,19 +1062,12 @@ def revise(
     # only one that leaves it with none is refused, because that is the state
     # `_test_target` answers by inventing a path outside the scope.
     if "allowed_files" in revision:
-        owned_tests = {
-            normalize_path(path)
-            for path in ticket.allowed_files
-            if is_test_path(path)
-        }
-        proposed_tests = {
-            normalize_path(path)
-            for path in revision["allowed_files"]
-            if is_test_path(path)
-        }
-        dropped = sorted(owned_tests) if owned_tests and not proposed_tests else []
+        # Shared with `ratify`, which does the same thing one step earlier —
+        # see `patch.keep_test_paths` for what each of them cost.
+        revision["allowed_files"], dropped = keep_test_paths(
+            ticket.allowed_files, revision["allowed_files"]
+        )
         if dropped:
-            revision["allowed_files"] = list(revision["allowed_files"]) + dropped
             store.log(
                 run_id,
                 f"{ticket.ticket_id}: respec proposed dropping "

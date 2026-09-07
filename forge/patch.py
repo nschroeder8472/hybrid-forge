@@ -1053,3 +1053,36 @@ def is_test_path(path: str) -> bool:
         return True
     stem = Path(parts[-1]).stem
     return bool(SNAKE_TEST.search(stem) or CAMEL_TEST.search(stem))
+
+
+def keep_test_paths(current: list[str], proposed: list[str]) -> tuple[list[str], list[str]]:
+    """Put back a ticket's test files when a proposed scope leaves it none.
+
+    Returns `(scope, kept)`, where `kept` is what had to be restored.
+
+    A revision may narrow a ticket's writable scope — a pass that sees the
+    ticket no longer writes a module should stop claiming it. It may not leave
+    the ticket with nowhere to write tests, because `_test_target` reads that
+    path to decide where the tester writes: with none declared it invents
+    `tests/<id>_test.py`, outside the ticket's own scope, where the executor
+    cannot repair a line of what the tester put there.
+
+    A rule about the *count*, not about the path. A revision that swaps one
+    test file for another leaves the ticket repairable and stands; only one
+    that leaves it with none is refused.
+
+    Two runs paid for this, at the two different moments a model rewrites a
+    scope. Run 1 of `HANDBACK-DASHBOARD.md`: a respec returned an
+    `allowed_files` without the declared `tests/test_handback_ui.py`, and the
+    rerun put three E501s in the invented file, hitting the identical three
+    lines on three attempts with the implementation finished and lint-clean
+    throughout. Run 7 of `TICKET-INSPECTOR.md`: the *sign-off* pass did the
+    same thing before any code existed, TI-002 was never asked for tests at
+    all, and its thirteen criteria were settled by a reviewer reading the diff.
+    The first was fixed where it happened; this is the answer both callers
+    share, so a third caller cannot rediscover it.
+    """
+    owned = {normalize_path(path) for path in current if is_test_path(path)}
+    offered = {normalize_path(path) for path in proposed if is_test_path(path)}
+    kept = sorted(owned) if owned and not offered else []
+    return list(proposed) + kept, kept

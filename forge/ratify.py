@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
-from .patch import is_safe_path, normalize_path
+from .patch import is_safe_path, keep_test_paths, normalize_path
 from .prompts import (
     Message,
     parse_ratify,
@@ -450,6 +450,34 @@ def _apply(
             revision[key] = safe
         else:
             revision.pop(key)
+
+    # A revision may narrow the scope and may not leave the ticket with nowhere
+    # to write tests. The same rule respec is held to, through the same
+    # function, because the two do the same thing at different moments and a
+    # rule spelled twice is a rule that will disagree with itself.
+    #
+    # It bites harder here. Respec revises a ticket that has already run, so a
+    # dropped test path costs the repair of tests that exist; this pass runs
+    # before any code, so the tester is never asked for anything at all and the
+    # ticket's criteria are settled by whoever reads the diff. TI-002 of
+    # `TICKET-INSPECTOR.md` landed exactly that way: thirteen criteria, no
+    # assertion of its own anywhere, green on a suite that never tested it.
+    if "allowed_files" in revision:
+        revision["allowed_files"], kept = keep_test_paths(
+            ticket.allowed_files, revision["allowed_files"]
+        )
+        if kept:
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: ratify proposed dropping "
+                f"{', '.join(kept)} from the writable scope. That is the "
+                f"ticket's own test file — the tester writes there, and with "
+                f"none declared nothing is asked to write tests at all — so it "
+                f"was kept. The rest of the revision stands.",
+                level="warn",
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "kept": kept},
+            )
 
     if "criteria" in revision:
         # Refused whole, like a spec revision that drops a settled decision.
