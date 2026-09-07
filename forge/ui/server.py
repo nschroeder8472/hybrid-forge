@@ -22,6 +22,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib import parse
 
 from ..config import Config
 from ..loop import (
@@ -97,6 +98,43 @@ def evidence(ticket: Ticket) -> dict[str, Any] | None:
         "distinct_classes": ticket.distinct_classes,
         "new_classes": list(ticket.new_classes[:5]),
     }
+
+
+def ticket_detail(store: Store, config: Config, ticket_id: str) -> dict[str, Any] | None:
+    """One ticket's whole story, for the run `snapshot()` is showing.
+
+    The run is found the way `snapshot` finds it — the live one while it is
+    non-terminal, otherwise the newest — so the page and the detail behind it
+    can never disagree about which run they are reading. `None` when there is
+    no run at all, or the run holds no ticket with that id.
+
+    `failures` is one entry per failed step `Store.failed_steps` returns,
+    oldest first, each detail cut to 4,000 characters: the same cap the page's
+    step list already applies, so a ticket that failed a long test run does
+    not ship its whole output to a browser.
+    """
+    run = _live_run(store) or store.latest_run()
+    if run is None:
+        return None
+    run_id = int(run["id"])
+    for ticket in store.list_tickets(run_id):
+        if ticket.ticket_id != ticket_id:
+            continue
+        return {
+            "id": ticket.ticket_id,
+            "title": ticket.title,
+            "status": ticket.status,
+            "route": describe(ticket.route),
+            "spec": ticket.spec,
+            "criteria": list(ticket.criteria),
+            "files": list(ticket.allowed_files),
+            "note": ticket.blocked_note,
+            "failures": [
+                {"step": name, "detail": detail[:4000]}
+                for name, detail in store.failed_steps(run_id, ticket_id)
+            ],
+        }
+    return None
 
 
 def snapshot(store: Store, config: Config) -> dict[str, Any]:
@@ -245,6 +283,15 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/state":
             self._send_json(snapshot(self.store, self.config))
+            return
+
+        if path.startswith("/api/ticket/"):
+            ticket_id = parse.unquote(path[len("/api/ticket/"):])
+            detail = ticket_detail(self.store, self.config, ticket_id)
+            if detail is None:
+                self._send_json({"error": "no such ticket"}, code=404)
+            else:
+                self._send_json(detail)
             return
 
         if path == "/api/events":
