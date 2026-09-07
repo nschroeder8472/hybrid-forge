@@ -1,13 +1,14 @@
 # Adaptive Ticket Loop — Specification
 
-**Status:** built 2026-09-06, with its trigger off. Steps 1 through 6 of §12
-have landed: the live run the order was waiting on, the objection-splitter
-replay, the volume counters, completion against the frozen criteria, the
-ratification counters, and SPLIT itself behind `loop.volumeThreshold`, which
-ships `0`. Steps 7 (RESTART) and 8 (plan-time prediction) are deliberately not
-built and the section on each says why. What every section below now describes
-is either shipped code or a decision not to write it; the "owed" notes are kept
-where the thing is still owed.
+**Status:** built 2026-09-06 with its trigger off, and exercised live on
+2026-09-07 by arming it against a fixture — §6.6 is what those runs found.
+Steps 1 through 6 of §12 have landed: the live run the order was waiting on,
+the objection-splitter replay, the volume counters, completion against the
+frozen criteria, the ratification counters, and SPLIT itself behind
+`loop.volumeThreshold`, which ships `0`. Steps 7 (RESTART) and 8 (plan-time
+prediction) are deliberately not built and the section on each says why. What
+every section below describes is either shipped code or a decision not to
+write it; the "owed" notes are kept where the thing is still owed.
 
 Revised 2026-08-28 against `main` at `91cb82e`. The original draft was written
 before the convergence work landed. Roughly half of what it specified already
@@ -234,6 +235,15 @@ Two caveats on the table, both of which the replay in §12 must settle:
   points, the volume axis should be recomputed over those, which is what the
   draft meant by "objections" in the first place.
 
+**A third caveat, from arming it.** A class is `(step, code, file)`, so the
+count tracks how many *files* a project has as much as how big a ticket is.
+`Puzzle-Path`'s 32 and 38 came from a large two-language tree; the largest any
+ticket in `examples/sample-project` has produced across fourteen runs is 2, and
+that ticket was the deliberately unsatisfiable one. A threshold fit on either
+number describes the other badly, which means `volumeThreshold` is not only
+unvalidated — it is not *portable*. Whoever arms it should read their own
+repository's counters first, which is what §4.2 records them for.
+
 ### 4.2 What to record now
 
 Record the volume axis alongside the cycle state and act on neither:
@@ -433,6 +443,69 @@ it.
 If child N breaks child N−1's criteria, that is coupling churn at the parent
 level. Do not re-split. Escalate, and `reopenStaleDependents` handles the requeue
 it already handles today.
+
+---
+
+### 6.6 What the first live splits found
+
+The trigger was armed at `volumeThreshold: 2` against
+`examples/sample-project/STALL.md` on 2026-09-07 and the ticket was decomposed
+five times. Every run found a defect, and **none of them was in `split.py`** —
+the module the unit tests cover hardest. Each lived at a seam between this
+mechanism and machinery that predates it, which is the part a test calling
+`_consider_split` directly cannot see.
+
+- **A cycle that only split ended the run.** `_consider_split` takes the parent
+  out of `eligible`, because it is a gate now, and puts its children on the
+  backlog as pending tickets. When the parent was the only eligible ticket the
+  list emptied, and the guard reading an empty list as *nothing left to retry*
+  stopped the run with two freshly created children never worked. A cycle that
+  decomposed now continues the run, and is charged to the retry budget: a cycle
+  that produces work without spending one is how an unbounded run gets built
+  out of bounded parts.
+
+- **Index coverage let the hard half of a criterion be dropped.** This is the
+  one that matters, because it manufactured a *false pass* on the backlog that
+  exists to be unsatisfiable — `done: 3`, green suite, reviewer approval,
+  parent gate closed. `covers` is a claim, and a claim checked by counting is
+  satisfied by any restatement. The planner claimed parent criterion 4 —
+  ``count_words("Hello, world!")`` returns ``{"hello": 1, "world": 1}``, *so
+  that* ``summarize(...)`` returns ``2 word(s), 2 occurrence(s)`` — and wrote
+  its child's criterion as the second clause alone, which passes on the
+  existing counter because two punctuated keys still count as two words. The
+  half it dropped is the half that cannot hold without writing a file the
+  ticket may not write. §6.1 says scope is conserved by construction; the first
+  implementation conserved the numbering. **A covered criterion now crosses to
+  the child verbatim** and is frozen as its `original_criteria`, with the
+  planner's own criteria kept after it, where they narrow a child's work
+  without loosening the parent's contract.
+
+- **A child was ordered behind its own parent, and the run reported `done` over
+  the deadlock.** The proposal was clean — no child asked to wait on the
+  parent. `respec._order_shared_files` reruns `derive_needs` on every revision,
+  and that rule orders any two tickets writing the same file by position: a
+  child writes its parent's files *by construction*, so the rule ordered it
+  behind a gate that was waiting for it, every time. `derive_needs` now skips a
+  ticket in status `split`, which writes nothing further, while siblings
+  sharing a file are still ordered against each other. `check` also refuses a
+  child that waits on anything but a sibling, and refuses a sibling cycle.
+
+- **The finish tally counted `blocked` and `failed` only.** A gate that never
+  closes has no failure of its own — what failed is a child, and a child parked
+  as unreachable is `skipped` — so the arithmetic reported success over work
+  nobody did. An open gate now counts as needing a human.
+
+**The fifth run is what the fixture was written to produce**, and it is better
+than the pre-split behaviour: `ST-001-a` done over criteria 1-3, `ST-001-b`
+blocked at ratification with the planner naming the inherited criterion it
+cannot satisfy, and the parent blocked because a parent does not partially
+complete. Three quarters of the work landed and the note names the single
+obligation that could not be met — which is decomposition earning its place
+rather than losing a whole ticket to its impossible quarter.
+
+What the five runs say about the *threshold* is nothing at all. They say the
+plumbing survives contact with a model: the proposals parsed, the invariant
+held against real criteria, and the failures were all in the wiring around it.
 
 ---
 
@@ -669,7 +742,10 @@ what each one turned into is recorded beside it.
 6. **SPLIT** (§6). ✅ Built: `forge/split.py`, the invariant, the schema, the
    planner prompt, the parent as a gate. `loop.volumeThreshold` ships `0`, so
    nothing splits until somebody sets it — and §4.1 is the argument for why
-   the person who sets it should look at their own numbers first.
+   the person who sets it should look at their own numbers first. **Armed live
+   at `2` on 2026-09-07** against the fixture written to be unsatisfiable, five
+   times; §6.6 is what those runs found, which was four defects in the wiring
+   around the mechanism and none in the mechanism.
 7. **RESTART** (§5.1), only if a live run shows the ladder answering
    `winnable` on a ticket that then stays flat. **Not built**, and the
    condition has not been met: no run has reached that state.
@@ -707,19 +783,28 @@ Answered since the draft:
 - ~~Is verification against the original criteria a model judgement or a test
   check?~~ A model judgement, reported and never enforced — §8.1.
 
+- ~~Does a review rejection carry more than one countable objection?~~ Yes, and
+  by a wide margin. §12 step 2's replay over 24 recorded rejections found 61
+  objections in them — 2.54 each, 23 of 24 carrying more than one, the largest
+  carrying twelve. The volume axis counts review points as well as tool
+  classes.
+- ~~Does a parent gate hold the baseline, or does each child take its own?~~
+  Inherited, as §6.4 said, and now exercised: five live splits, and no child
+  was ever blamed for red its parent left behind.
+
 Still open:
 
-- **Does a review rejection carry more than one countable objection?** §3.1's
-  replay answers it. If it does not, the volume axis reads tool classes only, and
-  the draft's whole "objection" framing was about diagnostics all along.
 - **Is the per-cycle distinct-class count a better discriminator than the
   lifetime count?** §4.1's table uses lifetime counts and they point the wrong
   way. The per-cycle series is what step 3 records, and it has never been looked
   at.
 - **Do split children share one run-scoped learnings tier, or does each inherit a
-  snapshot?** Shared is simpler and is what §3.2 proposes; inheritance stops one
-  child's wrong conclusion reaching its siblings. No evidence either way, and the
-  shared version is the reversible one.
-- **Does a parent gate hold the baseline, or does each child take its own?**
-  §6.4 says inherit, on invariant 14's reasoning. Unverified against a real
-  split, because none has happened.
+  snapshot?** A snapshot, for now, because that is what `children_of` can do
+  without a new tier in `Store.learn` — so a child reads what its *parent*
+  established and not what a sibling is establishing beside it. The shared
+  version §3.2 proposes is still unbuilt, and is still the reversible one.
+- **What does `volumeThreshold` mean in a repository that is not this one?**
+  Raised by arming it: a class carries a file, so the count tracks file surface
+  as much as ticket size — 32 and 38 in a large two-language tree, never more
+  than 2 in a four-file fixture. A number tuned in one repository is not
+  transferable to another, and nothing yet normalises it.

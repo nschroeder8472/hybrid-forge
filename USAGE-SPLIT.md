@@ -1,5 +1,11 @@
 # The dashboard says how many tokens, and not which kind
 
+**Status:** shipped. Run 6 of this repository, 2026-09-07, built by the loop:
+both tickets done on the first attempt, no failed step, 328 calls and 15.5M
+tokens. Nothing below was revised on the way — the delivered code sums the
+cache counters into `input`, reuses `format_tokens`, and leaves the four
+existing keys alone. Kept as the record of what was asked for.
+
 The dashboard's *Token usage* table has three columns — model, calls, tokens —
 and the third is `prompt_tokens + completion_tokens + cache_creation_tokens +
 cache_read_tokens` added together by `Store.usage_summary` and formatted once

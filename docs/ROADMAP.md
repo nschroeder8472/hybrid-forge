@@ -250,7 +250,7 @@ both runs used local models through a provider that reports no cache counters.
 
 ---
 
-## Adaptive ticket loop — built, trigger off
+## Adaptive ticket loop — built, armed once, trigger off
 
 **Status:** built 2026-09-06 —
 [ADAPTIVE-TICKET-LOOP.md](ADAPTIVE-TICKET-LOOP.md) §12 records what each step
@@ -317,6 +317,36 @@ decomposing from one about to land — at the drafted 8, the tickets with 10 and
 32 classes both passed and the one with 7 was the unsatisfiable one. The
 counters are now visible enough that the person who arms it can do so against
 their own numbers.
+
+**It has now been armed, and that is where the value came from.** Five live
+splits at `volumeThreshold: 2` against the fixture written to be unsatisfiable,
+2026-09-07, and every one of them found a defect —
+[ADAPTIVE-TICKET-LOOP.md](ADAPTIVE-TICKET-LOOP.md) §6.6 has all four. None was
+in `split.py`. Each lived at a seam between the new mechanism and machinery
+that predates it: the retry cycle's eligibility guard, the criteria ratchet's
+notion of coverage, the scheduler's shared-file ordering rule, the finish
+tally. Unit tests calling `_consider_split` directly could not reach any of
+them, because each was in what a *caller* did with a correct return value.
+
+The expensive one is worth stating plainly. `covers` was honoured as an index
+and abandoned as an obligation: the planner claimed a parent criterion, restated
+it as the half that could be satisfied, and the invariant approved it by
+counting. Both children passed, the gate closed, and the backlog that exists to
+be unsatisfiable was reported **done** — a green ticket over a criterion nobody
+met, produced by the mechanism written to prevent exactly that. A covered
+criterion now crosses to the child verbatim.
+
+The fifth run is the one the fixture was written to produce, and it is better
+than what the loop did before splitting existed: three of four criteria landed
+on a child that passed, and the ticket parked naming the single obligation that
+could not be met.
+
+**What none of it says is where the threshold belongs.** A class is
+`(step, code, file)`, so the count tracks how many files a project has as much
+as how big a ticket is — 32 and 38 on the reference run's large two-language
+tree, never more than 2 across fourteen runs of a four-file fixture. The number
+is not comparable between repositories, which is a stronger reason to ship at
+`0` than the original one.
 
 Two things are deliberately not built. RESTART waits on a live run showing the
 ladder answering `winnable` on a ticket that then stays flat, which has not

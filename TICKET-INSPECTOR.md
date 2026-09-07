@@ -1,5 +1,23 @@
 # A parked ticket answers in a footnote, and the answer is cut off
 
+**Status:** shipped. Run 7 of this repository, 2026-09-07, built by the loop.
+TI-001 landed on its first attempt; TI-002 spent three attempts returning a
+file with elided sections — so nothing was written — named that itself, and
+landed on the first attempt of the next cycle. Checked live afterwards against
+a run that had actually parked: the panel showed a ratification failure whole,
+1,038 characters of it, against the 60-character class the row had been
+showing.
+
+Two things below did not survive contact, and both are recorded rather than
+edited away. The criterion demanding `renderWriteControls` appear **zero**
+times assumed the helper had to be deleted; the sign-off pass revised it to
+"exactly twice — the definition and the call inside `renderInspector`", which
+is the better design and the one that shipped. And that same pass trimmed
+`tests/test_inspector_render.py` out of `allowed_files`, so nothing was ever
+asked to write tests and the criteria were settled by a reviewer reading the
+diff. The assertions were written by hand afterwards, and ratification is now
+held to the rule respec already had — see [RATIFY.md](docs/RATIFY.md).
+
 The dashboard's backlog row is one line per ticket, and everything a person
 needs in order to decide what to do with a parked one has been added to that
 line as indented small print. Three things are wrong with it, and they are the

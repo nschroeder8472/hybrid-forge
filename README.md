@@ -268,10 +268,16 @@ asked again — the run parks the ticket and says what was ambiguous.
 ## Monitoring
 
 `forge go` serves a dashboard on `127.0.0.1:8799`: backlog with per-ticket
-status, live event stream, recent steps, per-model token usage, and
-pause/resume/stop. It reads the same SQLite the loop writes, so a crashed
-dashboard cannot take a run with it and a restarted one reattaches with no
-handshake.
+status, live event stream, recent steps, per-model token usage split into
+input and output, and pause/resume/stop. It reads the same SQLite the loop
+writes, so a crashed dashboard cannot take a run with it and a restarted one
+reattaches with no handshake.
+
+Clicking a parked ticket opens it in front of the page: what it was asked to
+build, the criteria it is judged against, and the whole text of every step that
+failed — rather than the 60-character failure *class* the row shows, which is
+an identity for counting. The note and the criterion a person can write back
+are at the bottom of that panel, as equals.
 
 It has no authentication and its stop button ends a run, so it binds to
 loopback and warns on startup if you point `ui.host` anywhere else. Tunnel in
