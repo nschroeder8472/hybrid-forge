@@ -6,14 +6,28 @@ their own did. That is correlational and cannot settle the question it raises:
 votes that never had less room cannot show what less room would have cost. So
 this changes one variable and counts objections on both arms.
 
-    arm-thinks   loop.voteThinking = true    the vote reasons, as it always has
-    arm-blurts   loop.voteThinking = false   the vote answers without reasoning
+    arm-thinks    the fixture as it ships, and the control for both others
+    arm-blurts    loop.voteThinking = false      the vote does not reason
+    arm-revotes   loop.reviseBetweenPasses = false   nothing is rewritten
 
 Everything else is identical -- same ticket, same models, same budgets, same
-`ratifyPasses`. Only the *vote* changes: the planner's revision keeps its
-reasoning on both arms, which the per-model `reasoning-budget` flag could not
-have arranged, because planner and reviewer share a server with every other
-call they make.
+`ratifyPasses`. `arm-blurts` moves the *vote* alone: the planner's revision
+keeps its reasoning, which the per-model `reasoning-budget` flag could not have
+arranged, because planner and reviewer share a server with every other call
+they make.
+
+`arm-revotes` is the other half of the same question, and it was added after
+`arm-blurts` answered. The second pass changed a ticket's outcome three times
+in the record, and all three times the planner's revision had *failed* -- so
+the roles voted again on words nobody had touched, and changed their minds
+anyway. That makes the revision, which is the most expensive call in the pass
+and failed in three of eight, a thing whose cost has never been separated from
+the second vote's. This arm separates them: the pass repeats, the objections
+still travel to the next vote, and only the rewrite is gone.
+
+Read them as two independent comparisons against the same control, not as a
+ladder. `arm-blurts` asks whether a vote needs to reason. `arm-revotes` asks
+whether a second vote needs a revision in front of it.
 
 **The ticket is chosen so the right answer is already known.** `GR-002` in
 `examples/sample-project/GRIND.md` was written to be jointly impossible and is
@@ -34,9 +48,20 @@ Which makes the measurement a count rather than a judgement:
 currently get. `arm-blurts` keeping all of them, at a mean of a few hundred
 completion tokens a vote instead of several thousand, is the other answer.
 
+`arm-revotes` is read on the third question rather than the first two, because
+its votes reason normally and pass 1 should be the control's pass 1. What was
+open is what the *second* vote does with an objection nobody acted on.
+
+Run on 2026-09-08: all four roles refused again on unchanged text, two of them
+rejecting the standing position explicitly rather than the ticket. Nothing
+reached a build call, the ticket parked, and sign-off cost 47% more than the
+arm that revised -- a ticket nobody repairs cycles through the pass instead of
+leaving it. So the revision is what turns a correct refusal into a shippable
+ticket, and these roles do not flip merely for being asked twice.
+
     python scripts/vote_grading.py <directory> [--ticket GR-002] [--only ARM]
 
-It writes both arms and ingests the ticket into each. It does not run the loop;
+It writes every arm and ingests the ticket into each. It does not run the loop;
 the commands to do that are printed at the end. Run them one at a time -- they
 share a GPU.
 
@@ -59,7 +84,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sample_workspace import SAMPLE, copy_sample  # noqa: E402
 
-ARMS = {"arm-thinks": True, "arm-blurts": False}
+# Each arm is the loop settings that differ from the fixture's, one variable at
+# a time against `arm-thinks` -- which is the fixture as it ships, and the
+# control for both of the others.
+ARMS: dict[str, dict[str, object]] = {
+    "arm-thinks": {"voteThinking": True, "reviseBetweenPasses": True},
+    "arm-blurts": {"voteThinking": False, "reviseBetweenPasses": True},
+    "arm-revotes": {"voteThinking": True, "reviseBetweenPasses": False},
+}
 
 # The defect both earlier runs of this ticket found, and the string a vote's
 # objection has to be about for the arm to have kept what it is being asked to
@@ -82,10 +114,10 @@ def _ticket(spec: str, ticket_id: str) -> str:
     return match.group(0).rstrip() + "\n"
 
 
-def _write_arm(root: Path, vote_thinking: bool, ticket: str) -> None:
+def _write_arm(root: Path, settings: dict[str, object], ticket: str) -> None:
     config_path = root / ".hybridforge" / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    config["loop"]["voteThinking"] = vote_thinking
+    config["loop"].update(settings)
     # Both passes, because the measurement is what pass 1 raised *and* whether
     # the repair still happened. At one pass a refusal parks the ticket and the
     # second half of the question goes unasked.
@@ -133,10 +165,10 @@ def main(argv: list[str]) -> int:
 
     arms = {args.only: ARMS[args.only]} if args.only else dict(ARMS)
     base.mkdir(parents=True)
-    for arm, vote_thinking in arms.items():
+    for arm, settings in arms.items():
         root = base / arm
         copy_sample(root)
-        _write_arm(root, vote_thinking, ticket)
+        _write_arm(root, settings, ticket)
         code = forge_main(["--root", str(root), "ingest", str(root / "VOTE.md")])
         if code:
             shutil.rmtree(base, ignore_errors=True)
