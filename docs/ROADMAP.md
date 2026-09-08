@@ -530,6 +530,114 @@ spec does not survive contact.
 
 ---
 
+## Sign-off cost — replayed, and the knob is not free
+
+**Status:** measured 2026-09-07 by `scripts/ratify_cost.py`, nothing built. The
+*Reviewer cost* entry below found that sign-off rather than review holds most
+of the paid role's tokens, and pointed at `loop.ratifyPasses` as an existing
+knob rather than machinery anybody has to write. This is what turning it down
+would actually cost and buy.
+
+The counterfactual is computable rather than estimated, which is why this one
+needs no live run. A pass is every role voting; `ratify.resolve` decides the
+outcome from those votes alone; and a unanimous pass returns before any
+revision happens. So running the production `resolve` over the recorded pass-1
+votes *is* what `ratifyPasses: 1` would have decided for that ticket, and the
+recorded status is what it actually decided. 16 sign-off passes across both
+evidence trees, 8 of which reached a second vote — exactly the disputed half,
+because the second pass is never paid on a ticket everybody signed.
+
+**What it costs.** Sign-off is 55% of all 9.99M recorded tokens, the largest
+single line in either tree. Within it, pass 1 takes 3,163,600 tokens and the
+revision plus every later pass takes 2,114,032 — so 40.1% of sign-off, and
+roughly a fifth of everything, is what `ratifyPasses: 1` would not have spent.
+
+**What it buys, and the answer is not nothing.** Three of the eight second
+passes changed whether the ticket ships. Two are the same fixture in two runs:
+pass 1 returned `split`, which proceeds to build, and the second pass blocked a
+contract two of four roles had refused. One is a rescue in the other direction
+— `blocked` at pass 1, unanimous after the revision. Turning the knob to 1
+saves the 2.11M and builds that first contract twice while parking the ticket
+the revision saved, which is the trade the default was making all along. The
+difference is that it is now a number.
+
+**Where the waste is, is legible.** Pass-1 status predicts whether the second
+pass earns anything. Every outcome that moved started from `split` or
+`blocked`; all three tickets that reached pass 2 on a `majority` finished
+exactly where they started, at a cost of 730,005 tokens. A second pass made
+conditional on the pass-1 status — run it on `split` or `blocked`, skip it on
+`majority` — keeps all three outcome changes and returns a third of the extra
+spend. Unlike the diff-size threshold in the entry below, that rule has a
+mechanism behind it rather than a correlation: `majority` means more than half
+the roles have already signed, so a revision has fewer votes left to flip. It
+is still fitted on the same eight rows that score it, with three on the
+majority arm, and one counterexample would break it. What it is not is a
+threshold read off a distribution. Read the next two paragraphs before building
+it: they say what the outcomes it preserves were actually produced by, and it
+is not the revision this rule pays for.
+
+**That next replay has run, and it moved the argument.**
+`scripts/ratify_value.py` follows each pass into the attempts the ticket then
+spent, and reads revision failures out of the run log rather than inferring
+them from an empty `changed` list — `_revise` returns nothing and logs a
+warning when the planner's reply cannot be parsed or runs out of output room,
+and the next pass then votes on text nobody has touched. The plex tree's
+database predates sign-off, so this half is the forge tree alone: 12 tickets.
+
+**Three of the twelve passes voted twice on the same text**, the revision
+having failed — and those three are exactly the passes whose status moved.
+Both `caught` rows are among them. So the safety argument above is not what it
+looked like: the second pass did not block those contracts because the planner
+had improved them, but because the same four roles, reading the same words,
+voted differently the second time. Pass 1 said `split`; pass 2 said 0 of 4
+signed. A person later agreed the block was right — run 5's ticket was
+discharged by hand, *"after two ratification rounds correctly rejected the
+criteria timings"* — so the outcome was correct and pass 1's verdict was
+simply wrong. What that makes the second pass, on this evidence, is a re-roll
+of a noisy vote that the loop only performs by accident when a revision fails.
+Which is a different mechanism from the one the conditional rule above is
+aimed at, and a cheaper one to test: a second vote costs the roles, not the
+planner.
+
+**And the revision itself shows no downstream payoff.** Grouped by what
+happened between the votes, the tickets that shipped went: settled (pass 1
+unanimous, no revision) 5 built at a mean of 1.40 attempts and 189,172 tokens
+after sign-off; revised 3 built at 1.33 attempts and 224,901 tokens; re-voted 1
+built at 3.00 and 363,934. The revised group is no cheaper, and the sign of the
+difference is against it. At three tickets against five, all of different
+difficulty, that rules out a large effect and nothing finer — but the *"a
+revised contract may build better"* defence of the `same` rows now has data
+against it rather than nothing either way. One ticket still spent 265,747
+tokens being revised from `blocked` to `blocked`.
+
+**Why the three revisions failed is worth reading before raising a budget.**
+Only one is the runaway it was reported as: 93,615 characters, 98% duplicate
+lines, a thirty-line block emitted fifty-five times, cut off at the ceiling. A
+second was truncated without repeating at all — 6% duplication, a well-formed
+opening, and a tail that had wandered into prose about an unrelated ticket. The
+third was never truncated: it stopped on its own, closed its fences, and failed
+because one `"` inside a Python string in the `spec` field was left unescaped,
+at character 14,677 of 14,676. The successful revisions ran 3,982 to 14,871
+completion tokens against a 32,768 ceiling, which is the strongest evidence
+that size is not the constraint. What the three share is payload *shape*: one
+all-or-nothing JSON blob carrying source code, where a single character voids
+the reply. A revision that carried only the fields it changes would shrink all
+three failure surfaces; a larger ceiling addresses none of them.
+
+**The largest single number this replay found is not about passes at all.**
+81 sign-off votes returned a reply under 200 bytes — the four-line
+`SIGNOFF`/`BLOCKING`/`SUGGEST` protocol — and spent 503,732 completion tokens
+between them, a mean of 6,218 per yes-or-no. 66 of those votes spent more than
+3,000, which is 97% of all vote output. The models reason to their allotment
+before answering, and the answer is four lines. That is roughly a quarter of
+sign-off's whole cost, it is not a pass-count question, and the remedy is
+configuration rather than machinery: `reasoning_effort: none` in `extraBody`
+for the vote calls, or a vote prompt that asks for the verdict without the
+reasoning. It belongs to whoever tunes their own models, which is why it is
+recorded here rather than built.
+
+---
+
 ## Deferred from the review
 
 Found while reviewing the loop, judged not worth building yet.
@@ -573,7 +681,8 @@ Found while reviewing the loop, judged not worth building yet.
   So the lever this entry was written to justify building sits on the smaller
   half, while the larger half is already a config knob: `loop.ratifyPasses`,
   default 2, whose cost `docs/CONFIG.md` describes as a judgement rather than a
-  measurement.
+  measurement. That knob has since been replayed too — see *Sign-off cost*
+  above, which is where the remaining money in this entry went.
 
   **Skip-if-trivial buys nothing, and the replay says so without a threshold
   argument.** A rule of the shape *skip review when `measure` < T* keeps every
