@@ -142,8 +142,14 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--ticket",
         default="GR-002",
-        help="which GRIND.md ticket to put to the roles (default GR-002, the "
-        "one whose defect both earlier runs found)",
+        help="which ticket in the spec to put to the roles (default GR-002, "
+        "the one whose defect both earlier runs found)",
+    )
+    parser.add_argument(
+        "--spec",
+        default="GRIND.md",
+        help="which fixture spec to lift the ticket from (default GRIND.md; "
+        "SPLIT.md holds the ticket written to produce a pass-1 majority)",
     )
     parser.add_argument(
         "--only",
@@ -158,7 +164,7 @@ def main(argv: list[str]) -> int:
         print(f"error: {base} already exists; name a path that does not")
         return 1
 
-    spec = (SAMPLE / "GRIND.md").read_text(encoding="utf-8")
+    spec = (SAMPLE / args.spec).read_text(encoding="utf-8")
     ticket = _ticket(spec, args.ticket)
 
     from forge.cli import main as forge_main

@@ -916,6 +916,18 @@ class LoopSettings:
     # assuming; `scripts/vote_grading.py` builds the arm. See the *Sign-off
     # cost* entry in docs/ROADMAP.md.
     revise_between_passes: bool = True
+    # Whether a pass-1 majority is put to the roles a second time. A majority
+    # already ships the ticket, and across every recorded pass that reached a
+    # second vote on one, not one changed where it ended -- three tickets,
+    # 730,005 tokens, no outcome moved. Off, the pass stops there.
+    #
+    # Unlike the two settings above it removes no part of the mechanism: the
+    # vote still reasons, the revision still happens wherever the pass
+    # continues, and a `split` or a `blocked` still gets its second look. It
+    # only declines to re-ask a question whose answer has never changed. Both
+    # experiments that removed a part cost more than they saved; this is the
+    # remaining shape that has not been tried.
+    majority_repeats: bool = True
     # The order the roles vote in, within a pass. A permutation of `ROLES` —
     # every role votes exactly once, because the majority is counted over all
     # four and dropping one would change the arithmetic silently.
@@ -1214,6 +1226,7 @@ class Config:
             revise_between_passes=bool(
                 loop.get("reviseBetweenPasses", True)
             ),
+            majority_repeats=bool(loop.get("majorityRepeats", True)),
             ratify_order=tuple(loop.get("ratifyOrder", ROLES) or ROLES),
             participation_window=int(loop.get("participationWindow", 20)),
             volume_threshold=int(loop.get("volumeThreshold", 0)),
@@ -1675,6 +1688,7 @@ class Config:
                 "ratifyPasses": self.loop.ratify_passes,
                 "voteThinking": self.loop.vote_thinking,
                 "reviseBetweenPasses": self.loop.revise_between_passes,
+                "majorityRepeats": self.loop.majority_repeats,
                 "ratifyOrder": list(self.loop.ratify_order),
             },
             "ui": {

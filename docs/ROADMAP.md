@@ -777,9 +777,40 @@ outcome an operator wants when no repair is available, and it is what
 **Three ways of making sign-off cheaper have now been tested and all three are
 dead**: skipping review for trivial diffs has no safe threshold, taking
 reasoning off the vote stops the pass finding anything, and removing the
-revision stops the ticket landing. The remaining honest saving in this entry is
-still the one nobody has tried — making the second pass *conditional* on the
-pass-1 status rather than removing any part of it.
+revision stops the ticket landing.
+
+**The fourth is built, and it is the one that removes nothing.**
+`loop.majorityRepeats`, default true, declines to put a pass-1 `majority` to
+the roles a second time. A majority already ships the ticket, and across every
+recorded pass that reached a second vote on one — three tickets, 730,005
+tokens — not one ended anywhere other than where it started. Unlike the two
+settings above it takes no part of the mechanism away: the vote still reasons,
+the revision still happens wherever the pass continues, and a `split` or a
+`blocked` still gets its second look. It only declines to re-ask a question
+whose answer has never changed.
+
+**What it does not yet have is a live arm, and two attempts to build one
+failed.** `examples/sample-project/SPLIT.md` was written to produce a pass-1
+majority — ordinary work plus one criterion aimed at a single role — and has
+been run twice, unanimous both times. The first version asked for a wall-clock
+bound; all four signed, because a bound a test can approximate badly is not one
+a tester refuses. The second asked for an implementation detail no assertion
+can reach, and the tester **found exactly that** — *"only assertable by
+source/mock inspection; consider removing it"* — and signed anyway, filing it
+as a `SUGGEST`.
+
+That is the protocol working and the fixture's premise being wrong, and it is
+the more useful result. `BLOCKING` means *I cannot do my part*; `SUGGEST` means
+*this could be better*; a role that can proceed while objecting signs. So a
+pass-1 majority needs an impossibility landing on exactly one role, and the
+impossibilities a spec actually contains are visible to all four at once —
+which resolves `blocked`, not `majority`. Consistent with where the recorded
+majorities came from: real backlog tickets against a large tree, not a
+four-file fixture.
+
+So this setting ships on replay evidence and unit tests, with its live arm
+unbuilt and a note saying a third guess at the criterion is the least promising
+route. What would settle it is a majority from a real backlog.
 
 **One defect fell out of the join.** Two votes refused to sign while naming
 nothing: `SIGNOFF: no` over `BLOCKING: - NONE`. `resolve` counts the refusal

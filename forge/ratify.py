@@ -669,6 +669,7 @@ def ratify(
     passes: int,
     vote_thinking: bool = True,
     revise: bool = True,
+    majority_repeats: bool = True,
     sources: dict[str, str] | None = None,
     retrieved: str = "",
     digest: str = "",
@@ -708,6 +709,26 @@ def ratify(
         result.passes = pass_number
         status = resolve(votes)
         if status in (UNANIMOUS, UNAVAILABLE):
+            result.status = status
+            result.notes = notes
+            return _settle(store, run_id, ticket, result)
+
+        if status == MAJORITY and not majority_repeats:
+            # A majority already ships the ticket, and across every recorded
+            # pass that reached a second vote on one, not one changed where it
+            # ended. This declines to run the pass again rather than removing
+            # any part of it -- the two experiments that removed a part, the
+            # vote's reasoning and the planner's revision, both cost more than
+            # they saved. The objections still stand on the record and still
+            # travel to the roles that read them later.
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: a majority signed off on pass "
+                f"{pass_number}; not asking again "
+                f"(loop.majorityRepeats is off).",
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "pass": pass_number},
+            )
             result.status = status
             result.notes = notes
             return _settle(store, run_id, ticket, result)

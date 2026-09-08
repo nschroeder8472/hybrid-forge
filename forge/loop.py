@@ -3970,6 +3970,7 @@ class Orchestrator:
             passes=passes,
             vote_thinking=self.config.loop.vote_thinking,
             revise=self.config.loop.revise_between_passes,
+            majority_repeats=self.config.loop.majority_repeats,
             criteria_locked=not self.config.loop.respec_criteria,
             sources=sources,
             retrieved=retrieved,

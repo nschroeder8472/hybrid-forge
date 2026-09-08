@@ -18820,6 +18820,53 @@ class TestTheSignOffPass(unittest.TestCase):
         # Five planner calls' worth of roles: four votes plus the revision.
         self.assertEqual(len(self.calls), len(ROLES) * 2 + 1)
 
+    def _majority(self) -> dict:
+        """Pass one where three of four sign: `resolve` calls that a majority."""
+        return {
+            "planner": ["SIGNOFF: yes", "{}", "SIGNOFF: yes"],
+            "executor": ["SIGNOFF: yes", "SIGNOFF: yes"],
+            "tester": ["SIGNOFF: no\nBLOCKING:\n- cannot assert that", "SIGNOFF: yes"],
+            "reviewer": ["SIGNOFF: yes", "SIGNOFF: yes"],
+        }
+
+    def test_a_majority_is_put_to_them_again_by_default(self):
+        result = ratify.ratify(
+            self.store, self.run_id, self.ticket,
+            call=self._caller(self._majority()),
+            budget_for=lambda role: 4096, roles=ROLES, passes=2, root=self.root,
+        )
+
+        self.assertEqual(result.passes, 2)
+
+    def test_a_majority_can_be_left_where_it_stands(self):
+        """It removes no part of the pass -- the vote still reasons and a
+        revision still happens wherever the pass continues. It declines to
+        re-ask a question that has never changed its answer."""
+        result = ratify.ratify(
+            self.store, self.run_id, self.ticket,
+            call=self._caller(self._majority()),
+            budget_for=lambda role: 4096, roles=ROLES, passes=2,
+            majority_repeats=False, root=self.root,
+        )
+
+        self.assertEqual(result.status, ratify.MAJORITY)
+        self.assertEqual(result.passes, 1)
+        self.assertEqual(len(self.calls), len(ROLES))
+        self.assertTrue(result.proceeds)
+
+    def test_a_refusal_is_still_put_to_them_again_when_a_majority_is_not(self):
+        """The setting is about majorities alone. A `blocked` pass is the one
+        that most needs its second look, and taking that away is the experiment
+        that parked a ticket rather than landing it."""
+        result = ratify.ratify(
+            self.store, self.run_id, self.ticket,
+            call=self._caller(self._disputed()),
+            budget_for=lambda role: 4096, roles=ROLES, passes=2,
+            majority_repeats=False, root=self.root,
+        )
+
+        self.assertEqual(result.passes, 2)
+
     def test_unanimous_agreement_settles_it_in_one_pass(self):
         result = self._ratify({role: "SIGNOFF: yes" for role in ROLES})
 
