@@ -244,6 +244,7 @@ class OpenAICompatProvider(Provider):
             raise ProviderBadResponse(f"unexpected response shape: {str(data)[:400]}") from exc
 
         recovered = ""
+        abandoned: dict[str, Any] = {}
         finish_reason = choice.get("finish_reason") or "stop"
         if not text.strip():
             # Thinking models served over this shape put their chain of thought
@@ -253,6 +254,12 @@ class OpenAICompatProvider(Provider):
             # malformed output — naming the real cause here saves that hunt.
             reasoning = _reasoning_text(message)
             if reasoning and finish_reason in ("length", "max_tokens"):
+                # Kept, because the call being abandoned is the expensive one:
+                # it read the whole prompt and generated to the ceiling before
+                # this retry was even made. Replacing its usage with the
+                # retry's would make the costliest calls in a run the ones its
+                # accounting cannot see.
+                abandoned = data.get("usage") or {}
                 data, recovered = self._without_thinking(
                     payload, max_tokens, timeout
                 )
@@ -270,6 +277,17 @@ class OpenAICompatProvider(Provider):
         if usage.estimated:
             usage.prompt_tokens = self.count_tokens(messages)
             usage.completion_tokens = self.count_tokens([Message(role="assistant", content=text)])
+        if recovered:
+            # Both halves of the abandoned call are known even when its
+            # response carried no usage of its own: it was sent this same
+            # prompt, and `length` is what routed us here, so it generated the
+            # ceiling it was given.
+            usage.prompt_tokens += int(
+                abandoned.get("prompt_tokens", 0)
+            ) or self.count_tokens(messages)
+            usage.completion_tokens += (
+                int(abandoned.get("completion_tokens", 0)) or max_tokens
+            )
 
         return Completion(
             text=text,

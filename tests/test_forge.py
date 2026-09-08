@@ -15840,10 +15840,12 @@ class TestThinkingModelsThatNeverAnswer(unittest.TestCase):
         provider = self._provider(self._payload('{"ok":1}', "stop", reasoning=self.THOUGHT))
         self.assertEqual(self._complete(provider).text, '{"ok":1}')
 
-    def _twice(self, second: dict, **config) -> tuple[OpenAICompatProvider, list[dict]]:
+    def _twice(
+        self, second: dict, first: dict | None = None, **config
+    ) -> tuple[OpenAICompatProvider, list[dict]]:
         """A provider whose first reply is all reasoning and whose second is `second`."""
         sent: list[dict] = []
-        replies = [self._payload("", "length", reasoning=self.THOUGHT), second]
+        replies = [first or self._payload("", "length", reasoning=self.THOUGHT), second]
         provider = OpenAICompatProvider(
             "local",
             {
@@ -15886,6 +15888,48 @@ class TestThinkingModelsThatNeverAnswer(unittest.TestCase):
 
         self.assertIn("reasoning_effort", recovered)
         self.assertIn("thinker", recovered)
+
+    def test_the_abandoned_call_is_still_charged_for(self):
+        # It read the whole prompt and generated to the ceiling before the
+        # retry was made, so it is the expensive half. Reporting only the
+        # retry's usage would make the costliest calls in a run the ones the
+        # accounting cannot see.
+        first = self._payload("", "length", reasoning=self.THOUGHT)
+        first["usage"] = {"prompt_tokens": 900, "completion_tokens": 4096}
+        second = self._payload('{"ok":1}', "stop")
+        second["usage"] = {"prompt_tokens": 900, "completion_tokens": 20}
+        provider, _sent = self._twice(second, first=first)
+
+        usage = self._complete(provider).usage
+
+        self.assertEqual(usage.completion_tokens, 4096 + 20)
+        self.assertEqual(usage.prompt_tokens, 900 + 900)
+
+    def test_an_abandoned_call_reporting_no_usage_is_charged_its_ceiling(self):
+        # A server that reports nothing does not make the tokens free. The
+        # abandoned call was sent this prompt and stopped on `length`, so both
+        # halves are known without being reported.
+        second = self._payload('{"ok":1}', "stop")
+        second["usage"] = {"prompt_tokens": 900, "completion_tokens": 20}
+        provider, _sent = self._twice(second)
+
+        usage = self._complete(provider, max_tokens=4096).usage
+
+        self.assertEqual(usage.completion_tokens, 4096 + 20)
+        self.assertGreater(usage.prompt_tokens, 900)
+
+    def test_a_call_that_never_retried_is_charged_once(self):
+        """The addition must be reachable only through the retry: an ordinary
+        call carries no abandoned half, and doubling its prompt would overstate
+        every call the loop makes."""
+        provider = self._provider(self._payload('{"ok":1}', "stop"))
+
+        usage = self._complete(provider).usage
+
+        self.assertEqual(
+            usage.completion_tokens,
+            provider.count_tokens([Message(role="assistant", content='{"ok":1}')]),
+        )
 
     def test_an_operators_own_setting_is_never_overruled(self):
         # Someone who has written `reasoning_effort` into `extraBody` has
