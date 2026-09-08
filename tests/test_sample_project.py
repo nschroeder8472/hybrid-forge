@@ -98,6 +98,7 @@ class TestTheFixtureIsOnlyTheFixture(unittest.TestCase):
         "HARD.md",
         "OPAQUE.md",
         "SPEC.md",
+        "SPLIT.md",
         "STALL.md",
         "plugin/.flake8",
         "plugin/histogram/__init__.py",

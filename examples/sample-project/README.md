@@ -38,6 +38,8 @@ GRIND.md                    two tickets aimed at the middle; both land, and
                             one is refused by ratify before it is built
 OPAQUE.md                   one ticket that withholds the rule deciding its
                             answer, and the two ways the loop restores it
+SPLIT.md                    one ticket written to make the roles disagree
+                            without deadlocking; it does not, and why is in it
 BUG.md                      one report for `forge bug`
 .hybridforge/config.json    two workspaces, per-language commands
 ```
@@ -66,9 +68,9 @@ forge bug --file BUG.md    the reproduce-before-fix path
 `forge doctor` is the one to run first after any change to coverage,
 workspaces, or the canary: it prints the matrix without spending a token.
 
-`STALL.md`, `HARD.md`, `GRIND.md` and `OPAQUE.md` are each ingested *instead
-of* `SPEC.md`, in their own copy, when a change touches retries, respec,
-convergence or how a ticket is parked.
+`STALL.md`, `HARD.md`, `GRIND.md`, `OPAQUE.md` and `SPLIT.md` are each
+ingested *instead of* `SPEC.md`, in their own copy, when a change touches
+retries, respec, convergence or how a ticket is parked.
 
 - `STALL.md` must end **blocked**, and the note it leaves has to name the real
   problem — its first two runs ended `done` over a criterion nobody had met,
@@ -89,6 +91,17 @@ convergence or how a ticket is parked.
   three runs say the loop will not have it: `reading_scope` hands over the
   neighbouring file, and when it cannot, ratification blocks and asks for it in
   writing. Read `ratify_notes`, not the verdict.
+
+- `SPLIT.md` must end **done**, and its interest is entirely in the sign-off
+  notes rather than the verdict. It was written to produce a pass-1 *majority*
+  — three roles signing, one refusing — which is the case `loop.majorityRepeats`
+  is about and which no other fixture here reaches: `GR-002` is refused by all
+  four and everything else is signed by all four. Two versions have both gone
+  unanimous, and the second is the informative one: the tester found exactly
+  the flaw planted for it and filed it as a `SUGGEST` rather than a `BLOCKING`.
+  A role that can proceed while objecting signs. If a change ever makes this
+  ticket resolve `majority`, that is worth knowing; if it makes it resolve
+  `blocked`, something has started treating a suggestion as a refusal.
 
 `forge ingest` should report **parsed**, not planned. If it says planned, the
 spec grammar changed and `SPEC.md` no longer matches it — which is itself the

@@ -115,6 +115,7 @@
     "ratifyOrder": ["planner", "executor", "tester", "reviewer"],
     "voteThinking": true,
     "reviseBetweenPasses": true,
+    "majorityRepeats": true,
     "participationWindow": 20,
     "volumeThreshold": 0,
     "maxChildren": 8,
