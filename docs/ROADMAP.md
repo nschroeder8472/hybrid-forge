@@ -630,11 +630,53 @@ three failure surfaces; a larger ceiling addresses none of them.
 between them, a mean of 6,218 per yes-or-no. 66 of those votes spent more than
 3,000, which is 97% of all vote output. The models reason to their allotment
 before answering, and the answer is four lines. That is roughly a quarter of
-sign-off's whole cost, it is not a pass-count question, and the remedy is
-configuration rather than machinery: `reasoning_effort: none` in `extraBody`
-for the vote calls, or a vote prompt that asks for the verdict without the
-reasoning. It belongs to whoever tunes their own models, which is why it is
-recorded here rather than built.
+sign-off's whole cost and it is not a pass-count question.
+
+**The obvious remedy is wrong, and checking it is what produced the finding
+worth keeping.** Turning reasoning off for the vote assumes the reasoning is
+not what finds the defects — and deciding whether a ticket can be built is a
+judgement, which is the last place to remove thinking from on a cost argument.
+So `scripts/vote_cost.py` joins each vote *call* to the note that call
+produced, positionally within the pass and checked on the role name, and asks
+what the reasoning bought. 96 votes join.
+
+The relationship runs backwards from the assumption behind the cost argument.
+A vote that raised a blocking point or a suggestion spent a mean of 5,316
+tokens; a vote that said NONE to both spent 6,575. A vote that refused to sign
+spent 4,616; one that signed spent 6,786. **Of the 49 votes that ran to their
+reasoning allotment, not one raised a single point**, and only two refused to
+sign. Of the 47 that stopped on their own, 27 raised something and 23 refused.
+Every objection in the record came from a vote that reached a conclusion.
+
+Which says what the ceiling actually is. Reasoning to the allotment is not a
+model thinking harder about a hard ticket — it is a model that has not
+concluded, emitting its verdict because it is out of room. So the remedy is a
+**smaller allowance, not none**: give the vote less room and a model that has
+not decided answers rather than grinding to the ceiling. On this record that
+costs nothing visible, because no capped vote ever produced an objection.
+
+**And not per role.** The seats disagree. The planner raises objections at a
+mean of 2,831 tokens against 6,356 when it raises none, and the reviewer at
+2,937 against 6,583 — but the executor is the other way round, 9,975 when it
+objects against 6,197 when it does not. A blanket setting would take room from
+the one seat that looks to be using it.
+
+All of that is correlational, which is the whole of what an artifact tree can
+say: a model given less room might conclude sooner and miss something real,
+and votes that never had less room cannot show it. The experiment that settles
+it is [BLIND-GRADING.md](BLIND-GRADING.md)'s — one ticket, one variable,
+objections counted on both arms — and until it runs this is a reason to
+measure rather than a setting to ship.
+
+**One defect fell out of the join.** Two votes refused to sign while naming
+nothing: `SIGNOFF: no` over `BLOCKING: - NONE`. `resolve` counts the refusal
+against the ticket, but `_revise` builds the revision prompt from the blocking
+points, so the planner is handed a rejection with nothing to fix. Both are
+votes that ran to their allotment, which is consistent with the reading above —
+a model out of room emits the protocol without having filled it in. One of the
+two is run 5's planner, in one of the three passes where the revision then
+failed. A refusal that names no objection is a vote the protocol cannot act on,
+and the pass has no way to tell it apart from a signature.
 
 ---
 
