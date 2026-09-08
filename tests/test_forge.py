@@ -18745,6 +18745,81 @@ class TestTheSignOffPass(unittest.TestCase):
         self.assertTrue(seen[len(ROLES)][1])
         self.assertEqual(seen[len(ROLES)][0], "planner")
 
+    def _disputed(self) -> dict:
+        """A script where pass one refuses and pass two signs."""
+        return {
+            "planner": ["SIGNOFF: no\nBLOCKING:\n- unclear", "{}", "SIGNOFF: yes"],
+            **{
+                role: ["SIGNOFF: no\nBLOCKING:\n- unclear", "SIGNOFF: yes"]
+                for role in ROLES
+                if role != "planner"
+            },
+        }
+
+    def test_a_second_pass_without_a_revision_asks_the_same_text_again(self):
+        """The planner's rewrite is the pass's most expensive call and it
+        failed in three of eight recorded passes -- each time the roles voted
+        again on untouched words and changed their verdict anyway. Off, that
+        happens on purpose: the pass repeats, the rewrite does not."""
+        result = ratify.ratify(
+            self.store,
+            self.run_id,
+            self.ticket,
+            call=self._caller(self._disputed()),
+            budget_for=lambda role: 4096,
+            roles=ROLES,
+            passes=2,
+            revise=False,
+            root=self.root,
+        )
+
+        self.assertEqual(result.passes, 2)
+        self.assertEqual(result.changed, [])
+        # Two votes per role and no revision between them: the planner is
+        # asked exactly as often as everybody else.
+        self.assertEqual(self.calls.count("planner"), 2)
+        self.assertEqual(len(self.calls), len(ROLES) * 2)
+
+    def test_the_objections_still_reach_the_second_vote(self):
+        """Only the rewrite is gone. A second vote that could not read what the
+        first one objected to would be a different experiment."""
+        seen: list[list[dict]] = []
+
+        def call(role, messages, budget, **_options):
+            self.calls.append(role)
+            seen.append([m for m in messages])
+            replies = self._disputed()[role]
+            return Completion(
+                text=replies[min(len(seen) - 1, len(replies) - 1)],
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        ratify.ratify(
+            self.store, self.run_id, self.ticket, call=call,
+            budget_for=lambda role: 4096, roles=ROLES, passes=2,
+            revise=False, root=self.root,
+        )
+
+        second_pass = "".join(m.text for m in seen[len(ROLES)])
+        self.assertIn("unclear", second_pass)
+
+    def test_a_revision_still_happens_when_nothing_turned_it_off(self):
+        result = ratify.ratify(
+            self.store,
+            self.run_id,
+            self.ticket,
+            call=self._caller(self._disputed()),
+            budget_for=lambda role: 4096,
+            roles=ROLES,
+            passes=2,
+            root=self.root,
+        )
+
+        self.assertEqual(result.passes, 2)
+        # Five planner calls' worth of roles: four votes plus the revision.
+        self.assertEqual(len(self.calls), len(ROLES) * 2 + 1)
+
     def test_unanimous_agreement_settles_it_in_one_pass(self):
         result = self._ratify({role: "SIGNOFF: yes" for role in ROLES})
 

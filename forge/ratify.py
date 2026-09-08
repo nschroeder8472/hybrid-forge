@@ -668,6 +668,7 @@ def ratify(
     roles: Sequence[str],
     passes: int,
     vote_thinking: bool = True,
+    revise: bool = True,
     sources: dict[str, str] | None = None,
     retrieved: str = "",
     digest: str = "",
@@ -713,6 +714,25 @@ def ratify(
 
         if pass_number >= max(1, passes):
             break
+
+        if not revise:
+            # The pass repeats without the planner rewriting anything, so the
+            # roles vote a second time on the words they already refused. Not
+            # a degenerate case: three of the recorded passes did exactly this
+            # by accident, because the revision failed, and every one of them
+            # changed its verdict — which is what `loop.reviseBetweenPasses`
+            # exists to test deliberately. See docs/ROADMAP.md, *Sign-off
+            # cost*. The notes still travel, so the second vote reads the
+            # objections; only the ticket is unchanged.
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: no revision between passes "
+                f"(loop.reviseBetweenPasses is off); pass {pass_number + 1} "
+                f"votes on the same text.",
+                kind="ticket",
+                data={"ticket": ticket.ticket_id, "pass": pass_number},
+            )
+            continue
 
         changed, responses = _revise(
             store,

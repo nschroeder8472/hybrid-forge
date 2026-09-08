@@ -906,6 +906,16 @@ class LoopSettings:
     # than argued, and it moves the vote alone: the revision this same role
     # makes rewrites a whole ticket and keeps its reasoning either way.
     vote_thinking: bool = True
+    # Whether the planner rewrites the ticket between sign-off passes. True is
+    # every run before this existed. Off, the roles vote again on the words
+    # they already refused, reading the objections but not a revision — which
+    # is what three recorded passes did by accident when the revision failed,
+    # every one of them changing its verdict. The revision is the most
+    # expensive call in the pass and it failed in three of eight, so whether
+    # its cost is what moves those verdicts is worth measuring rather than
+    # assuming; `scripts/vote_grading.py` builds the arm. See the *Sign-off
+    # cost* entry in docs/ROADMAP.md.
+    revise_between_passes: bool = True
     # The order the roles vote in, within a pass. A permutation of `ROLES` —
     # every role votes exactly once, because the majority is counted over all
     # four and dropping one would change the arithmetic silently.
@@ -1201,6 +1211,9 @@ class Config:
             bug_hypotheses=int(loop.get("bugHypotheses", 3)),
             ratify_passes=int(loop.get("ratifyPasses", 2)),
             vote_thinking=bool(loop.get("voteThinking", True)),
+            revise_between_passes=bool(
+                loop.get("reviseBetweenPasses", True)
+            ),
             ratify_order=tuple(loop.get("ratifyOrder", ROLES) or ROLES),
             participation_window=int(loop.get("participationWindow", 20)),
             volume_threshold=int(loop.get("volumeThreshold", 0)),
@@ -1661,6 +1674,7 @@ class Config:
                 "bugHypotheses": self.loop.bug_hypotheses,
                 "ratifyPasses": self.loop.ratify_passes,
                 "voteThinking": self.loop.vote_thinking,
+                "reviseBetweenPasses": self.loop.revise_between_passes,
                 "ratifyOrder": list(self.loop.ratify_order),
             },
             "ui": {

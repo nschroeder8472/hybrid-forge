@@ -3969,6 +3969,7 @@ class Orchestrator:
             roles=self.config.loop.ratify_order,
             passes=passes,
             vote_thinking=self.config.loop.vote_thinking,
+            revise=self.config.loop.revise_between_passes,
             criteria_locked=not self.config.loop.respec_criteria,
             sources=sources,
             retrieved=retrieved,

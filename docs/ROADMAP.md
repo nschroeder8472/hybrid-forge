@@ -724,6 +724,63 @@ because the question was worth asking and may be worth asking again on other
 models — the finding is about these two, at these budgets, on one ticket — not
 because there is now a reason to turn it off. There is a reason not to.
 
+**The other half of the pass has not been priced, and the arm is built.** The
+run above settles what a vote's reasoning is worth. It says nothing about the
+planner's *revision*, which is the single most expensive call in a sign-off
+pass and which failed outright in three of the eight recorded passes. Those
+three are the same three whose outcome moved — the roles voted again on words
+nobody had touched and changed their verdicts anyway — so every outcome change
+in the record happened without a working revision, and the revision's cost has
+never been separated from the second vote's.
+
+`loop.reviseBetweenPasses`, default true, is that separation:
+`arm-revotes` in `scripts/vote_grading.py` runs the pass twice with the
+objections still travelling and only the rewrite gone.
+
+**It ran on 2026-09-08, and the second of the two predicted outcomes is what
+happened.**
+
+| | `arm-thinks` | `arm-revotes` |
+|---|---:|---:|
+| outcome | done | **blocked** |
+| attempts | 1 | 0 |
+| sign-off spend | 58,240 | **85,555** |
+| total tokens | 108,122 | 85,555 |
+
+Pass 1 was the control's pass 1 — all four roles refusing, each naming the
+rounding defect. Pass 2, on text nobody had touched, **all four refused
+again**, and two of them said so about the standing position rather than about
+the ticket: *"The prior answer is wrong in treating the sum criterion as
+settled"*. Not one verdict moved. The ticket parked, was respecced, went back
+to the roles, and parked again.
+
+So removing the revision does not save what it costs — **it made sign-off 47%
+more expensive and delivered nothing**, because a ticket that cannot be
+repaired cycles through the pass instead of leaving it. Sign-off was 100% of
+that arm's tokens. Nothing reached a build call: `attempts` is 0.
+
+Two things this settles beyond the setting. **The revision is what converts a
+correct refusal into a shippable ticket** — the second vote alone does not, and
+~26k tokens is the price of that conversion against a ticket the pass would
+otherwise refuse forever. And the *vote instability* reading above is weaker
+than the three accidental re-votes made it look: given a correctly stated
+objection and nothing changed, these roles hold their position unanimously
+rather than flipping. Whatever moved those three verdicts, it was not the mere
+fact of being asked twice.
+
+What the arm did do is show the pass working exactly as designed on a contract
+it should refuse: it caught the defect, held under a second asking, and parked
+with a note naming the fix — *"replace it with exact expected..."*. That is the
+outcome an operator wants when no repair is available, and it is what
+`ratifyPasses` is for.
+
+**Three ways of making sign-off cheaper have now been tested and all three are
+dead**: skipping review for trivial diffs has no safe threshold, taking
+reasoning off the vote stops the pass finding anything, and removing the
+revision stops the ticket landing. The remaining honest saving in this entry is
+still the one nobody has tried — making the second pass *conditional* on the
+pass-1 status rather than removing any part of it.
+
 **One defect fell out of the join.** Two votes refused to sign while naming
 nothing: `SIGNOFF: no` over `BLOCKING: - NONE`. `resolve` counts the refusal
 against the ticket, but `_revise` builds the revision prompt from the blocking
