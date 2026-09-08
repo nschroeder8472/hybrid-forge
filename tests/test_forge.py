@@ -15776,7 +15776,9 @@ class TestThinkingModelsThatNeverAnswer(unittest.TestCase):
 
     THOUGHT = "Let me think about this at considerable length. " * 20
 
-    def _provider(self, payload: dict, **config) -> OpenAICompatProvider:
+    def _provider(
+        self, payload: dict, sent: list[dict] | None = None, **config
+    ) -> OpenAICompatProvider:
         provider = OpenAICompatProvider(
             "local",
             {
@@ -15789,7 +15791,13 @@ class TestThinkingModelsThatNeverAnswer(unittest.TestCase):
             },
         )
         mod = sys.modules["forge.providers.openai_compat"]
-        self.enterContext(unittest.mock.patch.object(mod, "post_json", lambda *a, **k: payload))
+
+        def post(_url, body, **_kwargs):
+            if sent is not None:
+                sent.append(body)
+            return payload
+
+        self.enterContext(unittest.mock.patch.object(mod, "post_json", post))
         return provider
 
     @staticmethod
@@ -15888,6 +15896,54 @@ class TestThinkingModelsThatNeverAnswer(unittest.TestCase):
 
         self.assertIn("reasoning_effort", recovered)
         self.assertIn("thinker", recovered)
+
+    def test_thinking_is_on_unless_a_caller_turns_it_off(self):
+        """Every call the loop made before `loop.voteThinking` existed."""
+        sent: list[dict] = []
+        provider = self._provider(self._payload("ok", "stop"), sent=sent)
+
+        self._complete(provider)
+
+        self.assertNotIn("reasoning_effort", sent[0])
+
+    def test_a_call_that_does_not_want_reasoning_says_so_on_the_wire(self):
+        sent: list[dict] = []
+        provider = self._provider(self._payload("ok", "stop"), sent=sent)
+
+        provider.complete(
+            [Message(role="user", content="hi")], max_tokens=4096, thinking=False
+        )
+
+        self.assertEqual(sent[0]["reasoning_effort"], "none")
+
+    def test_only_the_off_switch_is_sent_never_a_level(self):
+        """`low` and `high` measure the same on the server this was written
+        against, so a level would read as graduated and would not be."""
+        sent: list[dict] = []
+        provider = self._provider(self._payload("ok", "stop"), sent=sent)
+
+        provider.complete(
+            [Message(role="user", content="hi")], max_tokens=4096, thinking=True
+        )
+
+        self.assertNotIn("reasoning_effort", sent[0])
+
+    def test_an_operators_reasoning_field_still_wins(self):
+        # The same rule `_without_thinking` follows when it declines to
+        # overrule one: someone who has written how this model thinks has
+        # chosen, and a per-call request does not get to quietly undo it.
+        sent: list[dict] = []
+        provider = self._provider(
+            self._payload("ok", "stop"),
+            sent=sent,
+            extraBody={"reasoning_effort": "high"},
+        )
+
+        provider.complete(
+            [Message(role="user", content="hi")], max_tokens=4096, thinking=False
+        )
+
+        self.assertEqual(sent[0]["reasoning_effort"], "high")
 
     def test_the_abandoned_call_is_still_charged_for(self):
         # It read the whole prompt and generated to the ceiling before the
@@ -18614,7 +18670,7 @@ class TestTheSignOffPass(unittest.TestCase):
     def _caller(self, script):
         """A caller that answers from `script`, keyed by role or by turn."""
 
-        def call(role, messages, budget):
+        def call(role, messages, budget, **_options):
             self.calls.append(role)
             replies = script[role]
             reply = replies.pop(0) if isinstance(replies, list) else replies
@@ -18633,6 +18689,61 @@ class TestTheSignOffPass(unittest.TestCase):
             passes=passes,
             root=self.root,
         )
+
+    def _thinking_asked(self, script, **options) -> list[tuple[str, bool]]:
+        """`(role, thinking)` for every call the pass made, in order."""
+        seen: list[tuple[str, bool]] = []
+
+        def call(role, messages, budget, *, thinking=True):
+            seen.append((role, thinking))
+            replies = script[role]
+            reply = replies.pop(0) if isinstance(replies, list) else replies
+            return Completion(text=reply, usage=Usage(), finish_reason="stop")
+
+        ratify.ratify(
+            self.store,
+            self.run_id,
+            self.ticket,
+            call=call,
+            budget_for=lambda role: 4096,
+            roles=ROLES,
+            passes=2,
+            root=self.root,
+            **options,
+        )
+        return seen
+
+    def test_a_vote_reasons_unless_the_setting_says_otherwise(self):
+        seen = self._thinking_asked({role: "SIGNOFF: yes" for role in ROLES})
+
+        self.assertEqual([thinking for _role, thinking in seen], [True] * len(ROLES))
+
+    def test_vote_thinking_off_reaches_every_vote(self):
+        seen = self._thinking_asked(
+            {role: "SIGNOFF: yes" for role in ROLES}, vote_thinking=False
+        )
+
+        self.assertEqual([thinking for _role, thinking in seen], [False] * len(ROLES))
+
+    def test_the_revision_keeps_its_reasoning_when_the_vote_loses_it(self):
+        """A vote is a verdict in four lines; the revision this same role makes
+        rewrites a whole ticket. The setting moves one of them."""
+        script = {
+            "planner": ["SIGNOFF: no\nBLOCKING:\n- unclear", "{}", "SIGNOFF: yes"],
+            **{
+                role: ["SIGNOFF: no\nBLOCKING:\n- unclear", "SIGNOFF: yes"]
+                for role in ROLES
+                if role != "planner"
+            },
+        }
+
+        seen = self._thinking_asked(script, vote_thinking=False)
+
+        # The planner's second call of pass one is the revision, and it is the
+        # only call in the pass that was allowed to reason.
+        self.assertEqual([thinking for _role, thinking in seen].count(True), 1)
+        self.assertTrue(seen[len(ROLES)][1])
+        self.assertEqual(seen[len(ROLES)][0], "planner")
 
     def test_unanimous_agreement_settles_it_in_one_pass(self):
         result = self._ratify({role: "SIGNOFF: yes" for role in ROLES})
@@ -18762,7 +18873,7 @@ class TestTheSignOffPass(unittest.TestCase):
         self.assertTrue(stored.ratify_notes)
 
     def test_an_unreachable_role_is_not_a_refusal(self):
-        def call(role, messages, budget):
+        def call(role, messages, budget, **_options):
             raise ProviderError("connection refused")
 
         result = ratify.ratify(
@@ -18877,7 +18988,7 @@ class TestRatificationInTheLoop(unittest.TestCase):
         """Answer each role from `script`, recording who was asked."""
         asked: list[str] = []
 
-        def call(run_id, role, messages, *, max_tokens, temperature=0.2):
+        def call(run_id, role, messages, *, max_tokens, temperature=0.2, **_options):
             asked.append(role)
             reply = script[role]
             text = reply.pop(0) if isinstance(reply, list) else reply
@@ -20221,7 +20332,7 @@ class TestRatifyRefusesTheShorterListInTheLoop(unittest.TestCase):
             "reviewer": ["SIGNOFF: yes", "SIGNOFF: yes"],
         }
 
-        def call(_run_id, role, _messages, *, max_tokens, temperature=0.2):
+        def call(_run_id, role, _messages, *, max_tokens, temperature=0.2, **_options):
             return Completion(text=scripts[role].pop(0), usage=Usage(), finish_reason="stop")
 
         orchestrator._call = call

@@ -30,7 +30,7 @@ import hashlib
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Protocol, Sequence
 
 from .patch import is_safe_path, keep_test_paths, normalize_path
 from .prompts import (
@@ -54,8 +54,27 @@ from .respec import (
 )
 from .state import Store, Ticket
 
-# `(role, messages, max_tokens) -> Completion`.
-Caller = Callable[[str, list[Message], int], Completion]
+
+class Caller(Protocol):
+    """`(role, messages, max_tokens) -> Completion`, with one option.
+
+    `thinking` false asks a reasoning model to answer without reasoning first.
+    Only the vote passes it, and only when configured to: a vote is a verdict
+    in four lines, while the revision this same caller makes rewrites a whole
+    ticket. Defaulted so a caller that does not care -- every one of them
+    before `loop.voteThinking` existed -- is unchanged.
+    """
+
+    def __call__(
+        self,
+        role: str,
+        messages: list[Message],
+        max_tokens: int,
+        *,
+        thinking: bool = True,
+    ) -> Completion:
+        ...
+
 
 # How a ticket left the pass. Anything but `blocked` and `unavailable` proceeds
 # to build; `unavailable` means no role could be reached and the pass was not
@@ -195,6 +214,7 @@ def _vote(
     retrieved: str,
     notes: Sequence[dict],
     digest: str,
+    thinking: bool = True,
 ) -> Vote:
     """Ask one role, and never let its answer end the run.
 
@@ -215,6 +235,7 @@ def _vote(
                 learnings=digest,
             ),
             budget,
+            thinking=thinking,
         )
     except ProviderError as exc:
         store.log(
@@ -646,6 +667,7 @@ def ratify(
     budget_for: Callable[[str], int],
     roles: Sequence[str],
     passes: int,
+    vote_thinking: bool = True,
     sources: dict[str, str] | None = None,
     retrieved: str = "",
     digest: str = "",
@@ -677,6 +699,7 @@ def ratify(
                 retrieved=retrieved,
                 notes=notes,
                 digest=digest,
+                thinking=vote_thinking,
             )
             votes.append(vote)
             notes.append(vote.as_note(pass_number))

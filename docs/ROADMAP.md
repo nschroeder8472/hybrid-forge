@@ -665,8 +665,64 @@ All of that is correlational, which is the whole of what an artifact tree can
 say: a model given less room might conclude sooner and miss something real,
 and votes that never had less room cannot show it. The experiment that settles
 it is [BLIND-GRADING.md](BLIND-GRADING.md)'s — one ticket, one variable,
-objections counted on both arms — and until it runs this is a reason to
-measure rather than a setting to ship.
+objections counted on both arms.
+
+**Building the experiment found that the version proposed here cannot be
+run.** A smaller allowance is not available per call: llama.cpp honours
+`reasoning_effort` as on or off — `low` and `high` measure identically against
+the server this was written on — and the graduated `reasoning-budget` is a flag
+on the model server, shared by every call that model makes. Planner and
+reviewer share one; executor and tester share the other. So lowering the budget
+to shorten a vote also shortens the planner's *revision*, which is the call
+already failing by running out of room.
+
+What is runnable moves the vote alone: `loop.voteThinking`, default true,
+sending `reasoning_effort: none` on the vote and leaving the revision as it
+was. `scripts/vote_grading.py` builds the two arms over `GR-002` — the ticket
+whose defect both earlier runs found, all four roles refusing on pass 1 and
+naming the same rounding error, which makes the measurement a count rather
+than a judgement.
+
+**It has run, on 2026-09-08, and it reverses the reading above.** One ticket,
+one variable, both arms to completion.
+
+| | `arm-thinks` | `arm-blurts` |
+|---|---:|---:|
+| sign-off spend | 62,061 | 6,073 |
+| roles refusing on pass 1 | 4 of 4 | 0 |
+| passes | 2 | 1 |
+| attempts | 1 | 3 |
+| failed steps | 0 | 2 |
+| **total tokens** | **111,529** | **184,569** |
+
+`arm-thinks` reproduced what the two earlier runs of this ticket did, for the
+third time: every role refused, each naming *each `1/3` share rounds to `33`,
+so the displayed percentages sum to `99`*, the planner repaired the spec, pass
+2 was unanimous and the build landed first attempt.
+
+`arm-blurts` signed the ticket off unanimously on pass 1. No refusal, no
+objection, no revision, at a mean of **20 completion tokens a vote**. The
+defect went through untouched and surfaced two steps later as
+`AssertionError: 99 != 100` — the same arithmetic, found the expensive way.
+
+So the correlation in the paragraphs above does not carry the causal claim
+built on it. It was true that no vote which ran to its allotment raised an
+objection, and false to read that as reasoning being idle: taken away, the
+votes stopped finding anything at all. **The cheaper sign-off made the run more
+expensive** — 55,988 tokens saved on the pass, 73,040 more spent overall, two
+failed steps, two extra attempts. Not a quality-for-cost trade; worse on both.
+
+Two smaller things the arms showed. Both tickets finished `done`, so the missed
+defect cost attempts rather than correctness — this executor found the
+asymmetric rule on its own once a test failure pointed at it. And the tests are
+not equally strong: the repaired spec let `arm-thinks` assert the exact rows
+`["a 34%", "b 33%", "c 33%"]` as well as the sum, where `arm-blurts` asserts
+only that the sum is 100 and never pins which entry takes the extra point.
+
+**`loop.voteThinking` stays, defaulted true, as the record of that.** It ships
+because the question was worth asking and may be worth asking again on other
+models — the finding is about these two, at these budgets, on one ticket — not
+because there is now a reason to turn it off. There is a reason not to.
 
 **One defect fell out of the join.** Two votes refused to sign while naming
 nothing: `SIGNOFF: no` over `BLOCKING: - NONE`. `resolve` counts the refusal

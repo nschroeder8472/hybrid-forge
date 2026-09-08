@@ -895,6 +895,17 @@ class LoopSettings:
     # See docs/RATIFY.md, including the rule it knowingly bends: a reviewer
     # that helped write the contract is not independent of it.
     ratify_passes: int = 2
+    # Whether a sign-off vote is allowed to reason before it answers. True is
+    # every run before this existed, and the default stays true: a vote decides
+    # whether a ticket can be built, which is a judgement, and the case for
+    # taking thinking away from it is a cost argument that the record does not
+    # settle. What the record does say is that of 49 votes that ran to their
+    # reasoning allotment, none raised a single objection, while 27 of the 47
+    # that stopped on their own did — see the *Sign-off cost* entry in
+    # docs/ROADMAP.md. This exists so that can be measured on both arms rather
+    # than argued, and it moves the vote alone: the revision this same role
+    # makes rewrites a whole ticket and keeps its reasoning either way.
+    vote_thinking: bool = True
     # The order the roles vote in, within a pass. A permutation of `ROLES` —
     # every role votes exactly once, because the majority is counted over all
     # four and dropping one would change the arithmetic silently.
@@ -1189,6 +1200,7 @@ class Config:
             repo_map=bool(loop.get("repoMap", True)),
             bug_hypotheses=int(loop.get("bugHypotheses", 3)),
             ratify_passes=int(loop.get("ratifyPasses", 2)),
+            vote_thinking=bool(loop.get("voteThinking", True)),
             ratify_order=tuple(loop.get("ratifyOrder", ROLES) or ROLES),
             participation_window=int(loop.get("participationWindow", 20)),
             volume_threshold=int(loop.get("volumeThreshold", 0)),
@@ -1648,6 +1660,7 @@ class Config:
                 "toolchainContext": self.loop.toolchain_context,
                 "bugHypotheses": self.loop.bug_hypotheses,
                 "ratifyPasses": self.loop.ratify_passes,
+                "voteThinking": self.loop.vote_thinking,
                 "ratifyOrder": list(self.loop.ratify_order),
             },
             "ui": {

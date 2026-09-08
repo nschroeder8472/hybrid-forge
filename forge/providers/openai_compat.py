@@ -208,6 +208,7 @@ class OpenAICompatProvider(Provider):
         temperature: float = 0.2,
         timeout: int = DERIVE_TIMEOUT,
         tools: Sequence[ToolSpec] = (),
+        thinking: bool = True,
     ) -> Completion:
         # Zero means the caller did not care; the budget decides. An
         # explicit timeout is always truthy and passes through.
@@ -218,6 +219,14 @@ class OpenAICompatProvider(Provider):
             "messages": [_turn(m) for m in messages],
             "max_tokens": max_tokens,
             **self.sampling,
+            # Before `extra_body` on purpose, so an operator who has written
+            # their own reasoning field still wins — the same rule
+            # `_without_thinking` follows when it declines to overrule one.
+            # Only the off switch is sent: this wire has `reasoning_effort`
+            # levels, and a llama.cpp server measured here answers `low` and
+            # `high` identically, so a level would be a setting that reads as
+            # graduated and is not.
+            **({} if thinking else {"reasoning_effort": "none"}),
             # Last, so a hand-written body can still override anything above it.
             **self.extra_body,
         }

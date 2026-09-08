@@ -202,6 +202,7 @@ class _Scripted(Provider):
         self.tools_ok = tools_ok
         self.seen: list[list[Message]] = []
         self.tools_offered: list[int] = []
+        self.thinking_asked: list[bool] = []
 
     def capabilities(self):
         return Capabilities(
@@ -210,9 +211,13 @@ class _Scripted(Provider):
             supports_tools=self.tools_ok,
         )
 
-    def complete(self, messages, *, max_tokens, temperature=0.2, timeout=0, tools=()):
+    def complete(
+        self, messages, *, max_tokens, temperature=0.2, timeout=0, tools=(),
+        thinking=True,
+    ):
         self.seen.append(list(messages))
         self.tools_offered.append(len(tools))
+        self.thinking_asked.append(thinking)
         text, calls = self.replies.pop(0)
         return Completion(
             text=text,
@@ -312,6 +317,23 @@ class TestTheConversation(unittest.TestCase):
 
         self.assertEqual(completion.text, "answer")
         self.assertEqual(provider.tools_offered, [0])
+
+    def test_every_turn_of_a_conversation_still_reasons(self):
+        """`loop.voteThinking` moves the sign-off vote and nothing else. A role
+        reading files to answer a ticket is the opposite of a four-line
+        verdict, and a setting that leaked here would be taking reasoning away
+        from the work it was measured on."""
+        provider = _Scripted(
+            [("", [ToolCall("1", "read_file", {"path": "a.py"})]), ("done", [])]
+        )
+        orchestrator = self._orchestrator(provider)
+
+        orchestrator._converse(
+            self.run_id, "executor", [Message(role="user", content="go")],
+            max_tokens=512,
+        )
+
+        self.assertEqual(provider.thinking_asked, [True, True])
 
     def test_what_was_read_is_recorded_in_the_run_log(self):
         provider = _Scripted(
