@@ -626,6 +626,34 @@ work. No repair heuristic was added for unescaped quotes inside JSON — a
 guessed repair produces a wrong spec silently, and a corrupted contract that
 parses is worse than one that is refused.
 
+**Run live on `GR-002`, and the first run found a defect the tests could
+not.** The transport was never the problem: every revision parsed, and a
+block-format `spec` applied correctly. What the change had introduced was a
+*steer*. Asking the planner to emit only the fields it is changing makes it ask
+which field the objection is about — and the objection names a criterion. So it
+rewrote the criterion instead of the rule, replacing the impossible sum with
+the three rounded values that cannot add up to it. The ratchet refused that
+correctly, the pass was thrown away, and the run cost 30 calls and 213.3k
+tokens against the control's 15 and 108.1k. Three earlier runs of this ticket
+had all repaired the *spec* first; the difference was the prompt, not the
+model.
+
+The prompt now says to reach for the spec first and why, and the re-run is
+`unanimous` in one sign-off with `changed=['spec']`, at 62,141 sign-off tokens
+over the same 9 calls the control used — a 6.7% difference on a line that had
+doubled. The planner still reached for the criteria as well, growing them from
+7 to 8, and the ratchet refused that half while keeping the spec change, which
+is the mechanism working rather than a second defect.
+
+Two things worth carrying. The whole-ticket rewrite was doing work nobody had
+credited it with: putting the spec in front of the planner every time is what
+kept the repair there, and a prompt that saves tokens by narrowing what a model
+is asked for can narrow what it *considers* along with it. And the run's total
+is 148,958 against the control's 108,122 — the gap is outside sign-off, three
+extra conversation turns inside the same three steps, which is a different spec
+being read rather than anything this change touches. One run each way; not a
+claim that the change is cost-neutral overall.
+
 **Why the three revisions failed is worth reading before raising a budget.**
 Only one is the runaway it was reported as: 93,615 characters, 98% duplicate
 lines, a thirty-line block emitted fifty-five times, cut off at the ceiling. A

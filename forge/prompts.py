@@ -3591,6 +3591,16 @@ backticks, open and close that block with four or more instead.
 changes; include *every* criterion if any of them does, because a list with
 only the changed ones in it reads as the rest having been dropped.
 
+Reach for the spec first. Most objections are that the spec's own rule cannot
+produce something the criteria demand, and the repair for that belongs in the
+rule, not in the demand. Rewriting a criterion to assert whatever the current
+rule happens to produce is the one revision that is always refused: it is
+checked against the values the plan pinned, and a criterion that stops
+asserting one has dropped it however well the new wording reads. A ticket was
+rewritten that way once — the impossible sum replaced by the three rounded
+values that could not add up to it — and the pass was thrown away and started
+again over exactly that.
+
 Every key is optional, except that the reply has to change something. Omit a
 key to leave that field exactly as it is. `criteria` and the file lists are
 replacements rather than additions, so send them in full or not at all.

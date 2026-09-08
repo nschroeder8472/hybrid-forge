@@ -22105,6 +22105,22 @@ class TestARevisionArrivesInBlocks(unittest.TestCase):
         self.assertIn("Omit every field you are leaving alone", text)
         self.assertIn("Nothing inside a block is escaped", text)
 
+    def test_the_prompt_steers_the_repair_at_the_spec(self):
+        """Choosing which field to emit is new, and the first live revision
+        under it reached for the criteria: it replaced an impossible sum with
+        the three rounded values that could not add up to it, the ratchet
+        refused that correctly, and the pass was thrown away. The system
+        message already said a criterion keeps its bar; that was enough when
+        the planner re-emitted the whole ticket and is not now."""
+        ticket = Ticket(
+            ticket_id="T-1", title="t", spec="s",
+            allowed_files=["a.py"], criteria=["it works"],
+        )
+        text = "\n".join(m.text for m in ratify_revision_prompt(ticket, []))
+
+        self.assertIn("Reach for the spec first", text)
+        self.assertIn("always refused", text)
+
 
 class TestTheSignOffPassDoesNotAskForAReview(unittest.TestCase):
     """Ratification runs before anything is built, and the prompt has to say so
