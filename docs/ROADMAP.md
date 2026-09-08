@@ -610,6 +610,22 @@ revised contract may build better"* defence of the `same` rows now has data
 against it rather than nothing either way. One ticket still spent 265,747
 tokens being revised from `blocked` to `blocked`.
 
+**The revision's shape is now the fix, and it is built.** A planner rewrite
+comes back as labelled fenced blocks — the executor's own shape, a heading
+naming the field and a variable-length fence holding it verbatim — instead of
+one JSON object. Nothing inside a block is escaped, so the failure below that
+cost a completed reply to a single quote has nowhere left to happen, and the
+prompt now asks for only the fields that change, with `criteria` kept
+all-or-nothing so a partial list cannot read as a drop. JSON is still accepted
+when no block is present.
+
+What this does not do is rescue the three recorded failures: they are replies
+to the older question, so they stay unparseable, and the argument for the fix
+is that the class is structurally gone rather than that the old replies now
+work. No repair heuristic was added for unescaped quotes inside JSON — a
+guessed repair produces a wrong spec silently, and a corrupted contract that
+parses is worse than one that is refused.
+
 **Why the three revisions failed is worth reading before raising a budget.**
 Only one is the runaway it was reported as: 93,615 characters, 98% duplicate
 lines, a thirty-line block emitted fifty-five times, cut off at the ceiling. A
@@ -821,6 +837,8 @@ a model out of room emits the protocol without having filled it in. One of the
 two is run 5's planner, in one of the three passes where the revision then
 failed. A refusal that names no objection is a vote the protocol cannot act on,
 and the pass has no way to tell it apart from a signature.
+
+**That is now fixed by asking again rather than by discarding the vote.** A refusal naming nothing is put back to the same role in the same thread — the question it was asked, its own reply, and a turn saying that reply refuses without naming anything and would park the ticket with no reason on it. A model that had a reason gives it; one that refused by accident signs. Two guards keep it from becoming an argument: a second empty refusal leaves the refusal exactly as it stood, and a *truncated* refusal is not re-asked at all, because running out of output room already has its own reading and is recorded as the blocking point.
 
 ---
 

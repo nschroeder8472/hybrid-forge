@@ -117,6 +117,8 @@ from forge.prompts import (
     repro_prompt,
     build_prompt,
     parse_ratify,
+    parse_ratify_revision,
+    ratify_revision_prompt,
     parse_respec,
     parse_verdict,
     ratification_message,
@@ -21920,6 +21922,188 @@ class TestAConfiguredTemperatureNeedNotOverrideDeterminism(unittest.TestCase):
     def test_nothing_configured_is_unchanged(self):
         self.assertEqual(self._at(None, 0.0), 0.0)
         self.assertEqual(self._at(None, 0.2), 0.2)
+
+
+class TestARefusalThatNamesNothingIsAskedAgain(unittest.TestCase):
+    """`SIGNOFF: no` over `BLOCKING: - NONE` is a vote the protocol cannot act
+    on: `resolve` counts it against the ticket, but `_revise` builds the
+    rewrite out of the blocking points, so the planner is handed a no with
+    nothing to fix. Two of the recorded refusals were exactly this, and one of
+    them sat in a pass whose revision then failed.
+
+    The correction goes back as a conversation, not a fresh prompt: the model
+    sees the question, its own answer, and what was wrong with the answer.
+    """
+
+    NOTHING = "SIGNOFF: no\nBLOCKING:\n- NONE\nSUGGEST:\n- NONE"
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        self.store = Store(self.root / "t.db")
+        self.run_id = self.store.create_run("ratify")
+        self.store.add_tickets(
+            self.run_id,
+            [
+                Ticket(
+                    ticket_id="T-1", title="t", spec="s",
+                    allowed_files=["a.py"], criteria=["it works"],
+                )
+            ],
+        )
+        self.ticket = self.store.list_tickets(self.run_id)[0]
+
+    def _vote(self, replies: list[str]) -> tuple[ratify.Vote, list[list]]:
+        threads: list[list] = []
+
+        def call(role, messages, budget, **_options):
+            threads.append(list(messages))
+            return Completion(
+                text=replies[min(len(threads) - 1, len(replies) - 1)],
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        vote = ratify._vote(
+            self.store, self.run_id, self.ticket, "tester",
+            call=call, budget=4096, sources=None, retrieved="",
+            notes=[], digest="",
+        )
+        return vote, threads
+
+    def test_a_refusal_naming_a_reason_is_left_alone(self):
+        vote, threads = self._vote(["SIGNOFF: no\nBLOCKING:\n- cannot assert it"])
+
+        self.assertEqual(len(threads), 1)
+        self.assertEqual(vote.blocking, ["cannot assert it"])
+
+    def test_a_signature_is_left_alone(self):
+        vote, threads = self._vote(["SIGNOFF: yes"])
+
+        self.assertEqual(len(threads), 1)
+        self.assertTrue(vote.signed)
+
+    def test_a_refusal_naming_nothing_is_asked_again(self):
+        vote, threads = self._vote(
+            [self.NOTHING, "SIGNOFF: no\nBLOCKING:\n- the criterion has no test"]
+        )
+
+        self.assertEqual(len(threads), 2)
+        self.assertFalse(vote.signed)
+        self.assertEqual(vote.blocking, ["the criterion has no test"])
+
+    def test_the_second_ask_carries_the_first_answer_and_the_reason(self):
+        _vote, threads = self._vote(
+            [self.NOTHING, "SIGNOFF: no\nBLOCKING:\n- the criterion has no test"]
+        )
+        second = threads[1]
+
+        # Its own reply is in the thread, as its own turn.
+        self.assertIn(self.NOTHING, [m.text for m in second])
+        self.assertEqual([m.role for m in second][-2:], ["assistant", "user"])
+        self.assertIn("lists no blocking point", second[-1].text)
+        # And the question it was originally asked is still in front of it.
+        self.assertEqual([m.role for m in threads[0]], [m.role for m in second[:-2]])
+
+    def test_a_second_empty_refusal_leaves_the_refusal_standing(self):
+        """The point is to recover a reason, never to talk a role out of its
+        verdict."""
+        vote, threads = self._vote([self.NOTHING, self.NOTHING])
+
+        self.assertEqual(len(threads), 2)
+        self.assertFalse(vote.signed)
+        self.assertEqual(vote.blocking, [])
+
+    def test_it_may_come_back_as_a_signature(self):
+        """A model that refused by accident says so, and that is a real answer
+        rather than one to be discarded for not being a refusal."""
+        vote, _threads = self._vote([self.NOTHING, "SIGNOFF: yes"])
+
+        self.assertTrue(vote.signed)
+
+    def test_a_truncated_refusal_is_not_asked_again(self):
+        """Truncation already has its own reading -- the budget ran out -- and
+        it is recorded as the blocking point rather than re-asked."""
+        cut = "SIGNOFF: no\nBLOCKING:"
+        threads: list[list] = []
+
+        def call(role, messages, budget, **_options):
+            threads.append(list(messages))
+            return Completion(text=cut, usage=Usage(), finish_reason="length")
+
+        vote = ratify._vote(
+            self.store, self.run_id, self.ticket, "tester",
+            call=call, budget=4096, sources=None, retrieved="",
+            notes=[], digest="",
+        )
+
+        self.assertEqual(len(threads), 1)
+        self.assertIn("ran out of output room", vote.blocking[0])
+
+
+class TestARevisionArrivesInBlocks(unittest.TestCase):
+    """The planner's rewrite comes back as labelled fenced blocks.
+
+    Three recorded revisions failed and one of them is the reason for the
+    shape: a reply that ran to completion, closed its fences, and lost to a
+    single unescaped `"` at character 14,677 of a 14,676-character JSON string
+    carrying Python source. Nothing inside a block is escaped, so that class of
+    failure has nowhere to happen.
+    """
+
+    def test_a_spec_carrying_code_and_quotes_survives_verbatim(self):
+        # The exact shape that voided a real reply: a Python string with an
+        # escaped backslash and a quote, inside the spec.
+        spec = 'cleaned = _UNSAFE.sub("-", str(value)).strip("-\\.")'
+        revision = parse_ratify_revision(
+            f"spec\n```\n{spec}\n```\n"
+        )
+
+        self.assertEqual(revision["spec"], spec)
+
+    def test_an_omitted_field_is_simply_absent(self):
+        """An omitted field keeps the value the ticket already has, so the
+        parser must not invent an empty one for it."""
+        revision = parse_ratify_revision("context\n```\nread bars.py\n```\n")
+
+        self.assertEqual(set(revision), {"context"})
+
+    def test_a_list_field_reads_a_line_at_a_time(self):
+        revision = parse_ratify_revision(
+            "criteria\n```\n- it parses\n- it round-trips\n```\n"
+        )
+
+        self.assertEqual(revision["criteria"], ["it parses", "it round-trips"])
+
+    def test_a_block_whose_body_holds_a_fence_is_wrapped_in_a_longer_one(self):
+        body = "Add this:\n\n```python\nx = 1\n```\n\nand nothing else."
+        revision = parse_ratify_revision(f"spec\n````\n{body}\n````\n")
+
+        self.assertEqual(revision["spec"], body)
+
+    def test_json_is_still_read_when_no_block_is_present(self):
+        """A model that has learned the older shape is not refused for it."""
+        revision = parse_ratify_revision(
+            '{"spec": "the revised spec", "responses": ["widened the scope"]}'
+        )
+
+        self.assertEqual(revision["spec"], "the revised spec")
+        self.assertEqual(revision["responses"], ["widened the scope"])
+
+    def test_a_reply_that_changes_nothing_is_still_refused(self):
+        with self.assertRaises(ValueError):
+            parse_ratify_revision("responses\n```\n- nothing to do\n```\n")
+
+    def test_the_prompt_asks_for_blocks_and_says_to_omit_the_rest(self):
+        ticket = Ticket(
+            ticket_id="T-1", title="t", spec="s",
+            allowed_files=["a.py"], criteria=["it works"],
+        )
+        text = "\n".join(
+            m.text for m in ratify_revision_prompt(ticket, [])
+        )
+
+        self.assertIn("Omit every field you are leaving alone", text)
+        self.assertIn("Nothing inside a block is escaped", text)
 
 
 class TestTheSignOffPassDoesNotAskForAReview(unittest.TestCase):

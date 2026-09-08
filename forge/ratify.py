@@ -223,20 +223,16 @@ def _vote(
     parking a ticket for disagreement that never happened is the kind of
     misreport that takes a human hours to see through.
     """
+    prompt = ratify_prompt(
+        ticket,
+        role,
+        sources=sources,
+        retrieved=retrieved,
+        notes=notes,
+        learnings=digest,
+    )
     try:
-        completion = call(
-            role,
-            ratify_prompt(
-                ticket,
-                role,
-                sources=sources,
-                retrieved=retrieved,
-                notes=notes,
-                learnings=digest,
-            ),
-            budget,
-            thinking=thinking,
-        )
+        completion = call(role, prompt, budget, thinking=thinking)
     except ProviderError as exc:
         store.log(
             run_id,
@@ -255,7 +251,100 @@ def _vote(
         blocking = blocking or [
             f"the {role} ran out of output room after {budget:,} tokens"
         ]
+
+    if not signed and not blocking and not completion.truncated:
+        # A refusal naming nothing is a vote the protocol cannot act on.
+        # `resolve` counts it against the ticket, but `_revise` builds the
+        # rewrite out of the blocking points, so the planner is handed a no
+        # with nothing to fix — and two of the recorded refusals were exactly
+        # this. Asked again in the same thread, with its own reply in front of
+        # it and the reason it is being asked, a model that had a reason says
+        # what it was; one that did not says so and signs.
+        signed, blocking, suggestions = _ask_again(
+            store, run_id, ticket, role,
+            call=call, budget=budget, prompt=prompt, completion=completion,
+            signed=signed, blocking=blocking, suggestions=suggestions,
+            thinking=thinking,
+        )
     return Vote(role, signed=signed, blocking=blocking, suggestions=suggestions)
+
+
+def _ask_again(
+    store: Store,
+    run_id: int,
+    ticket: Ticket,
+    role: str,
+    *,
+    call: Caller,
+    budget: int,
+    prompt: list[Message],
+    completion: Completion,
+    signed: bool,
+    blocking: list[str],
+    suggestions: list[str],
+    thinking: bool,
+) -> tuple[bool, list[str], list[str]]:
+    """One more turn, in the same thread, for a refusal that named nothing.
+
+    The correction goes back as a conversation rather than as a fresh prompt:
+    the model sees the question it was asked, the answer it gave, and what was
+    wrong with that answer. Asking again from scratch would lose the first two
+    and invite the same reply.
+
+    Whatever comes back is used only if it is *more* usable than what it
+    replaces. A second empty refusal stands as the refusal it already was --
+    the point is to recover a reason, never to talk a role out of its verdict.
+    """
+    thread = [
+        *prompt,
+        Message(role="assistant", content=completion.text),
+        Message(
+            role="user",
+            content=(
+                "That reply refuses the ticket and lists no blocking point, so "
+                "there is nothing for the planner to fix and the ticket would "
+                "park with no reason on it.\n\n"
+                "Answer again in the same format. If you cannot do your part "
+                "of this ticket as written, say what specifically stops you "
+                "under BLOCKING. If nothing does, sign it off."
+            ),
+        ),
+    ]
+    try:
+        second = call(role, thread, budget, thinking=thinking)
+    except ProviderError as exc:
+        store.log(
+            run_id,
+            f"{ticket.ticket_id}: the {role} refused sign-off without naming a "
+            f"reason, and could not be reached to be asked again ({exc}).",
+            level="warn",
+            kind="ticket",
+            data={"ticket": ticket.ticket_id, "role": role},
+        )
+        return signed, blocking, suggestions
+
+    again_signed, again_blocking, again_suggestions = parse_ratify(second.text)
+    if not again_signed and not again_blocking:
+        store.log(
+            run_id,
+            f"{ticket.ticket_id}: the {role} refused sign-off without naming a "
+            f"reason, twice. The refusal stands and the planner has nothing to "
+            f"work from.",
+            level="warn",
+            kind="ticket",
+            data={"ticket": ticket.ticket_id, "role": role},
+        )
+        return signed, blocking, suggestions
+
+    store.log(
+        run_id,
+        f"{ticket.ticket_id}: the {role} refused sign-off without naming a "
+        f"reason; asked again, it "
+        + ("signed off." if again_signed else "named what stops it."),
+        kind="ticket",
+        data={"ticket": ticket.ticket_id, "role": role, "signed": again_signed},
+    )
+    return again_signed, again_blocking, again_suggestions
 
 
 # How much longer than the spec it revises a proposed spec may be before it is
