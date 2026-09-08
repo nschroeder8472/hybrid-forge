@@ -86,6 +86,10 @@ class GeminiProvider(Provider):
         # Taking the argument anyway means no call site has to ask which kind
         # of provider a role happens to have.
         tools: Sequence[ToolSpec] = (),
+        # Accepted and ignored: this API has no per-call reasoning switch.
+        # Taken anyway so no call site has to ask which kind of provider a
+        # role happens to have.
+        thinking: bool = True,
     ) -> Completion:
         # Zero means the caller did not care; the budget decides. An
         # explicit timeout is always truthy and passes through.

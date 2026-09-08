@@ -410,6 +410,7 @@ class LlamaCppProvider(OpenAICompatProvider):
         temperature: float = 0.2,
         timeout: int = DERIVE_TIMEOUT,
         tools: Sequence[ToolSpec] = (),
+        thinking: bool = True,
     ) -> Completion:
         # Before every call, not once at startup. The loop alternates roles and
         # each role is its own provider instance, so what is resident is decided
@@ -422,6 +423,7 @@ class LlamaCppProvider(OpenAICompatProvider):
             temperature=temperature,
             timeout=timeout,
             tools=tools,
+            thinking=thinking,
         )
 
     # -- what doctor can see -------------------------------------------

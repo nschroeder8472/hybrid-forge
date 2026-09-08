@@ -113,6 +113,7 @@
     "freezeTests": true,
     "ratifyPasses": 2,
     "ratifyOrder": ["planner", "executor", "tester", "reviewer"],
+    "voteThinking": true,
     "participationWindow": 20,
     "volumeThreshold": 0,
     "maxChildren": 8,

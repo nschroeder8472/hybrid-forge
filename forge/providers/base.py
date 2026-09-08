@@ -442,6 +442,7 @@ class Provider(ABC):
         temperature: float = 0.2,
         timeout: int = DERIVE_TIMEOUT,
         tools: Sequence[ToolSpec] = (),
+        thinking: bool = True,
     ) -> Completion:
         """Send a completion request. Raises a ProviderError subclass on failure.
 
@@ -454,6 +455,12 @@ class Provider(ABC):
         refusal here would end a ticket over a capability the prompt did not
         need. Every provider still accepts the argument so a caller does not
         have to ask which kind it is holding.
+
+        `thinking` false asks a reasoning model to answer without reasoning
+        first. It is a request about *this* call, not a setting: a model with
+        no such control ignores it, and it never overrules an operator who has
+        written their own reasoning field into `extraBody`. Default true is
+        every call the loop made before this existed.
         """
 
     def request_timeout(self, max_tokens: int) -> int:

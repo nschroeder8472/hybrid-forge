@@ -87,7 +87,7 @@ class TestRatificationKeepsTheTestPath(unittest.TestCase):
         )
         ticket = store.list_tickets(run_id)[0]
 
-        def call(role, _messages, _budget):
+        def call(role, _messages, _budget, **_options):
             # One role blocks, so the planner is asked for a revision at all;
             # the revision narrows the scope out of the test file.
             if role == "planner" and self.asked:

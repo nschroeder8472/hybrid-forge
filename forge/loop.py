@@ -792,6 +792,7 @@ class Orchestrator:
         images: Sequence[ImagePart] = (),
         images_withheld: Sequence[str] = (),
         tools: Sequence[ToolSpec] = (),
+        thinking: bool = True,
     ) -> Completion:
         """One model call, with the budget gate wrapped around it.
 
@@ -846,6 +847,7 @@ class Orchestrator:
                     max_tokens=max_tokens,
                     temperature=temperature,
                     tools=tools,
+                    thinking=thinking,
                 )
             except RateLimited as exc:
                 reset_at = exc.reset_at or (time.time() + exc.seconds_remaining)
@@ -3932,12 +3934,29 @@ class Orchestrator:
 
         step_id = self.store.start_step(run_id, ticket.ticket_id, "ratify")
 
-        def call(role: str, messages: list[Message], budget: int) -> Completion:
+        def call(
+            role: str,
+            messages: list[Message],
+            budget: int,
+            *,
+            thinking: bool = True,
+        ) -> Completion:
             completion = self._call(
-                run_id, role, messages, max_tokens=budget, temperature=0.0
+                run_id,
+                role,
+                messages,
+                max_tokens=budget,
+                temperature=0.0,
+                thinking=thinking,
             )
             self._record_call(
-                ticket, f"ratify-{role}", role, completion, extra={"pass": "sign-off"}
+                ticket,
+                f"ratify-{role}",
+                role,
+                completion,
+                # Recorded on the call, because the arm an experiment ran is
+                # not reconstructable from a config file that has since moved.
+                extra={"pass": "sign-off", "thinking": thinking},
             )
             return completion
 
@@ -3949,6 +3968,7 @@ class Orchestrator:
             budget_for=self._output_budget,
             roles=self.config.loop.ratify_order,
             passes=passes,
+            vote_thinking=self.config.loop.vote_thinking,
             criteria_locked=not self.config.loop.respec_criteria,
             sources=sources,
             retrieved=retrieved,
