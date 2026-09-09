@@ -1895,6 +1895,38 @@ class Store:
             ).fetchall()
         )
 
+    def clear_step_detail(self, run_ids: Sequence[int]) -> tuple[int, int]:
+        """Empty the `detail` column of the runs whose artifacts are being pruned.
+
+        The step rows stay — `forge status` and the convergence machinery read
+        their statuses and classes, and dropping rows would make an old run's
+        history disappear rather than shrink. What goes is the bulk: the
+        transcripts, which are the same thing `forge prune` deletes from disk.
+
+        Returns `(rows, bytes)` — how many rows changed and how many UTF-8
+        bytes of `detail` they held before. Rows whose `detail` is already
+        empty are not counted in either number, so a second call over the same
+        runs reports `(0, 0)`. An empty `run_ids` changes nothing.
+        """
+        if not run_ids:
+            return (0, 0)
+        placeholders = ", ".join("?" for _ in run_ids)
+        with self._write() as connection:
+            rows = connection.execute(
+                f"SELECT detail FROM steps WHERE run_id IN ({placeholders}) "
+                "AND detail != ''",
+                tuple(run_ids),
+            ).fetchall()
+            if not rows:
+                return (0, 0)
+            total = sum(len(row["detail"].encode("utf-8")) for row in rows)
+            connection.execute(
+                f"UPDATE steps SET detail = '' WHERE run_id IN ({placeholders}) "
+                "AND detail != ''",
+                tuple(run_ids),
+            )
+        return (len(rows), total)
+
     # ------------------------------------------------------------------
     # Events (the dashboard's feed)
     # ------------------------------------------------------------------
