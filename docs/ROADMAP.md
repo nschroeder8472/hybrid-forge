@@ -874,9 +874,22 @@ and the pass has no way to tell it apart from a signature.
 
 Found while reviewing the loop, judged not worth building yet.
 
-- **Retention for the step log.** `forge prune` clears artifact trees; `run.db`
-  still grows without bound, and step detail is the bulk of it. Only matters
-  once a daemon has been running against a real backlog for weeks.
+- **Retention for the step log — half built.** `Store.clear_step_detail` landed
+  as RT-001, written by the loop itself against this repository, and nothing
+  calls it yet. Measured on this repository's own database: `steps.detail` was
+  1,871,779 bytes of 2,551,808 — 73% of the file, from 285 rows across seven
+  runs. `PRUNE.md` is the wiring plus the `VACUUM` that makes the file actually
+  shrink.
+- **What stops the executor on a real repository** —
+  [EXECUTOR-CEILINGS.md](EXECUTOR-CEILINGS.md). Four ceilings found by running
+  one ticket against this tree, each hidden behind the last: whole-file output
+  (fixed by replacement blocks), read exhaustion (measured, unfixed — raising
+  `toolTurns` from 8 to 16 doubled the reads and changed nothing), a
+  misdiagnosis that wasted the loop's one free correction (fixed), and tool
+  insufficiency (fixed by `grep(context)` and `read_symbol`; `outline` retired
+  at 0 calls in 49 across three probe arms). It also carries the open
+  `ResourceWarning` finding on `Store`'s per-thread connections, which is
+  measured *not* to be a leak.
 - **Per-role provider guarantees.** `claude-cli` now defaults to no tools, which
   makes it behave like the completion endpoint the loop assumes. A stronger
   version would let a role *declare* what it needs — "this role reads text and
