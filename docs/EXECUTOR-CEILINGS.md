@@ -121,12 +121,27 @@ Raising the cap is measured not to work. What is left:
   That is a spec habit, not a loop change, and it is likely the cheapest of
   these.
 
-### The executor narrates before it acts
+### The executor narrates before it acts — fixed 2026-09-09
 
 Run 11 attempt 1 read successfully, used `read_symbol`, correctly identified
 everything it needed — and then spent its output budget writing that summary
 and hit the limit before emitting any edit. The prose was accurate and
-unnecessary. Worth a prompt rule: blocks first, prose never.
+unnecessary.
+
+**Applied, in two places.** `EXECUTOR_SYSTEM` now carries the rule the attempt
+was lost to and nothing stated: *blocks first, prose never* — the first line of
+a reply is a path line, `BLOCKED:` or `IMPOSSIBLE:`, with the lost attempt
+given as the reason and a worked WRONG example of a reply that explains itself
+first.
+
+The second place is the correction sent afterwards, which was aimed at the
+wrong failure. Every truncated reply was told the same thing — *fewer files per
+response, no restated context* — and a reply that never named a file has no
+files to send fewer of. `names_a_file` splits the two: a path line counts even
+when the fence below it was cut off mid-block, so a reply that got partway
+through its files still gets the old advice, and one whose budget went entirely
+on prose is told that is what happened. The attempt is spent either way; only
+what the next one is told changes.
 
 ### SQLite connections are closed by the garbage collector — fixed 2026-09-09
 

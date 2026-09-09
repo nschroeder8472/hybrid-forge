@@ -79,6 +79,7 @@ from .patch import (
     laundered_assertions,
     weakened_criteria,
     matches_any,
+    names_a_file,
     normalize_path,
     parse_output,
     repo_relative,
@@ -5776,13 +5777,32 @@ class Orchestrator:
             # written and the attempt is spent instead. Not reprompted: the
             # second call gets the same budget and runs out of it the same way.
             if completion.truncated:
-                detail = (
-                    "Your previous response was cut off at the output limit, so "
-                    "no files were written. Emit the same implementation in "
-                    "fewer output tokens — fewer files per response, no "
-                    "restated context — or reply BLOCKED: if the ticket cannot "
-                    "be implemented within that budget."
-                )
+                # Two ways to run out, needing opposite advice. A reply that
+                # named files and was cut off partway through them asked for
+                # too much in one response. A reply that never named one spent
+                # the budget on prose before it started — run 11's first
+                # attempt read correctly, identified everything it needed, and
+                # hit the limit describing that. Telling it to send fewer files
+                # is telling it to do less of the thing it never began.
+                if names_a_file(completion.text):
+                    detail = (
+                        "Your previous response was cut off at the output "
+                        "limit, so no files were written. Emit the same "
+                        "implementation in fewer output tokens — fewer files "
+                        "per response, no restated context — or reply BLOCKED: "
+                        "if the ticket cannot be implemented within that "
+                        "budget."
+                    )
+                else:
+                    detail = (
+                        "Your previous response was cut off at the output "
+                        "limit before it named a single file, so nothing was "
+                        "written. The whole budget went on prose. Blocks "
+                        "first, prose never: open with a path line and a "
+                        "fenced block, and send no summary of what you read, "
+                        "no plan, and no explanation. Reply BLOCKED: if you "
+                        "genuinely cannot proceed."
+                    )
                 self.store.end_step(step_id, "failed", clip(completion.text, DETAIL_CHARS))
                 return StepResult(ok=False, detail=detail)
 
