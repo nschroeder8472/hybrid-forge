@@ -15,6 +15,7 @@ from collections import Counter
 from typing import Any, Sequence
 
 from .failures import distill
+from .patch import _unwrap_double_fence
 from .providers import ImagePart, Message, TextPart
 from .state import TICKET_BUG, Ticket
 
@@ -3547,18 +3548,58 @@ What the rewrite has to preserve:
   of the grid; the two roles that had to work under it refused, correctly, and
   the backlog stopped there without an attempt.
 
-Reply with a JSON object and nothing else:
+Reply with one labelled block per field you are changing, and nothing else.
+Omit every field you are leaving alone — an omitted field keeps the value the
+ticket already has, and re-emitting something unchanged is a chance to change
+it by accident.
 
-```json
-{
-  "spec": "the revised spec",
-  "criteria": ["every criterion, in full, including the unchanged ones"],
-  "allowed_files": ["path/one"],
-  "reference_files": ["path/two"],
-  "context": "the current context plus anything else the roles must carry, or omit this key",
-  "responses": ["one line per objection: what you changed, or why you did not"]
-}
-```
+    spec
+    ```
+    the revised spec, exactly as it should read
+    ```
+
+    criteria
+    ```
+    every criterion, in full, one per line, including the unchanged ones
+    ```
+
+    allowed_files
+    ```
+    path/one
+    ```
+
+    reference_files
+    ```
+    path/two
+    ```
+
+    context
+    ```
+    the current context plus anything else the roles must carry
+    ```
+
+    responses
+    ```
+    one line per objection: what you changed, or why you did not
+    ```
+
+Nothing inside a block is escaped: write the spec as it should read, quotes,
+backslashes, code and all. If a block's own content contains a line of three
+backticks, open and close that block with four or more instead.
+
+`criteria` is the one field that is all-or-nothing. Omit it if no criterion
+changes; include *every* criterion if any of them does, because a list with
+only the changed ones in it reads as the rest having been dropped.
+
+Reach for the spec first. Most objections are that the spec's own rule cannot
+produce something the criteria demand, and the repair for that belongs in the
+rule, not in the demand. Rewriting a criterion to assert whatever the current
+rule happens to produce is the one revision that is always refused: it is
+checked against the values the plan pinned, and a criterion that stops
+asserting one has dropped it however well the new wording reads. A ticket was
+rewritten that way once — the impossible sum replaced by the three rounded
+values that could not add up to it — and the pass was thrown away and started
+again over exactly that.
 
 Every key is optional, except that the reply has to change something. Omit a
 key to leave that field exactly as it is. `criteria` and the file lists are
@@ -3622,9 +3663,61 @@ def ratify_revision_prompt(
 """
 
     messages.append(
-        Message(role="user", content=body + "\nReturn the revised ticket as JSON now.")
+        Message(
+            role="user",
+            content=body
+            + "\nReturn the fields you are changing now, one labelled block "
+            "each, and omit the rest.",
+        )
     )
     return messages
+
+
+# One revised ticket field, as a labelled fenced block. The executor's shape,
+# reused deliberately: a heading naming the thing, then a variable-length fence
+# holding the value verbatim. Nothing inside is escaped, which is the whole
+# point — a `spec` carrying Python source has quotes and backslashes in it, and
+# one JSON reply was voided by a single unescaped `"` at character 14,677 of a
+# 14,676-character field. A body containing its own fence is wrapped in a
+# longer one, exactly as a file containing a fence already is.
+_FIELD_BLOCK = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*)?"
+    r"(?P<field>spec|criteria|allowed_files|reference_files|context|responses)"
+    r"(?:\*\*)?[ \t]*:?[ \t]*\n"
+    r"(?P<fence>`{3,})[^\n]*\n"
+    r"(?P<body>.*?)"
+    r"^(?P=fence)`*[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
+
+# `criteria`, `allowed_files`, `reference_files` and `responses` are lists; in
+# block form they arrive a line each, optionally bulleted.
+_LIST_FIELDS = ("criteria", "allowed_files", "reference_files", "responses")
+
+_BULLET = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+")
+
+
+def _revision_blocks(text: str) -> dict[str, Any]:
+    """Revised fields written as labelled blocks, or `{}` if none are.
+
+    A later block for the same field wins, which is what a model that restates
+    itself means, and matches how the executor's parser treats a repeated path.
+    """
+    found: dict[str, Any] = {}
+    for match in _FIELD_BLOCK.finditer(text):
+        field = match.group("field")
+        body = _unwrap_double_fence(match.group("body"))
+        if field in _LIST_FIELDS:
+            items = [
+                _BULLET.sub("", line).strip()
+                for line in body.splitlines()
+                if line.strip()
+            ]
+            if items:
+                found[field] = items
+        elif body.strip():
+            found[field] = body.strip()
+    return found
 
 
 def parse_ratify_revision(text: str) -> dict[str, Any]:
@@ -3636,7 +3729,20 @@ def parse_ratify_revision(text: str) -> dict[str, Any]:
     answer: the objection was narrow and so is the fix. What is still refused
     is a reply that changes nothing at all, which spends a pass and leaves the
     next vote reading the identical ticket.
+
+    Two shapes are accepted. Labelled fenced blocks are read first, because
+    they are the shape that cannot be voided by a quote: three revisions failed
+    in the recorded evidence and one of them was a reply that finished, closed
+    its fences, and lost to a single unescaped `"` inside a 14,676-character
+    JSON string carrying Python source. JSON is still read when no block is
+    present, so a model that has learned the older shape is not refused for it.
     """
+    blocks = _revision_blocks(text)
+    if blocks:
+        if not set(blocks) - {"rationale", "responses"}:
+            raise ValueError("planner reply revised nothing")
+        return blocks
+
     data = _json_object(text, who="planner")
 
     revision: dict[str, Any] = {}
