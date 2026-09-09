@@ -256,6 +256,21 @@ class Handler(BaseHTTPRequestHandler):
         except ConnectionError:
             self.close_connection = True
 
+    def finish(self) -> None:
+        """Hand the socket back, then this thread's database connection.
+
+        `ThreadingHTTPServer` runs each connection on a thread of its own, and
+        `Store` opens a connection per thread. Nothing closed them, so every
+        served connection left an open SQLite handle for the garbage collector
+        to find — a Windows file lock on the run database, held for as long as
+        refcounting took to notice. Closing here is per connection rather than
+        per request, so keep-alive still reuses one.
+        """
+        try:
+            super().finish()
+        finally:
+            self.store.close()
+
     # ------------------------------------------------------------------
 
     def _send(self, code: int, body: bytes, content_type: str) -> None:

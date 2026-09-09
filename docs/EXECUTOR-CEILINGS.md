@@ -128,10 +128,10 @@ everything it needed — and then spent its output budget writing that summary
 and hit the limit before emitting any edit. The prose was accurate and
 unnecessary. Worth a prompt rule: blocks first, prose never.
 
-### SQLite connections are closed by the garbage collector
+### SQLite connections are closed by the garbage collector — fixed 2026-09-09
 
-`Store` keeps one connection per thread in `threading.local()`. `close()`
-closes only the calling thread's. The dashboard is a `ThreadingHTTPServer`, so
+`Store` kept one connection per thread in `threading.local()`. `close()`
+closed only the calling thread's. The dashboard is a `ThreadingHTTPServer`, so
 **every request runs on a new thread that opens a connection** — `connect`,
 `PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout` — and nothing closes it
 explicitly.
@@ -159,11 +159,21 @@ noise. What is real:
   True on CPython, not a property to lean on, and an open handle on Windows
   blocks the temp-directory cleanup some tests do.
 
-Fixes, none applied: close the thread's connection when a request ends; give
-`Store` context-manager support so tests stop leaving them open. **On Windows
-this is the difference between a test suite that passes and one that does
-not**, and any ticket whose tests create a `Store` in a temp directory will hit
-it — which is every ticket touching state, including the two written here.
+**Applied.** `Store` now keeps a registry of every connection it opened, which
+is what makes closing another thread's possible at all. `close()` is unchanged
+and still touches only the caller's — the dashboard calls it from `Handler.finish`,
+as each connection thread ends, which is where the trail of open handles came
+from. `close_all()` closes the lot for a caller that can promise nobody else is
+using the store, and `__enter__`/`__exit__` are that promise, so a test owns its
+store with `with` and can then delete the directory. A `weakref.finalize` closes
+the connections of a store nobody closed at all — the case that covers the tests
+the loop writes, which will not know the context manager exists.
+
+Measured on this suite: `tests/test_forge.py` emitted **721 `ResourceWarning`s**
+before and none after; the nine left across the whole suite are `memory.py`'s
+subprocess pipes and test sockets, not databases. The dashboard half is pinned
+by `test_a_served_connection_does_not_leave_one_open`, which fails at `4 != 1`
+with the `finish` override removed.
 
 ### `forge prune` still does not prune the step log
 

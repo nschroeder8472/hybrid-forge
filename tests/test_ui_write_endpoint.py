@@ -69,10 +69,13 @@ class TestTheWriteEndpointsAreServed(unittest.TestCase):
     def setUp(self):
         # `mkdtemp` rather than `TemporaryDirectory`, which is what every other
         # store-backed test here uses. `Store` opens a connection per thread and
-        # `close()` can only close the caller's, so the handler threads keep
-        # theirs — and Windows refuses to unlink a database file a connection
-        # still holds, which failed every test in this class through its
-        # cleanup rather than its assertions.
+        # `close()` can only close the caller's — and Windows refuses to unlink
+        # a database file a connection still holds, which failed every test in
+        # this class through its cleanup rather than its assertions. The
+        # handler now closes its thread's connection as the connection ends,
+        # which is what `test_a_served_connection_does_not_leave_one_open`
+        # pins; the directory is still left behind rather than trusted to a
+        # cleanup ordering.
         root = Path(tempfile.mkdtemp()).resolve()
         self.store = _store(root)
         self.addCleanup(self.store.close)
@@ -91,6 +94,24 @@ class TestTheWriteEndpointsAreServed(unittest.TestCase):
         self.addCleanup(self.server.server_close)
         self.addCleanup(serving.join, 5)
         self.addCleanup(self.server.shutdown)
+
+    def test_a_served_connection_does_not_leave_one_open(self):
+        """The dashboard used to hand every connection thread's handle to the GC.
+
+        `ThreadingHTTPServer` runs a thread per connection and `Store` opens a
+        connection per thread, so a browser polling the dashboard left a trail
+        of open SQLite handles — each one a Windows lock on the run database —
+        for refcounting to clear whenever it got to them.
+        """
+        before = len(self.store._open)
+
+        for _ in range(3):
+            status, _ = _request(self.server, "POST", "/api/control", b'{"command": "pause"}')
+            self.assertEqual(status, 200)
+
+        # `urlopen` does not reuse a connection, so each request above was its
+        # own thread with its own connection. All three are closed.
+        self.assertEqual(len(self.store._open), before)
 
     def test_bound_handler_binds_the_store_and_the_config(self):
         handler = ui_server.bound_handler(self.config, self.store)
