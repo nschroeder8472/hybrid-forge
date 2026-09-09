@@ -24,6 +24,7 @@ from forge.patch import (
     Replacement,
     apply_edits,
     describe_unparsed,
+    names_a_file,
     parse_output,
 )
 from forge.prompts import EXECUTOR_SYSTEM
@@ -218,6 +219,36 @@ class TestTheExecutorIsToldAboutIt(unittest.TestCase):
 
     def test_it_says_a_new_file_is_still_sent_whole(self):
         self.assertIn("has to be sent whole", EXECUTOR_SYSTEM)
+
+    def test_it_says_the_blocks_come_before_any_prose(self):
+        """The attempt lost to narration was lost to a rule nothing stated."""
+        self.assertIn("Blocks first, prose never", EXECUTOR_SYSTEM)
+
+
+class TestWhetherAReplyGotAsFarAsNamingAFile(unittest.TestCase):
+    """Which of two opposite corrections a cut-off reply is owed."""
+
+    def test_a_closed_block_names_one(self):
+        self.assertTrue(names_a_file("app.py\n```\nx = 1\n```"))
+
+    def test_a_path_line_whose_fence_never_closed_still_names_one(self):
+        # What a reply cut off mid-file looks like: the block is open, so
+        # `parse_output` yields nothing, and the path line is the evidence.
+        self.assertTrue(names_a_file("app.py\n```python\ndef half("))
+
+    def test_prose_alone_names_nothing(self):
+        self.assertFalse(
+            names_a_file(
+                "I've reviewed the code. The problem is in parse(), which "
+                "needs a guard for the empty case."
+            )
+        )
+
+    def test_a_filename_inside_a_sentence_is_not_a_path_line(self):
+        """Otherwise every narration would be read as having started work."""
+        self.assertFalse(
+            names_a_file("First I will change app.py, then the test beside it.")
+        )
 
 
 class TestATextToolCallIsNamedForWhatItIs(unittest.TestCase):

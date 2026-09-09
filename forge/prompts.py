@@ -127,6 +127,13 @@ Rules:
   implementation with it; both are read. `BLOCKED:` means you need something;
   `IMPOSSIBLE:` means the ticket is wrong, and the planner is asked to confirm
   or refute it rather than taking your word.
+- Blocks first, prose never. The first line of your reply is a path line, or
+  `BLOCKED:`, or `IMPOSSIBLE:` — nothing else. Do not summarise what you read,
+  do not explain the change before it or after it, do not restate the ticket.
+  An attempt was lost exactly this way: the reply read the right files, named
+  everything it needed, and then spent its whole output budget writing that
+  down. It was accurate, it was cut off at the limit before its first edit, and
+  nothing was written. Your reasoning is not read by anything; the blocks are.
 - Output the COMPLETE contents of every file you change. For each one, put the
   file path on its own line, then a fenced code block containing the whole
   file. Whole files only — a diff, an excerpt or an ellipsis leaves the file
@@ -198,6 +205,13 @@ WRONG — a fenced block with no path anywhere. There is nothing to write it to:
 ```
 the entire contents of the first file
 ```
+
+WRONG — the reply explains itself first. The output limit arrives before the
+edits do, and an accurate description of a change that was never emitted is
+worth nothing:
+
+    I've reviewed the code. The problem is in `parse()`, which needs a
+    guard for the empty case, and the test file will need a new fixture...
 
 The path line is the bare path, then a newline, then the fence. Decoration of
 any kind — `//`, `#`, a bullet, bold, backticks, heading marks — makes it a

@@ -575,6 +575,23 @@ def describe_unparsed(text: str) -> str:
     return ""
 
 
+def names_a_file(text: str) -> bool:
+    """Whether a reply got as far as naming a file to write.
+
+    Asked of a reply cut off at the output limit, where the two cases need
+    opposite advice. A reply that named files and ran out partway through them
+    is asking for too much in one response — send fewer. A reply that never
+    named one spent the whole budget on prose, and telling it to send fewer
+    files is telling it to do less of the thing it never started.
+
+    A path line still counts when the fence below it was never closed, which is
+    what a cut-off block looks like, so `_BLOCK` is not enough on its own.
+    """
+    if _BLOCK.search(text):
+        return True
+    return any(_BARE_PATH.match(line) for line in text.split("\n"))
+
+
 def duplicate_paths(parsed: ParsedOutput) -> list[str]:
     """Paths the response wrote more than once, in first-seen order.
 

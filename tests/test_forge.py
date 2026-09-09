@@ -4670,6 +4670,40 @@ class TestTruncatedResponses(unittest.TestCase):
         self.assertIn("cut off at the output limit", result.detail)
         self.assertFalse((root / "app.py").exists())
 
+    def test_a_reply_that_narrated_until_it_ran_out_is_told_that(self):
+        """Run 11 attempt 1: read correctly, described it, hit the limit.
+
+        The advice the other branch gives — send fewer files per response — is
+        wrong here, because this reply never sent one.
+        """
+        orch, _, run_id = self._orchestrator()
+        orch._call = lambda *a, **k: self._completion(
+            "I've reviewed the code. The problem is in `parse()`, which needs "
+            "a guard for the empty case, and the test file will need a new "
+            "fixture before",
+            "length",
+        )
+
+        result = orch._attempt(run_id, Ticket("T-1", allowed_files=["app.py"]), "")
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.blocked)
+        self.assertIn("before it named a single file", result.detail)
+        self.assertIn("Blocks first, prose never", result.detail)
+        self.assertNotIn("fewer files per response", result.detail)
+
+    def test_a_reply_cut_off_partway_through_its_files_is_told_to_send_fewer(self):
+        orch, _, run_id = self._orchestrator()
+        orch._call = lambda *a, **k: self._completion(
+            "app.py\n```python\nx = 1\n```\n\nsecond.py\n```python\ndef half(",
+            "length",
+        )
+
+        result = orch._attempt(run_id, Ticket("T-1", allowed_files=["app.py"]), "")
+
+        self.assertIn("fewer files per response", result.detail)
+        self.assertNotIn("named a single file", result.detail)
+
     def test_untruncated_build_still_applies(self):
         orch, root, run_id = self._orchestrator()
         orch._call = lambda *a, **k: self._completion(
@@ -7822,11 +7856,12 @@ class TestHistoryIsTrimmedRatherThanBlocking(unittest.TestCase):
         )
 
         # The stub counts one token per character, so the window here is
-        # roughly 1.5k real tokens rather than 6k. Sized above the system
+        # roughly 2k real tokens rather than 8k. Sized above the system
         # prompt plus the ticket so the assertion is about the gate dropping
         # history, which is what this tests, and not about how long the
-        # executor's rules happen to be this month.
-        kept = _joined(self._fit(messages, window=6144))
+        # executor's rules happen to be this month — a rule added to those
+        # rules is what last moved it.
+        kept = _joined(self._fit(messages, window=8192))
 
         self.assertIn("the spec that must survive", kept)
         self.assertNotIn("Earlier attempts on this ticket", kept)

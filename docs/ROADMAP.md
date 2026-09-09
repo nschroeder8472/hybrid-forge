@@ -875,6 +875,8 @@ and the pass has no way to tell it apart from a signature.
 Four things this repository's own runs left open, in the order they are worth
 doing. All of them are written up in
 [EXECUTOR-CEILINGS.md](EXECUTOR-CEILINGS.md), which is the evidence for each.
+The first two are done; the entries are kept rather than deleted, because what
+was built is only worth reading beside the run that asked for it.
 
 **1. Close the store's connections explicitly — done, 2026-09-09.** `Store`
 kept a connection per thread in `threading.local()` and `close()` closed only
@@ -902,12 +904,23 @@ emitted **721 `ResourceWarning`s** and now emits none, with the nine left
 across the whole suite coming from `memory.py`'s subprocess pipes and test
 sockets. Touched `state.py` and `ui/server.py`.
 
-**2. Stop the executor narrating before it acts.** Run 11's first attempt read
-successfully, identified everything it needed, and then spent its whole output
-budget writing that summary down before emitting a single edit. The prose was
-accurate and unnecessary. A prompt rule — blocks first, prose never — is the
-cheap version; the expensive version is a parser that ignores everything before
-the first path line.
+**2. Stop the executor narrating before it acts — done, 2026-09-09.** Run 11's
+first attempt read successfully, identified everything it needed, and then
+spent its whole output budget writing that summary down before emitting a
+single edit. The prose was accurate and unnecessary.
+
+The cheap version was the right one, and the expensive one turned out not to be
+a fix at all: a parser that ignored everything before the first path line would
+change nothing, because `parse_output` already does — the budget is spent
+before the parser ever sees the reply. So `EXECUTOR_SYSTEM` states the rule
+— *blocks first, prose never* — with the lost attempt as its reason.
+
+What was missing beside it is the correction sent after a reply is cut off.
+There was one message for every truncation, telling the model to send fewer
+files per response, which is unusable advice for a reply that never named a
+file. `names_a_file` splits the two cases, counting a path line whose fence was
+cut off mid-block, so the narrating reply is now told that its budget went on
+prose. Touched `prompts.py`, `patch.py` and `loop.py`.
 
 **3. Reserve tool turns rather than announcing them.** `_converse` says *"That
 was your last read. Answer the ticket now"* at `remaining == 2` and the model
