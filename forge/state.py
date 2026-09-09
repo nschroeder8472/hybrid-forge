@@ -1927,6 +1927,35 @@ class Store:
             )
         return (len(rows), total)
 
+    def step_detail_usage(self, run_ids: Sequence[int]) -> tuple[int, int]:
+        """How much step detail the named runs hold, without clearing it.
+
+        The read-only half of `clear_step_detail`, for a dry run: the same
+        rows and the same UTF-8 byte total, counted rather than removed.
+        """
+        if not run_ids:
+            return (0, 0)
+        placeholders = ", ".join("?" for _ in run_ids)
+        rows = self._connection.execute(
+            f"SELECT detail FROM steps WHERE run_id IN ({placeholders}) "
+            "AND detail != ''",
+            tuple(run_ids),
+        ).fetchall()
+        if not rows:
+            return (0, 0)
+        total = sum(len(row["detail"].encode("utf-8")) for row in rows)
+        return (len(rows), total)
+
+    def vacuum(self) -> None:
+        """Reclaim the pages freed by a prune, so the file actually shrinks.
+
+        SQLite leaves freed pages in place for reuse; without this, a command
+        that cleared 1.8 MB of detail would report it while the file stayed
+        the same size. Called by `forge prune` after `clear_step_detail`.
+        """
+        with self._write() as connection:
+            connection.execute("VACUUM")
+
     # ------------------------------------------------------------------
     # Events (the dashboard's feed)
     # ------------------------------------------------------------------

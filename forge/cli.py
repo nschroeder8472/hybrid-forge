@@ -1227,16 +1227,17 @@ def cmd_replay(args: argparse.Namespace) -> int:
 
 
 def cmd_prune(args: argparse.Namespace) -> int:
-    """Drop the artifact trees of old runs.
+    """Drop the artifact trees of old runs, and the step detail that goes with them.
 
     Artifacts are the record of what every step actually did, and they are the
     reason a ticket that failed at 2am can be diagnosed at 9. But nothing ever
     removed them: one small project reached 979 files across eight runs, and a
     daemon left running against a real backlog does not level off.
 
-    Only whole runs are removed, newest kept, and only the artifact tree — the
-    database keeps every run's history either way, so `forge status` still
-    accounts for work this deletes the transcripts of.
+    Only whole runs are removed, newest kept. The transcripts on disk and the
+    step detail in the database are the same record of the same work, so the
+    detail of a pruned run goes with its artifact tree — the run, its tickets
+    and their statuses stay, and `forge status` still accounts for the work.
     """
     config = _load(args.root)
     store = _store(config)
@@ -1268,25 +1269,49 @@ def cmd_prune(args: argparse.Namespace) -> int:
     total = sum(
         entry.stat().st_size for path in doomed for entry in path.rglob("*") if entry.is_file()
     )
+    numbers = [_run_number(path.name) for path in doomed]
+    rows, detail_bytes = store.step_detail_usage(numbers)
     if args.dry_run:
         print(f"Would remove {len(doomed)} run(s), {_megabytes(total)}:")
         for path in doomed:
             print(f"  {path.name}")
+        print(
+            f"Would also clear {rows} step detail row(s), {_megabytes(detail_bytes)} "
+            f"of detail, from the database."
+        )
         print("\nRe-run without --dry-run to delete.")
         return 0
 
+    before = config.db_path.stat().st_size
     removed = 0
+    failed = 0
+    cleared_numbers = []
     for path in doomed:
         try:
             shutil.rmtree(path)
         except OSError as exc:
             print(f"  {path.name}: could not remove — {exc}")
+            failed += 1
             continue
         removed += 1
+        cleared_numbers.append(_run_number(path.name))
+
+    # The detail goes with the tree: only the runs whose directories are gone
+    # lose their step detail, so a directory that refused to delete keeps its
+    # record.
+    cleared_rows, cleared_bytes = store.clear_step_detail(cleared_numbers)
+    store.vacuum()
+    after = config.db_path.stat().st_size
 
     print(f"Removed {removed} run(s) of artifacts, {_megabytes(total)} freed.")
+    print(
+        f"Cleared {cleared_rows} step detail row(s), {_megabytes(cleared_bytes)} of detail."
+    )
+    print(
+        f"Vacuumed {config.db_path.name}: {_megabytes(before)} -> {_megabytes(after)}."
+    )
     print(f"Kept the {args.keep} newest. Run history stays in {config.db_path.name}.")
-    return 0
+    return 1 if failed else 0
 
 
 def _run_number(name: str) -> int:

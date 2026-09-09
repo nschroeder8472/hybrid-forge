@@ -136,9 +136,19 @@ closes only the calling thread's. The dashboard is a `ThreadingHTTPServer`, so
 `PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout` — and nothing closes it
 explicitly.
 
-**Measured, and it is not a leak.** Twenty request-like threads left exactly
-one live connection; CPython's refcounting closes each thread's connection when
-its locals are cleared. What is real:
+**It is not a leak** — twenty request-like threads left exactly one live
+connection, because CPython's refcounting closes each thread's connection when
+its locals are cleared. **It is not cosmetic either.** Run 11's test step
+failed four times with
+
+    PermissionError: [WinError 32] The process cannot access the file
+    because it is being used by another process
+
+on a temp directory a loop-written test was cleaning up. An open SQLite handle
+holds a Windows file lock, so a `Store` left to the garbage collector blocks
+`shutil.rmtree` of the directory it lives in. This is the failure the
+`ResourceWarning` was predicting, and it now costs whole test runs rather than
+noise. What is real:
 
 - **Test noise.** Tests construct `Store` on temp directories and never
   `close()`, so the suite emits `ResourceWarning` in volume — loud enough to
@@ -150,7 +160,10 @@ its locals are cleared. What is real:
   blocks the temp-directory cleanup some tests do.
 
 Fixes, none applied: close the thread's connection when a request ends; give
-`Store` context-manager support so tests stop leaving them open.
+`Store` context-manager support so tests stop leaving them open. **On Windows
+this is the difference between a test suite that passes and one that does
+not**, and any ticket whose tests create a `Store` in a temp directory will hit
+it — which is every ticket touching state, including the two written here.
 
 ### `forge prune` still does not prune the step log
 
