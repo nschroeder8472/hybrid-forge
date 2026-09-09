@@ -2013,15 +2013,42 @@ class Store:
         total = sum(len(row["detail"].encode("utf-8")) for row in rows)
         return (len(rows), total)
 
+    def checkpoint(self) -> bool:
+        """Fold the write-ahead log back into the database file and truncate it.
+
+        The database runs in WAL mode, so a write lands in `run.db-wal` and the
+        main file does not change until a checkpoint moves it. Nothing in the
+        loop cares — every reader goes through SQLite, which reads both — but
+        `forge prune` reports the file's size, and that number is meaningless
+        while the writes it is reporting on are still in the log. Measured on a
+        seeded workspace: 40 steps of detail written, and `run.db` still
+        4,096 bytes with all of it in the WAL.
+
+        `TRUNCATE` blocks until it can, and returns without truncating if
+        another connection is mid-read — the dashboard, most often. `False`
+        then, and the caller's own numbers stay honest because both of them are
+        measured the same way.
+        """
+        row = self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        return bool(row is not None and row[0] == 0)
+
     def vacuum(self) -> None:
         """Reclaim the pages freed by a prune, so the file actually shrinks.
 
         SQLite leaves freed pages in place for reuse; without this, a command
-        that cleared 1.8 MB of detail would report it while the file stayed
-        the same size. Called by `forge prune` after `clear_step_detail`.
+        that cleared 1.8 MB of detail would report it while the file stayed the
+        same size. Called by `forge prune` after `clear_step_detail`.
+
+        The checkpoint afterwards is what makes the shrink visible rather than
+        eventual. `VACUUM` in WAL mode rebuilds the database into the log, so
+        the main file kept its old size until whatever closed the connection
+        next happened to flush it — which for `forge prune` was interpreter
+        exit, after it had already printed *860 KB -> 860 KB* about a file that
+        did shrink to 464 KB a moment later.
         """
         with self._write() as connection:
             connection.execute("VACUUM")
+        self.checkpoint()
 
     # ------------------------------------------------------------------
     # Events (the dashboard's feed)

@@ -1,5 +1,11 @@
 # The half of retention that was under-specified
 
+**Built.** The loop wrote RT-002 against this repository and it passed all
+eight criteria. One thing none of them asserted turned out to be wrong anyway:
+the command reported a file size that the `VACUUM` had not yet produced,
+because in WAL mode the rebuilt database sits in the log until a checkpoint.
+`Store.checkpoint` is the fix, and the story is in `docs/EXECUTOR-CEILINGS.md`.
+
 `Store.clear_step_detail` landed as RT-001 and nothing calls it. The ticket's
 prose asked for the `cmd_prune` wiring too, and its acceptance criteria did
 not — the only one mentioning the command said `forge prune --dry-run` must

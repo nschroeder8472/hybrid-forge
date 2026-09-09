@@ -217,14 +217,29 @@ subprocess pipes and test sockets, not databases. The dashboard half is pinned
 by `test_a_served_connection_does_not_leave_one_open`, which fails at `4 != 1`
 with the `finish` override removed.
 
-### `forge prune` still does not prune the step log
+### `forge prune` still does not prune the step log — fixed
 
-`Store.clear_step_detail` landed as RT-001 and **nothing calls it**. Measured on
+`Store.clear_step_detail` landed as RT-001 and nothing called it. Measured on
 this repository's own database: `steps.detail` was **1,871,779 bytes of
 2,551,808 — 73% of the file**, from 285 rows across seven runs.
 
-RT-002 (`PRUNE.md`) is the wiring plus the `VACUUM` that makes the file
-actually shrink.
+RT-002 (`PRUNE.md`) was the wiring plus the `VACUUM`, and the loop wrote it —
+`cmd_prune` clears the detail of the runs whose artifact trees it removes, and
+the dry run reports what it would clear without touching the database.
+
+**The `VACUUM` half was only half true, and a live run said so.** Pruning a
+seeded workspace printed *"Cleared 20 step detail row(s), 391 KB of detail"*
+and then *"Vacuumed run.db: 860 KB -> 860 KB"* — about a file that was 464 KB a
+moment later. In WAL mode `VACUUM` rebuilds the database into the log, so the
+main file kept its old size until the connection closed, which for this command
+was interpreter exit. The eight criteria in `PRUNE.md` all held: the last of
+them asks that the file be *no larger* than before, which it was not. The
+number the command printed was the one nobody had asserted.
+
+`Store.checkpoint` folds the log back in, `vacuum` calls it, and `cmd_prune`
+takes both of its measurements with it applied. The same prune now reports
+*860 KB -> 464 KB*, and `test_the_size_it_reports_is_the_size_it_leaves_behind`
+compares the printed number against the file.
 
 ---
 

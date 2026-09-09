@@ -986,12 +986,22 @@ rule never blocked them.
 
 Found while reviewing the loop, judged not worth building yet.
 
-- **Retention for the step log — half built.** `Store.clear_step_detail` landed
-  as RT-001, written by the loop itself against this repository, and nothing
-  calls it yet. Measured on this repository's own database: `steps.detail` was
-  1,871,779 bytes of 2,551,808 — 73% of the file, from 285 rows across seven
-  runs. `PRUNE.md` is the wiring plus the `VACUUM` that makes the file actually
-  shrink.
+- **Retention for the step log — built, and the report it printed was wrong.**
+  `Store.clear_step_detail` landed as RT-001 and `cmd_prune` calls it: the runs
+  whose artifact trees are removed lose their step detail, and `--dry-run`
+  reports what it would clear without touching the database. Measured on this
+  repository's own database beforehand: `steps.detail` was 1,871,779 bytes of
+  2,551,808 — 73% of the file, from 285 rows across seven runs.
+
+  What `PRUNE.md` also asked for was the `VACUUM` that makes the file actually
+  shrink, and that is the part a live prune caught. It printed *"Vacuumed
+  run.db: 860 KB -> 860 KB"* about a file that was 464 KB a moment later: in
+  WAL mode `VACUUM` rebuilds the database into the log, and the main file kept
+  its old size until the connection closed at interpreter exit. Every one of
+  the ticket's eight criteria held — the last asks that the file be *no larger*
+  than before — so the number the command printed was the one nobody had
+  asserted. `Store.checkpoint` now folds the log back in, `vacuum` calls it,
+  and both of `cmd_prune`'s measurements are taken with it applied.
 - **What stops the executor on a real repository** —
   [EXECUTOR-CEILINGS.md](EXECUTOR-CEILINGS.md). Four ceilings found by running
   one ticket against this tree, each hidden behind the last: whole-file output
