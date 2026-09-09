@@ -17,12 +17,14 @@ import unittest
 from pathlib import Path
 
 from forge.artifacts import ARTIFACTS_DIR
-from forge.cli import cmd_prune
+from forge.cli import _megabytes, cmd_prune
 from forge.config import default_config
 from forge.state import Store
 
-OLD_DETAIL = "old step transcript " * 40
-NEW_DETAIL = "new step transcript " * 40
+# Just under `state.DETAIL_CHARS`, so nothing is clipped, and enough of it
+# that a vacuum has something to reclaim.
+OLD_DETAIL = "old step transcript " * 900
+NEW_DETAIL = "new step transcript " * 900
 
 
 def _workspace(root: Path) -> tuple[object, Store]:
@@ -111,7 +113,36 @@ class PruneRetentionTest(unittest.TestCase):
         printed = out.getvalue()
 
         self.assertIn(str(doomed_rows), printed)
-        self.assertLessEqual(config.db_path.stat().st_size, before)
+        self.assertLess(config.db_path.stat().st_size, before)
+
+    def test_the_size_it_reports_is_the_size_it_leaves_behind(self):
+        """The report used to be about where the bytes were, not how many.
+
+        `VACUUM` in WAL mode rebuilds the database into the log, so the main
+        file kept its old size until something closed the connection — which
+        for this command was interpreter exit, after it had already printed
+        `860 KB -> 860 KB` about a file that shrank to 464 KB a moment later.
+        """
+        root = Path(tempfile.mkdtemp()).resolve()
+        config, store = _workspace(root)
+        _seed(config, store)
+        store.close()
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cmd_prune(_args(root, keep=1, dry_run=False)), 0)
+        line = next(
+            line for line in out.getvalue().splitlines() if line.startswith("Vacuumed")
+        )
+
+        # Nothing else touches the file between the command and this read, so
+        # the number it printed has to be the number on disk.
+        left = config.db_path.stat().st_size
+        self.assertIn(_megabytes(left), line.rsplit("->", 1)[1])
+        self.assertNotEqual(
+            line.rsplit("->", 1)[1].strip().rstrip("."),
+            line.rsplit("->", 1)[0].split(":", 1)[1].strip(),
+        )
 
 
 if __name__ == "__main__":

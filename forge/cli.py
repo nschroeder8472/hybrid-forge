@@ -1282,6 +1282,11 @@ def cmd_prune(args: argparse.Namespace) -> int:
         print("\nRe-run without --dry-run to delete.")
         return 0
 
+    # Both sizes are taken with the write-ahead log folded in, or the report
+    # is about where the bytes are sitting rather than how many there are: a
+    # freshly written database can be 4 KB on disk with every byte of detail
+    # still in `run.db-wal`. `Store.vacuum` checkpoints on the other side.
+    store.checkpoint()
     before = config.db_path.stat().st_size
     removed = 0
     failed = 0
