@@ -122,12 +122,17 @@ class TestTheToolsAnswerWhatARoleAsks(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("not a valid regular expression", result.content)
 
-    def test_outline_lists_definitions_without_bodies(self):
+    def test_outline_is_no_longer_offered(self):
+        """Retired on measurement: 10 calls in 597 in production and 0 in 49
+        across three probe arms, one of which described it as the thing to call
+        first on any unread file. It could not end a lookup, so a turn spent on
+        it answered nothing. `read_symbol` replaced what it was for; the
+        repository map still uses `outline_python` itself."""
         result = self._run("outline", path="src/store.py")
 
-        self.assertIn("class Store", result.content)
-        self.assertIn("def save(self, row, *, flush)", result.content)
-        self.assertNotIn("return row", result.content)
+        self.assertFalse(result.ok)
+        self.assertIn("no tool named `outline`", result.content)
+        self.assertIn("read_symbol", result.content)
 
     def test_list_dir_marks_directories(self):
         result = self._run("list_dir", path=".")

@@ -110,9 +110,33 @@ The tools are read-only, and that is the whole safety argument:
 | tool | what it answers |
 |---|---|
 | `read_file(path, start, end)` | the contents, or a slice of them |
-| `grep(pattern, glob)` | where a symbol is used or defined |
+| `read_symbol(path, name)` | one definition — function, class, `Class.method` — whole |
+| `grep(pattern, glob, context)` | where a symbol is used or defined, and the lines around it |
 | `list_dir(path)` | what is in a directory |
-| `outline(path)` | a file's definitions and signatures, without its bodies |
+
+`grep` takes `context` because a match on its own is a line number: across 597
+recorded tool calls, **104 of 187 greps were followed immediately by a
+`read_file` of the file just matched**. `read_symbol` exists because the other
+half of that pattern was worse — grep for `def name`, then read a range around
+it chosen by eye, which either cuts the definition off or drags in its
+neighbours. The file knows where a definition ends.
+
+**A fifth tool, `outline`, was retired on measurement.** It listed a file's
+definitions without their bodies, and it was used 10 times in 597 calls in
+production and **0 times in 49 across three probe arms** — including one whose
+description said to call it first on any file not yet read. Rewriting the
+description changed nothing, which rules out discoverability; and the same
+model picked up `read_symbol` on first exposure, which rules out habit. What it
+could not do is *end* a lookup. Six of those ten outline calls were followed
+straight by a read, and none ever concluded anything, so a turn spent on it
+answered nothing. `read_symbol` displaced `read_file` (42.9% → 20.0%) precisely
+because it returns the thing that was wanted.
+
+`outline_python` itself is untouched: the repository map is built from it, and
+`read_symbol` uses it to list what a file *does* declare when the name asked
+for is absent — outline's one useful moment, delivered at the point of need
+rather than as a turn of its own. `scripts/tool_probe.py` re-runs the
+measurement against any model.
 
 No shell, no write, no network. Every path is normalised and confined to the
 repository root by `patch.is_safe_path`, which already guards the write side.
