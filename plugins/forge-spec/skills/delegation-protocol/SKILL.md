@@ -60,9 +60,14 @@ Four rules that decide whether the ticket is executable at all:
 
 1. **Name the libraries.** The executor implements; it does not choose. An
    unresolved choice comes back as `BLOCKED:`.
-2. **List every file it must read.** The executor has no filesystem. A file it
-   needs for a signature, an export name, or an enum order goes in the
-   reference list, or it will guess.
+2. **List every file it must read — and an example of anything it must write.**
+   A file the executor needs for a signature, an export name, or an enum order
+   goes in the reference list. It can read for itself, but only so many times
+   per attempt, so an unlisted file costs a turn rather than being impossible.
+   The half that gets forgotten is the *writing*: 38.6% of one measurement's
+   280 reads were of `tests/`, spent working out this project's conventions for
+   a test file the ticket ordered and never showed. Name a test that already
+   passes.
 3. **Give a runnable thing a way to be run.** When the backlog produces
    something a person starts, some ticket owns how it starts, some ticket owns
    the control that gets data into it, and some ticket owns what the person

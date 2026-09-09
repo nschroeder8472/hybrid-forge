@@ -53,6 +53,8 @@ say what happens instead alongside it.>
 ## Reference files
 
 - `path/to/read_only.rs`
+- `path/to/existing_test.rs`  <- an example of what this ticket has to write;
+  without one the conventions get worked out by reading, and reads are capped
 
 ## Acceptance criteria
 

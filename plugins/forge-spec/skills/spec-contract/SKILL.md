@@ -120,11 +120,24 @@ test asserting DOM properties its project does not define. A `bug` ticket is
 the exception: its reproduction goes to a derived path granted as extra scope,
 so it needs no entry. `/forge-spec-check` reports a ticket missing one.
 
-**Reference files.** The executor has no filesystem — it sees only what the
-ticket carries and returns whole files as text. Any file it must read to get an
-export name, a signature, an enum order, or a type right belongs here. A spec
-that says "read `src/api.rs`" without listing it is asking for something the
-executor cannot do, so it will guess instead.
+**Reference files.** Pasted into the prompt read-only. The executor can also
+read for itself, but only a fixed number of times per attempt — the last two of
+its turns are reserved for answering — so a file it is given costs nothing and a
+file it has to go looking for costs a turn it could have spent on the code. Any
+file it must read to get an export name, a signature, an enum order, or a type
+right belongs here.
+
+**Reference an example of anything the ticket has to write, not only what it
+reads.** Of 280 tool reads across three runs, **38.6% were of `tests/`** — the
+executor working out how this project names a fixture, which runner it uses and
+what an assertion looks like here, for a test file the ticket told it to write
+and gave it no example of. A ticket that designates a test path should name a
+test that already passes beside it. The same holds for any file with a house
+shape: a migration, a provider, a command module. List the nearest existing one.
+
+`/forge-spec-check` reports a ticket that writes a test and references none. It
+is a warning rather than a refusal, because the first ticket in a repository
+with no tests yet has nothing to point at.
 
 **Acceptance criteria.** Assertions that would *fail* if the behavior were
 wrong. "Returns `Err(ParseError)` for input missing a closing brace" is a

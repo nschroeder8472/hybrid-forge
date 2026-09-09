@@ -542,6 +542,52 @@ def untestable_scope(tickets: list[Ticket]) -> list[str]:
     return problems
 
 
+def unexampled_tests(tickets: list[Ticket]) -> list[str]:
+    """Tickets told to write a test and given no existing one to follow.
+
+    A ticket names a test path so the tester's output lands inside its scope —
+    that is `untestable_scope` above. This is the other half of the same line:
+    the path says where the file goes and nothing says what a test in this
+    project looks like, so whoever writes it works the conventions out by
+    reading.
+
+    That reading is measured. Of 280 tool reads across runs 8-10, **38.6% were
+    of `tests/`** — the executor finding out how this project names a fixture,
+    which runner it uses, and what an assertion looks like here, for a file the
+    ticket told it to write and gave it no example of. Reads are capped, and
+    every one spent on a convention is one not spent on the code under change.
+
+    A reference test cannot be checked for existence from the spec alone, and a
+    repository with no test yet has none to name, so this is a warning rather
+    than a refusal.
+
+    A path listed in both `Allowed files` and `Reference files` does not count:
+    that is the file being written, not an example of one.
+    """
+    problems = []
+    for ticket in tickets:
+        if routes.is_withheld(ticket.route):
+            continue
+        writing = [path for path in ticket.allowed_files if is_test_path(path)]
+        if not writing:
+            continue
+        written = {normalize_path(path) for path in ticket.allowed_files}
+        examples = [
+            path
+            for path in ticket.reference_files
+            if is_test_path(path) and normalize_path(path) not in written
+        ]
+        if examples:
+            continue
+        problems.append(
+            f"{ticket.ticket_id}: writes {', '.join(writing)} and references no "
+            f"existing test, so the conventions get worked out by reading — "
+            f"38.6% of one run's tool reads went on `tests/` for exactly that. "
+            f"Add a test that already passes to `Reference files`."
+        )
+    return problems
+
+
 def graph_problems(tickets: list[Ticket]) -> list[str]:
     """Everything wrong with the dependency graph, in human terms.
 

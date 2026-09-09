@@ -130,12 +130,23 @@ Raising the cap is measured not to work: 8 turns produced 14 reads, 16 produced
   arrives as a fact rather than a request, and that the conversation always has
   a turn left to put an answer in. Whether the tickets that died of read
   exhaustion now finish is a question for a live run, not for this change.
-- **A better reference-file habit.** Of 280 reads across runs 8–10, **38.6%
-  were of `tests/`** — the model working out house conventions for a test file
-  the ticket told it to write and gave it no example of. A ticket should list a
-  reference for anything it has to *write*, not only for the code it changes.
-  That is a spec habit, not a loop change, and it is likely the cheapest of
-  these.
+- **A better reference-file habit — done, 2026-09-09.** Of 280 reads across
+  runs 8–10, **38.6% were of `tests/`** — the model working out house
+  conventions for a test file the ticket told it to write and gave it no
+  example of. A ticket should list a reference for anything it has to *write*,
+  not only for the code it changes.
+
+  Still a spec habit rather than a loop change, but the habit is now checkable:
+  `ingest.unexampled_tests` reports a ticket that designates a test path and
+  references no existing test, and `forge ingest` and `/forge-spec-check` both
+  print it. A warning, never a refusal — the first ticket in a repository with
+  no tests has nothing to point at. The `forge-spec` skills ask for the example
+  the way they already ask for the path.
+
+  It fires on this repository's own fixture backlogs, and they are deliberately
+  left alone: `GRIND.md`, `HARD.md` and the rest are what several recorded runs
+  were measured against, and giving them a reference test changes the thing
+  being measured.
 
 ### The executor narrates before it acts — fixed 2026-09-09
 

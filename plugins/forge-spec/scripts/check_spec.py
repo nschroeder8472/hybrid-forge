@@ -34,6 +34,7 @@ try:
         parse_plan,
         plan_decisions,
         shared_file_conflicts,
+        unexampled_tests,
         untestable_scope,
     )
 except ImportError:
@@ -270,6 +271,7 @@ def main(argv: list[str]) -> int:
 
     warn: list[str] = []
     warn += untestable_scope(tickets)
+    warn += unexampled_tests(tickets)
     for ticket in tickets:
         for criterion in ticket.criteria:
             if VAGUE.search(criterion):
