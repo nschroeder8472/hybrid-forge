@@ -870,6 +870,53 @@ and the pass has no way to tell it apart from a signature.
 
 ---
 
+## Next, in order
+
+Four things this repository's own runs left open, in the order they are worth
+doing. All of them are written up in
+[EXECUTOR-CEILINGS.md](EXECUTOR-CEILINGS.md), which is the evidence for each.
+
+**1. Close the store's connections explicitly.** The only one of these that is
+breaking something today. `Store` keeps a connection per thread in
+`threading.local()` and `close()` closes only the caller's, so a `Store` left
+to the garbage collector holds a Windows file lock on its database. Run 11's
+test step failed four times with `PermissionError: [WinError 32]` on a temp
+directory a loop-written test was cleaning up. **Any ticket whose tests build a
+`Store` in a temp directory hits this**, which is every ticket touching state.
+Close the thread's connection when a dashboard request ends, and give `Store`
+context-manager support so tests stop leaving them open. Touches `state.py` and
+`ui/server.py`.
+
+**2. Stop the executor narrating before it acts.** Run 11's first attempt read
+successfully, identified everything it needed, and then spent its whole output
+budget writing that summary down before emitting a single edit. The prose was
+accurate and unnecessary. A prompt rule — blocks first, prose never — is the
+cheap version; the expensive version is a parser that ignores everything before
+the first path line.
+
+**3. Reserve tool turns rather than announcing them.** `_converse` says *"That
+was your last read. Answer the ticket now"* at `remaining == 2` and the model
+reads anyway. Raising the cap is measured not to help: 8 turns produced 14
+reads, 16 produced 28, and both ended identically, because the appetite scales
+to whatever it is given. Hard-stopping reads at `N-2` makes exhaustion
+structural instead of a request.
+
+**4. Reference an example of anything a ticket has to write.** Of 280 reads
+across runs 8-10, **38.6% were of `tests/`** — the executor working out house
+conventions for a test file the ticket told it to write and gave it no example
+of. This is a spec habit rather than a loop change, and it is the cheapest
+thing on this list: `forge-spec` should ask for a reference test the way it
+already asks for a test path.
+
+**A type checker is unclaimed.** `.flake8` is the only static analysis
+configured. Every shape defect this session cost a full test run to find — a
+kwarg threaded through five providers, a `Callable` alias becoming a `Protocol`,
+a dataclass field whose emptiness would have silently blinded three guards.
+mypy and pyright are development dependencies, so the zero-runtime-dependency
+rule never blocked them.
+
+---
+
 ## Deferred from the review
 
 Found while reviewing the loop, judged not worth building yet.
