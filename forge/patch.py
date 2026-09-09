@@ -502,6 +502,17 @@ _TEXT_TOOL_CALL = re.compile(
 )
 
 
+def wrote_a_tool_call(text: str) -> bool:
+    """Whether a reply is a tool call the model typed instead of making.
+
+    The shape a model reaches for when the tools are gone and it wants to read
+    anyway. `describe_unparsed` names it for the executor after the fact; the
+    conversation needs the same question answered while a turn is still left,
+    which is what the reserved answering turn is for.
+    """
+    return bool(_TEXT_TOOL_CALL.search(text))
+
+
 def describe_unparsed(text: str) -> str:
     """What went wrong in a reply that yielded no edits, or `""` if nothing did.
 

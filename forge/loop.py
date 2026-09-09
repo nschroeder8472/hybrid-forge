@@ -83,6 +83,7 @@ from .patch import (
     normalize_path,
     parse_output,
     repo_relative,
+    wrote_a_tool_call,
 )
 from .providers import (
     Completion,
@@ -155,6 +156,20 @@ from .state import (
 
 # Consecutive memory failures before the loop stops trying for this run.
 MEMORY_FAILURE_LIMIT = 3
+
+# How many of `loop.toolTurns` are kept back for answering, tools withdrawn.
+#
+# The rule this replaces was a request: at one turn remaining the conversation
+# said *"That was your last read. Answer the ticket now"* while still offering
+# the tools, and the model read anyway. Raising the cap is measured not to help
+# either — 8 turns produced 14 reads, 16 produced 28, and both ended the same
+# way, because the appetite scales to whatever it is given.
+#
+# So the turns are reserved rather than requested. Exhaustion becomes a fact
+# about the conversation the model is told, rather than a limit it is asked to
+# observe, and the second reserved turn is what a model that tries to read
+# anyway is answered with.
+ANSWERING_TURNS = 2
 
 # Message prefixes the budget gate may drop to make a prompt fit. Everything a
 # role is judged on — the spec, the criteria, the diff — is outside this list
@@ -938,12 +953,13 @@ class Orchestrator:
 
         Three limits, all of them set rather than discovered:
 
-        - **`loop.toolTurns`** caps the conversation. The last turn is taken
-          with the tools withdrawn and an instruction to answer from what it
-          has, because a model that has spent eight turns reading and has not
-          answered will not answer on the ninth either — and an attempt that
-          ends with no reply at all is worse than one that ends with a reply
-          built on a partial read.
+        - **`loop.toolTurns`** caps the conversation, and the last
+          `ANSWERING_TURNS` of them are taken with the tools withdrawn. A model
+          that has spent eight turns reading will not answer on the ninth, and
+          an attempt that ends with no reply at all is worse than one built on
+          a partial read. Reserved rather than announced: the previous rule
+          asked for the last turn back while still offering the tools, and the
+          reads continued.
         - **`Toolbox` caps each result** at `MAX_RESULT_CHARS`. A role that
           reads a 200k file gets a slice and is told how to ask for the rest.
         - **The tool ledger is recorded** on the step, so a ticket that failed
@@ -969,10 +985,15 @@ class Orchestrator:
         toolbox = Toolbox(self.config.root)
         thread = list(messages)
         turns = max(1, self.config.loop.tool_turns)
+        # Never reserve so much that nothing can be read. At the default of 8
+        # this withdraws the tools for turns 7 and 8; at 2 it leaves the single
+        # reading turn a two-turn conversation has, which is what that setting
+        # asked for.
+        reserved = min(ANSWERING_TURNS, max(1, turns - 1))
         completion = None
 
         for remaining in range(turns, 0, -1):
-            last = remaining == 1
+            answering = remaining <= reserved
             completion = self._call(
                 run_id,
                 role,
@@ -983,12 +1004,36 @@ class Orchestrator:
                 **(attachments if len(thread) == len(messages) else {}),
                 max_tokens=max_tokens,
                 temperature=temperature,
-                # Withdrawn on the final turn. Offering tools while saying
-                # "answer now" is a contradiction, and the models that lose
-                # that argument lose it by calling one more tool.
-                **({} if last else {"tools": TOOLS}),
+                # Withdrawn for the answering turns. Offering tools while
+                # saying "answer now" is a contradiction, and the models that
+                # lose that argument lose it by calling one more tool.
+                **({} if answering else {"tools": TOOLS}),
             )
             if not completion.tool_calls:
+                # A model whose tools are gone and which wants to read anyway
+                # types the call out instead of making it. That reply carries
+                # no answer, and treating it as one throws the attempt away on
+                # a formatting complaint about a mistake it did not make. This
+                # is what the second reserved turn is for, and the only thing
+                # it is for: said once, with a turn left to act on it.
+                if answering and remaining > 1 and wrote_a_tool_call(completion.text):
+                    thread.append(
+                        Message(role="assistant", content=completion.text)
+                    )
+                    thread.append(
+                        Message(
+                            role="user",
+                            content=(
+                                "That was a tool call written out as text, so "
+                                "nothing was read. The read tools are gone for "
+                                "the rest of this conversation. Answer now, in "
+                                "the format asked for, from what you already "
+                                "have — or say what you are missing on a line "
+                                "starting BLOCKED:."
+                            ),
+                        )
+                    )
+                    continue
                 break
 
             thread.append(
@@ -1002,15 +1047,18 @@ class Orchestrator:
                 result = toolbox.run(call)
                 thread.append(Message(role="tool", content="", tool_result=result))
 
-            if remaining == 2:
-                # One turn left. Said plainly, and before the turn rather than
-                # after it, so the model spends it answering.
+            if remaining == reserved + 1:
+                # The reads are over, and this says so as a fact rather than a
+                # request: the tools are not offered on any turn from here, so
+                # there is nothing left to argue with.
                 thread.append(
                     Message(
                         role="user",
                         content=(
-                            "That was your last read. Answer the ticket now, "
-                            "in the format asked for, from what you have."
+                            "That was your last read — the tools are withdrawn "
+                            "for the rest of this conversation. Answer the "
+                            "ticket now, in the format asked for, from what "
+                            "you have."
                         ),
                     )
                 )

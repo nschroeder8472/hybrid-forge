@@ -311,6 +311,96 @@ class TestTheConversation(unittest.TestCase):
             "".join(m.text for m in provider.seen[-1] if m.role == "user"),
         )
 
+    def test_the_last_two_turns_are_taken_with_no_tools_to_call(self):
+        """Reserved rather than requested.
+
+        The rule this replaces asked for the final turn back while still
+        offering the tools, and the reads continued — measured at both 8 turns
+        and 16.
+        """
+        reading = ("", [ToolCall("c", "list_dir", {"path": "src"})])
+        provider = _Scripted([reading] * 7 + [("final answer", [])])
+        orch = self._orchestrator(provider)
+        orch.config.loop.tool_turns = 8
+
+        orch._converse(
+            self.run_id, "executor", [Message(role="user", content="do it")],
+            max_tokens=1000,
+        )
+
+        # Six turns could read; the last two could not.
+        self.assertEqual(provider.tools_offered[:6], [len(TOOLS)] * 6)
+        self.assertEqual(provider.tools_offered[6:], [0, 0])
+
+    def test_the_reads_are_over_is_said_before_the_first_answering_turn(self):
+        reading = ("", [ToolCall("c", "list_dir", {"path": "src"})])
+        provider = _Scripted([reading] * 7 + [("final answer", [])])
+        orch = self._orchestrator(provider)
+        orch.config.loop.tool_turns = 8
+
+        orch._converse(
+            self.run_id, "executor", [Message(role="user", content="do it")],
+            max_tokens=1000,
+        )
+
+        # The turn that first had no tools is the turn that carried the notice.
+        said = "".join(m.text for m in provider.seen[6] if m.role == "user")
+        self.assertIn("the tools are withdrawn", said)
+        earlier = "".join(m.text for m in provider.seen[5] if m.role == "user")
+        self.assertNotIn("the tools are withdrawn", earlier)
+
+    def test_a_tool_call_typed_out_spends_the_reserved_turn_and_is_answered(self):
+        """Run 9's ending, with a turn left to do something about it.
+
+        The model whose tools are gone types the call instead of making it.
+        That reply carries no answer, and taking it as one spends the attempt
+        on a formatting complaint about a mistake the model did not make.
+        """
+        reading = ("", [ToolCall("c", "list_dir", {"path": "src"})])
+        typed = ("<function=read_file>\n<parameter=path>\nsrc/ui.py\n", [])
+        provider = _Scripted([reading] * 6 + [typed, ("final answer", [])])
+        orch = self._orchestrator(provider)
+        orch.config.loop.tool_turns = 8
+
+        completion = orch._converse(
+            self.run_id, "executor", [Message(role="user", content="do it")],
+            max_tokens=1000,
+        )
+
+        self.assertEqual(completion.text, "final answer")
+        said = "".join(m.text for m in provider.seen[-1] if m.role == "user")
+        self.assertIn("written out as text", said)
+
+    def test_the_typed_call_correction_is_not_sent_with_no_turn_left(self):
+        """Said once, with a turn to act on it, or not said at all."""
+        typed = ("<function=read_file>\n<parameter=path>\nsrc/ui.py\n", [])
+        provider = _Scripted([typed])
+        orch = self._orchestrator(provider)
+        orch.config.loop.tool_turns = 1
+
+        completion = orch._converse(
+            self.run_id, "executor", [Message(role="user", content="do it")],
+            max_tokens=1000,
+        )
+
+        self.assertEqual(completion.text, typed[0])
+        self.assertEqual(len(provider.seen), 1)
+
+    def test_a_two_turn_conversation_still_gets_its_one_read(self):
+        """The reserve never grows past what the setting leaves to read with."""
+        provider = _Scripted(
+            [("", [ToolCall("c", "list_dir", {"path": "src"})]), ("answer", [])]
+        )
+        orch = self._orchestrator(provider)
+        orch.config.loop.tool_turns = 2
+
+        orch._converse(
+            self.run_id, "executor", [Message(role="user", content="do it")],
+            max_tokens=1000,
+        )
+
+        self.assertEqual(provider.tools_offered, [len(TOOLS), 0])
+
     def test_a_provider_without_tools_is_called_once_and_offered_none(self):
         provider = _Scripted([("answer", [])], tools_ok=False)
         orch = self._orchestrator(provider)
