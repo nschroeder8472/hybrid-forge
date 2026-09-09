@@ -105,15 +105,31 @@ absent — outline's one useful moment, delivered where it is needed.
 
 ## What is still open
 
-### Read exhaustion has no fix
+### Read exhaustion — the announcement is now a reserve, 2026-09-09
 
-Raising the cap is measured not to work. What is left:
+Raising the cap is measured not to work: 8 turns produced 14 reads, 16 produced
+28, and both ended the same way.
 
-- **The final turn is not binding.** `_converse` says *"That was your last
-  read. Answer the ticket now"* at `remaining == 2` and the model reads anyway.
-- **Reserve turns rather than announce them.** Hard-stop reads at `N-2` and
-  give two turns to answering, so exhaustion is structural rather than a
-  request.
+- **The final turn was not binding, and now there is nothing to bind.**
+  `_converse` said *"That was your last read. Answer the ticket now"* at
+  `remaining == 2` while still offering the tools, and the model read anyway.
+  The tools are now withdrawn for the last `ANSWERING_TURNS` — two — so at the
+  default of 8 turns, six can read. The sentence is still sent, one turn
+  earlier, and it now describes what has already happened rather than asking
+  for it. Below `toolTurns: 3` only one turn is reserved, because a reserve
+  that leaves nothing to read with is not what that setting asked for.
+- **The second reserved turn has one job.** A model whose tools are gone and
+  which wants to read anyway types the call out instead of making it — run 9's
+  ending. That reply carries no answer, and taking it as one spends the attempt
+  on a formatting complaint about a mistake the model did not make. It is now
+  told what happened while a turn remains to act on it, once, and never when no
+  turn remains.
+
+  What this does **not** claim is a change in read appetite. Six reading turns
+  are still six turns a model will fill; what is fixed is that exhaustion now
+  arrives as a fact rather than a request, and that the conversation always has
+  a turn left to put an answer in. Whether the tickets that died of read
+  exhaustion now finish is a question for a live run, not for this change.
 - **A better reference-file habit.** Of 280 reads across runs 8–10, **38.6%
   were of `tests/`** — the model working out house conventions for a test file
   the ticket told it to write and gave it no example of. A ticket should list a

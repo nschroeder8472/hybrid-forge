@@ -875,8 +875,8 @@ and the pass has no way to tell it apart from a signature.
 Four things this repository's own runs left open, in the order they are worth
 doing. All of them are written up in
 [EXECUTOR-CEILINGS.md](EXECUTOR-CEILINGS.md), which is the evidence for each.
-The first two are done; the entries are kept rather than deleted, because what
-was built is only worth reading beside the run that asked for it.
+The first three are done; the entries are kept rather than deleted, because
+what was built is only worth reading beside the run that asked for it.
 
 **1. Close the store's connections explicitly — done, 2026-09-09.** `Store`
 kept a connection per thread in `threading.local()` and `close()` closed only
@@ -922,12 +922,30 @@ file. `names_a_file` splits the two cases, counting a path line whose fence was
 cut off mid-block, so the narrating reply is now told that its budget went on
 prose. Touched `prompts.py`, `patch.py` and `loop.py`.
 
-**3. Reserve tool turns rather than announcing them.** `_converse` says *"That
-was your last read. Answer the ticket now"* at `remaining == 2` and the model
-reads anyway. Raising the cap is measured not to help: 8 turns produced 14
-reads, 16 produced 28, and both ended identically, because the appetite scales
-to whatever it is given. Hard-stopping reads at `N-2` makes exhaustion
-structural instead of a request.
+**3. Reserve tool turns rather than announcing them — done, 2026-09-09.**
+`_converse` said *"That was your last read. Answer the ticket now"* at
+`remaining == 2` while still offering the tools, and the model read anyway.
+Raising the cap is measured not to help either: 8 turns produced 14 reads, 16
+produced 28, and both ended identically, because the appetite scales to
+whatever it is given.
+
+The tools are now withdrawn for the last `ANSWERING_TURNS` — two — so at the
+default of 8, six turns can read and the sentence describes what has already
+happened rather than asking for it. Below `toolTurns: 3` only one turn is
+reserved, because a reserve that leaves nothing to read with is not what that
+setting asked for.
+
+The second reserved turn has exactly one job. A model whose tools are gone and
+which still wants to read types the call out as text — run 9's ending — and
+that reply carries no answer, so taking it as one spends the attempt on a
+formatting complaint about a mistake the model did not make. It is now told so
+while a turn remains to act on it, once, and never when no turn remains.
+
+What this does not claim is a smaller read appetite: six reading turns are
+still six turns a model will fill. What changed is that exhaustion is a fact
+rather than a request, and that the conversation always has a turn left to put
+an answer in. Whether that finishes the tickets read exhaustion was ending is a
+question for a live run. Touched `loop.py` and `patch.py`.
 
 **4. Reference an example of anything a ticket has to write.** Of 280 reads
 across runs 8-10, **38.6% were of `tests/`** — the executor working out house

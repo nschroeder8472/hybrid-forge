@@ -204,7 +204,10 @@ roles, and `_call` is a single funnel every role goes through.
 Three limits are set rather than discovered:
 
 - **A turn cap per attempt.** A model that has not answered after it is not
-  going to.
+  going to. The last two turns of it are taken with the tools withdrawn, so the
+  conversation always has somewhere to put an answer. Reserved rather than
+  requested: asking for the final turn back while still offering the tools was
+  measured to change nothing.
 - **A byte cap per tool result.** `read_file` on a 200k file returns a slice
   and says so.
 - **The budget gate runs per turn**, not per step, so a conversation that grows
