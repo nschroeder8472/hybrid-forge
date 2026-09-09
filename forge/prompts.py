@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from typing import Any, Sequence
+from typing import Any, Collection, Sequence
 
 from .failures import distill
 from .patch import _unwrap_double_fence
@@ -1017,6 +1017,51 @@ the acceptance criteria below are the bar, and nothing here adds to it.
     )
 
 
+OSCILLATION_HEADING = "## Your last two changes are undoing each other"
+
+
+def oscillation_message(
+    returned: Collection[str], displaced: Collection[str]
+) -> Message | None:
+    """Name the cycle the loop found, since noticing it was not working.
+
+    The prior-failures block already tells the executor that a failure it has
+    seen before means the two changes are undoing each other. That asks it to
+    compare its own history and conclude something; this states the conclusion,
+    with both halves named, because the run this comes from had the history in
+    the prompt for every attempt of the cycle and never once said so.
+
+    The last paragraph is the part that could not be written before. An
+    alternation is the shape a genuine contradiction takes when a model meets
+    it — two criteria that cannot both hold — and `IMPOSSIBLE:` is the route
+    for saying so. Offered only here, where there is evidence for it, rather
+    than in the standing rules where it would invite the claim on any hard
+    ticket.
+    """
+    if not returned or not displaced:
+        return None
+    return Message(
+        role="user",
+        content=f"""{OSCILLATION_HEADING}
+This is not the loop guessing: your last attempt failed on exactly what the
+attempt before last failed on, and the one in between failed on something
+else. You are alternating between two fixes rather than converging.
+
+Failing again now:
+{chr(10).join(f"- {name}" for name in sorted(returned))}
+
+What the attempt in between failed on instead:
+{chr(10).join(f"- {name}" for name in sorted(displaced))}
+
+Do not re-apply either fix. Find the change that satisfies both at once — and
+if you have concluded that no implementation can, say so on a line starting
+`IMPOSSIBLE:` naming these two and why they cannot both hold. That claim is
+read by the planner, which can change the spec; another turn of this cycle is
+read by nobody.
+""",
+    )
+
+
 def build_prompt(
     ticket: Ticket,
     failure_context: str = "",
@@ -1026,6 +1071,7 @@ def build_prompt(
     toolchain: dict[str, str] | None = None,
     learned_limit: int = 12,
     failure_classes: Sequence[dict] = (),
+    oscillation: tuple[Collection[str], Collection[str]] | None = None,
     prior_failures: Sequence[str] = (),
     malformed: str = "",
     prior_turns: Sequence[tuple[str, str]] = (),
@@ -1093,6 +1139,14 @@ def build_prompt(
     counted = _classes_message(failure_classes)
     if counted is not None:
         messages.append(counted)
+
+    # After the counts and before the raw history: the count says what keeps
+    # happening, this says the two newest are trading places, and the history
+    # below is the detail both are about.
+    if oscillation is not None:
+        cycle = oscillation_message(*oscillation)
+        if cycle is not None:
+            messages.append(cycle)
 
     if prior_failures and not prior_turns:
         earlier = "\n\n".join(distill(entry, limit=800) for entry in prior_failures)

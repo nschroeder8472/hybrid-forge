@@ -1793,6 +1793,39 @@ class Store:
                 },
             )
 
+    def ticket_class_sets(
+        self, run_id: int, ticket_id: str, limit: int = 12
+    ) -> list[list[str]]:
+        """One entry per failed step, oldest last, each its set of classes.
+
+        `ticket_classes` below aggregates — it answers "how many times has this
+        kind of failure happened", which is what a count in the prompt needs
+        and is exactly the wrong shape for asking whether the *order* of the
+        failures is a cycle. A tally cannot tell A-then-B-then-A from
+        A-then-A-then-B.
+
+        Empty class lists are kept rather than skipped. A step whose output
+        parsed as nothing is a hole in the sequence, and dropping it would
+        splice two attempts together that had one between them — reading as an
+        oscillation that did not happen. `oscillating` refuses a hole for the
+        same reason.
+        """
+        rows = self._connection.execute(
+            "SELECT classes FROM steps "
+            "WHERE run_id = ? AND ticket_id = ? AND status = 'failed' "
+            f"AND {_STEP_KIND_SQL} NOT IN ({_placeholders(NOT_ABOUT_THE_CODE)}) "
+            "ORDER BY id DESC LIMIT ?",
+            (run_id, ticket_id, *NOT_ABOUT_THE_CODE, limit),
+        ).fetchall()
+        found: list[list[str]] = []
+        for row in reversed(rows):
+            try:
+                names = json.loads(row["classes"] or "[]")
+            except (TypeError, ValueError):
+                names = []
+            found.append(sorted(str(name) for name in names))
+        return found
+
     def ticket_classes(
         self, run_id: int, ticket_id: str, after: int = 0
     ) -> list[dict]:

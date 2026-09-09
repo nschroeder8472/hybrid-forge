@@ -993,13 +993,38 @@ Found while reviewing the loop, judged not worth building yet.
   text-only question. It is still discovered at call time rather than at
   `config.validate()`, because nothing yet knows a role is *going* to be sent
   an image — which is what `kind: image` would settle.
-- **Cross-ticket oscillation detection.** The executor now sees its last two
-  failures, which is enough to spot an A-then-B-then-A cycle if it reads them.
-  Detecting the cycle mechanically — comparing failure signatures across
-  attempts, the way `signatures()` already compares them across tickets — would
-  catch it without depending on the model noticing. Deferrable only while the
-  terminating condition is a test result; an image ticket ends on an opinion, and
-  the spec above treats stall detection as required rather than nice to have.
+- **Oscillation detection — built, 2026-09-09.** The executor sees its last
+  failures and is told that a failure it has seen before means its two changes
+  are undoing each other. That asked it to compare its own history and conclude
+  something, and one run had exactly that history in the prompt for every
+  attempt of a cycle without it ever being said.
+
+  `failures.oscillating` says it instead: given one class set per failed step,
+  oldest last, it reports the A-then-B-then-A at the tail. Classes rather than
+  signatures, for the reason `classify` exists — `TS2532` at line 40 and at
+  line 51 are one misunderstanding, and a comparison that separates them sees a
+  new failure every time and never a repeat. `Store.ticket_class_sets` is the
+  ordered read the aggregate `ticket_classes` cannot give: a tally cannot tell
+  A-then-B-then-A from A-then-A-then-B. `Orchestrator._oscillation` asks after
+  every charged failure, logs the pair once, and the next attempt's prompt names
+  both halves and asks for `IMPOSSIBLE:` if they cannot both hold — the one
+  place that claim is invited, since an alternation is the shape a real
+  contradiction takes.
+
+  Strict on purpose: the newest set must repeat the one before last exactly,
+  the one between must differ, and no set may be empty, because telling an
+  executor to reconcile two failures that are not in tension is worse than
+  missing a cycle.
+
+  This is finer than the `churning` verdict in [CONVERGENCE.md](CONVERGENCE.md),
+  which compares whole cycles and says that *some* failures went while others
+  arrived. Churning is the cycle-level shape; this is the attempt-level one,
+  and it names the two classes rather than the pattern.
+
+  What it does not yet do is end anything. An oscillating ticket still spends
+  its attempts, and whether the cycle should count toward `flatCycles` is a
+  question for a run that produces one — none of this repository's own runs
+  has.
 - **Reviewer cost — replayed, and the premise was wrong about which step.**
   Review is the paid role on a hybrid run, and the two remedies this entry
   named were skipping review for tickets whose diff is trivial and batching
