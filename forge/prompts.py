@@ -142,6 +142,23 @@ Rules:
   formatting, and functions the ticket never mentions included. Rewriting a
   line that already worked is a change the spec did not ask for, and it will be
   rejected at review even when the behavior is identical. Copy first, then add.
+- For a file too large to restate, send REPLACEMENTS instead. In place of the
+  file's contents, put one or more blocks of this shape inside the fence:
+
+      <<<<<<< SEARCH
+      the lines exactly as they appear in the file now
+      =======
+      the lines you want in their place
+      >>>>>>> REPLACE
+
+  The path line and the fence are unchanged; only what is inside the fence
+  differs. Read the file first and copy the SEARCH lines out of what you read,
+  whitespace included — the text has to match the file **exactly once**. If it
+  matches twice the edit is refused, so include enough surrounding lines to
+  pin it down. To insert something, SEARCH for the line you want to put it
+  next to and REPLACE with both. To delete, leave the REPLACE half empty.
+  A file that does not exist yet has to be sent whole; there is nothing to
+  search.
 
 The format, exactly. The path goes OUTSIDE the fence, on the line above it:
 

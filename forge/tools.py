@@ -9,10 +9,23 @@ docs/CONTEXT-TOOLS.md.
 
 So the role gets to look. Four tools, all read-only:
 
-    read_file(path, start, end)   the contents, or a slice
-    grep(pattern, glob)           where a symbol is defined or used
-    list_dir(path)                what is in a directory
-    outline(path)                 definitions and signatures, no bodies
+    read_file(path, start, end)     the contents, or a slice
+    read_symbol(path, name)         one definition, whole, by name
+    grep(pattern, glob, context)    where a symbol is defined or used
+    list_dir(path)                  what is in a directory
+
+There was a fifth, `outline`, which listed a file's definitions without
+their bodies. It was retired after being measured: 10 calls in 597 in
+production, and 0 in 49 across three probe arms -- including one whose
+description said to call it first on any unread file. The reason is in
+what replaced it. `read_symbol`, offered for the first time, was picked up
+immediately and displaced `read_file`, because it *ends* a lookup;
+`outline` never could. A table of contents costs a turn and answers
+nothing, and six of those ten calls were followed straight by a read.
+`outline_python` itself lives on -- the repository map is built from it,
+and `read_symbol` lists a file's declarations with it when the name asked
+for is not there, which is outline's one useful moment delivered where it
+is needed rather than as a turn of its own.
 
 **No write, no shell, no network.** The property this loop rests on is that a
 model cannot change the tree except through a patch that was reviewed; that is
@@ -49,6 +62,34 @@ DEFAULT_READ_LINES = 400
 # Matches reported by one `grep`. A pattern with more hits than this is too
 # broad to be answered usefully, and saying so beats truncating silently.
 MAX_MATCHES = 60
+
+# Lines either side of a match that `grep` will return. A match on its own is
+# a line number and nothing else, so seeing what it means costs a second call:
+# across 597 recorded tool calls, 104 of 187 greps were followed immediately by
+# a `read_file` of the file just matched. Capped rather than unbounded because
+# the point is to answer the follow-up, not to become a way to read a file.
+MAX_CONTEXT = 20
+
+
+def _hit(relative: str, number: int, lines: list[str], context: int) -> str:
+    """One match, with `context` lines either side of it when asked for.
+
+    The matched line keeps the `path:line: text` shape every caller already
+    parses; the surrounding lines are numbered the same way and marked with a
+    dash instead of a colon, so a reader can tell at a glance which line the
+    pattern actually hit.
+    """
+    if not context:
+        return f"{relative}:{number}: {lines[number - 1].strip()[:200]}"
+    first = max(1, number - context)
+    last = min(len(lines), number + context)
+    out = []
+    for index in range(first, last + 1):
+        mark = ":" if index == number else "-"
+        out.append(f"{relative}:{index}{mark} {lines[index - 1][:200]}")
+    return "\n".join(out)
+
+
 # Entries listed by `list_dir`.
 MAX_ENTRIES = 200
 # Directories never walked, listed or searched. Not a security boundary —
@@ -96,11 +137,39 @@ TOOLS: list[ToolSpec] = [
         },
     ),
     ToolSpec(
+        name="read_symbol",
+        description=(
+            "Read one definition — a function, a class, or a method as "
+            "`Class.method` — whole, by name. Prefer this to grepping for a "
+            "definition and then reading a guessed range around it: the file "
+            "knows where the definition ends. Python only."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Repository-relative path, e.g. forge/state.py",
+                },
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "The definition to read, e.g. apply_edits, Store, or "
+                        "Store.end_step."
+                    ),
+                },
+            },
+            "required": ["path", "name"],
+        },
+    ),
+    ToolSpec(
         name="grep",
         description=(
             "Search the repository for a regular expression. Returns matching "
             "lines as `path:line: text`. Use this to find where a name is "
-            "defined or used before reading a file."
+            "defined or used before reading a file. Pass `context` to get the "
+            "surrounding lines back with each match, which usually answers the "
+            "question without a second call."
         ),
         parameters={
             "type": "object",
@@ -114,6 +183,13 @@ TOOLS: list[ToolSpec] = [
                     "description": (
                         "Restrict the search to paths matching this glob, "
                         "e.g. forge/*.py. Optional."
+                    ),
+                },
+                "context": {
+                    "type": "integer",
+                    "description": (
+                        "Lines of surrounding code to return either side of "
+                        "each match, up to 20. Defaults to 0."
                     ),
                 },
             },
@@ -137,24 +213,6 @@ TOOLS: list[ToolSpec] = [
                     ),
                 },
             },
-        },
-    ),
-    ToolSpec(
-        name="outline",
-        description=(
-            "List the definitions in a source file — classes, functions, their "
-            "signatures and line numbers — without their bodies. Cheaper than "
-            "reading a large file when you only need to know what is in it."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Repository-relative path to a source file.",
-                },
-            },
-            "required": ["path"],
         },
     ),
 ]
@@ -186,9 +244,9 @@ class Toolbox:
         """
         handlers = {
             "read_file": self._read_file,
+            "read_symbol": self._read_symbol,
             "grep": self._grep,
             "list_dir": self._list_dir,
-            "outline": self._outline,
         }
         handler = handlers.get(call.name)
         if handler is None:
@@ -313,6 +371,10 @@ class Toolbox:
         glob = arguments.get("glob") or ""
         if glob and not isinstance(glob, str):
             return "`glob` must be a string, e.g. forge/*.py", False, raw
+        try:
+            context = max(0, min(MAX_CONTEXT, int(arguments.get("context") or 0)))
+        except (TypeError, ValueError):
+            return "`context` must be a whole number of lines.", False, raw
 
         hits: list[str] = []
         for path in self._walk():
@@ -325,9 +387,10 @@ class Toolbox:
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            for number, line in enumerate(text.splitlines(), start=1):
+            lines = text.splitlines()
+            for number, line in enumerate(lines, start=1):
                 if pattern.search(line):
-                    hits.append(f"{relative}:{number}: {line.strip()[:200]}")
+                    hits.append(_hit(relative, number, lines, context))
                     if len(hits) > MAX_MATCHES:
                         break
             if len(hits) > MAX_MATCHES:
@@ -378,25 +441,106 @@ class Toolbox:
             listing += f"\n... {len(entries) - MAX_ENTRIES} more entries"
         return f"{self._relative(path) or '.'}/\n{listing}", True, str(raw)
 
-    def _outline(self, arguments: dict) -> tuple[str, bool, str]:
+    def _read_symbol(self, arguments: dict) -> tuple[str, bool, str]:
+        """One definition, whole, found by name rather than by line number.
+
+        The pattern this replaces was two calls and a guess: `grep` for
+        `def _orchestrator`, read the line number out of the match, then
+        `read_file` a range around it chosen by eye. The range is a guess, and
+        a wrong one either cuts the definition off or drags in a hundred lines
+        of its neighbours. The file knows where the definition ends.
+
+        A name that is not there answers with the names that are. A failed
+        lookup otherwise costs a second call to find out what to ask for, and
+        that second call is `outline` -- which the caller could have run first
+        and did not.
+        """
         path, why = self._resolve(arguments.get("path"))
         if path is None:
             return why, False, str(arguments.get("path", ""))
         name = str(arguments.get("path", ""))
-        if not path.exists() or path.is_dir():
-            return f"`{name}` is not a readable file.", False, name
+        wanted = str(arguments.get("name") or "").strip()
+        summary = f"{name}:{wanted}" if wanted else name
+        if not wanted:
+            return "`name` is required, e.g. Store.end_step or apply_edits.", False, summary
+        if not path.is_file():
+            return f"`{name}` is not a readable file.", False, summary
         if path.suffix.lower() != ".py":
             return (
-                f"`{name}` is not Python; `outline` reads Python only. Use "
-                "`read_file` or `grep`.",
+                f"`{name}` is not Python; `read_symbol` reads Python only. Use "
+                "`grep` with `context`, or `read_file`.",
                 False,
-                name,
+                summary,
             )
+
         text = path.read_text(encoding="utf-8", errors="replace")
-        lines = outline_python(text)
-        if not lines:
-            return f"`{name}` declares nothing at module level.", True, name
-        return f"{name}: {len(text.splitlines())} lines\n" + "\n".join(lines), True, name
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as exc:
+            return f"`{name}` does not parse: {exc}", False, summary
+
+        found = _find_symbol(tree, wanted)
+        if found is None:
+            declared = outline_python(text)
+            listing = "\n".join(declared) if declared else "  (nothing at module level)"
+            return (
+                f"`{name}` declares no `{wanted}`. What it does declare:\n{listing}",
+                False,
+                summary,
+            )
+
+        first, last = found
+        lines = text.splitlines()
+        body = "\n".join(
+            f"{number:>6}  {lines[number - 1]}" for number in range(first, last + 1)
+        )
+        return (
+            f"{name}:{first}-{last} — {wanted}\n{body}",
+            True,
+            f"{summary}:{first}-{last}",
+        )
+
+
+def _find_symbol(tree: ast.Module, wanted: str) -> tuple[int, int] | None:
+    """The first and last line of `wanted`, or None if the module has no such
+    definition.
+
+    `Class.method` addresses a method; a bare name matches a module-level
+    definition, and failing that a method of that name on any class, because a
+    caller who knows the method name and not its class is the common case and
+    refusing them costs a turn.
+
+    Decorators count as part of the definition. A reader shown a function
+    without its `@property` has been shown something that behaves differently
+    from what is on disk.
+    """
+    def span(node) -> tuple[int, int]:
+        first = min(
+            [node.lineno] + [item.lineno for item in getattr(node, "decorator_list", [])]
+        )
+        return first, (node.end_lineno or node.lineno)
+
+    definition = (ast.FunctionDef, ast.AsyncFunctionDef)
+    owner, _, member = wanted.partition(".")
+
+    for node in tree.body:
+        if member:
+            if isinstance(node, ast.ClassDef) and node.name == owner:
+                for child in node.body:
+                    if isinstance(child, definition) and child.name == member:
+                        return span(child)
+            continue
+        if isinstance(node, (*definition, ast.ClassDef)) and node.name == wanted:
+            return span(node)
+
+    if member:
+        return None
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            for child in node.body:
+                if isinstance(child, definition) and child.name == wanted:
+                    return span(child)
+    return None
 
 
 def outline_python(source: str) -> list[str]:

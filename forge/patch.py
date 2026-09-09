@@ -52,6 +52,64 @@ _BLOCK = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 
+# A body holding these is a set of edits rather than a file. The markers are
+# the ones every model has seen: a conflict block is the one diff-adjacent
+# shape that does not depend on line numbers or context offsets, neither of
+# which a model produces reliably.
+_SEARCH_OPEN = "<<<<<<< SEARCH"
+
+_REPLACEMENT = re.compile(
+    r"^<{7} SEARCH[ \t]*\n"
+    r"(?P<search>.*?)"
+    r"^={7}[ \t]*\n"
+    r"(?P<replace>.*?)"
+    r"^>{7} REPLACE[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def _edit(path: str, body: str) -> FileEdit:
+    """One block body, read as replacements if it holds them and a file if not.
+
+    `content` is set either way. It is what the whole file will be in the
+    ordinary case, and the replacement halves in the other -- the new code,
+    which is what the guards that read it are looking for.
+    """
+    if _SEARCH_OPEN not in body:
+        return FileEdit(path=path, content=body)
+    found = _replacements(body)
+    if not found:
+        # It said SEARCH and did not finish the block: a truncated reply, or a
+        # marker inside a file that happens to contain one. Neither is a set of
+        # edits, and reading it as a whole file is what this did before.
+        return FileEdit(path=path, content=body)
+    return FileEdit(
+        path=path,
+        content="\n".join(item.replace for item in found),
+        replacements=found,
+    )
+
+
+def _replacements(body: str) -> list[Replacement]:
+    """Every search-and-replace in one block body, in the order given.
+
+    A trailing newline before each marker belongs to the marker rather than to
+    the text, so it is dropped: the model wrote the marker on its own line, not
+    a blank line at the end of the code it is matching.
+    """
+    found = []
+    for match in _REPLACEMENT.finditer(body):
+        search = match.group("search")
+        replace = match.group("replace")
+        found.append(
+            Replacement(
+                search=search[:-1] if search.endswith("\n") else search,
+                replace=replace[:-1] if replace.endswith("\n") else replace,
+            )
+        )
+    return found
+
+
 BLOCKED_PREFIX = "BLOCKED:"
 
 # The executor's other refusal, and a different claim. `BLOCKED:` says *I need
@@ -155,9 +213,30 @@ def _unwrap_double_fence(body: str) -> str:
 
 
 @dataclass
+class Replacement:
+    """One search-and-replace inside a file the executor is editing."""
+
+    search: str
+    replace: str
+
+
+@dataclass
 class FileEdit:
     path: str
     content: str
+    # Set when the executor sent replacements rather than a whole file. The
+    # cost of a whole-file reply is the size of the *existing* file, not of the
+    # change, so a one-method addition to a 96 KB module costs 96 KB of output
+    # -- which is more than this loop's executor is given. One real ticket
+    # spent 2,647,873 tokens across three attempts and wrote nothing, because
+    # each of the two files it was allowed exceeded the budget on its own.
+    #
+    # `content` stays populated either way. Three guards read it --
+    # `foreign_bindings`, `laundered_assertions` and `weakened_criteria` -- and
+    # a field left empty here would take all three out silently on any
+    # patch-shaped reply, which is the kind of hole that is found much later
+    # than it is made.
+    replacements: list["Replacement"] = field(default_factory=list)
 
 
 @dataclass
@@ -225,7 +304,7 @@ def parse_output(text: str) -> ParsedOutput:
         if _fence_is_too_short(match.group("fence"), body):
             truncated.append(path)
             continue
-        edits.append(FileEdit(path=path, content=body))
+        edits.append(_edit(path, body))
     if edits or truncated:
         return ParsedOutput(
             edits=_drop_repeats(edits),
@@ -404,6 +483,25 @@ def infer_single_file(text: str, current: str = "") -> str:
     return candidate
 
 
+# A tool call the model wrote as text instead of making. Servers differ on
+# which of these they parse into a real call, and a model that has run out of
+# tool turns will sometimes emit one anyway -- so this shape arrives as
+# ordinary content, with no files in it.
+#
+# It has to be recognised before the path and fence heuristics, because it
+# looks exactly like the mistake those are for. The path a tool call asks to
+# read sits on a line of its own, so `_BARE_PATH` matches it and the reply gets
+# reported as "named files but did not fence their contents" -- a correction
+# about a mistake the model did not make, which leaves it no reason to stop
+# making the one it did. Three attempts of one real ticket went that way.
+_TEXT_TOOL_CALL = re.compile(
+    r"<\s*(?:tool_call|function_call|invoke)\b"
+    r"|^[ \t]*<function=[\w.]+"
+    r"|^[ \t]*<parameter[ \t]*=",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
 def describe_unparsed(text: str) -> str:
     """What went wrong in a reply that yielded no edits, or `""` if nothing did.
 
@@ -421,6 +519,17 @@ def describe_unparsed(text: str) -> str:
     if list(_BLOCK.finditer(text)):
         # The caller asked about a reply that did parse. Nothing to add.
         return ""
+
+    if _TEXT_TOOL_CALL.search(text):
+        return (
+            "Your response was a tool call written out as text, so nothing was "
+            "read and no file was written. Tools are offered on the earlier "
+            "turns and withdrawn on the last one; once they are gone, a tool "
+            "call is only text. Answer now from what you have already read: "
+            "the file path on its own line, then a fenced block holding either "
+            "the whole file or SEARCH/REPLACE edits. If you truly cannot "
+            "proceed without reading more, say so on a line starting BLOCKED:."
+        )
 
     lines = text.split("\n")
     fenced = any(_FENCE_RUN.match(line) for line in lines)
@@ -635,12 +744,56 @@ def apply_edits(root: Path, edits: list[FileEdit]) -> list[str]:
             raise ValueError(f"refusing to write outside the project root: {edit.path}")
         target = root / edit.path
         target.parent.mkdir(parents=True, exist_ok=True)
-        body = edit.content
+        body = _replaced(target, edit) if edit.replacements else edit.content
         if not body.endswith("\n"):
             body += "\n"
         target.write_text(body, encoding="utf-8")
         written.append(edit.path)
     return written
+
+
+def _replaced(target: Path, edit: FileEdit) -> str:
+    """The file with every replacement applied, or a refusal naming why not.
+
+    Each search has to match **exactly once**. A block matching twice, applied
+    to whichever came first, corrupts a file in a way a suite may well not
+    catch — quietly, and in a place nobody is looking. That is worse than the
+    failure it would be replacing, so it is refused instead, and the message
+    says what to make unique.
+
+    Every replacement is applied to the same in-memory copy, so a later search
+    may match text an earlier one introduced. The file is written once, by the
+    caller, after all of them succeed: a refusal partway through leaves the
+    file exactly as it was rather than half-edited.
+    """
+    if not target.is_file():
+        raise ValueError(
+            f"{edit.path}: cannot edit a file that does not exist. Send it "
+            f"whole to create it."
+        )
+    body = target.read_text(encoding="utf-8")
+    for item in edit.replacements:
+        first = (item.search.strip().splitlines() or [""])[0]
+        if not item.search.strip():
+            raise ValueError(
+                f"{edit.path}: an empty SEARCH block matches everywhere and "
+                f"was refused. Search for the lines you mean to change."
+            )
+        found = body.count(item.search)
+        if found != 1:
+            raise ValueError(
+                f"{edit.path}: the SEARCH block starting `{first[:60]}` "
+                f"matched {found} times, and a replacement has to match "
+                f"exactly once. "
+                + (
+                    "Include enough surrounding lines to make it unique."
+                    if found > 1
+                    else "Check it against the file as it is now, whitespace "
+                    "included."
+                )
+            )
+        body = body.replace(item.search, item.replace, 1)
+    return body
 
 
 # Ways a test file can re-declare the code under test instead of referencing

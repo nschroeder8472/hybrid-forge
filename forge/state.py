@@ -1895,6 +1895,67 @@ class Store:
             ).fetchall()
         )
 
+    def clear_step_detail(self, run_ids: Sequence[int]) -> tuple[int, int]:
+        """Empty the `detail` column of the runs whose artifacts are being pruned.
+
+        The step rows stay — `forge status` and the convergence machinery read
+        their statuses and classes, and dropping rows would make an old run's
+        history disappear rather than shrink. What goes is the bulk: the
+        transcripts, which are the same thing `forge prune` deletes from disk.
+
+        Returns `(rows, bytes)` — how many rows changed and how many UTF-8
+        bytes of `detail` they held before. Rows whose `detail` is already
+        empty are not counted in either number, so a second call over the same
+        runs reports `(0, 0)`. An empty `run_ids` changes nothing.
+        """
+        if not run_ids:
+            return (0, 0)
+        placeholders = ", ".join("?" for _ in run_ids)
+        with self._write() as connection:
+            rows = connection.execute(
+                f"SELECT detail FROM steps WHERE run_id IN ({placeholders}) "
+                "AND detail != ''",
+                tuple(run_ids),
+            ).fetchall()
+            if not rows:
+                return (0, 0)
+            total = sum(len(row["detail"].encode("utf-8")) for row in rows)
+            connection.execute(
+                f"UPDATE steps SET detail = '' WHERE run_id IN ({placeholders}) "
+                "AND detail != ''",
+                tuple(run_ids),
+            )
+        return (len(rows), total)
+
+    def step_detail_usage(self, run_ids: Sequence[int]) -> tuple[int, int]:
+        """How much step detail the named runs hold, without clearing it.
+
+        The read-only half of `clear_step_detail`, for a dry run: the same
+        rows and the same UTF-8 byte total, counted rather than removed.
+        """
+        if not run_ids:
+            return (0, 0)
+        placeholders = ", ".join("?" for _ in run_ids)
+        rows = self._connection.execute(
+            f"SELECT detail FROM steps WHERE run_id IN ({placeholders}) "
+            "AND detail != ''",
+            tuple(run_ids),
+        ).fetchall()
+        if not rows:
+            return (0, 0)
+        total = sum(len(row["detail"].encode("utf-8")) for row in rows)
+        return (len(rows), total)
+
+    def vacuum(self) -> None:
+        """Reclaim the pages freed by a prune, so the file actually shrinks.
+
+        SQLite leaves freed pages in place for reuse; without this, a command
+        that cleared 1.8 MB of detail would report it while the file stayed
+        the same size. Called by `forge prune` after `clear_step_detail`.
+        """
+        with self._write() as connection:
+            connection.execute("VACUUM")
+
     # ------------------------------------------------------------------
     # Events (the dashboard's feed)
     # ------------------------------------------------------------------
