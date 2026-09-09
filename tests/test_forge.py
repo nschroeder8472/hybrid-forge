@@ -12,11 +12,13 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import gc
 import hashlib
 import io
 import itertools
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -847,6 +849,67 @@ class TestATicketHasSomewhereToPutItsTests(unittest.TestCase):
             [self._ticket(route="withheld:security", allowed_files=["src/auth.ts"])]
         )
         self.assertEqual(found, [])
+
+
+class TestTheStoreLetsGoOfItsDatabase(unittest.TestCase):
+    """An open SQLite handle is a Windows file lock on the database.
+
+    A store closed only by the garbage collector held that lock until
+    refcounting noticed, and a test deleting the temp directory it lived in
+    failed with `PermissionError: [WinError 32]` rather than on an assertion.
+    Every ticket whose tests build a store in a temp directory met it.
+    """
+
+    def _root(self) -> Path:
+        return Path(tempfile.mkdtemp()).resolve()
+
+    def test_a_store_owned_by_a_with_block_releases_its_directory(self):
+        root = self._root()
+        with Store(root / "t.db") as store:
+            store.create_run("goal")
+
+        # The assertion is that this does not raise. On Windows it did.
+        shutil.rmtree(root)
+        self.assertFalse(root.exists())
+
+    def test_a_store_nobody_closes_is_released_when_it_is_collected(self):
+        """The backstop, for the tests the loop writes and we do not."""
+        root = self._root()
+        store = Store(root / "t.db")
+        store.create_run("goal")
+
+        del store
+        gc.collect()
+
+        shutil.rmtree(root)
+        self.assertFalse(root.exists())
+
+    def test_close_all_shuts_the_connections_other_threads_opened(self):
+        store = Store(self._root() / "t.db")
+        run_id = store.create_run("goal")
+        # `close()` can only reach the calling thread's connection, which is
+        # why the registry exists: this one belongs to a thread that is gone.
+        threading.Thread(target=lambda: store.list_tickets(run_id)).start()
+        time.sleep(0.1)
+        self.assertEqual(len(store._open), 2)
+
+        store.close_all()
+
+        self.assertEqual(store._open, [])
+
+    def test_close_leaves_the_connections_it_does_not_own_alone(self):
+        """The safe close stays safe: a live thread's cursor is not pulled."""
+        store = Store(self._root() / "t.db")
+        run_id = store.create_run("goal")
+        threading.Thread(target=lambda: store.list_tickets(run_id)).start()
+        time.sleep(0.1)
+
+        store.close()
+
+        self.assertEqual(len(store._open), 1)
+        # And the store is still usable: the next call opens a fresh one.
+        self.assertEqual(store.list_tickets(run_id), [])
+        store.close_all()
 
 
 class TestStoreResume(unittest.TestCase):

@@ -18,6 +18,7 @@ import re
 import sqlite3
 import threading
 import time
+import weakref
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -661,6 +662,27 @@ def _learned_key(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
 
 
+def _close_connections(
+    connections: list[sqlite3.Connection], lock: threading.Lock
+) -> None:
+    """Close every connection a `Store` opened, from whichever thread calls.
+
+    Kept at module level and handed only the list, because a `weakref.finalize`
+    callback that referenced the `Store` would keep it alive forever and never
+    run. Safe to call for another thread's connection only when nothing can be
+    using it: at `close_all`, which its caller promises, or at finalization,
+    where the store is already unreachable.
+    """
+    with lock:
+        while connections:
+            try:
+                connections.pop().close()
+            except sqlite3.Error:
+                # A connection already closed, or one whose thread died mid
+                # statement. Neither is worth failing an interpreter shutdown.
+                pass
+
+
 class Store:
     """All persistent state for one repository's runs."""
 
@@ -677,6 +699,22 @@ class Store:
         # readers do not block the writer, and each thread gets its own cursor
         # state instead of trampling a shared one.
         self._local = threading.local()
+        # Every connection the store has open, whichever thread opened it.
+        # `threading.local` alone cannot be closed from outside the thread that
+        # filled it, and an open SQLite handle holds a Windows file lock — so a
+        # store left to the garbage collector blocked `shutil.rmtree` of the
+        # temp directory its database lived in, and a test cleaning up after
+        # itself failed with `PermissionError: [WinError 32]`. This registry is
+        # what makes closing them all possible.
+        self._open: list[sqlite3.Connection] = []
+        self._open_lock = threading.Lock()
+        # The backstop for a store nobody closes. It runs when the store
+        # becomes unreachable rather than when each thread's locals are
+        # cleared, which is what a loop-written test — which will not know to
+        # use the context manager — needs before it deletes its temp directory.
+        self._finalizer = weakref.finalize(
+            self, _close_connections, self._open, self._open_lock
+        )
         connection = self._connect()
         connection.executescript(SCHEMA)
         self._migrate()
@@ -691,6 +729,8 @@ class Store:
         # seconds is far longer than anything this store does.
         connection.execute("PRAGMA busy_timeout=5000")
         self._local.connection = connection
+        with self._open_lock:
+            self._open.append(connection)
         return connection
 
     @property
@@ -757,13 +797,40 @@ class Store:
     def close(self) -> None:
         """Close this thread's connection. Other threads keep their own.
 
-        Enough for every caller there is: the CLI closes the store it opened,
-        and the dashboard's threads are daemons that die with the process.
+        The safe close, and the only one a thread may call while other threads
+        are still working: it touches nothing it does not own. The dashboard
+        calls it as each request thread finishes.
         """
         connection = getattr(self._local, "connection", None)
         if connection is not None:
+            with self._open_lock:
+                if connection in self._open:
+                    self._open.remove(connection)
             connection.close()
             self._local.connection = None
+
+    def close_all(self) -> None:
+        """Close every connection this store opened, on every thread.
+
+        The caller promises no other thread is still using the store — true at
+        the end of a `with` block, and true of a CLI command that is about to
+        return. Where that promise cannot be made, use `close`, which closes
+        only the calling thread's, and let the finalizer take the rest.
+        """
+        self._local.connection = None
+        _close_connections(self._open, self._open_lock)
+
+    def __enter__(self) -> Store:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        """Release the database file, so a test can delete the directory.
+
+        An open handle keeps a Windows lock on the file; a store closed only by
+        the garbage collector is a `shutil.rmtree` that fails. Any test that
+        builds a store on a temp directory should own it with `with`.
+        """
+        self.close_all()
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:

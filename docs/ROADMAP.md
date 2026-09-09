@@ -876,16 +876,31 @@ Four things this repository's own runs left open, in the order they are worth
 doing. All of them are written up in
 [EXECUTOR-CEILINGS.md](EXECUTOR-CEILINGS.md), which is the evidence for each.
 
-**1. Close the store's connections explicitly.** The only one of these that is
-breaking something today. `Store` keeps a connection per thread in
-`threading.local()` and `close()` closes only the caller's, so a `Store` left
-to the garbage collector holds a Windows file lock on its database. Run 11's
-test step failed four times with `PermissionError: [WinError 32]` on a temp
-directory a loop-written test was cleaning up. **Any ticket whose tests build a
-`Store` in a temp directory hits this**, which is every ticket touching state.
-Close the thread's connection when a dashboard request ends, and give `Store`
-context-manager support so tests stop leaving them open. Touches `state.py` and
-`ui/server.py`.
+**1. Close the store's connections explicitly — done, 2026-09-09.** `Store`
+kept a connection per thread in `threading.local()` and `close()` closed only
+the caller's, so a `Store` left to the garbage collector held a Windows file
+lock on its database. Run 11's test step failed four times with
+`PermissionError: [WinError 32]` on a temp directory a loop-written test was
+cleaning up, and any ticket whose tests build a `Store` in a temp directory met
+the same thing.
+
+Three closes now, at descending levels of promise. `close()` is unchanged and
+still touches only the calling thread's connection — the dashboard calls it as
+each connection thread finishes, which is where the leak was: a thread per
+connection, a connection per thread, and nothing closing either. `close_all()`
+closes every connection the store opened, for a caller that can promise nobody
+else is using it, and `__enter__`/`__exit__` are that promise written down, so
+a test can own a store with `with` and then delete its directory. A
+`weakref.finalize` is the backstop for the store nobody closes at all, which is
+the case that matters most: it fires when the store becomes unreachable rather
+than when each thread's locals clear, and the tests the loop writes will not
+know about the context manager. Closing another thread's connection at all is
+what the new registry in `Store._open` is for.
+
+The suite is the visible half of the result: `tests/test_forge.py` alone
+emitted **721 `ResourceWarning`s** and now emits none, with the nine left
+across the whole suite coming from `memory.py`'s subprocess pipes and test
+sockets. Touched `state.py` and `ui/server.py`.
 
 **2. Stop the executor narrating before it acts.** Run 11's first attempt read
 successfully, identified everything it needed, and then spent its whole output
@@ -934,9 +949,9 @@ Found while reviewing the loop, judged not worth building yet.
   `toolTurns` from 8 to 16 doubled the reads and changed nothing), a
   misdiagnosis that wasted the loop's one free correction (fixed), and tool
   insufficiency (fixed by `grep(context)` and `read_symbol`; `outline` retired
-  at 0 calls in 49 across three probe arms). It also carries the open
-  `ResourceWarning` finding on `Store`'s per-thread connections, which is
-  measured *not* to be a leak.
+  at 0 calls in 49 across three probe arms). Its `ResourceWarning` finding on
+  `Store`'s per-thread connections — measured *not* to be a leak, and breaking
+  Windows test cleanup anyway — is fixed; see item 1 above.
 - **Per-role provider guarantees.** `claude-cli` now defaults to no tools, which
   makes it behave like the completion endpoint the loop assumes. A stronger
   version would let a role *declare* what it needs — "this role reads text and
