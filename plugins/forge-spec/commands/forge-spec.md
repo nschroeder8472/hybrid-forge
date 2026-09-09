@@ -73,6 +73,11 @@ Two tickets may share a file — they get an ordering edge from document order.
 What they may not do is assert that file's whole contents; ingest refuses that,
 and the `spec-contract` skill says why.
 
+Give every ticket that writes a test the path of one that already passes, in
+its reference files. A ticket that names where the test goes and nothing about
+what a test here looks like sends the executor reading to find out: 38.6% of
+280 measured reads went that way, and reads are capped.
+
 ## 4. Write the criteria yourself
 
 Acceptance criteria are assertions that would fail if the behavior were wrong.

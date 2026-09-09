@@ -64,7 +64,12 @@ from .config import (
     normalize_workspace_root,
 )
 from .ingest import ingest as ingest_document
-from .ingest import undeclared_order, untestable_scope, write_tickets
+from .ingest import (
+    undeclared_order,
+    unexampled_tests,
+    untestable_scope,
+    write_tickets,
+)
 from .loop import (
     CONTROL_KEY,
     CONTROL_PAUSE,
@@ -742,6 +747,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
     _warn_missing_manifests(config, tickets)
     _warn_untestable_scope(tickets)
+    _warn_unexampled_tests(tickets)
 
     # Said after `derive_needs` has run, so a shared writable file has already
     # been ordered and is not what this is about.
@@ -1679,6 +1685,18 @@ def _warn_untestable_scope(tickets: list) -> list[str]:
     `ingest.untestable_scope`.
     """
     problems = untestable_scope(tickets)
+    for problem in problems:
+        print(f"\nwarning: {problem}")
+    return problems
+
+
+def _warn_unexampled_tests(tickets: list) -> list[str]:
+    """Say which tickets write a test with no example of one to follow.
+
+    Here rather than at the first read, because by the first read the turn is
+    already being spent. See `ingest.unexampled_tests`.
+    """
+    problems = unexampled_tests(tickets)
     for problem in problems:
         print(f"\nwarning: {problem}")
     return problems

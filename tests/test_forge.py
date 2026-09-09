@@ -50,6 +50,7 @@ from forge.ingest import (
     graph_problems,
     looks_like_plan,
     plan_decisions,
+    unexampled_tests,
     untestable_scope,
     plan_with_model,
     render_ticket,
@@ -847,6 +848,67 @@ class TestATicketHasSomewhereToPutItsTests(unittest.TestCase):
     def test_a_withheld_ticket_is_exempt(self):
         found = untestable_scope(
             [self._ticket(route="withheld:security", allowed_files=["src/auth.ts"])]
+        )
+        self.assertEqual(found, [])
+
+
+class TestATicketShowsWhatItAsksToBeWritten(unittest.TestCase):
+    """`unexampled_tests`: a designated test path is half an instruction.
+
+    The path says where the file goes. Nothing says what a test in this project
+    looks like, so whoever writes it finds out by reading — 38.6% of 280 tool
+    reads across runs 8-10 were of `tests/`, and reads are capped.
+    """
+
+    @staticmethod
+    def _ticket(**kwargs):
+        base = dict(ticket_id="AB-001", title="t", spec="s", criteria=["c"])
+        base.update(kwargs)
+        return Ticket(**base)
+
+    def test_a_ticket_writing_a_test_with_no_example_is_reported(self):
+        found = unexampled_tests(
+            [self._ticket(allowed_files=["src/a.py", "tests/test_a.py"])]
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("references no existing test", found[0])
+
+    def test_an_existing_test_in_the_reference_list_settles_it(self):
+        found = unexampled_tests(
+            [
+                self._ticket(
+                    allowed_files=["src/a.py", "tests/test_a.py"],
+                    reference_files=["tests/test_b.py"],
+                )
+            ]
+        )
+        self.assertEqual(found, [])
+
+    def test_the_file_being_written_is_not_an_example_of_itself(self):
+        """A path in both lists is the target, not something to copy from."""
+        found = unexampled_tests(
+            [
+                self._ticket(
+                    allowed_files=["src/a.py", "tests/test_a.py"],
+                    reference_files=["./tests/test_a.py"],
+                )
+            ]
+        )
+        self.assertEqual(len(found), 1)
+
+    def test_a_ticket_that_writes_no_test_is_quiet(self):
+        # `untestable_scope` is the check for that, and it says something else.
+        found = unexampled_tests([self._ticket(allowed_files=["src/a.py"])])
+        self.assertEqual(found, [])
+
+    def test_a_withheld_ticket_is_exempt(self):
+        found = unexampled_tests(
+            [
+                self._ticket(
+                    route="withheld:security",
+                    allowed_files=["src/auth.py", "tests/test_auth.py"],
+                )
+            ]
         )
         self.assertEqual(found, [])
 

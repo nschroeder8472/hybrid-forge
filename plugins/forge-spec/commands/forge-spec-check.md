@@ -43,6 +43,12 @@ says what to change; the reasoning is in the `spec-contract` skill.
   and with none it writes outside the ticket's scope, where the executor cannot
   repair what it produced. Add the test file to `Allowed files`; a `bug` ticket
   is exempt, since its reproduction path is granted separately.
+- *references no existing test* — the ticket says where its test goes and
+  nothing about what a test here looks like, so whoever writes it works the
+  conventions out by reading. 38.6% of one measurement's 280 reads went on
+  `tests/` for that reason, and reads are capped. Add a test that already
+  passes to `Reference files`. Nothing to point at, in a repository with no
+  tests yet, is a fair answer — hence a warning.
 - *criterion the harness already settles* — the run executes lint, typecheck,
   the build and the suite before anything is judged. Delete the criterion: the
   tester's job is to turn every one of them into an assertion, and this one

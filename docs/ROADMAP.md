@@ -875,8 +875,8 @@ and the pass has no way to tell it apart from a signature.
 Four things this repository's own runs left open, in the order they are worth
 doing. All of them are written up in
 [EXECUTOR-CEILINGS.md](EXECUTOR-CEILINGS.md), which is the evidence for each.
-The first three are done; the entries are kept rather than deleted, because
-what was built is only worth reading beside the run that asked for it.
+All four are done; the entries are kept rather than deleted, because what was
+built is only worth reading beside the run that asked for it.
 
 **1. Close the store's connections explicitly — done, 2026-09-09.** `Store`
 kept a connection per thread in `threading.local()` and `close()` closed only
@@ -947,12 +947,31 @@ rather than a request, and that the conversation always has a turn left to put
 an answer in. Whether that finishes the tickets read exhaustion was ending is a
 question for a live run. Touched `loop.py` and `patch.py`.
 
-**4. Reference an example of anything a ticket has to write.** Of 280 reads
-across runs 8-10, **38.6% were of `tests/`** — the executor working out house
-conventions for a test file the ticket told it to write and gave it no example
-of. This is a spec habit rather than a loop change, and it is the cheapest
-thing on this list: `forge-spec` should ask for a reference test the way it
-already asks for a test path.
+**4. Reference an example of anything a ticket has to write — done,
+2026-09-09.** Of 280 reads across runs 8-10, **38.6% were of `tests/`** — the
+executor working out house conventions for a test file the ticket told it to
+write and gave it no example of.
+
+Still a spec habit rather than a loop change, and now a checkable one.
+`ingest.unexampled_tests` reports a ticket that designates a test path and
+references no existing test; `forge ingest` prints it beside the scope warnings
+and `/forge-spec-check` lists it. A warning and never a refusal, because the
+first ticket in a repository with no tests has nothing to point at. The
+`forge-spec` skills, template and command now ask for the example the way they
+already ask for the path — and the claim that "the executor has no filesystem",
+which was the reason the reference list existed, is corrected everywhere it
+appeared: it can read, six times per attempt at the default, and a file it has
+to go looking for costs a turn it could have spent on the code.
+
+The check fires on this repository's own fixture backlogs. They are left
+unchanged on purpose: `GRIND.md`, `HARD.md`, `SPEC.md` and the others are what
+several recorded runs were measured against, and giving them a reference test
+changes what a re-run would measure. Touched `ingest.py`, `cli.py` and the
+`forge-spec` plugin.
+
+**That is the whole list.** What is left for these four is a live run, which is
+the only thing that can say whether the reads they were built to cheapen are
+actually cheaper.
 
 **A type checker is unclaimed.** `.flake8` is the only static analysis
 configured. Every shape defect this session cost a full test run to find — a
