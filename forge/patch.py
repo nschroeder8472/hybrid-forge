@@ -483,6 +483,25 @@ def infer_single_file(text: str, current: str = "") -> str:
     return candidate
 
 
+# A tool call the model wrote as text instead of making. Servers differ on
+# which of these they parse into a real call, and a model that has run out of
+# tool turns will sometimes emit one anyway -- so this shape arrives as
+# ordinary content, with no files in it.
+#
+# It has to be recognised before the path and fence heuristics, because it
+# looks exactly like the mistake those are for. The path a tool call asks to
+# read sits on a line of its own, so `_BARE_PATH` matches it and the reply gets
+# reported as "named files but did not fence their contents" -- a correction
+# about a mistake the model did not make, which leaves it no reason to stop
+# making the one it did. Three attempts of one real ticket went that way.
+_TEXT_TOOL_CALL = re.compile(
+    r"<\s*(?:tool_call|function_call|invoke)\b"
+    r"|^[ \t]*<function=[\w.]+"
+    r"|^[ \t]*<parameter[ \t]*=",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
 def describe_unparsed(text: str) -> str:
     """What went wrong in a reply that yielded no edits, or `""` if nothing did.
 
@@ -500,6 +519,17 @@ def describe_unparsed(text: str) -> str:
     if list(_BLOCK.finditer(text)):
         # The caller asked about a reply that did parse. Nothing to add.
         return ""
+
+    if _TEXT_TOOL_CALL.search(text):
+        return (
+            "Your response was a tool call written out as text, so nothing was "
+            "read and no file was written. Tools are offered on the earlier "
+            "turns and withdrawn on the last one; once they are gone, a tool "
+            "call is only text. Answer now from what you have already read: "
+            "the file path on its own line, then a fenced block holding either "
+            "the whole file or SEARCH/REPLACE edits. If you truly cannot "
+            "proceed without reading more, say so on a line starting BLOCKED:."
+        )
 
     lines = text.split("\n")
     fenced = any(_FENCE_RUN.match(line) for line in lines)

@@ -19,7 +19,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from forge.patch import FileEdit, Replacement, apply_edits, parse_output
+from forge.patch import (
+    FileEdit,
+    Replacement,
+    apply_edits,
+    describe_unparsed,
+    parse_output,
+)
 from forge.prompts import EXECUTOR_SYSTEM
 
 ONE = """forge/state.py
@@ -212,6 +218,52 @@ class TestTheExecutorIsToldAboutIt(unittest.TestCase):
 
     def test_it_says_a_new_file_is_still_sent_whole(self):
         self.assertIn("has to be sent whole", EXECUTOR_SYSTEM)
+
+
+class TestATextToolCallIsNamedForWhatItIs(unittest.TestCase):
+    """A model out of tool turns sometimes writes the call out instead of
+    making it. The path it asks to read sits on a line of its own, so the
+    path-and-fence heuristics claimed it had "named files but did not fence
+    their contents" -- a correction about a mistake it had not made, which left
+    it no reason to stop making the one it had. Three attempts of one real
+    ticket went that way, twice over, across three runs.
+    """
+
+    WHOLE_FILE = "a.py\n```\nx = 1\n```\n"
+
+    UNFENCED = "a.py\nx = 1\n"
+
+    CALL = (
+        "I have enough context. Let me verify one detail first.\n\n"
+        "<tool_call>\n<function=read_file>\n<parameter=path>\n"
+        "forge/config.py\n</parameter>\n</function>\n</tool_call>\n"
+    )
+
+    def test_it_is_not_reported_as_a_missing_fence(self):
+        said = describe_unparsed(self.CALL)
+
+        self.assertNotIn("did not fence", said)
+
+    def test_it_says_the_call_was_only_text(self):
+        said = describe_unparsed(self.CALL)
+
+        self.assertIn("tool call written out as text", said)
+
+    def test_it_says_what_to_do_instead(self):
+        said = describe_unparsed(self.CALL)
+
+        self.assertIn("Answer now from what you have already read", said)
+        self.assertIn("BLOCKED:", said)
+
+    def test_a_reply_that_parsed_is_still_left_alone(self):
+        """The guard runs on replies with no files in them. One that parsed
+        is not the caller's question however it is worded."""
+        self.assertEqual(describe_unparsed(self.WHOLE_FILE), "")
+
+    def test_an_ordinary_missing_fence_still_says_so(self):
+        said = describe_unparsed(self.UNFENCED)
+
+        self.assertIn("did not fence", said)
 
 
 if __name__ == "__main__":
