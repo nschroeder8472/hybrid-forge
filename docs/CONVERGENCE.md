@@ -619,6 +619,14 @@ things. Churning is the executor trading one failure for another, which the
 anti-oscillation block in its own prompt is written for and which more attempts
 can genuinely resolve. Flat is nothing varying at all.
 
+Churning is the cycle-level shape of that trade. The attempt-level one is
+`failures.oscillating`, which reads the ordered class sets of a ticket's failed
+steps and reports an exact A-then-B-then-A at the tail. Where churning says
+*some went and others came*, this names the two classes that are trading places
+and puts both in the next attempt's prompt — because the anti-oscillation block
+asked the executor to notice the cycle itself, and one run had the whole cycle
+in front of it, attempt after attempt, and never did.
+
 Cycle boundaries come from `Ticket.cycle_mark`, the highest step id at the last
 boundary — step ids are monotonic, so "everything after this" is the current
 cycle's evidence without a cycle number on every row.

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Collection, Sequence
 from pathlib import Path
 
 # A file extension, for every pattern here that needs to recognise one. The
@@ -492,6 +493,52 @@ def classify(step: str, output: str) -> set[str]:
     )
     message = _message_of(first)
     return {f"{step} {message}"} if message else set()
+
+
+def oscillating(
+    history: Sequence[Collection[str]],
+) -> tuple[frozenset[str], frozenset[str]] | None:
+    """The A-then-B-then-A cycle at the end of a failure history, or `None`.
+
+    `history` is one entry per failed attempt, oldest first, each the set of
+    classes that attempt produced. The answer is `(returned, displaced)` — what
+    is failing again, and what was failing in between — or `None` when the tail
+    is not a cycle.
+
+    The executor is already shown its last failures and told that a fix it has
+    tried before will fail the same way again. That depends on it reading them
+    and noticing, and the run this comes from is the argument against relying on
+    that: a change that fixes A breaks B, the fix for B brings A back, and the
+    whole retry budget goes by with the loop able to see every attempt and no
+    part of it able to see the cycle.
+
+    Classes rather than signatures, for the reason `classify` exists: `TS2532`
+    at line 40 and at line 51 are one misunderstanding, and a comparison that
+    calls them different sees a new failure every time and never a repeat.
+
+    Deliberately strict, because the fix for a false positive is worse than
+    missing a cycle — the executor would be told to reconcile two failures that
+    are not in tension:
+
+    - the newest attempt has to repeat the one before last **exactly**, not
+      merely overlap it;
+    - the attempt in between has to be **different**, or this is a repeat
+      rather than an oscillation and `_convergence` already counts it;
+    - no set may be empty, since an unparseable failure means *cannot
+      attribute* and two of those are not evidence of anything.
+    """
+    if len(history) < 3:
+        return None
+    returned, displaced, before = (
+        frozenset(history[-1]),
+        frozenset(history[-2]),
+        frozenset(history[-3]),
+    )
+    if not returned or not displaced or not before:
+        return None
+    if returned != before or returned == displaced:
+        return None
+    return (returned, displaced)
 
 
 # One rejection, split into the objections it actually carries.

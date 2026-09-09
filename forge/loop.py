@@ -37,7 +37,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NamedTuple, Sequence
+from typing import Any, Collection, NamedTuple, Sequence
 
 from . import imports
 from . import manifests
@@ -58,6 +58,7 @@ from .failures import (
     errors_naming,
     files_blamed,
     locations,
+    oscillating,
     reroot,
     signatures,
     strip_ansi,
@@ -434,6 +435,11 @@ class Orchestrator:
         # `_repo_map` for why a landed ticket does not invalidate it.
         self._repo_map_cache: str | None = None
         self._impossible_claims: dict[str, str] = {}
+        # Oscillations already reported, as `(ticket, returned, displaced)`.
+        # The cycle is detected again on every failed attempt while it holds,
+        # and a warning repeated every few minutes is one a reader stops
+        # seeing; the executor is still told each time.
+        self._oscillations: set[tuple[str, tuple[str, ...], tuple[str, ...]]] = set()
         # Why the run gave up on verifying anything, once it has. Set when a
         # ticket's every verify step was excused, which means the project no
         # longer builds and no later ticket can be checked either. Ends the
@@ -1677,6 +1683,44 @@ class Orchestrator:
             },
         )
         return note
+
+    def _oscillation(
+        self, run_id: int, ticket: Ticket
+    ) -> tuple[frozenset[str], frozenset[str]] | None:
+        """The A-then-B-then-A cycle this ticket is in, or `None`.
+
+        Read from the step log rather than from a counter, so a retry cycle
+        that starts with fresh locals still sees the attempts before it — the
+        same reason `history` and `rejections` are seeded from it.
+
+        Logged the first time each pair is seen and not again. The cycle is
+        reported on every subsequent failed attempt while it holds, and a line
+        repeated once a minute is one a reader stops seeing.
+        """
+        found = oscillating(self.store.ticket_class_sets(run_id, ticket.ticket_id))
+        if found is None:
+            return None
+        returned, displaced = found
+        key = (ticket.ticket_id, tuple(sorted(returned)), tuple(sorted(displaced)))
+        if key not in self._oscillations:
+            self._oscillations.add(key)
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: this attempt failed on exactly what the "
+                f"attempt before last failed on, with something else in "
+                f"between — {', '.join(sorted(returned))} against "
+                f"{', '.join(sorted(displaced))}. The two fixes are undoing "
+                f"each other; the next attempt is told so, and asked for "
+                f"IMPOSSIBLE: if they cannot both hold.",
+                level="warn",
+                kind="ticket",
+                data={
+                    "ticket": ticket.ticket_id,
+                    "returned": sorted(returned),
+                    "displaced": sorted(displaced),
+                },
+            )
+        return found
 
     def _charge(self, run_id: int, ticket: Ticket, found: set[str]) -> None:
         """Record failures as this ticket's, permanently.
@@ -4422,6 +4466,11 @@ class Orchestrator:
         # answer`, and the attempt charged for failing to reduce a count that
         # had never been taken.
         last_detail = ""
+        # The A-then-B-then-A cycle `_oscillation` found, if it found one, for
+        # the next attempt's prompt. Recomputed after every charged failure and
+        # cleared the moment the pattern stops holding, so an executor that
+        # breaks out of the cycle is not still being told it is in one.
+        cycle: tuple[frozenset[str], frozenset[str]] | None = None
         # Whether the next attempt runs with the compile gate switched off.
         #
         # Set after a stall, and this is load-bearing. The gate returns before
@@ -4445,6 +4494,7 @@ class Orchestrator:
                 run_id, ticket, failure_context, retrieved, baseline,
                 pre_existing=pre_existing, authored=authored, touched=touched,
                 prior_failures=history[-self._prior_failures:],
+                oscillation=cycle,
                 rejections=rejections,
                 repro=repro,
                 inner_turns=0 if gate_off else self.config.loop.inner_turns - spent,
@@ -4604,6 +4654,7 @@ class Orchestrator:
                 level="warn",
                 kind="ticket",
             )
+            cycle = self._oscillation(run_id, ticket)
 
         ticket.status = TICKET_FAILED
         self._discard_tests(run_id, ticket, authored)
@@ -5697,6 +5748,7 @@ class Orchestrator:
         authored: dict[str, bool] | None = None,
         touched: set[str] | None = None,
         prior_failures: Sequence[str] = (),
+        oscillation: tuple[Collection[str], Collection[str]] | None = None,
         rejections: list[str] | None = None,
         repro: tuple[str, str] | None = None,
         inner_turns: int = 0,
@@ -5792,6 +5844,7 @@ class Orchestrator:
                             run_id, ticket.ticket_id
                         ),
                         prior_failures=prior_failures,
+                        oscillation=oscillation,
                         malformed=malformed,
                         prior_turns=prior_turns,
                         repository_map=self._repo_map(),

@@ -99,12 +99,14 @@ from forge.failures import (
     errors_naming,
     files_blamed,
     locations,
+    oscillating,
     reroot,
     signatures,
     reported_test_count,
 )
 from forge.prompts import (
     FAILURE_CLASSES_HEADING,
+    OSCILLATION_HEADING,
     LEARNED_HEADING,
     contested_subjects,
     learned_message,
@@ -12525,6 +12527,109 @@ class TestTheLoopCountsWhatKeepsFailing(unittest.TestCase):
         orch.config.loop.prior_failures = 5
 
         self.assertEqual(orch._prior_failures, 5)
+
+
+class TestTheLoopSeesTheCycleRatherThanHopingTheModelDoes(unittest.TestCase):
+    """`oscillating`: A-then-B-then-A, found by comparing rather than reading.
+
+    The executor has been told all along that a failure it has seen before
+    means its two changes are undoing each other. That asks it to compare its
+    own history and conclude something, and one run had exactly that history in
+    the prompt for every attempt of a cycle without ever saying so.
+    """
+
+    def _store(self):
+        store = Store(Path(tempfile.mkdtemp()).resolve() / "t.db")
+        return store, store.create_run("goal")
+
+    def _fail(self, store, run_id, name, detail, ticket="T-1"):
+        step = store.start_step(run_id, ticket, name)
+        store.end_step(step, "failed", detail)
+
+    def test_a_then_b_then_a_is_a_cycle(self):
+        found = oscillating([{"a"}, {"b"}, {"a"}])
+
+        self.assertEqual(found, (frozenset({"a"}), frozenset({"b"})))
+
+    def test_the_same_failure_three_times_is_not_one(self):
+        """That is a repeat, and the counted classes already say so."""
+        self.assertIsNone(oscillating([{"a"}, {"a"}, {"a"}]))
+
+    def test_a_partial_return_is_not_one(self):
+        # Strict on purpose: telling an executor to reconcile two failures that
+        # are not in tension is worse than missing a cycle.
+        self.assertIsNone(oscillating([{"a"}, {"b"}, {"a", "c"}]))
+
+    def test_a_hole_in_the_history_is_not_one(self):
+        # An empty class set means the output parsed as nothing, which is
+        # "cannot attribute" rather than "no errors".
+        self.assertIsNone(oscillating([set(), {"b"}, set()]))
+
+    def test_two_attempts_are_not_enough_to_alternate(self):
+        self.assertIsNone(oscillating([{"a"}, {"b"}]))
+
+    def test_only_the_newest_three_decide_it(self):
+        # A cycle that has stopped is not one the next attempt should be told
+        # about.
+        self.assertIsNone(oscillating([{"a"}, {"b"}, {"a"}, {"c"}]))
+
+    def test_the_step_log_gives_the_sets_in_order(self):
+        store, run_id = self._store()
+        self._fail(store, run_id, "typecheck", "src/a.ts(4,1): error TS2532: x")
+        self._fail(store, run_id, "lint", "src/b.ts:1: Error: bad (no-shadow)")
+        self._fail(store, run_id, "typecheck", "src/a.ts(51,1): error TS2532: x")
+
+        sets = store.ticket_class_sets(run_id, "T-1")
+
+        self.assertEqual(
+            sets,
+            [
+                ["typecheck TS2532 in src/a.ts"],
+                ["lint no-shadow in src/b.ts"],
+                ["typecheck TS2532 in src/a.ts"],
+            ],
+        )
+        self.assertIsNotNone(oscillating(sets))
+
+    def test_the_orchestrator_finds_it_and_says_so_once(self):
+        orch, _root, run_id = _stub_orchestrator()
+        ticket = Ticket("T-1")
+        for detail in (
+            "src/a.ts(4,1): error TS2532: x",
+            "src/b.ts:1: Error: bad (no-shadow)",
+            "src/a.ts(51,1): error TS2532: x",
+        ):
+            self._fail(orch.store, run_id, "typecheck", detail)
+
+        found = orch._oscillation(run_id, ticket)
+        again = orch._oscillation(run_id, ticket)
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found, again)
+        warnings = [
+            row["message"]
+            for row in orch.store.events_after(0)
+            if row["level"] == "warn" and "before last" in row["message"]
+        ]
+        self.assertEqual(len(warnings), 1)
+
+    def test_the_next_attempt_is_told_which_two(self):
+        shown = _joined(
+            build_prompt(
+                Ticket("T-1"),
+                oscillation=({"typecheck TS2532 in src/a.ts"}, {"lint no-shadow"}),
+            )
+        )
+
+        self.assertIn(OSCILLATION_HEADING, shown)
+        self.assertIn("typecheck TS2532 in src/a.ts", shown)
+        self.assertIn("lint no-shadow", shown)
+        self.assertIn("IMPOSSIBLE:", shown)
+
+    def test_a_ticket_that_is_not_cycling_is_told_nothing(self):
+        shown = _joined(build_prompt(Ticket("T-1")))
+
+        self.assertNotIn(OSCILLATION_HEADING, shown)
 
 
 class TestTheLoopCountsHowMuchKeepsFailing(unittest.TestCase):
