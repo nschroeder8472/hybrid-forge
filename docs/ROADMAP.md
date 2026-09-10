@@ -530,6 +530,176 @@ spec does not survive contact.
 
 ---
 
+## Looking at what it built — a UI ticket the loop can see
+
+**Status:** not built, and asked for. What exists is listed below; what is
+missing is one process primitive and one step.
+
+**The problem has evidence, and it is this repository's own.**
+[CANVAS-POSTMORTEM.md](CANVAS-POSTMORTEM.md) §7 records four defects that
+shipped together in one page, with **146 tests green and four commands clean**:
+
+- the ruler labelled the wrong columns — every label positioned at a world
+  coordinate with `view.origin` never subtracted, so column 0's label sat 95
+  pixels from column 0. **Six criteria covered that ruler**, all about how many
+  labels are emitted and which indices they carry, and none said *where a label
+  goes*;
+- the ruler was never drawn, because nothing imported it;
+- the zoom readout showed `1500%` where the spec said a percentage of scale 32;
+- the page's file input was `hidden` with nothing to open it, so the editor
+  could not load a level at all.
+
+Every one of those is visible in a single screenshot, and none of them is
+reachable by a suite that passes. That is the whole argument.
+
+**The current mitigation catches absence, not wrongness.** `check_spec.py`
+reminds an author when a backlog writes an entry point, and `spec-contract`
+tells them to assert the wiring mechanically — *"imports `composeFrame` and
+calls it"*, *"contains a control with id `open`"*. Those are worth having and
+they caught the missing control. They cannot catch a control that exists and is
+invisible, a label that is emitted and misplaced, or a number that is rendered
+and wrong. The ruler had six criteria and shipped 95 pixels off.
+
+### What already exists
+
+| | |
+|---|---|
+| multimodal messages | a role can be handed a PNG today — [IMAGE-LOOP.md](IMAGE-LOOP.md) phase 1, shipped |
+| `supports_images`, `roleNeeds: ["images"]` | a reviewer that cannot see is refused at `validate` rather than shown a filename |
+| reference images | a ticket's reading scope attaches its `.png` files to executor, tester and reviewer |
+| `commands.test[".png"]` | per-language verify already runs a tester-written check against an *artifact* rather than against code |
+| `artifacts.py` | durable per-step recording — where a screenshot would live |
+| `processes._start` / `_kill_tree` | process-group start, and a kill that actually kills the tree |
+
+### What is missing
+
+1. **A process that outlives one command.** `run_command` runs to completion,
+   and nothing starts an app and holds it while something else probes it. This
+   is the framework piece, and half of it is already written: `_start` puts the
+   child in its own group and `_kill_tree` reaps it, which is the hard part on
+   both platforms.
+2. **Something that drives the UI.** A screenshot needs a browser or a toolkit
+   harness. This is where it gets difficult for some programs, and where the
+   design should refuse to be clever: **the project supplies the command, the
+   loop supplies the shape.** Playwright is the obvious answer for the web and
+   is a runtime dependency this project does not have and should not acquire; a
+   project that already has it writes one line of config.
+3. **The step that looks.** After apply and verify, run the project's capture
+   command, attach what it produced to review, and judge the criteria that are
+   about what is visible.
+
+### Why it is the same loop as the image one
+
+The steps are named after code and only two of them are about code. The rest is
+a shape — *produce an artifact under a scope, check it mechanically, have
+something that gains nothing from passing rule on it, refine until a criterion
+is met or the budget runs out.* An image ticket is that shape with a generated
+artifact. **A UI ticket is that shape with an artifact the project's own build
+produces**, which makes it the easier of the two: there is no image provider to
+choose, no `supports_edit` question, and the refinement input is an ordinary
+code edit rather than a mask.
+
+So the two should share the step and differ only in who makes the pixels. If
+that is true, the capture command belongs beside `lint` and `test` in
+`commands`, and the vision review is one call per *attempt* — the same
+per-attempt cost [IMAGE-LOOP.md](IMAGE-LOOP.md) already argues for, and for the
+same reason: what it is checking changes every attempt.
+
+### Which seat looks — a role the project configures
+
+**Decided:** the seeing seat is a role named in `.hybridforge/config.json`, not
+a provider the loop picks. A project points it at whatever model it has, the
+same way it points the reviewer at one, and a project with nothing that can see
+does not get the step.
+
+`ROLES` stays four. It is a fixed tuple and sign-off is counted over all of it,
+so a fifth voting seat would change what a majority is — the entry that
+measured that is *Sign-off cost*, and none of it is worth disturbing to add a
+screenshot. The precedent for a configurable seat that is not a new vote is
+already in the code: `memory.recordRole` names which of the four writes to
+memory, defaults to `reviewer`, and is refused at `validate` when it names
+something that is not a role.
+
+So the shape is that one, twice:
+
+```json
+"loop": { "viewRole": "reviewer" },
+"roleNeeds": { "reviewer": ["images"] },
+"commands": { "capture": { ".html": "npm run screenshot" } }
+```
+
+- **`loop.viewRole`** — which of the four is shown the capture. `reviewer` by
+  default, because it is already the seat that rules on whether the work meets
+  the criteria and it has just read the diff. A project whose reviewer is a
+  strong text model and whose vision model is a cheap one moves it.
+- **`roleNeeds`** — already built, and it is what makes the configuration
+  honest: declare `images` on the seat that looks and a model that cannot see
+  is refused at `validate` rather than shown a filename mid-run.
+- **`commands.capture`** — the project's own command, per extension, beside
+  `lint` and `test`. A project that has none does not get the step, exactly as
+  a project with no lint command does not get lint.
+
+That leaves the loop with no opinion about browsers, drivers or checkpoints,
+which is the same position it takes on compilers.
+
+### What has to be decided
+
+- **Which criteria are pixels and which are judgement.** *"the histogram is
+  800×600"* is an assertion a `.png` test command can make today. *"the label
+  sits above the column it names"* is a vision verdict. That split is the
+  unverifiable-criterion problem IMAGE-LOOP §5 already answers by blocking at
+  ingest, and it should be answered once for both.
+- **Determinism.** Fonts, DPI and platform move pixels. A pixel-diff against a
+  golden image is the wrong default for a loop that is supposed to converge on
+  behaviour; a vision verdict against a stated property is the right one, and
+  costs a call.
+- **Headless.** Some UIs cannot run without a display, and some cannot run at
+  all in CI. A project that cannot produce a PNG does not get this step, the
+  same way a project with no lint command does not get lint.
+- **Whether a screenshot is a reference file or a step artifact.** It is
+  produced by the run, so it is an artifact; but the reviewer reads it as
+  reference. `artifacts.py` and the reading scope currently have no shared
+  vocabulary for that.
+
+### The cheapest thing that could kill it — half of it has now run
+
+**A replay.** Take a page carrying those four defects, screenshot it, put the
+image to a vision reviewer with the ticket's actual criteria, and count what it
+names. If it does not report the ruler offset, the zoom readout, or the
+invisible file input, the step is theatre and none of the framework above is
+worth building.
+
+`scripts/ui_replay.py` is that experiment, and three of its four parts ran on
+2026-09-10. Write-up: [UI-REPLAY.md](UI-REPLAY.md).
+
+- **The original artifact is gone.** No database on this machine holds PF-011
+  to PF-015 and nothing on disk carries `renderRuler`, so the fixture is the
+  postmortem's description rebuilt rather than the run's own HTML.
+- **The mechanical half reproduces exactly.** Eight criteria of the shape the
+  backlog actually carried — counts, indices, gaps, presence — **all pass**
+  against a page where every label is 95px from the column it names, the
+  minimap is absent, the readout reads `1600%`, and the file input cannot be
+  reached.
+- **The capture half needs nothing new.** A browser the machine already had,
+  headless, one command, a 3.4 KB PNG. No driver, no dependency, and for a
+  static page no long-lived process either — which bounds what item 1 above is
+  actually for: it is needed by an app with a server, not by a page.
+- **The judge half cannot run here.** No configured role can see: `claude-cli`
+  declares `supports_images = False`, both llama.cpp models are text-only, and
+  there is no key for a vision endpoint. That is the open question this entry
+  now waits on, and it is a smaller one than the framework.
+
+**And looking at the capture changed what the step should be asked.** Only the
+label offset is visible as an internal inconsistency. A minimap that was never
+drawn and an input that is `display:none` are *absences*, and `1600%` is wrong
+only against a spec that asked for a percentage of scale 32. So the reviewer
+must be given the spec and the criteria beside the image, and asked whether the
+render satisfies them — not asked to find bugs. That is the same question the
+code reviewer is already asked, which is an argument for one step rather than a
+new one.
+
+---
+
 ## Sign-off cost — replayed, and the knob is not free
 
 **Status:** measured 2026-09-07 by `scripts/ratify_cost.py`, nothing built. The
