@@ -47,7 +47,7 @@ from . import ratify as ratification
 from . import respec
 from . import evidence
 from . import routes
-from .artifacts import ABANDONED_DIR, Artifacts, safe_name
+from .artifacts import ABANDONED_DIR, ARTIFACTS_DIR, Artifacts, safe_name
 from .budget import BudgetGate, Wait
 from .config import ANY_LANGUAGE, REPO_ROOT, Config, ConfigError, Workspace
 from .failures import (
@@ -1132,8 +1132,12 @@ class Orchestrator:
         command: str,
         ticket_id: str = "",
         workspace: Workspace | None = None,
+        env: dict[str, str] | None = None,
     ) -> StepResult:
         """Run one of the project's own commands and record what it said.
+
+        `env` adds names to the command's environment without taking any away.
+        Only the capture step uses it, to say where to write.
 
         `workspace` decides where it runs. A build's commands are written to be
         run from inside it — `npm test` needs the directory holding its
@@ -1184,7 +1188,7 @@ class Orchestrator:
         # for the same reason it was here — a suite that prints one must not
         # crash the daemon reading its own step.
         result = processes.run_command(
-            command, workspace.path(self.config.root), limit
+            command, workspace.path(self.config.root), limit, env
         )
 
         # Stripped before anything reads it, for the same reason it is rerooted
@@ -1279,7 +1283,9 @@ class Orchestrator:
     # The verify steps, in the order a failure is cheapest to diagnose.
     _VERIFY_STEPS = ("lint", "typecheck", "test")
 
-    def _verify_plan(self, ticket: Ticket | None = None) -> list[VerifyStep]:
+    def _verify_plan(
+        self, ticket: Ticket | None = None, kinds: Sequence[str] | None = None
+    ) -> list[VerifyStep]:
         """Every verify command to run, as `(step name, command, workspace)`.
 
         One command per step assumed a repository is one language, and then one
@@ -1304,6 +1310,11 @@ class Orchestrator:
         command keeps its plain name, so a one-language, one-build project's
         step log and dashboard read exactly as before; only a project that
         genuinely has two gets `test[.js]` or `test[path-forge]`.
+
+        `kinds` overrides which command kinds are planned. It exists for
+        `capture`, which resolves per language and per workspace exactly as the
+        verify kinds do and is not one of them: nothing it reports is compared
+        against a baseline, and it runs after they have all passed.
         """
         workspaces = self.config.workspaces
         if ticket is not None:
@@ -1312,7 +1323,7 @@ class Orchestrator:
         plan: list[VerifyStep] = []
         for workspace in workspaces:
             present = self._languages_present(workspace)
-            for kind in self._VERIFY_STEPS:
+            for kind in kinds or self._VERIFY_STEPS:
                 commands = workspace.commands_for(kind)
                 wanted = {
                     suffix: command
@@ -5667,6 +5678,110 @@ class Orchestrator:
             images.append(ImagePart(media_type=media_type, data=data, path=path))
         return images, withheld
 
+    # Where a capture command is told to write. Handed to the command as an
+    # environment variable rather than as an argument, so a project's own
+    # `npm run screenshot` needs no wrapper to accept a positional it was never
+    # written to take.
+    CAPTURE_DIR_VAR = "FORGE_CAPTURE_DIR"
+
+    def _capture(
+        self, run_id: int, ticket: Ticket, attempt: int
+    ) -> tuple[list[ImagePart], StepResult | None]:
+        """Render what this ticket built, and return it as pictures.
+
+        `commands.capture` is the project's own command, resolved per language
+        and per workspace exactly as `lint` and `test` are. A project that has
+        none does not get this step, the same way a project with no lint
+        command does not get lint — and that is the whole configuration story,
+        because the loop has no opinion about browsers, drivers or toolkits.
+
+        The command is told where to write through `FORGE_CAPTURE_DIR` and
+        every image that appears there is collected. Naming a directory rather
+        than a file is what lets one command emit a screen per state without
+        the loop knowing how many there will be.
+
+        Returns `(images, failure)`. A capture command that exits non-zero
+        fails the attempt, for the same reason a failing test does: it is the
+        project's own statement about its own tree, and a UI that cannot be
+        rendered is not a UI that passed. It runs after verification, so what
+        it is rendering has already compiled.
+
+        Never raises. A capture that produced nothing is not a failure — a
+        command may legitimately have nothing to draw for this ticket — and the
+        review then happens as it always did.
+        """
+        plan = [
+            step
+            for step in self._verify_plan(ticket, kinds=("capture",))
+            if step.command.strip()
+        ]
+        if not plan:
+            return [], None
+
+        into = (
+            self.config.config_dir
+            / ARTIFACTS_DIR
+            / f"run-{run_id}"
+            / ticket.ticket_id
+            / f"attempt-{attempt}"
+            / "capture"
+        )
+        try:
+            into.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: could not make a capture directory — {exc}",
+                level="warn",
+                kind="capture",
+            )
+            return [], None
+
+        for name, command, workspace in plan:
+            result = self._shell(
+                run_id,
+                name,
+                command,
+                ticket.ticket_id,
+                workspace=workspace,
+                env={self.CAPTURE_DIR_VAR: str(into)},
+            )
+            if not result.ok:
+                return [], StepResult(ok=False, detail=result.detail)
+
+        images: list[ImagePart] = []
+        withheld: list[str] = []
+        for path in sorted(into.rglob("*")):
+            media_type = IMAGE_TYPES.get(path.suffix.lower())
+            if not media_type or not path.is_file():
+                continue
+            try:
+                size = path.stat().st_size
+                if size > self._IMAGE_CEILING:
+                    withheld.append(f"{path.name} ({size:,} bytes, too large to send)")
+                    continue
+                if len(images) >= self._IMAGE_LIMIT:
+                    withheld.append(f"{path.name} (over the {self._IMAGE_LIMIT}-image limit)")
+                    continue
+                images.append(
+                    ImagePart(
+                        media_type=media_type, data=path.read_bytes(), path=str(path)
+                    )
+                )
+            except OSError:
+                continue
+
+        if images or withheld:
+            self.store.log(
+                run_id,
+                f"{ticket.ticket_id}: captured {len(images)} rendering(s) for "
+                f"{self.config.loop.view_role} to look at"
+                + (f"; {len(withheld)} not sent" if withheld else "."),
+                kind="capture",
+                data={"images": [Path(i.path).name for i in images], "withheld": withheld},
+            )
+        return images, None
+
     @staticmethod
     def _attachments(
         images: Sequence[ImagePart], withheld: Sequence[str]
@@ -6671,18 +6786,33 @@ class Orchestrator:
 
         images, images_withheld = self._reference_images(ticket)
 
+        # What this attempt actually renders, if the project can render it.
+        # After verification on purpose: a page that does not compile is not a
+        # page worth looking at, and the capture command would be reporting the
+        # build's failure in its own words.
+        rendered, capture_failure = self._capture(run_id, ticket, ticket.attempts)
+        if capture_failure is not None:
+            return capture_failure
+        images = [*images, *rendered]
+
+        # Which seat is shown it, and therefore which one reviews. `reviewer`
+        # is the default and changes nothing; a project whose vision model is a
+        # different seat names that one, which is the whole of the
+        # configuration story — see `loop.viewRole`.
+        viewer = self.config.loop.view_role if rendered else "reviewer"
+
         step_id = self.store.start_step(run_id, ticket.ticket_id, "review")
         try:
             completion = self._converse(
                 run_id,
-                "reviewer",
+                viewer,
                 review_prompt(
                     ticket,
                     diff,
                     retrieved,
                     toolchain=self._toolchain_for(ticket),
                     repository_map=self._repo_map(),
-                    can_read=self._can_read("reviewer"),
+                    can_read=self._can_read(viewer),
                     # Its own earlier rejections of this same ticket. Without
                     # them a reviewer can object to X, get X fixed, then object
                     # to Y it never raised — three attempts, three unrelated
@@ -6694,7 +6824,7 @@ class Orchestrator:
                     unchecked=unchecked,
                 ),
                 **self._attachments(images, images_withheld),
-                max_tokens=self._output_budget("reviewer"),
+                max_tokens=self._output_budget(viewer),
                 temperature=0.0,
             )
         except ProviderError as exc:

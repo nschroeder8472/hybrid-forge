@@ -937,6 +937,14 @@ class LoopSettings:
     # than argued, and it moves the vote alone: the revision this same role
     # makes rewrites a whole ticket and keeps its reasoning either way.
     vote_thinking: bool = True
+    # Which role is shown a ticket's captured rendering, and therefore reviews
+    # it. `reviewer` is every run before this existed and changes nothing; a
+    # project whose reviewer is a strong text model and whose vision model is a
+    # different seat names that one instead. The capability itself is declared
+    # in `roleNeeds`, so a seat that cannot see is refused at `validate` rather
+    # than shown a filename mid-run. See *Looking at what it built* in
+    # docs/ROADMAP.md.
+    view_role: str = "reviewer"
     # Whether the planner rewrites the ticket between sign-off passes. True is
     # every run before this existed. Off, the roles vote again on the words
     # they already refused, reading the objections but not a revision — which
@@ -1258,6 +1266,7 @@ class Config:
             bug_hypotheses=int(loop.get("bugHypotheses", 3)),
             ratify_passes=int(loop.get("ratifyPasses", 2)),
             vote_thinking=bool(loop.get("voteThinking", True)),
+            view_role=str(loop.get("viewRole", "reviewer")),
             revise_between_passes=bool(
                 loop.get("reviseBetweenPasses", True)
             ),
@@ -1398,6 +1407,13 @@ class Config:
                 f"sign-off is counted over all {len(ROLES)}, so leaving one out "
                 f"would change what a majority is. Use loop.ratifyPasses 0 to "
                 f"turn sign-off off entirely."
+            )
+        if self.loop.view_role not in ROLES:
+            raise ConfigError(
+                f"loop.viewRole is {self.loop.view_role!r}, which is not a role "
+                f"(expected one of {', '.join(ROLES)}). It names which seat is "
+                f"shown a captured rendering, not a new seat — sign-off is "
+                f"counted over the four, so there is no fifth."
             )
         for role in ROLES:
             name = self.roles.get(role)
@@ -1777,6 +1793,7 @@ class Config:
                 "bugHypotheses": self.loop.bug_hypotheses,
                 "ratifyPasses": self.loop.ratify_passes,
                 "voteThinking": self.loop.vote_thinking,
+                "viewRole": self.loop.view_role,
                 "reviseBetweenPasses": self.loop.revise_between_passes,
                 "majorityRepeats": self.loop.majority_repeats,
                 "ratifyOrder": list(self.loop.ratify_order),

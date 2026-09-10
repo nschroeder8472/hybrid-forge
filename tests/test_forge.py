@@ -7940,6 +7940,183 @@ def _stub_orchestrator(commands: dict[str, str] | None = None):
     return Orchestrator(config, store), root, store.create_run("goal")
 
 
+class TestTheLoopLooksAtWhatItBuilt(unittest.TestCase):
+    """`commands.capture`: a picture of the ticket's work, for a role to read.
+
+    The case is `docs/CANVAS-POSTMORTEM.md` §7 — four defects in one page with
+    146 tests green — and `docs/UI-REPLAY.md` is the experiment that decided
+    the step was worth building rather than argued it.
+    """
+
+    def _orchestrator(self, capture: str):
+        root = Path(tempfile.mkdtemp()).resolve()
+        (root / "page.html").write_text("<p>hi</p>", encoding="utf-8")
+        config = Config(
+            root=root,
+            models={
+                "m": {
+                    "kind": "openai",
+                    "baseUrl": "http://127.0.0.1:1/v1",
+                    "model": "stub",
+                    "contextWindow": 8192,
+                    "maxOutputTokens": 1024,
+                }
+            },
+            roles={role: "m" for role in ROLES},
+            commands={"lint": "", "typecheck": "", "test": "", "capture": capture},
+        )
+        store = Store(config.db_path)
+        return Orchestrator(config, store), root, store.create_run("goal")
+
+    @staticmethod
+    def _ticket() -> Ticket:
+        return Ticket("AB-001", title="t", spec="s", criteria=["c"],
+                      allowed_files=["page.html"])
+
+    # A command that writes one PNG into the directory it is handed. The bytes
+    # are a real PNG header so `IMAGE_TYPES` and the size checks see a picture
+    # rather than a file that happens to end in `.png`.
+    _WRITER = (
+        'python -c "'
+        "import os,pathlib;"
+        "p=pathlib.Path(os.environ['FORGE_CAPTURE_DIR'])/'shot.png';"
+        "p.write_bytes(bytes.fromhex('89504e470d0a1a0a') + b'x'*64)"
+        '"'
+    )
+
+    def test_the_command_is_told_where_to_write_and_the_result_is_attached(self):
+        orch, _root, run_id = self._orchestrator(self._WRITER)
+
+        images, failure = orch._capture(run_id, self._ticket(), 1)
+
+        self.assertIsNone(failure)
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0].media_type, "image/png")
+        self.assertTrue(images[0].path.endswith("shot.png"))
+
+    def test_a_project_with_no_capture_command_runs_nothing(self):
+        # The same rule lint has: no command, no step.
+        orch, _root, run_id = self._orchestrator("")
+
+        images, failure = orch._capture(run_id, self._ticket(), 1)
+
+        self.assertEqual((images, failure), ([], None))
+
+    def test_a_capture_that_fails_fails_the_attempt(self):
+        # Unlike `format`, whose failure is never the ticket's. This is the
+        # project's own statement about its own tree.
+        orch, _root, run_id = self._orchestrator('python -c "raise SystemExit(3)"')
+
+        images, failure = orch._capture(run_id, self._ticket(), 1)
+
+        self.assertEqual(images, [])
+        self.assertIsNotNone(failure)
+        self.assertFalse(failure.ok)
+
+    def test_a_capture_that_draws_nothing_is_not_a_failure(self):
+        # A command may legitimately have nothing to draw for a ticket, and the
+        # review then happens exactly as it did before captures existed.
+        orch, _root, run_id = self._orchestrator('python -c "pass"')
+
+        images, failure = orch._capture(run_id, self._ticket(), 1)
+
+        self.assertEqual((images, failure), ([], None))
+
+    def test_what_is_written_is_not_an_image_and_is_ignored(self):
+        orch, _root, run_id = self._orchestrator(
+            'python -c "'
+            "import os,pathlib;"
+            "pathlib.Path(os.environ['FORGE_CAPTURE_DIR']).joinpath('log.txt')"
+            ".write_text('not a picture')"
+            '"'
+        )
+
+        images, failure = orch._capture(run_id, self._ticket(), 1)
+
+        self.assertEqual((images, failure), ([], None))
+
+    def test_the_capture_lands_under_this_attempt_in_the_artifact_tree(self):
+        orch, _root, run_id = self._orchestrator(self._WRITER)
+
+        images, _ = orch._capture(run_id, self._ticket(), 2)
+
+        self.assertIn("attempt-2", images[0].path)
+        self.assertIn("AB-001", images[0].path)
+
+    def test_the_review_call_carries_the_rendering(self):
+        """The call site, which the tests above do not reach.
+
+        `_capture` returning pictures is worth nothing if `_attempt` does not
+        put them in front of the role that judges the ticket.
+        """
+        orch, root, run_id = _stub_orchestrator(
+            {"lint": "", "typecheck": "", "test": "", "capture": self._WRITER}
+        )
+        seen: list[dict] = []
+
+        def call(*args, **kwargs):
+            seen.append({"role": args[1] if len(args) > 1 else "", **kwargs})
+            texts = [
+                "page.html\n```html\n<p>done</p>\n```",
+                "tests/ab_001_test.py\n```python\ndef test_a():\n    assert True\n```",
+                "ACCEPT\nlooks right",
+            ]
+            return Completion(
+                text=texts[min(len(seen) - 1, len(texts) - 1)],
+                usage=Usage(),
+                finish_reason="stop",
+            )
+
+        orch._call = call
+        orch._attempt(
+            run_id,
+            Ticket(
+                "AB-001",
+                allowed_files=["page.html", "tests/ab_001_test.py"],
+                criteria=["the page says done"],
+            ),
+            "",
+        )
+
+        review = next(c for c in seen if c["role"] == "reviewer")
+        self.assertEqual(len(review["images"]), 1)
+        self.assertTrue(review["images"][0].path.endswith("shot.png"))
+        # And the earlier calls carried none: a capture is of what was built,
+        # so nothing before the build can have it.
+        self.assertNotIn("images", seen[0])
+
+
+class TestTheSeatThatLooksIsConfigured(unittest.TestCase):
+    """`loop.viewRole`: which role is shown a rendering, and reviews it."""
+
+    def _config(self, **loop) -> Config:
+        return Config(
+            root=Path(tempfile.mkdtemp()).resolve(),
+            models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192}},
+            roles={role: "m" for role in ROLES},
+            commands={"test": "pytest"},
+            loop=LoopSettings(**loop),
+        )
+
+    def test_the_reviewer_is_the_default(self):
+        self._config().validate()
+        self.assertEqual(LoopSettings().view_role, "reviewer")
+
+    def test_another_of_the_four_is_allowed(self):
+        self._config(view_role="tester").validate()
+
+    def test_a_fifth_seat_is_refused(self):
+        # Sign-off is counted over `ROLES`, so a new seat would change what a
+        # majority is. This names one of the four; it does not add one.
+        config = self._config(view_role="viewer")
+
+        with self.assertRaises(ConfigError) as caught:
+            config.validate()
+
+        self.assertIn("not a role", str(caught.exception))
+        self.assertIn("no fifth", str(caught.exception))
+
+
 class TestWritableFilesAreNeverAbridged(unittest.TestCase):
     """The executor returns whole files and is told to preserve every line it
     was not asked to change. Showing it three quarters of a file and asking for

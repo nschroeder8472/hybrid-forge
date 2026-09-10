@@ -58,18 +58,29 @@ class Outcome:
     timed_out: bool
 
 
-def _start(command: str, cwd: Path, sink: IO[bytes]) -> subprocess.Popen[bytes]:
-    """Start `command` as the leader of its own group, writing into `sink`."""
+def _start(
+    command: str,
+    cwd: Path,
+    sink: IO[bytes],
+    env: dict[str, str] | None = None,
+) -> subprocess.Popen[bytes]:
+    """Start `command` as the leader of its own group, writing into `sink`.
+
+    `env` is merged over the current environment rather than replacing it: a
+    command written against this machine needs its PATH, and `None` keeps the
+    inherited environment exactly as it was.
+    """
+    merged = {**os.environ, **env} if env else None
     if WINDOWS:
         # Its own group, so `taskkill /T` has a tree to walk.
         creation = subprocess.CREATE_NEW_PROCESS_GROUP
         return subprocess.Popen(  # noqa: S602 - the user's own configured command
             command, shell=True, cwd=str(cwd), stdout=sink, stderr=sink,
-            creationflags=creation,
+            creationflags=creation, env=merged,
         )
     return subprocess.Popen(  # noqa: S602 - the user's own configured command
         command, shell=True, cwd=str(cwd), stdout=sink, stderr=sink,
-        start_new_session=True,
+        start_new_session=True, env=merged,
     )
 
 
@@ -114,8 +125,17 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         pass
 
 
-def run_command(command: str, cwd: Path, timeout: float) -> Outcome:
+def run_command(
+    command: str,
+    cwd: Path,
+    timeout: float,
+    env: dict[str, str] | None = None,
+) -> Outcome:
     """Run `command` from `cwd`, and return within `timeout` seconds.
+
+    `env` adds to the environment rather than replacing it: a project's own
+    command needs the PATH and the toolchain variables it was written
+    against, and a capture step adding one name must not take those away.
 
     Returns what the command said either way. A command that finished reports
     its own exit code with `timed_out` false; one that was killed reports
@@ -127,7 +147,7 @@ def run_command(command: str, cwd: Path, timeout: float) -> Outcome:
     path = Path(handle.name)
     timed_out = False
     try:
-        proc = _start(command, cwd, handle)
+        proc = _start(command, cwd, handle, env)
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:

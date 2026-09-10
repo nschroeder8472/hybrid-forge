@@ -560,6 +560,38 @@ after each attempt. An empty string skips that check.
   skipped, and the attempt is judged exactly as it would have been with no
   formatter configured.
 
+`capture` is different again: it produces a *picture* of what the ticket built,
+for a role to look at.
+
+```json
+"commands": {
+  "capture": { ".html": "npm run screenshot" }
+}
+```
+
+- **It runs after verification and before review**, so what it renders has
+  already compiled. A page that does not build is not a page worth looking at.
+- **It is told where to write, through `FORGE_CAPTURE_DIR`** — an absolute path
+  under the run's artifact tree, created before the command starts. Every
+  image that appears there is attached to the review. A directory rather than a
+  filename is what lets one command emit a screen per state without the loop
+  knowing how many there will be.
+- **Its failure *is* the ticket's**, unlike `format`. It is the project's own
+  statement about the project's own tree, and a UI that cannot be rendered has
+  not passed. A capture that succeeds and produces nothing is not a failure —
+  the review then happens exactly as it did before.
+- **Nothing is assumed about how you render.** No driver, no browser, no
+  library: a project supplies a command or does not get the step, the same way
+  a project with no lint command does not get lint. Whatever you use, **turn
+  subpixel antialiasing off** — a capture with it on made a reviewer report a
+  zoom readout as "rendered red, an error state" on a page that sets no colour,
+  because the glyph edges carried `rgb(217,180,122)` fringes. An attempt spent
+  chasing a colour nobody chose is what it costs. See
+  [UI-REPLAY.md](UI-REPLAY.md).
+
+Which role looks is [`loop.viewRole`](#loop), and whether that role can see at
+all is worth declaring in [`roleNeeds`](#roleneeds).
+
 It runs only over the files that attempt landed — the executor's and the
 tester's — never the ticket's whole glob, and never a bug ticket's
 reproduction, which is the standard the fix is measured against.
@@ -831,6 +863,7 @@ run some context, never the run.
 | `ratifyPasses` | `2` | Sign-off passes over a ticket before its first attempt. Every role is asked whether it can do its part as written, the planner rewrites the ticket from what they say, and the pass repeats. A ticket ships when everyone signs off, when a majority does, or when the planner and one other do; below that it parks with the objections recorded. Costs `roles × passes` calls per ticket before any code exists, one of them on the reviewer. See [RATIFY.md](RATIFY.md). |
 | `voteThinking` | `true` | Whether a sign-off vote may reason before it answers. Leave it on. It exists because the cost of vote reasoning is real — a four-line verdict costing thousands of tokens — and the question was worth testing rather than arguing; `scripts/vote_grading.py` builds the two arms, and the run on 2026-09-08 answered it. With reasoning off, all four roles signed off a ticket carrying a defect all four had refused on every previous run, at 20 completion tokens a vote, and the run cost 73,040 tokens *more* overall for the attempts that defect then caused. It moves the vote only; the planner's revision keeps its reasoning either way, which a per-model `reasoning-budget` cannot arrange because the roles share their servers. On a provider with no per-call reasoning switch it is accepted and ignored. See the *Sign-off cost* entry in [ROADMAP.md](ROADMAP.md). |
 | `reviseBetweenPasses` | `true` | Whether the planner rewrites the ticket between sign-off passes. Leave it on. Off, the roles vote again on the words they already refused — objections still travel, only the rewrite is gone — and the run on 2026-09-08 showed what that costs: all four roles refused a second time on unchanged text, the ticket parked without ever reaching a build call, and sign-off came to 47% *more* than the arm that revised, because a ticket that cannot be repaired cycles through the pass instead of leaving it. The revision is what converts a correct refusal into a shippable ticket. `scripts/vote_grading.py` builds the arm; see the *Sign-off cost* entry in [ROADMAP.md](ROADMAP.md). |
+| `viewRole` | `"reviewer"` | Which role is shown a ticket's captured rendering, and therefore reviews it. Only tickets whose workspace has a `capture` command produce one, so on every other ticket this changes nothing and the reviewer reviews as it always did. `reviewer` is the right default because that seat already rules on whether the work meets the criteria; a project whose reviewer is a strong text model and whose vision model is a different seat names that one. It is not a fifth seat — sign-off is counted over the four roles, so a new one would change what a majority is. Declare `roleNeeds` on whichever seat this names, or a model that cannot see is told the files exist and shown their names instead of being refused at startup. See *Looking at what it built* in [ROADMAP.md](ROADMAP.md). |
 | `majorityRepeats` | `true` | Whether a pass-1 `majority` is put to the roles a second time. A majority already ships the ticket, and across every recorded pass that reached a second vote on one — three tickets, 730,005 tokens — not one ended anywhere other than where it started. Off, the pass stops there. Unlike `voteThinking` and `reviseBetweenPasses` it removes no part of the mechanism: the vote still reasons, the revision still happens wherever the pass continues, and a `split` or `blocked` still gets its second look. Shipped on replay evidence and unit tests; no live arm exists, because two fixtures written to produce a pass-1 majority both went unanimous. See the *Sign-off cost* entry in [ROADMAP.md](ROADMAP.md). |
 | `ratifyOrder` | all four, in the order above | The order the roles vote in, within a pass. A permutation of the four — it sets the order they vote, not which of them vote, and an order omitting one is refused because sign-off is counted over all four. Two things ride on it. Votes accumulate as they are cast and every role sees the ones before it, so the first votes blind and the last answers three arguments. And on a backend serving one checkpoint at a time (`llamacpp` with `exclusive`, or a router started with `--models-max 1`), two roles sharing a model are free when adjacent and cost a reload when not — see below. |
 | `participationWindow` | `20` | How many ratified tickets `forge signoff` reads before it is willing to say a role has never blocked anything. Report only: nothing in the loop reads it, and no behaviour changes on a role that signs everything. Below the window the report stays silent, because a role that has seen three good tickets and blocked none of them has done nothing wrong. See [ADAPTIVE-TICKET-LOOP](ADAPTIVE-TICKET-LOOP.md) §8.2. |

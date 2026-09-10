@@ -571,7 +571,29 @@ and wrong. The ruler had six criteria and shipped 95 pixels off.
 | `artifacts.py` | durable per-step recording — where a screenshot would live |
 | `processes._start` / `_kill_tree` | process-group start, and a kill that actually kills the tree |
 
-### What is missing
+### Built, 2026-09-10
+
+The step ships: `commands.capture` is a project-supplied command, resolved per
+language and per workspace exactly as `lint` and `test` are, run after
+verification and before review. It is told where to write through
+`FORGE_CAPTURE_DIR` — a directory under the run's artifact tree, so one command
+can emit a screen per state without the loop knowing how many there will be —
+and every image that appears there is attached to the review. `loop.viewRole`
+names the seat that is shown it and therefore reviews it, defaulting to
+`reviewer`, and `roleNeeds` is what makes a blind seat a refusal at `validate`
+rather than a filename mid-run.
+
+A capture that exits non-zero **fails the attempt**, unlike `format` whose
+failure is never the ticket's: it is the project's own statement about its own
+tree, and a UI that cannot be rendered has not passed. A capture that succeeds
+and draws nothing is not a failure, and the review happens as it always did.
+
+**What is deliberately not built is item 1 below.** The replay bounded it: a
+static page needs no long-lived process at all, and every project that renders
+to a file is served by a command. The primitive is for an app with a server
+behind it, and it should be built when a backlog needs one rather than now.
+
+### What was missing
 
 1. **A process that outlives one command.** `run_command` runs to completion,
    and nothing starts an app and holds it while something else probes it. This
