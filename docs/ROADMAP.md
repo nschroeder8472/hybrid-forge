@@ -624,18 +624,42 @@ same reason: what it is checking changes every attempt.
   reference. `artifacts.py` and the reading scope currently have no shared
   vocabulary for that.
 
-### The cheapest thing that could kill it
+### The cheapest thing that could kill it — half of it has now run
 
-**A replay, buildable with what exists today.** Take the canvas run's own
-delivered HTML, screenshot it once by hand, put the image to a vision reviewer
-with PF-015's actual criteria, and count what it names. If it does not report
-the ruler offset, the zoom readout, or the invisible file input, then the step
-is theatre and none of the framework above is worth building. If it names them,
-that is the first evidence this document has — and unlike everything else here,
-it needs no new machinery, no long-lived process, and no driver.
+**A replay.** Take a page carrying those four defects, screenshot it, put the
+image to a vision reviewer with the ticket's actual criteria, and count what it
+names. If it does not report the ruler offset, the zoom readout, or the
+invisible file input, the step is theatre and none of the framework above is
+worth building.
 
-That replay is the next thing to do, and it should happen before the process
-primitive.
+`scripts/ui_replay.py` is that experiment, and three of its four parts ran on
+2026-09-10. Write-up: [UI-REPLAY.md](UI-REPLAY.md).
+
+- **The original artifact is gone.** No database on this machine holds PF-011
+  to PF-015 and nothing on disk carries `renderRuler`, so the fixture is the
+  postmortem's description rebuilt rather than the run's own HTML.
+- **The mechanical half reproduces exactly.** Eight criteria of the shape the
+  backlog actually carried — counts, indices, gaps, presence — **all pass**
+  against a page where every label is 95px from the column it names, the
+  minimap is absent, the readout reads `1600%`, and the file input cannot be
+  reached.
+- **The capture half needs nothing new.** A browser the machine already had,
+  headless, one command, a 3.4 KB PNG. No driver, no dependency, and for a
+  static page no long-lived process either — which bounds what item 1 above is
+  actually for: it is needed by an app with a server, not by a page.
+- **The judge half cannot run here.** No configured role can see: `claude-cli`
+  declares `supports_images = False`, both llama.cpp models are text-only, and
+  there is no key for a vision endpoint. That is the open question this entry
+  now waits on, and it is a smaller one than the framework.
+
+**And looking at the capture changed what the step should be asked.** Only the
+label offset is visible as an internal inconsistency. A minimap that was never
+drawn and an input that is `display:none` are *absences*, and `1600%` is wrong
+only against a spec that asked for a percentage of scale 32. So the reviewer
+must be given the spec and the criteria beside the image, and asked whether the
+render satisfies them — not asked to find bugs. That is the same question the
+code reviewer is already asked, which is an argument for one step rather than a
+new one.
 
 ---
 

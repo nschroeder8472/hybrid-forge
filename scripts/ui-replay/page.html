@@ -1,0 +1,57 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Puzzle-Path editor</title>
+<style>
+  body { font: 13px system-ui, sans-serif; margin: 0; background: #14161a; color: #e6e6e6; }
+  header { display: flex; gap: 16px; align-items: center; padding: 10px 14px;
+            background: #1c1f26; border-bottom: 1px solid #2a2e37; }
+  #zoom { font-variant-numeric: tabular-nums; }
+  /* The file input the editor loads a level with. Hidden, with nothing that
+     opens it -- the fourth defect, exactly as it shipped. */
+  #open { display: none; }
+  #stage { position: relative; height: 260px; overflow: hidden; }
+  .ruler { position: absolute; top: 0; left: 0; right: 0; height: 22px;
+            background: #21252e; border-bottom: 1px solid #2a2e37; }
+  .tick { position: absolute; top: 4px; transform: translateX(-50%);
+           font-size: 11px; color: #9aa3b2; }
+  .cell { position: absolute; top: 40px; width: 14px; height: 14px;
+           background: #3b82f6; border-radius: 2px; }
+  .grid { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+</style>
+<header>
+  <strong>Puzzle-Path</strong>
+  <span id="zoom">1600%</span>
+  <input id="open" type="file" accept=".json">
+</header>
+<div id="stage" style="width:232px">
+  <div class="ruler">
+    <div class="tick" style="left:8px">0</div>
+    <div class="tick" style="left:24px">1</div>
+    <div class="tick" style="left:40px">2</div>
+    <div class="tick" style="left:56px">3</div>
+    <div class="tick" style="left:72px">4</div>
+    <div class="tick" style="left:88px">5</div>
+    <div class="tick" style="left:104px">6</div>
+    <div class="tick" style="left:120px">7</div>
+    <div class="tick" style="left:136px">8</div>
+    <div class="tick" style="left:152px">9</div>
+    <div class="tick" style="left:168px">10</div>
+    <div class="tick" style="left:184px">11</div>
+  </div>
+  <div class="grid">
+    <div class="cell" style="left:-87px"></div>
+    <div class="cell" style="left:-71px"></div>
+    <div class="cell" style="left:-55px"></div>
+    <div class="cell" style="left:-39px"></div>
+    <div class="cell" style="left:-23px"></div>
+    <div class="cell" style="left:-7px"></div>
+    <div class="cell" style="left:9px"></div>
+    <div class="cell" style="left:25px"></div>
+    <div class="cell" style="left:41px"></div>
+    <div class="cell" style="left:57px"></div>
+    <div class="cell" style="left:73px"></div>
+    <div class="cell" style="left:89px"></div>
+  </div>
+  <!-- The minimap has a module of its own and nothing imports it, so it is
+       never drawn. The second defect: present in the spec, absent on screen. -->
+</div>
