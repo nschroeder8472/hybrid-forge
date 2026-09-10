@@ -969,9 +969,22 @@ several recorded runs were measured against, and giving them a reference test
 changes what a re-run would measure. Touched `ingest.py`, `cli.py` and the
 `forge-spec` plugin.
 
-**That is the whole list.** What is left for these four is a live run, which is
-the only thing that can say whether the reads they were built to cheapen are
-actually cheaper.
+**The ingest half is narrower than it reads, and a live run is what said so.**
+`cmd_ingest` widens every ticket's reading scope with `evidence.reading_scope`
+*before* the check runs, and one of that function's three sources is source
+siblings in the same directory — so a ticket writing `tests/report_test.py` is
+handed `tests/counter_test.py` without anyone asking. On the 2026-09-10 run of
+`SPEC.md` the warning was silent for all three tickets while
+`/forge-spec-check` reported two of them, and the silence was right: every role
+went on to read the sibling test it had been given. So the ingest warning fires
+only where no sibling exists, and the habit it is named for lives in the
+authored document, which is where `/forge-spec-check` and the `forge-spec`
+skills look.
+
+**That was the whole list, and it has now been run.**
+[LIVE-RUN-2026-09-10.md](LIVE-RUN-2026-09-10.md) has the numbers. The short
+version is that a backlog which lands first try exercises almost none of this:
+the four ceilings were built for a run that fails, and this one did not.
 
 **A type checker is unclaimed.** `.flake8` is the only static analysis
 configured. Every shape defect this session cost a full test run to find — a

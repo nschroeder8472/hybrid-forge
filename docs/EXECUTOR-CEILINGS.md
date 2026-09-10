@@ -148,6 +148,15 @@ Raising the cap is measured not to work: 8 turns produced 14 reads, 16 produced
   were measured against, and giving them a reference test changes the thing
   being measured.
 
+  The ingest half is narrower than that reads. `cmd_ingest` widens each
+  ticket's reading scope with `evidence.reading_scope` before the check runs,
+  and one of its sources is source siblings in the same directory — so a ticket
+  writing `tests/report_test.py` is handed `tests/counter_test.py` already. On
+  the 2026-09-10 run the warning was silent for all three tickets and every
+  role then read that sibling, which is the warning being right rather than
+  broken. It fires where no sibling exists; the habit itself lives in the
+  authored document, which is `/forge-spec-check`'s half.
+
 ### The executor narrates before it acts — fixed 2026-09-09
 
 Run 11 attempt 1 read successfully, used `read_symbol`, correctly identified
