@@ -51,6 +51,37 @@ DB_FILE = "run.db"
 
 ROLES = ("planner", "executor", "tester", "reviewer")
 
+# What a role may be declared to need, as `need -> (capability, why)`.
+#
+# Every one of these is a property of the model a role is pointed at, and every
+# one of them is survivable by degrading: a role whose provider cannot take
+# tools gets the pasted-sources prompt, a model that cannot see is told an
+# image exists rather than shown it, a provider without a system role gets the
+# instructions folded into the first user turn. Degrading quietly is the right
+# default — it is what lets one config serve a laptop and a cloud key — and it
+# is the wrong behaviour when the operator has decided the capability is the
+# point. `roleNeeds` is where that decision is written down, and a declared
+# need the provider cannot promise is refused at `validate` rather than
+# discovered on the call that needed it.
+ROLE_NEEDS: dict[str, tuple[str, str]] = {
+    "images": (
+        "supports_images",
+        "it would be told an image exists and shown its filename instead",
+    ),
+    "tools": (
+        "supports_tools",
+        "it would fall back to the pasted-sources prompt and read nothing",
+    ),
+    "temperature": (
+        "supports_temperature",
+        "its sampling temperature would be whatever the endpoint defaults to",
+    ),
+    "system": (
+        "supports_system_role",
+        "its instructions would be folded into the first user turn",
+    ),
+}
+
 
 class ConfigError(Exception):
     """Configuration is missing or internally inconsistent."""
@@ -1068,6 +1099,9 @@ class Config:
     room: str = ""
     models: dict[str, dict[str, Any]] = field(default_factory=dict)
     roles: dict[str, str] = field(default_factory=dict)
+    # What each role must be able to do, declared rather than discovered. See
+    # `ROLE_NEEDS` and `_validate_role_needs`.
+    role_needs: dict[str, list[str]] = field(default_factory=dict)
     commands: dict[str, str] = field(default_factory=dict)
     never_delegate: list[str] = field(default_factory=list)
     # Raw block; parsed by forge.memory so config.py stays free of MCP details.
@@ -1158,6 +1192,7 @@ class Config:
             room=data.get("room", ""),
             models=data.get("models", {}) or {},
             roles=data.get("roles", {}) or {},
+            role_needs=data.get("roleNeeds", {}) or {},
             commands=data.get("commands", {}) or {},
             never_delegate=data.get("neverDelegate", []) or [],
             memory=data.get("memory", {}) or {},
@@ -1372,6 +1407,60 @@ class Config:
                 raise ConfigError(
                     f"role {role!r} points at model {name!r}, which is not declared "
                     f"in `models` (have: {', '.join(sorted(self.models))})."
+                )
+        self._validate_role_needs()
+
+    def _validate_role_needs(self) -> None:
+        """Refuse a role pointed at a model that cannot do what it was told to.
+
+        Every capability here degrades rather than failing, which is what makes
+        this worth declaring: a run whose reviewer cannot see spends its whole
+        budget on screenshots it was shown the filenames of, and nothing in the
+        log reads as an error. The operator who knows the capability is the
+        point says so here, and finds out at `forge doctor` rather than at the
+        call.
+
+        A capability is read off the provider without contacting it — every
+        adapter answers `capabilities()` from its own config block — so this
+        stays a configuration check and does not become a liveness one. A
+        provider that cannot be constructed at all is left to the checks above
+        and to `doctor`, rather than being reported here as a missing feature.
+        """
+        for role, needs in self.role_needs.items():
+            if role not in ROLES:
+                raise ConfigError(
+                    f"roleNeeds names {role!r}, which is not a role. "
+                    f"Expected one of {', '.join(ROLES)}."
+                )
+            if isinstance(needs, str) or not isinstance(needs, (list, tuple)):
+                raise ConfigError(
+                    f"roleNeeds[{role!r}] is {type(needs).__name__}; expected a "
+                    f"list of capability names, e.g. [\"images\"]."
+                )
+            unknown = [need for need in needs if need not in ROLE_NEEDS]
+            if unknown:
+                # Refused rather than ignored: a need nobody checks reads
+                # exactly like one that passed.
+                raise ConfigError(
+                    f"roleNeeds[{role!r}] asks for "
+                    f"{', '.join(repr(need) for need in unknown)}, which "
+                    f"nothing checks. Known: {', '.join(sorted(ROLE_NEEDS))}."
+                )
+            if not needs:
+                continue
+            try:
+                capabilities = self.provider_for(role).capabilities()
+            except Exception:
+                continue
+            for need in needs:
+                attribute, cost = ROLE_NEEDS[need]
+                if getattr(capabilities, attribute, False):
+                    continue
+                raise ConfigError(
+                    f"role {role!r} is declared to need {need!r}, and model "
+                    f"{self.roles[role]!r} does not offer it — {cost}. Point "
+                    f"the role at a model that does, or drop {need!r} from "
+                    f"roleNeeds[{role!r}] and accept the fallback."
                 )
 
     # ------------------------------------------------------------------
@@ -1657,6 +1746,7 @@ class Config:
             "room": self.room,
             "models": self.models,
             "roles": self.roles,
+            "roleNeeds": self.role_needs,
             "commands": self.commands,
             "neverDelegate": self.never_delegate,
             "memory": self.memory,

@@ -491,6 +491,46 @@ asks for *the reviewer*, config decides who that is.
 Review is roughly one call per ticket and close to all of the money on a hybrid
 run. That is the trade being made deliberately.
 
+## `roleNeeds`
+
+```json
+"roleNeeds": {
+  "executor": ["images"]
+}
+```
+
+Optional, and empty by default. It says what a role's model must actually be
+able to do, and a model that cannot is refused at startup rather than found out
+mid-run.
+
+Everything listable here is a capability the loop otherwise **degrades** around,
+which is why declaring it is worth anything:
+
+| Need | Without it |
+|---|---|
+| `images` | the role is told an image exists and shown its filename |
+| `tools` | the role gets the pasted-sources prompt and reads nothing itself |
+| `temperature` | sampling is whatever the endpoint defaults to |
+| `system` | the system prompt is folded into the first user turn |
+
+Degrading quietly is the right default — it is what lets one config serve a
+laptop and a cloud key — and it is the wrong behaviour when the capability is
+the point. A run whose reviewer cannot see spends its budget ruling on
+filenames, and nothing in the log reads as an error.
+
+A capability name nothing checks is refused rather than ignored: a need nobody
+reads looks exactly like one that passed. So is a name that is not a role, and
+a single capability written as a bare string rather than a list.
+
+The capability is read from the model's own config block, so this stays a
+configuration check and never becomes a liveness one. Whether a provider
+answers at all is `forge doctor`'s question.
+
+`forge ingest` covers the half this cannot: a backlog whose tickets carry
+`.png` reference files, ingested against an executor that cannot see, prints a
+warning naming the tickets. Declaring `roleNeeds` turns that warning into a
+refusal one step earlier.
+
 ---
 
 ## `commands`

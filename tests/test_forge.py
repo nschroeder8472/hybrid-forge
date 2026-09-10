@@ -50,6 +50,7 @@ from forge.ingest import (
     graph_problems,
     looks_like_plan,
     plan_decisions,
+    image_references,
     unexampled_tests,
     untestable_scope,
     plan_with_model,
@@ -2146,6 +2147,144 @@ class TestCommandsAreKeyedByLanguage(unittest.TestCase):
         self.assertEqual(
             Config.load(config.root).command_for("test", "web/a.js"), "node --test"
         )
+
+
+class TestARoleCanDeclareWhatItNeeds(unittest.TestCase):
+    """`roleNeeds`: the capabilities that degrade quietly, made load-bearing.
+
+    Every capability a role can be pointed at is survivable — a provider that
+    cannot take tools gets the pasted-sources prompt, a model that cannot see
+    is told an image exists and shown its filename. Degrading is the right
+    default and the wrong behaviour when the operator has decided the
+    capability is the point. A run whose reviewer cannot see spends its whole
+    budget ruling on filenames, and nothing in the log reads as an error.
+    """
+
+    def _config(self, needs: dict, model: dict | None = None) -> Config:
+        return Config(
+            root=Path(tempfile.mkdtemp()).resolve(),
+            models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192,
+                          **(model or {})}},
+            roles={role: "m" for role in ("planner", "executor", "tester", "reviewer")},
+            role_needs=needs,
+            commands={"test": "pytest"},
+        )
+
+    def test_a_need_the_model_cannot_meet_is_refused_at_validate(self):
+        config = self._config({"reviewer": ["images"]})
+
+        with self.assertRaises(ConfigError) as caught:
+            config.validate()
+
+        self.assertIn("'images'", str(caught.exception))
+        self.assertIn("shown its filename", str(caught.exception))
+
+    def test_a_need_the_model_meets_is_silent(self):
+        config = self._config({"reviewer": ["images"]}, model={"multimodal": True})
+
+        config.validate()
+
+    def test_declaring_nothing_keeps_every_fallback(self):
+        # The default. One config serves a laptop and a cloud key precisely
+        # because these degrade rather than refusing.
+        self._config({}).validate()
+
+    def test_a_capability_nothing_checks_is_refused_rather_than_ignored(self):
+        # A need nobody reads looks exactly like one that passed.
+        config = self._config({"reviewer": ["vision"]})
+
+        with self.assertRaises(ConfigError) as caught:
+            config.validate()
+
+        self.assertIn("nothing checks", str(caught.exception))
+        self.assertIn("images", str(caught.exception))
+
+    def test_a_name_that_is_not_a_role_is_refused(self):
+        config = self._config({"summariser": ["images"]})
+
+        with self.assertRaises(ConfigError) as caught:
+            config.validate()
+
+        self.assertIn("not a role", str(caught.exception))
+
+    def test_one_capability_written_as_a_string_is_refused(self):
+        # `"images"` iterates as characters, so every letter would read as a
+        # capability nothing checks — a confusing way to say the same thing.
+        config = self._config({"reviewer": "images"})
+
+        with self.assertRaises(ConfigError) as caught:
+            config.validate()
+
+        self.assertIn("expected a list", str(caught.exception))
+
+    def test_it_survives_a_round_trip_through_the_file(self):
+        config = self._config({"executor": ["tools"]})
+        config.write()
+
+        self.assertEqual(Config.load(config.root).role_needs, {"executor": ["tools"]})
+
+
+class TestABacklogOfPicturesMeetsABlindExecutor(unittest.TestCase):
+    """Whether the executor can see is knowable before the run, not during it.
+
+    The loop degrades: a model that cannot see is told the file exists and
+    shown its name. That is right in the middle of a run and a poor way to find
+    out that every ticket in the backlog is about a screenshot.
+    """
+
+    @staticmethod
+    def _ticket(**kwargs):
+        base = dict(ticket_id="AB-001", title="t", spec="s", criteria=["c"])
+        base.update(kwargs)
+        return Ticket(**base)
+
+    def _config(self, **model) -> Config:
+        return Config(
+            root=Path(tempfile.mkdtemp()).resolve(),
+            models={"m": {"kind": "openai", "model": "x", "contextWindow": 8192,
+                          **model}},
+            roles={role: "m" for role in ("planner", "executor", "tester", "reviewer")},
+            commands={"test": "pytest"},
+        )
+
+    def test_the_pictures_a_backlog_carries_are_listed(self):
+        found = image_references(
+            [
+                self._ticket(reference_files=["docs/spec.md", "assets/hero.png"]),
+                self._ticket(ticket_id="AB-002", reference_files=["src/a.py"]),
+            ]
+        )
+
+        self.assertEqual(found, [("AB-001", ["assets/hero.png"])])
+
+    def test_an_svg_is_text_and_stays_text(self):
+        # It is XML, it is readable, and a role that can read it can edit it.
+        found = image_references([self._ticket(reference_files=["assets/logo.svg"])])
+
+        self.assertEqual(found, [])
+
+    def test_a_blind_executor_is_named_at_ingest(self):
+        tickets = [self._ticket(reference_files=["assets/hero.png"])]
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            problems = cli._warn_unseeable_images(self._config(), tickets)
+
+        self.assertEqual(len(problems), 1)
+        self.assertIn("cannot see an image", problems[0])
+        self.assertIn("roleNeeds", problems[0])
+        self.assertIn("AB-001", out.getvalue())
+
+    def test_an_executor_that_can_see_is_not_warned_about(self):
+        tickets = [self._ticket(reference_files=["assets/hero.png"])]
+
+        problems = cli._warn_unseeable_images(self._config(multimodal=True), tickets)
+
+        self.assertEqual(problems, [])
+
+    def test_a_backlog_with_no_pictures_asks_nothing_of_the_model(self):
+        tickets = [self._ticket(reference_files=["src/a.py"])]
+
+        self.assertEqual(cli._warn_unseeable_images(self._config(), tickets), [])
 
 
 class TestRetryCycleConfig(unittest.TestCase):

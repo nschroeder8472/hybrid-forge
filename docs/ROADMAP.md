@@ -1012,16 +1012,29 @@ Found while reviewing the loop, judged not worth building yet.
   at 0 calls in 49 across three probe arms). Its `ResourceWarning` finding on
   `Store`'s per-thread connections — measured *not* to be a leak, and breaking
   Windows test cleanup anyway — is fixed; see item 1 above.
-- **Per-role provider guarantees.** `claude-cli` now defaults to no tools, which
-  makes it behave like the completion endpoint the loop assumes. A stronger
-  version would let a role *declare* what it needs — "this role reads text and
-  returns text" — and refuse a provider that cannot promise it, rather than
-  relying on a default. One capability now works that way and only one:
-  `supports_images` is declared per model, and a prompt carrying an image
-  reaches a provider that cannot see it as a refusal rather than as a silently
-  text-only question. It is still discovered at call time rather than at
-  `config.validate()`, because nothing yet knows a role is *going* to be sent
-  an image — which is what `kind: image` would settle.
+- **Per-role provider guarantees — built, 2026-09-09.** `claude-cli` defaults
+  to no tools, which makes it behave like the completion endpoint the loop
+  assumes. A role can now *declare* what it needs instead of relying on that
+  default: `roleNeeds` lists capabilities per role, and `config.validate`
+  refuses a model that cannot promise one.
+
+  What makes it worth declaring is that all four are capabilities the loop
+  otherwise degrades around — `images`, `tools`, `temperature`, `system` — and
+  degrading quietly is right until the capability is the point. A run whose
+  reviewer cannot see spends its budget ruling on filenames with nothing in the
+  log reading as an error. A capability name nothing checks is refused rather
+  than ignored, since a need nobody reads looks exactly like one that passed.
+
+  The other half was the timing: an image was discovered at the call carrying
+  it, because nothing knew a role was *going* to be sent one. `kind: image`
+  turns out not to be needed for that — a ticket's reference files already say
+  it. `ingest.image_references` reports the pictures a backlog carries, and
+  `forge ingest` warns when they meet an executor that cannot see. The suffix
+  table both halves read is one table now, in `patch.IMAGE_TYPES`; a second
+  copy is a `.webp` that is text to one reader and a picture to the other.
+
+  Still discovered at call time is the *degradation* itself, which is correct:
+  refusing there would end a code ticket over a screenshot nobody needed.
 - **Oscillation detection — built, 2026-09-09.** The executor sees its last
   failures and is told that a failure it has seen before means its two changes
   are undoing each other. That asked it to compare its own history and conclude

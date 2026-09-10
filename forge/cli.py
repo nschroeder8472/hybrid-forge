@@ -65,6 +65,7 @@ from .config import (
 )
 from .ingest import ingest as ingest_document
 from .ingest import (
+    image_references,
     undeclared_order,
     unexampled_tests,
     untestable_scope,
@@ -748,6 +749,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     _warn_missing_manifests(config, tickets)
     _warn_untestable_scope(tickets)
     _warn_unexampled_tests(tickets)
+    _warn_unseeable_images(config, tickets)
 
     # Said after `derive_needs` has run, so a shared writable file has already
     # been ordered and is not what this is about.
@@ -1702,6 +1704,42 @@ def _warn_unexampled_tests(tickets: list) -> list[str]:
     already being spent. See `ingest.unexampled_tests`.
     """
     problems = unexampled_tests(tickets)
+    for problem in problems:
+        print(f"\nwarning: {problem}")
+    return problems
+
+
+def _warn_unseeable_images(config: Config, tickets: list) -> list[str]:
+    """Say when this backlog needs a model that can see and has one that cannot.
+
+    The loop degrades rather than failing — a blind model is told the file
+    exists and shown its name — and that is right in the middle of a run and
+    useless as a way to discover it. Both halves are known here: the tickets
+    say what the backlog carries, and the config says what the executor is.
+
+    A warning, because the degradation is real and sometimes wanted: a ticket
+    whose screenshot is decoration still lands. An operator who knows better
+    writes `roleNeeds`, and then this is a refusal at `validate` instead.
+    """
+    carried = image_references(tickets)
+    if not carried:
+        return []
+    try:
+        if config.provider_for("executor").capabilities().supports_images:
+            return []
+    except Exception:
+        # Whether the executor can be built at all is `doctor`'s question, and
+        # answering it here as "cannot see" would be a guess.
+        return []
+    problems = [
+        f"{ticket_id}: reads {', '.join(images)}, and the executor is "
+        f"{config.model_name_for('executor')!r}, which cannot see an image — "
+        f"it will be told the files exist and shown their names. Point the "
+        f"executor at a multimodal model, or add "
+        f'`"roleNeeds": {{"executor": ["images"]}}` to make that a refusal '
+        f"rather than a degradation."
+        for ticket_id, images in carried
+    ]
     for problem in problems:
         print(f"\nwarning: {problem}")
     return problems
