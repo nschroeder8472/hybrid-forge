@@ -67,6 +67,7 @@ from .failures import (
 from .ingest import write_tickets
 from .memory import MemoryClient, MemoryRefused, MemoryUnavailable, ticket_query
 from .patch import (
+    IMAGE_TYPES,
     FileEdit,
     ParsedOutput,
     apply_edits,
@@ -4702,21 +4703,9 @@ class Orchestrator:
     # succeeding and a far better one than silent data loss.
     _WRITABLE_CEILING = 200_000
 
-    # Reference files that are pictures rather than text, by extension, with
-    # the media type each is sent as. A reference `.png` used to be read as
-    # UTF-8 with `errors="replace"` and pasted into a fenced block, so what the
-    # model saw as the contents of `assets/hero.png` was several thousand
-    # replacement characters.
-    #
-    # `.svg` is deliberately absent: it is XML, it is readable, and a role that
-    # can read it can also edit it. It stays text.
-    _IMAGE_TYPES = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".gif": "image/gif",
-        ".webp": "image/webp",
-    }
+    # Which reference files are pictures, and the media type each is sent as,
+    # is `patch.IMAGE_TYPES` — shared with the ingest check that asks whether a
+    # backlog needs a model that can see at all.
 
     # What one image may weigh before it is named rather than attached. The
     # providers refuse a larger one anyway — 5 MB is the smallest of their
@@ -5590,7 +5579,7 @@ class Orchestrator:
             # replacement characters under a heading that says this is the file
             # — which is worse than not showing it, because the role has no way
             # to tell the difference.
-            if Path(path).suffix.lower() in self._IMAGE_TYPES:
+            if Path(path).suffix.lower() in IMAGE_TYPES:
                 continue
             candidate = (self.config.root / path).resolve()
             try:
@@ -5635,7 +5624,7 @@ class Orchestrator:
         for path in wanted:
             if any(ch in path for ch in "*?["):
                 continue
-            media_type = self._IMAGE_TYPES.get(Path(path).suffix.lower())
+            media_type = IMAGE_TYPES.get(Path(path).suffix.lower())
             if not media_type or not is_safe_path(self.config.root, path):
                 continue
             normalized = normalize_path(path)

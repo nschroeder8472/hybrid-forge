@@ -26,7 +26,7 @@ import re
 from pathlib import Path
 
 from . import routes
-from .patch import is_test_path, normalize_path
+from .patch import is_image_path, is_test_path, normalize_path
 from .providers import Message, Provider
 from .state import TICKET_FEATURE, TICKET_SPLIT, Ticket
 
@@ -586,6 +586,27 @@ def unexampled_tests(tickets: list[Ticket]) -> list[str]:
             f"Add a test that already passes to `Reference files`."
         )
     return problems
+
+
+def image_references(tickets: list[Ticket]) -> list[tuple[str, list[str]]]:
+    """Tickets whose reading scope contains pictures, with the pictures.
+
+    Asked at ingest so the question *can this run's executor see at all* is
+    answered before a run exists. Until now it was answered at the call that
+    carried the image: a blind model is told the file exists and shown its
+    name, which is the right degradation mid-run and a poor way to find out
+    that every ticket in the backlog is about a screenshot.
+
+    The capability is not read here. This says what the backlog needs; which
+    model is pointed at the executor is the caller's question, and `roleNeeds`
+    is where an operator writes down that it is not negotiable.
+    """
+    found = []
+    for ticket in tickets:
+        images = [path for path in ticket.reference_files if is_image_path(path)]
+        if images:
+            found.append((ticket.ticket_id, images))
+    return found
 
 
 def graph_problems(tickets: list[Ticket]) -> list[str]:

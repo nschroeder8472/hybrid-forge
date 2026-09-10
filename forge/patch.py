@@ -1205,6 +1205,33 @@ SNAKE_TEST = re.compile(r"^test_|_test$|_spec$|\.test$|\.spec$", re.IGNORECASE)
 CAMEL_TEST = re.compile(r"(?:^|[a-z0-9])(?:Test|Tests|Spec|Specs)$")
 
 
+# Reference files that are pictures rather than text, with the media type each
+# is sent as. A reference `.png` used to be read as UTF-8 with
+# `errors="replace"` and pasted into a fenced block, so what the model saw as
+# the contents of `assets/hero.png` was several thousand replacement
+# characters.
+#
+# `.svg` is deliberately absent: it is XML, it is readable, and a role that can
+# read it can also edit it. It stays text.
+#
+# Here rather than on the orchestrator because two other things now ask the
+# same question — whether a ticket carries images, at ingest, and which media
+# type to attach one as — and a second copy of this list is a ticket whose
+# `.webp` is text to one reader and a picture to the other.
+IMAGE_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+
+def is_image_path(path: str) -> bool:
+    """Whether this reference file is a picture rather than text."""
+    return Path(path).suffix.lower() in IMAGE_TYPES
+
+
 def is_test_path(path: str) -> bool:
     """Whether this path is a test file, in any language's spelling.
 
