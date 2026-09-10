@@ -649,10 +649,15 @@ which is the same position it takes on compilers.
   sits above the column it names"* is a vision verdict. That split is the
   unverifiable-criterion problem IMAGE-LOOP §5 already answers by blocking at
   ingest, and it should be answered once for both.
-- **Determinism.** Fonts, DPI and platform move pixels. A pixel-diff against a
-  golden image is the wrong default for a loop that is supposed to converge on
-  behaviour; a vision verdict against a stated property is the right one, and
-  costs a call.
+- **Determinism, and it is not only fonts.** A pixel-diff against a golden image
+  is the wrong default for a loop that is supposed to converge on behaviour; a
+  vision verdict against a stated property is the right one, and costs a call.
+  But the capture itself can manufacture a finding: both Claude runs reported
+  the zoom readout *"rendered red, styling of an error state"* on a page that
+  sets no colour on it, and decoding the PNG found `rgb(217,180,122)` and
+  `rgb(116,180,218)` fringing grey glyphs — subpixel antialiasing, read as
+  meaning. **The capture command must disable subpixel antialiasing**, and an
+  attempt spent on a colour nobody chose is what it costs not to.
 - **Headless.** Some UIs cannot run without a display, and some cannot run at
   all in CI. A project that cannot produce a PNG does not get this step, the
   same way a project with no lint command does not get lint.
@@ -700,9 +705,14 @@ worth building.
   re-asking the existing criteria of the rendering, and not as asking a model
   what looks wrong.
 
-  The seat is also the weakest available — a 30B local checkpoint missing a
-  95-pixel offset says as much about the checkpoint as about the step. The same
-  page against a frontier vision model is one call and still unrun.
+  **A stronger seat then changed the answer, and that call has now been made.**
+  `claude-cli` takes images as paths when the role has read tools, which its own
+  comment said was the way out; with it, Claude found **three of the four
+  outright** — the file input, the minimap the spec names, and the readout, with
+  the arithmetic — named the fourth's symptom both runs, and made no miscalls.
+  So the misses were the seat, not the step, and the framework is worth
+  building. What §6 found still holds: every defect either seat named, it named
+  because a criterion or the spec sentence beside it asked.
 
 **And looking at the capture changed what the step should be asked.** Only the
 label offset is visible as an internal inconsistency. A minimap that was never
