@@ -328,6 +328,11 @@ def review(root: Path, role: str) -> int:
 
 
 def main(argv: list[str]) -> int:
+    # A model's answer is not cp1252, and a Windows console says so by raising
+    # after the call has been paid for. Replace what cannot be encoded rather
+    # than losing the reply.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--page", action="store_true", help="build and print the path")
     parser.add_argument("--capture", action="store_true", help="also render it to a PNG")

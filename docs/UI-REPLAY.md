@@ -162,6 +162,63 @@ with no model that can does not get the step. None of the three routes above is
 a change to that design — they are three ways to have a model behind the seat,
 and the seat is the same in all of them.
 
+## 6. The judge half ran, and the answer is *partly*
+
+2026-09-10, `nemotron-3-nano-omni` with its projector loaded, `reviewer` seat,
+temperature 0. Run twice, byte-identical both times — same verdicts, same 706
+prompt and 1,415 completion tokens.
+
+Of the four defects it was shown:
+
+| defect | verdict |
+|---|---|
+| the file input cannot be reached | **found** — *"no file input element for .json is visible"* |
+| every label 95px from its column | not named; criteria 1–5 all passed |
+| the minimap is never drawn | **missed** — never raised, though the spec names it |
+| the readout reads `1600%` | **missed** — read correctly and passed |
+
+And one miscall: it failed *"the first label is half a cell from the ruler's own
+left edge"*, which is true — label 0 sits at 8px and the ruler's left edge is 0.
+It hedged with *"not clearly"*, which reads like the visual oddity showing
+through the wrong criterion.
+
+So one real find, one false failure, two misses. **Not theatre, and not
+sufficient.**
+
+**The find is the interesting part, because of where it came from.** Criterion 7
+— *"the page contains a file input that accepts .json"* — is the kind of
+mechanical wiring assertion `spec-contract` already asks for, and it **passes as
+a source check and fails as a render check**. Same sentence, same ticket,
+opposite verdict, and the render's verdict is the true one: the input is in the
+DOM and no person can reach it. That is the entire mechanism the step would add,
+demonstrated on the defect that made the original editor unusable.
+
+**The FINDINGS section added nothing.** Both runs listed exactly what the failed
+criteria already said. Every defect the reviewer named, it named because a
+criterion asked. That is §4's prediction with evidence under it: the step is
+worth building as *re-asking the existing criteria of the rendering*, and not
+worth building as "look at this and tell me what is wrong".
+
+**What the misses have in common** is that both need the spec held against the
+picture rather than the criteria: the minimap is a sentence in the spec with no
+criterion, and `1600%` is only wrong if you carry the *percentage of scale 32*
+rule while reading it. The reviewer was given both and used neither. Two
+readings are open — a stronger seat would cross-reference, or prose in a spec is
+not something any reviewer reliably checks and these needed criteria of their
+own. This experiment cannot separate them, and the second reading is the one
+this repository already holds — *Prose in a spec body is not a contract;
+only criteria are*, in [EXECUTOR-CEILINGS.md](EXECUTOR-CEILINGS.md).
+
+**And the seat is the weakest one available.** A 30B-A3B local checkpoint
+missing a 95-pixel offset is evidence about that checkpoint at least as much as
+about the step. The same page, the same prompt and a frontier vision model is a
+one-call experiment that is still unrun, and it is what should decide how much
+of the framework to build.
+
+**Cost, since a false failure is not free.** One of eight criteria was failed
+wrongly. On a live ticket that is an attempt spent chasing a defect that is not
+there, which is the same cost a wrong reviewer rejection has today.
+
 ## What this does not claim
 
 The fixture is a reconstruction, so a reviewer naming its defects would be
