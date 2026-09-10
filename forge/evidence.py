@@ -23,7 +23,7 @@ import re
 import subprocess
 from collections import Counter
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from .patch import normalize_path
 
@@ -129,7 +129,16 @@ def _read(root: Path, path: str) -> str:
         return ""
 
 
-def _scan(root: Path, files: list[str], match, limit: int) -> list[str]:
+def _scan(
+    root: Path,
+    files: list[str],
+    # A compiled pattern's `match`, which returns the match or `None`. Typed
+    # by what the callers pass rather than as a predicate: `re.Pattern.match`
+    # is overloaded, and narrowing it to `-> bool` here made the call site the
+    # error rather than this line.
+    match: Callable[[str], object],
+    limit: int,
+) -> list[str]:
     """Search the project without git, as `path:line: text`.
 
     The fallback under both searches below. Slower than `git grep`, and

@@ -46,7 +46,7 @@ import ast
 import fnmatch
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
 
 from .patch import is_safe_path, normalize_path
 from .providers.base import ToolCall, ToolResult, ToolSpec
@@ -95,6 +95,11 @@ MAX_ENTRIES = 200
 # Directories never walked, listed or searched. Not a security boundary —
 # `is_safe_path` is that — but a model that greps `.git` gets pack files, and
 # one that lists `__pycache__` learns nothing.
+# What `read_symbol` addresses: a function, an async function, or a class. All
+# three carry `lineno` and `end_lineno`; the bare `ast.AST` they share does not,
+# which is what makes the union worth writing down.
+_Definition = Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef]
+
 SKIP_DIRS = frozenset(
     {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv",
      ".mypy_cache", ".ruff_cache", "dist", "build", ".hybridforge"}
@@ -514,23 +519,31 @@ def _find_symbol(tree: ast.Module, wanted: str) -> tuple[int, int] | None:
     without its `@property` has been shown something that behaves differently
     from what is on disk.
     """
-    def span(node) -> tuple[int, int]:
+    def span(node: _Definition) -> tuple[int, int]:
         first = min(
             [node.lineno] + [item.lineno for item in getattr(node, "decorator_list", [])]
         )
         return first, (node.end_lineno or node.lineno)
 
-    definition = (ast.FunctionDef, ast.AsyncFunctionDef)
+    # Written out at each `isinstance` rather than held in a variable: a
+    # checker narrows a literal tuple of types and cannot narrow a name bound
+    # to one, and what it narrows to is what gives `span` its `lineno`.
     owner, _, member = wanted.partition(".")
 
     for node in tree.body:
         if member:
             if isinstance(node, ast.ClassDef) and node.name == owner:
                 for child in node.body:
-                    if isinstance(child, definition) and child.name == member:
+                    if (
+                        isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and child.name == member
+                    ):
                         return span(child)
             continue
-        if isinstance(node, (*definition, ast.ClassDef)) and node.name == wanted:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name == wanted
+        ):
             return span(node)
 
     if member:
@@ -538,7 +551,10 @@ def _find_symbol(tree: ast.Module, wanted: str) -> tuple[int, int] | None:
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
             for child in node.body:
-                if isinstance(child, definition) and child.name == wanted:
+                if (
+                    isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and child.name == wanted
+                ):
                     return span(child)
     return None
 

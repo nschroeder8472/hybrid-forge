@@ -853,6 +853,9 @@ class Store:
                 "VALUES (?, ?, ?, ?, ?)",
                 (RUN_IDLE, goal, source, now, now),
             )
+        # `lastrowid` is `int | None` because a cursor that ran something
+        # other than an INSERT has none. This one always did.
+        assert cursor.lastrowid is not None
         return int(cursor.lastrowid)
 
     def set_run_status(self, run_id: int, status: str, note: str = "") -> None:
@@ -1456,7 +1459,10 @@ class Store:
         wrote it, and carrying no record of what the parser made of it at the
         time — so these can be re-read but not checked for a difference.
         """
-        clauses, values = ["detail != ''"], []
+        # Bound parameters, mixed on purpose: a run id is an integer and a
+        # ticket id is a string, and both go into the same `?` list.
+        clauses: list[str] = ["detail != ''"]
+        values: list[Any] = []
         if run_id is not None:
             clauses.append("run_id = ?")
             values.append(run_id)
@@ -1622,6 +1628,9 @@ class Store:
                 "VALUES (?, ?, ?, 'running', ?)",
                 (run_id, ticket_id, name, time.time()),
             )
+        # `lastrowid` is `int | None` because a cursor that ran something
+        # other than an INSERT has none. This one always did.
+        assert cursor.lastrowid is not None
         return int(cursor.lastrowid)
 
     def end_step(self, step_id: int, status: str, detail: str = "") -> None:
@@ -2102,6 +2111,9 @@ class Store:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (run_id, time.time(), level, kind, message[:8000], json.dumps(data or {})),
             )
+        # `lastrowid` is `int | None` because a cursor that ran something
+        # other than an INSERT has none. This one always did.
+        assert cursor.lastrowid is not None
         return int(cursor.lastrowid)
 
     def events_after(self, event_id: int, limit: int = 200) -> list[sqlite3.Row]:

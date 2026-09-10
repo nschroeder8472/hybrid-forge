@@ -32,6 +32,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO
 
 WINDOWS = os.name == "nt"
 
@@ -57,7 +58,7 @@ class Outcome:
     timed_out: bool
 
 
-def _start(command: str, cwd: Path, sink) -> subprocess.Popen:
+def _start(command: str, cwd: Path, sink: IO[bytes]) -> subprocess.Popen[bytes]:
     """Start `command` as the leader of its own group, writing into `sink`."""
     if WINDOWS:
         # Its own group, so `taskkill /T` has a tree to walk.
@@ -94,7 +95,15 @@ def _kill_tree(proc: subprocess.Popen) -> None:
             pass
     else:
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            # Ignored for the type checker rather than for the reader: these
+            # three exist on every platform this branch runs on, and do not
+            # exist in the stubs when it is checked from Windows. A
+            # `sys.platform` test would narrow them, and `WINDOWS` is one
+            # constant read by both branches — worth more than the annotation.
+            os.killpg(  # type: ignore[attr-defined]
+                os.getpgid(proc.pid),  # type: ignore[attr-defined]
+                signal.SIGKILL,  # type: ignore[attr-defined]
+            )
             return
         except (ProcessLookupError, PermissionError, OSError):
             pass

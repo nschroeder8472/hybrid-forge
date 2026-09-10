@@ -730,6 +730,14 @@ class Orchestrator:
         if not entry:
             self.store.end_step(step_id, "ok", "nothing durable to record")
             return
+        if self.memory is None:
+            # Both recorder passes check this before they ask a model
+            # anything, so reaching here means a third caller arrived without
+            # the guard. Recorded rather than raised: a memory write is the
+            # last thing a finished ticket does, and nothing about the ticket
+            # depends on it.
+            self.store.end_step(step_id, "ok", "no memory server configured")
+            return
 
         try:
             result = self.memory.remember(entry, title=title)
@@ -1014,7 +1022,14 @@ class Orchestrator:
                 # Withdrawn for the answering turns. Offering tools while
                 # saying "answer now" is a contradiction, and the models that
                 # lose that argument lose it by calling one more tool.
-                **({} if answering else {"tools": TOOLS}),
+                #
+                # Spread rather than passed as `tools=[]`, for the reason
+                # `_attachments` gives: a call with no tools to offer stays the
+                # call it has always been. A checker reads the merged mapping
+                # as one `**dict[str, list[ToolSpec]]` against every keyword it
+                # could land on, which is a fact about the spread and not about
+                # the argument.
+                **({} if answering else {"tools": TOOLS}),  # type: ignore[arg-type]
             )
             if not completion.tool_calls:
                 # A model whose tools are gone and which wants to read anyway
@@ -4031,7 +4046,11 @@ class Orchestrator:
         def call(
             role: str,
             messages: list[Message],
-            budget: int,
+            # Named as `ratify.Caller` names it. Every call site passes it
+            # positionally, so a mismatch here costs nothing until the first
+            # one that does not — and then it is a `TypeError` in the middle of
+            # a sign-off pass, from a protocol that says it is satisfied.
+            max_tokens: int,
             *,
             thinking: bool = True,
         ) -> Completion:
@@ -4039,7 +4058,7 @@ class Orchestrator:
                 run_id,
                 role,
                 messages,
-                max_tokens=budget,
+                max_tokens=max_tokens,
                 temperature=0.0,
                 thinking=thinking,
             )
@@ -6503,8 +6522,9 @@ class Orchestrator:
                 # ticket with the bug it was filed for still in place. Checked
                 # textually because the signature parser needs a location the
                 # tool may not print.
+                reproduction = repro[0] if repro else ""
                 still_failing = (
-                    errors_naming(result.detail, repro[0]) if repro else []
+                    errors_naming(result.detail, reproduction) if reproduction else []
                 )
                 if not still_failing:
                     self.store.log(
@@ -6525,7 +6545,7 @@ class Orchestrator:
                     f"the ticket exists to clear; not excused.",
                     level="warn",
                     kind="verify",
-                    data={"step": name, "reproduction": repro[0]},
+                    data={"step": name, "reproduction": reproduction},
                 )
 
             # A bug ticket whose fix works and whose suite still fails, because

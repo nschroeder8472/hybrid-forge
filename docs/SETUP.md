@@ -518,14 +518,22 @@ overnight run never started.
 Working *on* hybrid-forge needs two more:
 
 ```bash
-pip install -e "/path/to/hybrid-forge[dev]"   # adds flake8 and pytest
+pip install -e "/path/to/hybrid-forge[dev]"   # adds flake8, pytest and mypy
 ```
 
-Both are required rather than suggested. `tests/test_lint.py` runs `flake8` over
-the tree and fails when the tool is absent instead of skipping — an enforcement
-that disappears on the machine that lacks it enforces nothing — and the fixture
-under `examples/sample-project` now grades generated code with the same linter,
-which is what makes a run there able to fail the way real runs do.
+All three are required rather than suggested. `tests/test_lint.py` runs `flake8`
+over the tree and `tests/test_types.py` runs `mypy` over the package, and both
+fail when their tool is absent instead of skipping — an enforcement that
+disappears on the machine that lacks it enforces nothing. The fixture under
+`examples/sample-project` grades generated code with the same linter, which is
+what makes a run there able to fail the way real runs do.
+
+The settings live where a reader can run the same command by hand: `.flake8`
+for one, `[tool.mypy]` in `pyproject.toml` for the other, so `flake8` and `mypy`
+with no arguments do what the suite does. mypy is checked against **3.10**, the
+floor `requires-python` sets, and `disallow_untyped_defs` is on — a new function
+without annotations fails the gate rather than quietly opting its body out of
+every other check.
 
 If you want the loop to drive Claude for planning and review, Claude Code must
 be installed **on whatever machine runs the daemon** — the `claude-cli` adapter

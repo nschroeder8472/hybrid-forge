@@ -33,9 +33,10 @@ dependencies = []
 # Lint is not optional. The repository is flake8-clean and `tests/test_lint.py`
 # fails rather than skips when the tool is missing, because an enforcement that
 # disappears on the machine without it enforces nothing. `pytest` is here for
-# the same reason: the suite is how any of this is checked.
+# the same reason: the suite is how any of this is checked, and `mypy` for the
+# reason `[tool.mypy]` below gives.
 [project.optional-dependencies]
-dev = ["flake8>=7", "pytest>=8"]
+dev = ["flake8>=7", "pytest>=8", "mypy>=1.11"]
 
 [project.urls]
 Homepage = "https://github.com/nschroeder8472/hybrid-forge"
@@ -50,6 +51,38 @@ include = ["forge*"]
 
 [tool.setuptools.package-data]
 forge = ["ui/*.html"]
+
+# Static analysis was `.flake8` and nothing else, and flake8 does not read
+# types. Every shape defect this project has had cost a whole test run to find
+# — a keyword argument threaded through five providers, a `Callable` alias that
+# had become a `Protocol` and no longer matched the function passed to it, a
+# dataclass field whose emptiness would have silently blinded three guards.
+# mypy and pyright are both development dependencies rather than runtime ones,
+# so the zero-runtime-dependency rule never argued against either; mypy is here
+# because it installs with pip and needs no Node.
+[tool.mypy]
+files = ["forge"]
+# The floor `requires-python` sets. Checking against the newest interpreter
+# would accept syntax and stdlib the supported one does not have.
+python_version = "3.10"
+# The package is annotated throughout, so this costs nothing today and is the
+# whole point tomorrow: a function added without annotations fails the gate
+# rather than quietly opting its body out of every check below.
+disallow_untyped_defs = true
+check_untyped_defs = true
+warn_redundant_casts = true
+# Off deliberately. `processes.py` needs `os.killpg` ignored when it is checked
+# from Windows and not when it is checked from Linux, so an "unused ignore"
+# finding would make the gate's result depend on which machine ran it.
+warn_unused_ignores = false
+
+# `tomllib` is stdlib from 3.11 and absent at the version checked against,
+# which is the situation `manifests.py` already handles with a `try` and a
+# `None` fallback. Without this the checker reports the 3.10 truth as an error
+# on every run.
+[[tool.mypy.overrides]]
+module = "tomllib"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 # Only this project's own suite. `examples/sample-project` is a fixture with

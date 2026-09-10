@@ -13,6 +13,7 @@ exclude =
     .git,
     __pycache__,
     .pytest_cache,
+    .mypy_cache,
     build,
     hybrid_forge.egg-info,
     # The daemon's own working directory: run databases, artifact trees, and

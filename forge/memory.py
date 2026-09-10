@@ -701,7 +701,7 @@ class MemoryClient:
             f"room={self.settings.room or '(unscoped)'} "
             + (f"scope=[{scope}] " if scope else "")
             + (f"writeScope=[{write_scope}] " if write_scope else "")
-            + f"read={self._tool.get('name')} {write_state} "
+            + f"read={(self._tool or {}).get('name')} {write_state} "
             f"available={', '.join(self._available_tools)}"
         )
 
