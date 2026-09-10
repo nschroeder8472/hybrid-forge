@@ -134,6 +134,13 @@ Route 1 finishes this experiment. Until then the answer key is in
 `scripts/ui_replay.py` under `UNSEEN`, deliberately not printed beside the page:
 handing a reviewer the verdict is not a test of the reviewer.
 
+**Whichever route supplies the model, the seat is configuration.** The roadmap
+entry now settles that: `loop.viewRole` names which of the four roles is shown
+the capture, `roleNeeds` declares that it must be able to see, and a project
+with no model that can does not get the step. None of the three routes above is
+a change to that design — they are three ways to have a model behind the seat,
+and the seat is the same in all of them.
+
 ## What this does not claim
 
 The fixture is a reconstruction, so a reviewer naming its defects would be

@@ -605,6 +605,43 @@ that is true, the capture command belongs beside `lint` and `test` in
 per-attempt cost [IMAGE-LOOP.md](IMAGE-LOOP.md) already argues for, and for the
 same reason: what it is checking changes every attempt.
 
+### Which seat looks — a role the project configures
+
+**Decided:** the seeing seat is a role named in `.hybridforge/config.json`, not
+a provider the loop picks. A project points it at whatever model it has, the
+same way it points the reviewer at one, and a project with nothing that can see
+does not get the step.
+
+`ROLES` stays four. It is a fixed tuple and sign-off is counted over all of it,
+so a fifth voting seat would change what a majority is — the entry that
+measured that is *Sign-off cost*, and none of it is worth disturbing to add a
+screenshot. The precedent for a configurable seat that is not a new vote is
+already in the code: `memory.recordRole` names which of the four writes to
+memory, defaults to `reviewer`, and is refused at `validate` when it names
+something that is not a role.
+
+So the shape is that one, twice:
+
+```json
+"loop": { "viewRole": "reviewer" },
+"roleNeeds": { "reviewer": ["images"] },
+"commands": { "capture": { ".html": "npm run screenshot" } }
+```
+
+- **`loop.viewRole`** — which of the four is shown the capture. `reviewer` by
+  default, because it is already the seat that rules on whether the work meets
+  the criteria and it has just read the diff. A project whose reviewer is a
+  strong text model and whose vision model is a cheap one moves it.
+- **`roleNeeds`** — already built, and it is what makes the configuration
+  honest: declare `images` on the seat that looks and a model that cannot see
+  is refused at `validate` rather than shown a filename mid-run.
+- **`commands.capture`** — the project's own command, per extension, beside
+  `lint` and `test`. A project that has none does not get the step, exactly as
+  a project with no lint command does not get lint.
+
+That leaves the loop with no opinion about browsers, drivers or checkpoints,
+which is the same position it takes on compilers.
+
 ### What has to be decided
 
 - **Which criteria are pixels and which are judgement.** *"the histogram is
