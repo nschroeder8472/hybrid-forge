@@ -945,6 +945,16 @@ class LoopSettings:
     # than shown a filename mid-run. See *Looking at what it built* in
     # docs/ROADMAP.md.
     view_role: str = "reviewer"
+    # The model that seat uses *for a capture review only*, when it should not
+    # be the model it uses for everything else. Empty means the seat's own
+    # model, which is every run before this existed.
+    #
+    # This is the case `viewRole` alone cannot express: a backlog whose roles
+    # are local checkpoints, where the one call that has to read a rendering
+    # wants the strongest vision model available. Naming a model rather than
+    # adding a seat keeps `ROLES` at four — sign-off is counted over it — and
+    # keeps the choice in the project's config, where the rest of this lives.
+    view_model: str = ""
     # Whether the planner rewrites the ticket between sign-off passes. True is
     # every run before this existed. Off, the roles vote again on the words
     # they already refused, reading the objections but not a revision — which
@@ -1267,6 +1277,7 @@ class Config:
             ratify_passes=int(loop.get("ratifyPasses", 2)),
             vote_thinking=bool(loop.get("voteThinking", True)),
             view_role=str(loop.get("viewRole", "reviewer")),
+            view_model=str(loop.get("viewModel", "")),
             revise_between_passes=bool(
                 loop.get("reviseBetweenPasses", True)
             ),
@@ -1414,6 +1425,11 @@ class Config:
                 f"(expected one of {', '.join(ROLES)}). It names which seat is "
                 f"shown a captured rendering, not a new seat — sign-off is "
                 f"counted over the four, so there is no fifth."
+            )
+        if self.loop.view_model and self.loop.view_model not in self.models:
+            raise ConfigError(
+                f"loop.viewModel is {self.loop.view_model!r}, which is not "
+                f"declared in `models` (have: {', '.join(sorted(self.models))})."
             )
         for role in ROLES:
             name = self.roles.get(role)
@@ -1729,6 +1745,19 @@ class Config:
         name = self.roles[role]
         return build_provider(name, self.model_block(name))
 
+    def provider_for_model(self, name: str) -> Provider:
+        """Build a provider by the name it is declared under.
+
+        `provider_for` answers "who plays this role"; this answers "which of
+        the declared models is this", for the one caller that names a model
+        instead of a seat — `loop.viewModel`.
+        """
+        if name not in self.models:
+            raise ConfigError(
+                f"no model named {name!r} (have: {', '.join(sorted(self.models))})."
+            )
+        return build_provider(name, self.model_block(name))
+
     def model_name_for(self, role: str) -> str:
         return self.roles[role]
 
@@ -1794,6 +1823,7 @@ class Config:
                 "ratifyPasses": self.loop.ratify_passes,
                 "voteThinking": self.loop.vote_thinking,
                 "viewRole": self.loop.view_role,
+                "viewModel": self.loop.view_model,
                 "reviseBetweenPasses": self.loop.revise_between_passes,
                 "majorityRepeats": self.loop.majority_repeats,
                 "ratifyOrder": list(self.loop.ratify_order),

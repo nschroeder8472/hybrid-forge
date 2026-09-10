@@ -115,6 +115,7 @@
     "ratifyOrder": ["planner", "executor", "tester", "reviewer"],
     "voteThinking": true,
     "viewRole": "reviewer",
+    "viewModel": "",
     "reviseBetweenPasses": true,
     "majorityRepeats": true,
     "participationWindow": 20,
