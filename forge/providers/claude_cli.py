@@ -17,8 +17,10 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from collections.abc import Sequence
 from typing import Any
 
@@ -148,6 +150,38 @@ class ClaudeCLIProvider(Provider):
         # the agent back, or name the tools it may use.
         self.tools = config.get("tools", "")
 
+    @staticmethod
+    def _image_paths(
+        turns: list[Message], held: list[tempfile.TemporaryDirectory]
+    ) -> list[str]:
+        """Where each image in the prompt can be opened from.
+
+        A part that came from a file is named at its own path — the model then
+        reads what the ticket actually references, and nothing is copied. One
+        that arrived as bytes is written to a directory that lives until the
+        call returns; `held` is what keeps it alive, since a
+        `TemporaryDirectory` cleans up when it is collected and the CLI is a
+        separate process that has not started yet.
+        """
+        paths: list[str] = []
+        for message in turns:
+            for index, part in enumerate(message.images):
+                if part.path and Path(part.path).is_file():
+                    paths.append(str(Path(part.path).resolve()))
+                    continue
+                holder = tempfile.TemporaryDirectory(prefix="forge-image-")
+                held.append(holder)
+                suffix = {
+                    "image/png": ".png",
+                    "image/jpeg": ".jpg",
+                    "image/gif": ".gif",
+                    "image/webp": ".webp",
+                }.get(part.media_type, ".bin")
+                path = Path(holder.name) / f"image-{index}{suffix}"
+                path.write_bytes(part.data)
+                paths.append(str(path))
+        return paths
+
     def complete(
         self,
         messages: list[Message],
@@ -186,6 +220,19 @@ class ClaudeCLIProvider(Provider):
         prompt = "\n\n".join(
             f"{'User' if m.role == 'user' else 'Assistant'}: {m.text}" for m in turns
         )
+
+        # Images become paths the model is told to open. `_require_vision`
+        # above has already refused this prompt if the role has no tools, so
+        # reaching here means the reply will be written after looking rather
+        # than after reading a filename.
+        held: list[tempfile.TemporaryDirectory] = []
+        paths = self._image_paths(turns, held)
+        if paths:
+            listing = "\n".join(f"- {path}" for path in paths)
+            prompt = (
+                f"Read these image files before answering. They are part of the "
+                f"question, not context to summarise:\n{listing}\n\n{prompt}"
+            )
 
         if not shutil.which(self.binary):
             raise ProviderUnreachable(
@@ -296,6 +343,19 @@ class ClaudeCLIProvider(Provider):
             )
         return ""
 
+    # Tool settings under which the CLI can open a file it is handed. `default`
+    # is the CLI's own full set; a named list is matched on `Read`, which is
+    # the one that renders an image rather than decoding it as text.
+    def _can_read_files(self) -> bool:
+        if self.allow_all_tools:
+            return True
+        tools = str(self.tools).strip().lower()
+        if not tools:
+            return False
+        return tools == "default" or "read" in {
+            name.strip() for name in tools.split(",")
+        }
+
     def capabilities(self) -> Capabilities:
         return Capabilities(
             context_window=int(self.config.get("contextWindow", 200_000)),
@@ -303,9 +363,12 @@ class ClaudeCLIProvider(Provider):
             # The CLI has no temperature knob; the loop must not try to set one.
             supports_temperature=False,
             # The prompt reaches the CLI as text on stdin and there is nowhere
-            # to put bytes. Naming a file path instead would not work either:
-            # this adapter defaults to no tools, which is what makes it behave
-            # like the completion endpoint the loop assumes, so a reviewer sent
-            # `assets/hero.png` would be ruling on a filename.
-            supports_images=False,
+            # to put bytes, so an image can only arrive as a path the model
+            # opens for itself. Whether it can do that is a property of this
+            # role's tools, not of the CLI: with none — the default, and what
+            # makes this adapter behave like the completion endpoint the loop
+            # assumes — a reviewer sent `assets/hero.png` would be ruling on a
+            # filename, which is worse than being told it cannot see. With
+            # `Read` it opens the file and looks at it.
+            supports_images=self._can_read_files(),
         )

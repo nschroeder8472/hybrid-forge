@@ -219,6 +219,56 @@ of the framework to build.
 wrongly. On a live ticket that is an attempt spent chasing a defect that is not
 there, which is the same cost a wrong reviewer rejection has today.
 
+## 7. The same page, a stronger seat — and the answer changes
+
+The section above ends by saying a 30B local checkpoint missing a 95-pixel
+offset is evidence about the checkpoint. That was worth one call to settle, and
+`claude-cli` now takes images: `supports_images` is true exactly when the role
+has read tools, and an image reaches the CLI as a path it opens rather than as
+bytes it has nowhere to put. The adapter's own comment said a filename would be
+worse than a refusal — it still is, and having `Read` is the difference.
+
+Same page, same prompt, same criteria. Two runs.
+
+| defect | nemotron-omni | claude (opus, `--tools Read`) |
+|---|---|---|
+| file input cannot be reached | found | **found**, both runs |
+| minimap never drawn | missed | **found**, both runs |
+| readout reads `1600%` | missed, passed it | **found**, both runs, with the arithmetic: *"1600% of scale 32 = 512px per cell contradicts the ~15px cells drawn"* |
+| every label 95px from its column | not named | **symptom named**, both runs — *"ruler labels 8–11 have no tiles beneath them"*, *"a single row of ~7 tiles"* against 12 labels — and criterion 1 refused rather than passed |
+| miscalls | 1 (failed a criterion that holds) | 0 |
+
+**So the misses were the seat.** Three of four found outright, the fourth's
+symptom named both times and the criterion it would have passed marked
+`UNKNOWN` instead — which is the honest verdict for a picture that cannot show
+the offset directly. It also passed criterion 6 correctly, the one nemotron
+failed wrongly.
+
+That settles what §6 could not: the step is not limited by what a rendering can
+carry, and the framework the entry describes is worth building. It also keeps
+§6's other finding intact — every one of these came from a criterion or from the
+spec sentence beside it. The minimap was found because the spec named a minimap.
+
+## 8. The capture can invent a defect, and this one did
+
+Both Claude runs reported the zoom readout *"rendered red, styling of an
+error/invalid state"*. The page sets no colour on it: `#zoom` declares only
+`font-variant-numeric`, and the body colour is `#e6e6e6`.
+
+Decoding the PNG settles it. Over the readout, beside the header fill
+`rgb(28,31,38)` and the declared `rgb(230,230,230)`, the glyphs carry
+`rgb(217,180,122)` and `rgb(116,180,218)` — warm and cool fringes on opposite
+edges, which is subpixel antialiasing. The capture rendered grey text with
+coloured edges and the reviewer read the colour as meaning.
+
+**That is a capture-configuration defect, not a model defect, and it is the
+concrete form of the entry's "determinism" question.** It is not only fonts and
+DPI moving pixels: a renderer's default text antialiasing can manufacture a
+finding that is nowhere in the page, and on a live ticket that is an attempt
+spent on a colour nobody chose. Whatever command the project supplies should
+disable subpixel antialiasing, and the entry should say so rather than leaving
+"determinism" as a word.
+
 ## What this does not claim
 
 The fixture is a reconstruction, so a reviewer naming its defects would be
@@ -227,4 +277,8 @@ shipped them. The stronger version is a UI ticket run live and reviewed blind,
 which is the thing the entry is for and which this cannot substitute for.
 
 And the author of the fixture cannot be its judge. Whoever wrote the answer key
-knows where to look.
+knows where to look — which is why both seats were sent the same prompt with the
+answer key withheld, and why the extra findings in §7 that are *not* among the
+four are reported here rather than counted: no grid drawn, a ruler strip that
+stops at the stage's width, tiles hugging x=0. Those are true of the fixture and
+say more about how crudely it was built than about either model.
