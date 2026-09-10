@@ -103,16 +103,37 @@ That is the same question the code reviewer is already asked, about a different
 artifact. It is an argument for one step and one role rather than a new kind of
 review.
 
-## 5. What is blocked, and it is not the framework
+## 5. The seat that looks — one flag, and it was already paid for
 
-**No configured role on this machine can see.** `claude-cli` declares
-`supports_images = False`; both llama.cpp models are text-only (`multimodal`
-false or absent); there is no `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or
-`GEMINI_API_KEY` set. The strongest model available here is unusable as a vision
-reviewer by its adapter's own declaration.
+**The first answer was wrong and the checkpoints settled it.** `claude-cli`
+declares `supports_images = False`; there is no `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY` or `GEMINI_API_KEY` set; and the executor's checkpoint,
+`Qwen3.8-27B-UD-Q4_K_M.gguf`, is `arch=qwen35` with no vision or clip keys in
+its metadata and **no `mmproj-*.gguf` anywhere in its repository**. Nothing to
+switch on.
 
-That declaration has a reason, and it also names the way out. From
-`claude_cli.py`:
+The reviewer's checkpoint is a different story. `nemotron-3-nano-omni` ships
+`mmproj-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16.gguf` beside its weights —
+`arch=clip`, `clip.has_vision_encoder`, 390 tensors — **already downloaded, and
+switched off on purpose.** `presets.py` writes `mmproj-auto = false` for any
+model whose block does not say `"multimodal": true`, and the router preset's own
+header gives the reason: *"spends VRAM no role here uses"*. That reason expired
+the moment a role wanted to look.
+
+So the seeing seat cost one flag in `.hybridforge/config.json`, a regenerated
+preset, and a router restart — no key, no download, no code. It also lands on
+the seat the design already wanted: nemotron serves `reviewer`, which is
+`loop.viewRole`'s default, so nothing is reassigned.
+
+What it costs is the projector's VRAM on every load of that checkpoint, which
+under `--models-max 1` is whenever the planner or the reviewer runs.
+
+**`scripts/ui_replay.py --review <repo> --role reviewer`** is the judge half,
+and it asks the config which model looks rather than deciding for itself. A role
+whose provider cannot see is refused before a prompt is built.
+
+`claude-cli`'s declaration has a reason, and it also names a second way out,
+worth keeping for a machine with no local vision model. From `claude_cli.py`:
 
 > The prompt reaches the CLI as text on stdin and there is nowhere to put bytes.
 > Naming a file path instead would not work either: this adapter defaults to no

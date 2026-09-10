@@ -32,10 +32,15 @@ PNG and exit. No driver, no runtime dependency, no long-lived process -- which
 is as far as a *static* page goes, and exactly as far as this experiment needs
 to go. `FORGE_BROWSER` names the binary when the defaults below miss.
 
-The other half needs a role that can see, and this machine has none -- the
-`claude-cli` adapter declares `supports_images = False`, both llama.cpp models
-are text-only, and there is no key for a vision endpoint. When there is one, the
-criteria this prints are what to put beside the screenshot.
+The other half needs a role that can see, and which role that is belongs to the
+project's config rather than to this script:
+
+    python scripts/ui_replay.py --review /path/to/repo --role reviewer
+
+`--review` loads that repository's `.hybridforge/config.json`, refuses a role
+whose provider cannot see, and otherwise sends the capture with the spec and
+the criteria beside it. What it must not send is `UNSEEN` below, which is the
+answer key: handing a reviewer the verdict is not a test of the reviewer.
 """
 
 from __future__ import annotations
@@ -45,6 +50,10 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # the providers are imported where they are used
+    from forge.providers import Message
 
 OUT = Path(__file__).resolve().parent / "ui-replay"
 
@@ -227,12 +236,114 @@ def capture(page_path: Path, size: tuple[int, int] = (460, 300)) -> Path:
     return out
 
 
+REVIEW_SYSTEM = """You are reviewing a rendering against the criteria it was
+built to satisfy.
+
+You are shown one screenshot and the ticket's acceptance criteria. Answer for
+each criterion whether the rendering satisfies it, and then say what else is
+wrong with what you can see.
+
+Rules:
+- Judge the picture, not the code. You have not been shown any source.
+- A criterion the picture cannot settle is `UNKNOWN`, not a guess. Say what
+  you would need to see.
+- Something the spec asks for and the picture does not contain is a finding,
+  and it is the easiest kind to miss: an element that was never drawn looks
+  exactly like empty space.
+
+Answer in this shape, and nothing else:
+
+CRITERION 1: PASS | FAIL | UNKNOWN — one sentence
+...
+FINDINGS:
+- one line each, or NONE
+"""
+
+# What the ticket asked for, as the reviewer is told it. The criteria are the
+# `CRITERIA` above in the reviewer's own words; the spec lines are what the
+# postmortem records the spec as having said, and without them three of the
+# four defects are unfindable -- see docs/UI-REPLAY.md §4.
+REVIEW_SPEC = """## Spec
+
+The editor shows a level on a grid. A ruler runs along the top of the stage and
+labels each column with its index, and every label is positioned over the
+column it names. A minimap sits in the stage's bottom-right corner. The header
+carries a zoom readout, expressed as a percentage of scale 32, and a control a
+person uses to open a level file.
+
+## Acceptance criteria
+"""
+
+
+def review_prompt(shot: Path) -> list["Message"]:
+    """The screenshot, the spec and the criteria, as one prompt."""
+    from forge.prompts import reference_images_message
+    from forge.providers import ImagePart, Message
+
+    criteria = "\n".join(f"{i}. {text}" for i, (text, _) in enumerate(CRITERIA, 1))
+    image = ImagePart(
+        media_type="image/png", data=shot.read_bytes(), path=str(shot)
+    )
+    attached = reference_images_message([image], can_see=True)
+    assert attached is not None
+    return [
+        Message(role="system", content=REVIEW_SYSTEM),
+        attached,
+        Message(role="user", content=f"{REVIEW_SPEC}{criteria}\n"),
+    ]
+
+
+def review(root: Path, role: str) -> int:
+    """Put the capture to a configured role and print what it says.
+
+    `root` is a repository whose `.hybridforge/config.json` names the models,
+    so which model looks is a question the config answers and this script does
+    not -- the design the roadmap entry settles. A role whose provider cannot
+    see is refused here rather than sent a prompt it would answer blind.
+    """
+    from forge.config import Config
+
+    config = Config.load(root)
+    provider = config.provider_for(role)
+    if not provider.capabilities().supports_images:
+        raise SystemExit(
+            f"role {role!r} is {config.model_name_for(role)!r}, which cannot "
+            f"see. Point it at a multimodal model, or name another role."
+        )
+
+    shot = capture(build())
+    print(f"shot: {shot}")
+    print(f"role: {role} -> {config.model_name_for(role)} ({provider.kind})\n")
+    completion = provider.complete(
+        review_prompt(shot),
+        max_tokens=min(4096, provider.capabilities().max_output_tokens),
+        temperature=0.0,
+    )
+    print(completion.text.strip())
+    print(
+        f"\n[{completion.usage.prompt_tokens} prompt, "
+        f"{completion.usage.completion_tokens} completion tokens]"
+    )
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--page", action="store_true", help="build and print the path")
     parser.add_argument("--capture", action="store_true", help="also render it to a PNG")
+    parser.add_argument(
+        "--review",
+        metavar="ROOT",
+        help="put the capture to a configured role in this repository and stop",
+    )
+    parser.add_argument(
+        "--role", default="reviewer", help="which role looks (default: reviewer)"
+    )
     parser.add_argument("--answers", action="store_true", help="print the answer key")
     args = parser.parse_args(argv)
+
+    if args.review:
+        return review(Path(args.review), args.role)
 
     path = build()
     if args.page:
