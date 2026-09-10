@@ -824,6 +824,7 @@ class Orchestrator:
         images_withheld: Sequence[str] = (),
         tools: Sequence[ToolSpec] = (),
         thinking: bool = True,
+        model: str = "",
     ) -> Completion:
         """One model call, with the budget gate wrapped around it.
 
@@ -837,8 +838,17 @@ class Orchestrator:
         see is told the files exist and named rather than sent them — raising
         would end a code ticket over a screenshot nobody needed.
         """
-        provider = self.config.provider_for(role)
-        model_name = self.config.model_name_for(role)
+        # `model` overrides which checkpoint answers, and nothing else: the
+        # role still decides the prompt, the budget, the step label and what
+        # the usage is recorded against. Only the capture review passes it —
+        # see `loop.viewModel`, which exists so a backlog of local models can
+        # send its one seeing call somewhere that can see.
+        provider = (
+            self.config.provider_for_model(model)
+            if model
+            else self.config.provider_for(role)
+        )
+        model_name = model or self.config.model_name_for(role)
 
         if images or images_withheld:
             attached = reference_images_message(
@@ -957,6 +967,10 @@ class Orchestrator:
         temperature: float = 0.2,
         images: Sequence[ImagePart] = (),
         images_withheld: Sequence[str] = (),
+        # Passed straight through to every `_call` this conversation makes, so
+        # a capture review runs on the model `loop.viewModel` names rather than
+        # on the seat's own. Empty everywhere else.
+        model: str = "",
     ) -> Completion:
         """One role's turn, with read tools, until it answers.
 
@@ -994,7 +1008,7 @@ class Orchestrator:
         if not self._can_read(role):
             return self._call(
                 run_id, role, messages, **attachments,
-                max_tokens=max_tokens, temperature=temperature,
+                max_tokens=max_tokens, temperature=temperature, model=model,
             )
 
         toolbox = Toolbox(self.config.root)
@@ -1019,6 +1033,7 @@ class Orchestrator:
                 **(attachments if len(thread) == len(messages) else {}),
                 max_tokens=max_tokens,
                 temperature=temperature,
+                model=model,
                 # Withdrawn for the answering turns. Offering tools while
                 # saying "answer now" is a contradiction, and the models that
                 # lose that argument lose it by calling one more tool.
@@ -6826,6 +6841,11 @@ class Orchestrator:
                 **self._attachments(images, images_withheld),
                 max_tokens=self._output_budget(viewer),
                 temperature=0.0,
+                # Only when there is something to look at. A ticket with no
+                # rendering is reviewed by the seat's own model, so a project
+                # naming a vision model here does not pay for it on every
+                # ticket in the backlog.
+                model=self.config.loop.view_model if rendered else "",
             )
         except ProviderError as exc:
             self.store.end_step(step_id, "failed", str(exc))
