@@ -530,6 +530,115 @@ spec does not survive contact.
 
 ---
 
+## Looking at what it built — a UI ticket the loop can see
+
+**Status:** not built, and asked for. What exists is listed below; what is
+missing is one process primitive and one step.
+
+**The problem has evidence, and it is this repository's own.**
+[CANVAS-POSTMORTEM.md](CANVAS-POSTMORTEM.md) §7 records four defects that
+shipped together in one page, with **146 tests green and four commands clean**:
+
+- the ruler labelled the wrong columns — every label positioned at a world
+  coordinate with `view.origin` never subtracted, so column 0's label sat 95
+  pixels from column 0. **Six criteria covered that ruler**, all about how many
+  labels are emitted and which indices they carry, and none said *where a label
+  goes*;
+- the ruler was never drawn, because nothing imported it;
+- the zoom readout showed `1500%` where the spec said a percentage of scale 32;
+- the page's file input was `hidden` with nothing to open it, so the editor
+  could not load a level at all.
+
+Every one of those is visible in a single screenshot, and none of them is
+reachable by a suite that passes. That is the whole argument.
+
+**The current mitigation catches absence, not wrongness.** `check_spec.py`
+reminds an author when a backlog writes an entry point, and `spec-contract`
+tells them to assert the wiring mechanically — *"imports `composeFrame` and
+calls it"*, *"contains a control with id `open`"*. Those are worth having and
+they caught the missing control. They cannot catch a control that exists and is
+invisible, a label that is emitted and misplaced, or a number that is rendered
+and wrong. The ruler had six criteria and shipped 95 pixels off.
+
+### What already exists
+
+| | |
+|---|---|
+| multimodal messages | a role can be handed a PNG today — [IMAGE-LOOP.md](IMAGE-LOOP.md) phase 1, shipped |
+| `supports_images`, `roleNeeds: ["images"]` | a reviewer that cannot see is refused at `validate` rather than shown a filename |
+| reference images | a ticket's reading scope attaches its `.png` files to executor, tester and reviewer |
+| `commands.test[".png"]` | per-language verify already runs a tester-written check against an *artifact* rather than against code |
+| `artifacts.py` | durable per-step recording — where a screenshot would live |
+| `processes._start` / `_kill_tree` | process-group start, and a kill that actually kills the tree |
+
+### What is missing
+
+1. **A process that outlives one command.** `run_command` runs to completion,
+   and nothing starts an app and holds it while something else probes it. This
+   is the framework piece, and half of it is already written: `_start` puts the
+   child in its own group and `_kill_tree` reaps it, which is the hard part on
+   both platforms.
+2. **Something that drives the UI.** A screenshot needs a browser or a toolkit
+   harness. This is where it gets difficult for some programs, and where the
+   design should refuse to be clever: **the project supplies the command, the
+   loop supplies the shape.** Playwright is the obvious answer for the web and
+   is a runtime dependency this project does not have and should not acquire; a
+   project that already has it writes one line of config.
+3. **The step that looks.** After apply and verify, run the project's capture
+   command, attach what it produced to review, and judge the criteria that are
+   about what is visible.
+
+### Why it is the same loop as the image one
+
+The steps are named after code and only two of them are about code. The rest is
+a shape — *produce an artifact under a scope, check it mechanically, have
+something that gains nothing from passing rule on it, refine until a criterion
+is met or the budget runs out.* An image ticket is that shape with a generated
+artifact. **A UI ticket is that shape with an artifact the project's own build
+produces**, which makes it the easier of the two: there is no image provider to
+choose, no `supports_edit` question, and the refinement input is an ordinary
+code edit rather than a mask.
+
+So the two should share the step and differ only in who makes the pixels. If
+that is true, the capture command belongs beside `lint` and `test` in
+`commands`, and the vision review is one call per *attempt* — the same
+per-attempt cost [IMAGE-LOOP.md](IMAGE-LOOP.md) already argues for, and for the
+same reason: what it is checking changes every attempt.
+
+### What has to be decided
+
+- **Which criteria are pixels and which are judgement.** *"the histogram is
+  800×600"* is an assertion a `.png` test command can make today. *"the label
+  sits above the column it names"* is a vision verdict. That split is the
+  unverifiable-criterion problem IMAGE-LOOP §5 already answers by blocking at
+  ingest, and it should be answered once for both.
+- **Determinism.** Fonts, DPI and platform move pixels. A pixel-diff against a
+  golden image is the wrong default for a loop that is supposed to converge on
+  behaviour; a vision verdict against a stated property is the right one, and
+  costs a call.
+- **Headless.** Some UIs cannot run without a display, and some cannot run at
+  all in CI. A project that cannot produce a PNG does not get this step, the
+  same way a project with no lint command does not get lint.
+- **Whether a screenshot is a reference file or a step artifact.** It is
+  produced by the run, so it is an artifact; but the reviewer reads it as
+  reference. `artifacts.py` and the reading scope currently have no shared
+  vocabulary for that.
+
+### The cheapest thing that could kill it
+
+**A replay, buildable with what exists today.** Take the canvas run's own
+delivered HTML, screenshot it once by hand, put the image to a vision reviewer
+with PF-015's actual criteria, and count what it names. If it does not report
+the ruler offset, the zoom readout, or the invisible file input, then the step
+is theatre and none of the framework above is worth building. If it names them,
+that is the first evidence this document has — and unlike everything else here,
+it needs no new machinery, no long-lived process, and no driver.
+
+That replay is the next thing to do, and it should happen before the process
+primitive.
+
+---
+
 ## Sign-off cost — replayed, and the knob is not free
 
 **Status:** measured 2026-09-07 by `scripts/ratify_cost.py`, nothing built. The

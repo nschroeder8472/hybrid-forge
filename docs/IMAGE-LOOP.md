@@ -16,6 +16,16 @@ The claim this spec tests is that the shape is the valuable part. If it is, an
 image ticket is a `kind`, the way a bug ticket is — not a sibling tool with its
 own state machine.
 
+**A second artifact wants the same shape, and has evidence this one does not.**
+*Looking at what it built* in [ROADMAP.md](ROADMAP.md) asks for a UI ticket the
+loop can see — start the app, capture it, judge what is visible — and it opens
+with four defects that shipped in one page on a green suite. It is the easier
+half of the same problem: the artifact is produced by the project's own build
+rather than by a model, so there is no image provider to choose and no
+`supports_edit` question, and the refinement input is an ordinary code edit
+rather than a mask. Whatever step is built to look at a rendering should be one
+step, not two.
+
 ---
 
 ## What has no evidence yet
