@@ -684,10 +684,25 @@ worth building.
   headless, one command, a 3.4 KB PNG. No driver, no dependency, and for a
   static page no long-lived process either — which bounds what item 1 above is
   actually for: it is needed by an app with a server, not by a page.
-- **The judge half cannot run here.** No configured role can see: `claude-cli`
-  declares `supports_images = False`, both llama.cpp models are text-only, and
-  there is no key for a vision endpoint. That is the open question this entry
-  now waits on, and it is a smaller one than the framework.
+- **The judge half has now run, and the answer is *partly*.** The seat cost one
+  flag: `nemotron-3-nano-omni` already had its projector on disk, switched off
+  because `presets.py` writes `mmproj-auto = false` for any model not declared
+  `multimodal`. With it loaded, the reviewer found **one of the four defects**
+  — the unreachable file input — miscalled one criterion that holds, and missed
+  the minimap and the zoom readout. Run twice at temperature 0, byte-identical.
+
+  The find is the mechanism, not luck. *"The page contains a file input that
+  accepts `.json`"* is exactly the wiring assertion `spec-contract` already asks
+  for, and it **passes as a source check and fails as a render check** — the
+  same sentence, opposite verdicts, and the rendering's is the true one. What
+  the reviewer added *beyond* the criteria was nothing: both runs' free-form
+  findings restated the failed criteria. So the step is worth building as
+  re-asking the existing criteria of the rendering, and not as asking a model
+  what looks wrong.
+
+  The seat is also the weakest available — a 30B local checkpoint missing a
+  95-pixel offset says as much about the checkpoint as about the step. The same
+  page against a frontier vision model is one call and still unrun.
 
 **And looking at the capture changed what the step should be asked.** Only the
 label offset is visible as an internal inconsistency. A minimap that was never
