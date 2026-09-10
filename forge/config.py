@@ -1742,7 +1742,7 @@ class Config:
     def write(self) -> Path:
         """Serialize back to disk, preserving the documented shape."""
         self.config_dir.mkdir(parents=True, exist_ok=True)
-        payload = {
+        payload: dict[str, Any] = {
             "room": self.room,
             "models": self.models,
             "roles": self.roles,

@@ -1064,20 +1064,20 @@ def revise(
     if "allowed_files" in revision:
         # Shared with `ratify`, which does the same thing one step earlier —
         # see `patch.keep_test_paths` for what each of them cost.
-        revision["allowed_files"], dropped = keep_test_paths(
+        revision["allowed_files"], dropped_paths = keep_test_paths(
             ticket.allowed_files, revision["allowed_files"]
         )
-        if dropped:
+        if dropped_paths:
             store.log(
                 run_id,
                 f"{ticket.ticket_id}: respec proposed dropping "
-                f"{', '.join(dropped)} from the writable scope. That is the "
+                f"{', '.join(dropped_paths)} from the writable scope. That is the "
                 f"ticket's own test file — the tester writes there, and the "
                 f"executor repairs what it writes — so it was kept. The rest "
                 f"of the revision stands.",
                 level="warn",
                 kind="ticket",
-                data={"ticket": ticket.ticket_id, "kept": dropped},
+                data={"ticket": ticket.ticket_id, "kept": dropped_paths},
             )
 
     # A revision that re-proposes a cause the loop already disproved by running
@@ -1190,22 +1190,28 @@ def revise(
     # whole: a spec revised around a dropped decision has already reasoned from
     # its absence, and keeping the sentence while keeping the rest of that
     # reasoning would produce a spec that contradicts itself.
-    dropped: list[str] = []
+    #
+    # Not `dropped`: that name is already bound above, to the test paths the
+    # revision tried to drop from the writable scope. Two unrelated lists under
+    # one name in one function, the second silently overwriting the first.
+    dropped_decisions: list[str] = []
     if "spec" in revision:
-        dropped = _dropped_decisions(ticket, revision["spec"], ruled_out)
-        if dropped:
+        dropped_decisions = _dropped_decisions(ticket, revision["spec"], ruled_out)
+        if dropped_decisions:
             revision.pop("spec")
             store.log(
                 run_id,
-                f"{ticket.ticket_id}: respec dropped {len(dropped)} decision(s) "
-                f"the plan marked as settled; the spec revision was refused. A "
-                f"decision is not a criterion, so nothing downstream would have "
-                f"noticed — the ticket would have gone green against a choice "
-                f"nobody made:\n"
-                + "\n".join(f"  - {decision}" for decision in dropped[:5]),
+                f"{ticket.ticket_id}: respec dropped "
+                f"{len(dropped_decisions)} decision(s) the plan marked as "
+                f"settled; the spec revision was refused. A decision is not a "
+                f"criterion, so nothing downstream would have noticed — the "
+                f"ticket would have gone green against a choice nobody made:\n"
+                + "\n".join(
+                    f"  - {decision}" for decision in dropped_decisions[:5]
+                ),
                 level="warn",
                 kind="ticket",
-                data={"decisions": dropped},
+                data={"decisions": dropped_decisions},
             )
 
     restored_context = _preserve_plan_context(ticket, revision)
@@ -1353,7 +1359,7 @@ def revise(
             refused_criteria=refused,
             minted_criteria=minted,
             admitted_criteria=admitted,
-            refused_decisions=dropped,
+            refused_decisions=dropped_decisions,
             restored_context=restored_context,
             pending_scope=pending_scope,
         )
@@ -1413,7 +1419,7 @@ def revise(
         refused_criteria=refused,
         minted_criteria=minted,
         admitted_criteria=admitted,
-        refused_decisions=dropped,
+        refused_decisions=dropped_decisions,
         restored_context=restored_context,
         pending_scope=pending_scope,
     )

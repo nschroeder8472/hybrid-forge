@@ -191,10 +191,13 @@ def candidates(path: str, target: str) -> list[str]:
         for _ in range(level - 1):
             base = base.parent
         parts = module.split(".") if module else []
-        stem = base.joinpath(*parts) if parts else base
+        # Not `stem`: that name is bound to a `str` in the Rust branch above,
+        # and reusing it here for a `Path` is two types under one name inside
+        # one function.
+        package = base.joinpath(*parts) if parts else base
         return [
-            _posix(stem.with_suffix(".py")) if parts else "",
-            _posix(stem / "__init__.py"),
+            _posix(package.with_suffix(".py")) if parts else "",
+            _posix(package / "__init__.py"),
             # A relative `from .x import y` where `y` is the module and `x` the
             # package is spelled `from .x import y` too, so the parent package
             # existing is enough to say this names something real.

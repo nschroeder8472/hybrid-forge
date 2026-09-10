@@ -973,12 +973,38 @@ changes what a re-run would measure. Touched `ingest.py`, `cli.py` and the
 the only thing that can say whether the reads they were built to cheapen are
 actually cheaper.
 
-**A type checker is unclaimed.** `.flake8` is the only static analysis
-configured. Every shape defect this session cost a full test run to find — a
-kwarg threaded through five providers, a `Callable` alias becoming a `Protocol`,
-a dataclass field whose emptiness would have silently blinded three guards.
-mypy and pyright are development dependencies, so the zero-runtime-dependency
-rule never blocked them.
+**A type checker is claimed — mypy, 2026-09-09.** `.flake8` was the only static
+analysis configured, and flake8 does not read types. Every shape defect this
+session cost a full test run to find — a kwarg threaded through five providers,
+a `Callable` alias becoming a `Protocol`, a dataclass field whose emptiness
+would have silently blinded three guards. mypy and pyright are both development
+dependencies, so the zero-runtime-dependency rule never blocked either; mypy
+installs with pip and needs no Node.
+
+`[tool.mypy]` in `pyproject.toml` checks `forge` against **3.10**, the floor
+`requires-python` sets, with `disallow_untyped_defs` on so a function added
+without annotations fails rather than opting its body out of every other check.
+`tests/test_types.py` is the gate, following `test_lint.py` exactly: a missing
+mypy fails instead of skipping.
+
+**What the first clean run found is not what the argument usually promises.**
+No live crashes. What it found were traps — the class of thing a test suite is
+worst at:
+
+- one name bound to two unrelated lists in `respec._revise`, where the second
+  binding silently won and the first was correct only because every read of it
+  happened before the rebinding;
+- three `lastrowid` reads that would raise rather than return if SQLite handed
+  back what its own stubs say it can;
+- the `Caller` protocol's third parameter named `max_tokens` against an
+  implementation calling it `budget` — every caller passes it positionally, so
+  it works until the first one that does not, and then it is a `TypeError` in
+  the middle of a sign-off pass, from a protocol that says it is satisfied;
+- half a dozen locals holding two types at different points, one of them a
+  `Path` reusing a `str`'s name inside one function.
+
+Eight functions were missing annotations and now have them, which is what lets
+the gate hold the line rather than only record where it was drawn.
 
 ---
 

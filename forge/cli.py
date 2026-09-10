@@ -39,6 +39,7 @@ import sys
 import time
 import webbrowser
 from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path
 
 from . import (
@@ -83,7 +84,7 @@ from .memory import MemoryClient
 from .patch import matches_any
 from .prompts import bug_prompt, locate_prompt, parse_bug, parse_locate
 from .profile import Profile
-from .providers import ProviderError
+from .providers import Completion, Message, ProviderError
 from .state import (
     RUN_IDLE,
     TICKET_BLOCKED,
@@ -628,7 +629,9 @@ def _report_duplicated_typecheck(config: Config) -> None:
             )
 
 
-def _report_typecheck_gaps(config: Config, census) -> None:
+def _report_typecheck_gaps(
+    config: Config, census: Counter[tuple[str | None, str]]
+) -> None:
     """Languages whose test command does not type-check them, and nothing else does.
 
     Reported, never gated — the same weight `LANGUAGE-COVERAGE.md` gives lint,
@@ -666,7 +669,9 @@ def _report_typecheck_gaps(config: Config, census) -> None:
     )
 
 
-def _print_matrix(config: Config, workspace, census: dict[str, int]) -> list[str]:
+def _print_matrix(
+    config: Config, workspace: Workspace, census: dict[str, int]
+) -> list[str]:
     """One build's language matrix. Returns its uncovered extensions."""
     width = max(max(len(suffix) for suffix in census), 8)
     print("\n  language  files  test / lint")
@@ -782,8 +787,8 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     # but which of them goes first is a decision just made on their behalf.
     if derived:
         print(f"\nOrdered {len(derived)} pair(s) that write the same file:")
-        for later, earlier, path in derived:
-            print(f"  {later} waits for {earlier}  ({path})")
+        for later, earlier, shared in derived:
+            print(f"  {later} waits for {earlier}  ({shared})")
 
     print("\nReview the tickets, then run `forge go`.")
     return 0
@@ -1054,7 +1059,7 @@ def _respec(
     # the first character of the answer.
     budget = provider.capabilities().max_output_tokens
 
-    def call(messages, limit):
+    def call(messages: list[Message], limit: int) -> Completion:
         return provider.complete(messages, max_tokens=limit, temperature=0.0)
 
     locked = not (config.loop.respec_criteria or allow_criteria)
@@ -1934,7 +1939,7 @@ def _write_command(
     kind: str,
     language: str,
     command: str | bool,
-    suffixes=(),
+    suffixes: Sequence[str] = (),
 ) -> int:
     """Put one language's command into one build, turning a string into a map.
 
@@ -1948,10 +1953,13 @@ def _write_command(
     succeeded, printed a confirmation, and changed no behaviour at all.
     """
     existing = workspace.commands.get(kind, "")
-    if isinstance(existing, str) and existing:
-        block = {ANY_LANGUAGE: existing}
-    else:
-        block = dict(existing or {})
+    # `str | bool`, not `str`: `--skip` writes a literal `false` for a language
+    # somebody has decided not to check, which `_exempt` reads back.
+    block: dict[str, str | bool] = (
+        {ANY_LANGUAGE: existing}
+        if isinstance(existing, str) and existing
+        else dict(existing or {})
+    )
     for key in suffixes or (language,):
         if key != ANY_LANGUAGE:
             block[key] = command

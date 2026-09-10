@@ -354,7 +354,7 @@ def _ask_again(
 _SPEC_RUNAWAY = 4.0
 
 
-def _prompt_digest(prompt) -> str:
+def _prompt_digest(prompt: Sequence[Message]) -> str:
     """A stable fingerprint of a revision prompt, for "have we asked this?".
 
     Over the messages' text, so a prompt rebuilt from the same ticket and the
