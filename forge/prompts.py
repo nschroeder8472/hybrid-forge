@@ -3403,10 +3403,47 @@ something you cannot work under, and the loop takes your reason over your vote.
 # between four sign-offs and four opinions: a role asked "is this ticket good?"
 # answers about somebody else's job, and a planner reading four such answers
 # cannot tell which of them it has to act on.
+# The heading over the current tree in a sign-off prompt, and the sentence that
+# keeps it from being read as a defect list.
+#
+# Ratification is the one pass where the code and the contract are *supposed*
+# to disagree: nothing has been built, so everything the spec promises is
+# absent. Handed a spec and a tree under a neutral heading, a role can answer
+# by subtracting one from the other, and what comes back is the ticket restated
+# as objections to itself. Two seats did exactly that across four passes of one
+# ticket, and neither was wrong about the facts.
+#
+# Only the sign-off prompts say this. After an attempt has failed, a gap
+# between the spec and the tree is the most useful thing respec can be shown,
+# and telling it to expect one would be telling it to ignore the evidence.
+RATIFY_SOURCES_HEADING = """## The files as they exist now, before this ticket is built
+
+This is the tree the ticket starts from, and everything the spec says it will
+add is missing here — that is what *before* means. A field the spec introduces,
+a function it says to write, a call it says to add: absent below, present
+afterwards, and neither is an objection. Read this to judge whether what the
+ticket asks for fits what is already here, never to report the difference."""
+
 RATIFY_QUESTIONS = {
+    # Future tense for the reason the reviewer's is, and it took a second run
+    # to notice this seat had never been given the same treatment. "Does its
+    # scope match what it describes" is answerable by diffing the spec against
+    # the tree, and a model that answers it that way reports every field the
+    # ticket adds as a field the ticket lacks. One planner blocked the same
+    # ticket twice with five objections that were the spec's own bullets
+    # restated: *"World struct lacks `level_data: Level` and `spawn: (f32,
+    # f32)` fields; must add them"* — which is the ticket, written as a fault
+    # in the ticket. The two questions that never failed this way, the
+    # executor's and the tester's, both ask what the role could *do*, and no
+    # comparison of spec to tree answers that.
     "planner": (
-        "Is this still one testable unit of the work the plan asked for, with "
-        "the right dependencies, and does its scope match what it describes?"
+        "Once this ticket has been built, will it be one testable unit of the "
+        "work the plan asked for? Its scope is what it may write, not what "
+        "exists: every file the spec says it will create is missing from the "
+        "tree right now, by definition, and that is the work rather than a "
+        "fault in the contract. Name a dependency it needs and does not "
+        "declare, a file the spec tells it to write that the allowed scope "
+        "leaves out, or work here that belongs in a ticket of its own."
     ),
     "executor": (
         "Could you produce this implementation using only the spec, the scope, "
@@ -3544,7 +3581,7 @@ def ratify_prompt(
 
     if sources:
         body += f"""
-## The files as they exist now
+{RATIFY_SOURCES_HEADING}
 {_sources_block(sources)}
 """
 
@@ -3804,7 +3841,7 @@ def ratify_revision_prompt(
 
     if sources:
         body += f"""
-## The files as they exist now
+{RATIFY_SOURCES_HEADING}
 {_sources_block(sources)}
 """
 

@@ -23007,6 +23007,65 @@ class TestTheSignOffPassDoesNotAskForAReview(unittest.TestCase):
         self.assertIn("already settled", question)
         self.assertIn("sign off on it", question)
 
+    def test_the_planner_is_asked_about_a_ticket_that_is_not_built_yet(self):
+        """The same trap the reviewer's question was rewritten to avoid, on the
+        one seat that never got the treatment.
+
+        `does its scope match what it describes` is answerable by diffing the
+        spec against the tree, and a planner that answered it that way blocked
+        one ticket twice with five objections that were the spec's own bullets
+        restated as faults.
+        """
+        from forge.prompts import RATIFY_QUESTIONS
+
+        question = RATIFY_QUESTIONS["planner"]
+
+        self.assertIn("Once this ticket has been built", question)
+        self.assertNotIn("does its scope match what it describes", question)
+
+    def test_the_tree_is_labelled_as_the_one_before_the_ticket(self):
+        """A sign-off prompt carries the spec and the code that does not
+        implement it yet. Under a neutral heading a role can answer by
+        subtracting one from the other, and what comes back is the ticket
+        restated as objections to itself."""
+        from forge.prompts import ratify_prompt
+
+        ticket = Ticket(
+            ticket_id="PF-003",
+            title="serialize a level",
+            spec="`World` gains `pub level_data: Level`.",
+            criteria=["it round-trips"],
+        )
+        body = "\n".join(
+            message.text
+            for message in ratify_prompt(
+                ticket, "planner", sources={"src/world.rs": "pub struct World {}"}
+            )
+        )
+
+        self.assertIn("before this ticket is built", body)
+        self.assertIn("never to report the difference", body)
+
+    def test_respec_is_not_told_to_expect_the_gap(self):
+        """After an attempt has failed, a gap between the spec and the tree is
+        the most useful thing respec can be shown. Telling it to expect one
+        would be telling it to ignore its own evidence."""
+        from forge.prompts import respec_prompt
+
+        ticket = Ticket(
+            ticket_id="PF-003", title="t", spec="s", criteria=["c"],
+            allowed_files=["src/a.py"],
+        )
+        body = "\n".join(
+            message.text
+            for message in respec_prompt(
+                ticket, [{"name": "tests", "detail": "1 failed"}],
+                sources={"src/a.py": "x = 1"},
+            )
+        )
+
+        self.assertNotIn("never to report the difference", body)
+
     def test_the_reviewer_still_gets_its_own_question_and_not_anothers(self):
         from forge.prompts import RATIFY_QUESTIONS
 
