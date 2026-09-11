@@ -19370,6 +19370,99 @@ class TestTheSignOffPass(unittest.TestCase):
         )
         return seen
 
+    def _costed_caller(self, script, costs):
+        """A caller whose replies carry token counts, keyed by role."""
+
+        def call(role, messages, budget, **_options):
+            self.calls.append(role)
+            replies = script[role]
+            reply = replies.pop(0) if isinstance(replies, list) else replies
+            spend = costs.get(role, 0)
+            return Completion(
+                text=reply,
+                usage=Usage(completion_tokens=spend),
+                finish_reason="stop",
+            )
+
+        return call
+
+    # The empty answer skeleton, formatted exactly as the prompt asks for it.
+    HUSK = "SIGNOFF: no\nBLOCKING:\n- NONE\nSUGGEST:\n- NONE"
+
+    def test_an_expensive_empty_refusal_is_not_counted_as_a_refusal(self):
+        """The platformer run: nemotron returned this 14 times across two
+        seats, 8,217 completion tokens and 49 bytes apiece. The reasoning ran
+        out before the verdict was written, and counting it as a no parked
+        tickets on a position no role ever took."""
+        script = {role: "SIGNOFF: yes" for role in ROLES}
+        script["reviewer"] = [self.HUSK, self.HUSK]
+
+        result = ratify.ratify(
+            self.store,
+            self.run_id,
+            self.ticket,
+            call=self._costed_caller(script, {"reviewer": 8217}),
+            budget_for=lambda role: 4096,
+            roles=ROLES,
+            passes=2,
+            root=self.root,
+        )
+
+        self.assertEqual(result.status, ratify.UNANIMOUS)
+
+    def test_a_cheap_empty_refusal_still_stands(self):
+        """A role that means "no, and I have nothing to point at" says so in
+        about twenty tokens. That is a verdict, and withdrawing it would be
+        talking a role out of its vote."""
+        script = {role: "SIGNOFF: yes" for role in ROLES}
+        script["reviewer"] = [self.HUSK, self.HUSK]
+
+        result = ratify.ratify(
+            self.store,
+            self.run_id,
+            self.ticket,
+            call=self._costed_caller(script, {"reviewer": 20}),
+            budget_for=lambda role: 4096,
+            roles=ROLES,
+            passes=1,
+            root=self.root,
+        )
+
+        # Three of four rather than three of three: the refusal is still in
+        # the denominator, which is the whole difference from the case above.
+        self.assertEqual(result.status, ratify.MAJORITY)
+
+    def test_a_husk_that_names_a_reason_when_asked_again_keeps_it(self):
+        """Recovery comes first. The withdrawal is only for a role that is
+        still empty after being shown its own reply."""
+        script = {role: "SIGNOFF: yes" for role in ROLES}
+        script["reviewer"] = [
+            self.HUSK,
+            "SIGNOFF: no\nBLOCKING:\n- the scope omits src/b.rs",
+        ]
+
+        result = ratify.ratify(
+            self.store,
+            self.run_id,
+            self.ticket,
+            call=self._costed_caller(script, {"reviewer": 8217}),
+            budget_for=lambda role: 4096,
+            roles=ROLES,
+            passes=1,
+            root=self.root,
+        )
+
+        # Counted, not withdrawn: three of four, and the reason on the record
+        # for the planner to work from.
+        self.assertEqual(result.status, ratify.MAJORITY)
+        blocking = [
+            point
+            for note in result.notes
+            if note["role"] == "reviewer"
+            for point in note["blocking"]
+        ]
+        self.assertIn("the scope omits src/b.rs", blocking)
+
     def test_a_vote_reasons_unless_the_setting_says_otherwise(self):
         seen = self._thinking_asked({role: "SIGNOFF: yes" for role in ROLES})
 

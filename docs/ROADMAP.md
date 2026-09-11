@@ -1085,6 +1085,48 @@ and the pass has no way to tell it apart from a signature.
 
 **That is now fixed by asking again rather than by discarding the vote.** A refusal naming nothing is put back to the same role in the same thread — the question it was asked, its own reply, and a turn saying that reply refuses without naming anything and would park the ticket with no reason on it. A model that had a reason gives it; one that refused by accident signs. Two guards keep it from becoming an argument: a second empty refusal leaves the refusal exactly as it stood, and a *truncated* refusal is not re-asked at all, because running out of output room already has its own reading and is recorded as the blocking point.
 
+**Asking again was not enough, and a live run put a number on how often — 2026-09-10.**
+The platformer backlog ran with nemotron in the planner and reviewer seats at a
+`reasoningBudget` of 8192. Across 40 sign-off votes, **14 came back as 8,217
+completion tokens and 49 bytes of output** — the empty answer skeleton,
+byte-identical every time, in both seats, surviving the second asking. 35% of
+that model's votes, and 203,788 tokens spent on replies carrying nothing.
+
+The guess above was right about the mechanism and wrong about the remedy. The
+reasoning consumes the allowance, the verdict it was working towards never gets
+written, and what reaches the parser is a correctly formatted refusal of
+nothing. Asking again produces the same thing, because the second call has the
+same budget and the same amount of thinking to do.
+
+What makes it invisible is that no field reports it. `finish_reason` is `stop`
+and `truncated` is false, both correctly: the *answer* completed. It was the
+reasoning before it that ran out, and no provider reports a reasoning cut. The
+signal that does exist is the cost: a role that means *no, and I have nothing
+to point at* says so in about twenty completion tokens — the measured figure
+from `arm-blurts` — and a husk costs three orders of magnitude more for the
+same four lines. Nothing has been observed between those two numbers.
+
+So `ratify._husk` reads the cost of a contentless refusal, and one that ran past
+`_HUSK_TOKENS` after being asked twice is recorded as a vote that did not
+happen rather than as a refusal. This is the one place a standing refusal is
+withdrawn, and the reason it does not contradict *never to talk a role out of
+its verdict* is that there was no verdict: the run above parked tickets on
+positions no role ever took. A cheap empty refusal still stands, and a provider
+reporting no usage at all leaves every refusal standing, because withdrawing a
+vote is the stronger move and should need a number behind it.
+
+**`resolve` had to change with it, and the change is older than the husk.** A
+vote that did not happen was already out of the numerator and still in the
+denominator, so one unreachable role made unanimity impossible and could push a
+pass to `blocked` on a verdict nobody reached — three roles signing and one
+outage read as three of four. Errored votes now leave the denominator too. The
+all-errors case returns `unavailable` exactly as before.
+
+What this does not fix is why that model needs more than 8192 tokens to answer
+a four-line question about a contract. Raising its budget, or giving the seat to
+a model that fits, are both still open; this only stops the loop reading the
+overflow as a refusal.
+
 ---
 
 ## Next, in order

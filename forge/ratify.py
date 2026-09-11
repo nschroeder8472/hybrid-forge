@@ -150,19 +150,26 @@ def resolve(votes: Sequence[Vote]) -> str:
     Nobody reachable is not a verdict. A pass where every call failed returns
     `unavailable`, and the caller proceeds unratified rather than parking a
     ticket over an outage.
+
+    **A vote that did not happen is not counted, and not only when none of
+    them did.** It is out of the denominator as well as the numerator, because
+    the alternative reads a role's silence as a refusal: four roles, three
+    signing and one unreachable, is a ticket three roles agreed on, and
+    counting the fourth as a no makes unanimity impossible and can push the
+    pass to `blocked` on a verdict nobody reached. One live run lost 14 votes
+    that way — see `_husk`.
     """
-    if not votes:
-        return UNAVAILABLE
-    if all(vote.error for vote in votes):
+    counted = [vote for vote in votes if not vote.error]
+    if not counted:
         return UNAVAILABLE
 
-    total = len(votes)
-    signed = sum(1 for vote in votes if vote.signed)
+    total = len(counted)
+    signed = sum(1 for vote in counted if vote.signed)
     if signed == total:
         return UNANIMOUS
     if signed * 2 > total:
         return MAJORITY
-    planner_signed = any(vote.signed for vote in votes if vote.role == PLANNER)
+    planner_signed = any(vote.signed for vote in counted if vote.role == PLANNER)
     if planner_signed and signed >= 2:
         return SPLIT
     return BLOCKED
@@ -200,6 +207,38 @@ def learnings(store: Store, run_id: int, *, exclude: str = "", limit: int = 6) -
         if len(lines) > limit * 4:
             break
     return "\n".join(lines)
+
+
+# What a contentless refusal costs before it stops being one. A role that
+# means "no, and I have nothing to point at" says so in about twenty
+# completion tokens -- the measured figure from `arm-blurts`, the run that
+# took reasoning off the vote entirely. A reasoning model whose budget runs
+# out mid-thought emits the same four lines for three orders of magnitude
+# more, because the verdict it was working towards never got written: one
+# live run produced 8,217 completion tokens and 49 bytes of output, fourteen
+# times, byte-identical, across both seats one model held. Nothing between
+# those two numbers has been observed, so the floor sits well clear of both.
+_HUSK_TOKENS = 1_000
+
+
+def _husk(completion: Completion) -> bool:
+    """Whether a contentless reply is one the model never finished reaching.
+
+    Asked only of a reply that already refuses and names nothing, so the
+    question left is what it cost to say. Cheap means the role had nothing to
+    say and said so, which is a verdict the pass must keep. Expensive means the
+    thinking consumed the allowance and the answer is what was left over, which
+    is not a verdict at all.
+
+    Deliberately not read off `finish_reason` or `truncated`: both describe the
+    *answer*, and in every recorded instance the answer completed normally. It
+    was the reasoning before it that ran out, and no provider reports that.
+
+    A provider that reports no usage at all leaves this false, so its refusals
+    stand as refusals. That is the right way round: withdrawing a vote is the
+    stronger move, and it should need a number to justify it.
+    """
+    return completion.usage.completion_tokens >= _HUSK_TOKENS
 
 
 def _vote(
@@ -266,6 +305,31 @@ def _vote(
             signed=signed, blocking=blocking, suggestions=suggestions,
             thinking=thinking,
         )
+        if not signed and not blocking and _husk(completion):
+            # Asked twice and still nothing, having spent an allowance on it.
+            # This is the one case where a standing refusal is withdrawn, and
+            # it is withdrawn because there was never a verdict behind it: the
+            # role reasoned until its budget ran out and emitted the answer
+            # skeleton. Counting that as a no parks the ticket on a position
+            # nobody took, and does it silently, since the reply is correctly
+            # formatted. Cheap refusals still stand -- see `_husk`.
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: the {role} spent "
+                f"{completion.usage.completion_tokens:,} tokens and returned "
+                f"the empty answer template, twice. Its reasoning ran out "
+                f"before it reached a verdict, so no vote is counted either "
+                f"way. Raise that model's reasoning budget, or give the seat "
+                f"to a model that fits its thinking in the one it has.",
+                level="warn",
+                kind="ticket",
+                data={
+                    "ticket": ticket.ticket_id,
+                    "role": role,
+                    "completion_tokens": completion.usage.completion_tokens,
+                },
+            )
+            return Vote(role, signed=False, error="reasoning ran out")
     return Vote(role, signed=signed, blocking=blocking, suggestions=suggestions)
 
 
