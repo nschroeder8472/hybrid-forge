@@ -8815,18 +8815,59 @@ class Orchestrator:
             return "(git not available; diff unavailable)"
 
     def _commit(self, run_id: int, ticket: Ticket) -> None:
+        """Commit what the ticket wrote, scoped to what it was allowed to write.
+
+        Staged explicitly, because `git commit -a` stages tracked files only
+        and most of what this loop produces is a file that did not exist
+        before. A greenfield run put five verified tickets into the tree and
+        committed none of them: every commit ended "nothing added to commit but
+        untracked files present", the step was recorded failed, and nothing
+        reads that step, so the repository still held one hand-written commit
+        after an afternoon of work.
+
+        The pathspec is the ticket's own scope, so a commit carries what this
+        ticket wrote and nothing a build left lying around next to it. Which
+        means a generated lock file stays uncommitted unless a ticket owns it —
+        the right trade: a scope is what the loop enforces everywhere else, and
+        sweeping the tree would commit whatever happened to be in it.
+        """
         message = f"{ticket.ticket_id}: {ticket.title}".strip().rstrip(":")
         step_id = self.store.start_step(run_id, ticket.ticket_id, "commit")
-        result = subprocess.run(
-            ["git", "commit", "-am", message],
-            cwd=self.config.root,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
+        scope = sorted(ticket.allowed_files)
+        if not scope:
+            self.store.end_step(step_id, "ok", "the ticket owns no files")
+            return
+
+        def git(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["git", *args],
+                cwd=self.config.root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+
+        # `-A` so a file the ticket deleted is staged as a deletion rather than
+        # left behind in the index.
+        staged = git("add", "-A", "--", *scope)
+
+        # Asked of the index rather than read off the commit's refusal: git
+        # says "nothing added to commit but untracked files present" when the
+        # scope is clean and something else in the tree is not, and that
+        # sentence is translated. An empty diff is the same fact in a form
+        # that survives a locale.
+        unchanged = git("diff", "--cached", "--quiet", "--", *scope).returncode == 0
+        if staged.returncode == 0 and unchanged:
+            self.store.end_step(step_id, "ok", "nothing in scope had changed")
+            return
+
+        result = git("commit", "-m", message, "--", *scope)
+        output = "\n".join(
+            part.strip()
+            for part in (staged.stdout, staged.stderr, result.stdout, result.stderr)
+            if part.strip()
         )
-        ok = result.returncode == 0
-        self.store.end_step(
-            step_id, "ok" if ok else "failed", f"{result.stdout}\n{result.stderr}".strip()
-        )
+        ok = staged.returncode == 0 and result.returncode == 0
+        self.store.end_step(step_id, "ok" if ok else "failed", output)

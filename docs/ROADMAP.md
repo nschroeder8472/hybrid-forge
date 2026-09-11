@@ -1198,6 +1198,18 @@ only where no sibling exists, and the habit it is named for lives in the
 authored document, which is where `/forge-spec-check` and the `forge-spec`
 skills look.
 
+**And on an empty repository it fires on everything, which is the same
+narrowness from the other side.** The platformer backlog ingested with the
+warning on all fifteen tickets while `/forge-spec-check` reported one.
+`reading_scope` keeps only files that exist, and in a greenfield backlog a
+ticket's example is written by an earlier ticket in the same backlog — PT-006's
+example is `tests/collide_test.rs`, which PT-005 creates. At ingest time none of
+them exist, so every ticket looks unexampled and none of them is: the spec named
+the example, and by the time the ticket runs it is there. What would make the
+warning right on a fresh repo is checking the backlog's own earlier tickets for
+the path before checking the disk. Until then it is a warning to read against
+`/forge-spec-check`, which reads the document rather than the tree.
+
 **That was the whole list, and it has now been run.**
 [LIVE-RUN-2026-09-10.md](LIVE-RUN-2026-09-10.md) has the numbers. The short
 version is that a backlog which lands first try exercises almost none of this:

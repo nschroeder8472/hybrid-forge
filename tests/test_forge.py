@@ -17307,6 +17307,71 @@ def _git_orchestrator(commands: dict[str, str] | None = None):
     return orch, root, run_id
 
 
+class TestAutoCommitCommitsWhatTheTicketWrote(unittest.TestCase):
+    """`git commit -a` stages tracked files, and a new one is not tracked.
+
+    A greenfield run verified five tickets and committed none of them: every
+    commit ended "nothing added to commit but untracked files present", and
+    because nothing reads the commit step, the run reported itself fine while
+    the repository stayed at the one commit a person had made by hand.
+    """
+
+    def _committed(self, root):
+        log = subprocess.run(
+            ["git", "log", "--oneline"],
+            cwd=root, capture_output=True, text=True, check=False,
+        )
+        return [line for line in log.stdout.splitlines() if line.strip()]
+
+    def _repo(self):
+        orch, root, run_id = _git_orchestrator()
+        for key, value in (("user.email", "t@example.com"), ("user.name", "T")):
+            subprocess.run(
+                ["git", "config", key, value], cwd=root, capture_output=True, check=False
+            )
+        return orch, root, run_id
+
+    def test_a_file_that_did_not_exist_before_is_committed(self):
+        orch, root, run_id = self._repo()
+        (root / "src").mkdir(parents=True, exist_ok=True)
+        (root / "src" / "game.py").write_text("x = 1\n", encoding="utf-8")
+
+        orch._commit(run_id, Ticket("T-1", title="a start",
+                                    allowed_files=["src/game.py"]))
+
+        self.assertEqual(len(self._committed(root)), 1)
+        self.assertIn("T-1: a start", self._committed(root)[0])
+
+    def test_a_file_outside_the_scope_is_left_alone(self):
+        """A build artifact sitting next to the work is not the ticket's."""
+        orch, root, run_id = self._repo()
+        (root / "src").mkdir(parents=True, exist_ok=True)
+        (root / "src" / "game.py").write_text("x = 1\n", encoding="utf-8")
+        (root / "Cargo.lock").write_text("generated\n", encoding="utf-8")
+
+        orch._commit(run_id, Ticket("T-1", title="a start",
+                                    allowed_files=["src/game.py"]))
+
+        tracked = subprocess.run(
+            ["git", "ls-files"], cwd=root, capture_output=True, text=True, check=False
+        ).stdout
+        self.assertIn("src/game.py", tracked)
+        self.assertNotIn("Cargo.lock", tracked)
+
+    def test_a_ticket_that_changed_nothing_is_not_recorded_as_failed(self):
+        orch, root, run_id = self._repo()
+        (root / "src").mkdir(parents=True, exist_ok=True)
+        (root / "src" / "game.py").write_text("x = 1\n", encoding="utf-8")
+        ticket = Ticket("T-1", title="a start", allowed_files=["src/game.py"])
+        orch._commit(run_id, ticket)
+
+        orch._commit(run_id, ticket)
+
+        commits = [s for s in orch.store.recent_steps(run_id) if s["name"] == "commit"]
+        self.assertEqual([s["status"] for s in commits], ["ok", "ok"])
+        self.assertEqual(len(self._committed(root)), 1)
+
+
 class TestAFailedTicketIsTakenBackOutOfTheTree(unittest.TestCase):
     """Nothing used to revert a failed ticket, on the grounds that a human may
     want to salvage what it wrote. The cost was paid by everything after it:
