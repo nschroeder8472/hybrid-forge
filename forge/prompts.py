@@ -3921,9 +3921,14 @@ def _fenced_fields(text: str) -> list[tuple[str | None, str]]:
     for match in _ANY_FENCE.finditer(text):
         labelled = _LABEL_TAIL.search(text[: match.start()])
         body = match.group("body")
-        if labelled is None and carried is None and body.strip() in _FIELDS:
+        if labelled is None and body.strip() in _FIELDS:
             # A block holding nothing but a field name is that field's heading,
-            # fenced along with everything else.
+            # fenced along with everything else -- never a value, whatever
+            # precedes it. One planner emitted all six headings in a row as
+            # empty blocks and then started again with the content, and while
+            # `carried is None` here the second heading was read as the first
+            # one's value: `spec` came out as the word "criteria". A field only
+            # named in such a run kept it, because nothing later overwrote it.
             carried = body.strip()
             continue
         pairs.append((labelled.group("field") if labelled else carried, body))

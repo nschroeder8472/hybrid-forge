@@ -22908,6 +22908,32 @@ class TestARevisionArrivesInBlocks(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_ratify_revision("```\nsome prose nobody labelled\n```\n")
 
+    def test_a_run_of_bare_headings_yields_no_field_at_all(self):
+        """PT-007's revision: the planner emitted all six headings as empty
+        blocks, then started again with the content under them.
+
+        A heading is never a value, so a run of them has to collapse rather
+        than pair up — read as values, `spec` came out as the word "criteria"
+        and `allowed_files` as "reference_files", and a field named only in
+        the run would have kept that with nothing later to overwrite it.
+        """
+        skeleton = "".join(
+            f"```\n{field}\n```\n\n"
+            for field in ("spec", "criteria", "allowed_files")
+        )
+
+        with self.assertRaises(ValueError):
+            parse_ratify_revision(skeleton)
+
+    def test_content_after_a_run_of_headings_lands_on_the_right_field(self):
+        revision = parse_ratify_revision(
+            "```\nspec\n```\n\n```\ncriteria\n```\n\n"
+            "```\nspec\n```\n\n```\nthe real spec\n```\n"
+        )
+
+        self.assertEqual(revision["spec"], "the real spec")
+        self.assertNotIn("criteria", revision)
+
     def test_the_placeholders_are_read_out_of_the_templates(self):
         """Listing them by hand would let a reworded skeleton slip the guard,
         so every example value the two templates show is derived from them."""
