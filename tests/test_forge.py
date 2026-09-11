@@ -1535,6 +1535,15 @@ class TestRespec(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_respec("I think the ticket is fine, actually.")
 
+    def test_the_templates_own_example_is_not_a_revised_spec(self):
+        """A planner that fills the skeleton's captions back in has revised
+        nothing, and a spec of "the revised spec" would replace a real one."""
+        with self.assertRaises(ValueError):
+            parse_respec(
+                '{"spec": "the revised spec", '
+                '"criteria": ["revised acceptance criteria"]}'
+            )
+
 
 class TestAutomaticRetryCycles(unittest.TestCase):
     """A backlog that ends blocked at 2am does nothing until somebody wakes up.
@@ -22664,15 +22673,54 @@ class TestARevisionArrivesInBlocks(unittest.TestCase):
     def test_json_is_still_read_when_no_block_is_present(self):
         """A model that has learned the older shape is not refused for it."""
         revision = parse_ratify_revision(
-            '{"spec": "the revised spec", "responses": ["widened the scope"]}'
+            '{"spec": "gravity runs before the death check", '
+            '"responses": ["widened the scope"]}'
         )
 
-        self.assertEqual(revision["spec"], "the revised spec")
+        self.assertEqual(revision["spec"], "gravity runs before the death check")
         self.assertEqual(revision["responses"], ["widened the scope"])
 
     def test_a_reply_that_changes_nothing_is_still_refused(self):
         with self.assertRaises(ValueError):
             parse_ratify_revision("responses\n```\n- nothing to do\n```\n")
+
+    def test_a_template_echoed_back_revises_nothing(self):
+        """PT-006 of the platformer run: the planner returned the skeleton.
+
+        The spec block came back holding the template's own caption, the loop
+        wrote it over a spec a person had written, and all four roles then
+        refused a ticket that said "the revised spec, exactly as it should
+        read". The backlog stopped there with the real spec still on disk in
+        `original_spec`. An echo has to read as a reply that changed nothing.
+        """
+        caption = "the revised spec, exactly as it should read"
+
+        with self.assertRaises(ValueError):
+            parse_ratify_revision(f"spec\n```\n{caption}\n```\n")
+
+    def test_a_real_field_beside_an_echoed_one_still_lands(self):
+        revision = parse_ratify_revision(
+            "spec\n```\nthe revised spec, exactly as it should read\n```\n"
+            "context\n```\n`World` owns the level now\n```\n"
+        )
+
+        self.assertEqual(set(revision), {"context"})
+
+    def test_an_echoed_list_entry_goes_and_its_neighbours_stay(self):
+        revision = parse_ratify_revision(
+            "allowed_files\n```\n- src/world.rs\n- path/one\n```\n"
+        )
+
+        self.assertEqual(revision["allowed_files"], ["src/world.rs"])
+
+    def test_the_placeholders_are_read_out_of_the_templates(self):
+        """Listing them by hand would let a reworded skeleton slip the guard,
+        so every example value the two templates show is derived from them."""
+        from forge.prompts import _placeholders
+
+        self.assertIn("the revised spec", _placeholders())
+        self.assertIn("the revised spec, exactly as it should read", _placeholders())
+        self.assertIn("revised acceptance criteria", _placeholders())
 
     def test_the_prompt_asks_for_blocks_and_says_to_omit_the_rest(self):
         ticket = Ticket(

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from functools import cache
 from typing import Any, Collection, Sequence
 
 from .failures import distill
@@ -3256,6 +3257,64 @@ def _json_object(text: str, *, who: str = "model") -> dict[str, Any]:
     return data
 
 
+# One field of a reply template, as the templates themselves write it: a bare
+# field name, then a fence holding the example value. Indented, unlike the real
+# thing, which is why this cannot be `_FIELD_BLOCK`.
+_SKELETON_BLOCK = re.compile(
+    r"^[ \t]*(?:spec|criteria|allowed_files|reference_files|context|responses)"
+    r"[ \t]*\n[ \t]*(?P<fence>`{3,})[^\n]*\n(?P<body>.*?)"
+    r"^[ \t]*(?P=fence)[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+@cache
+def _placeholders() -> frozenset[str]:
+    """Every example value the reply templates show, as literal strings.
+
+    A planner that copies a skeleton back instead of filling it in has revised
+    nothing, and the loop must not write "the revised spec, exactly as it
+    should read" into a ticket over a spec a person wrote. It did once: a
+    ratify revision replaced a good spec with that sentence, all four roles
+    then refused a ticket that no longer said anything, and the backlog stopped
+    on a ticket whose real spec was still on disk in the original.
+
+    Read out of the templates rather than listed here, so editing a skeleton
+    cannot leave the guard behind pointing at wording nothing emits any more.
+    """
+    found: set[str] = set()
+    skeleton = re.search(r"^\{\n.*?^\}", RESPEC_SYSTEM, re.MULTILINE | re.DOTALL)
+    if skeleton:
+        for value in json.loads(skeleton.group(0)).values():
+            entries = value if isinstance(value, list) else [value]
+            found.update(str(entry).strip() for entry in entries)
+    for match in _SKELETON_BLOCK.finditer(RATIFY_REVISE_SYSTEM):
+        found.update(
+            line.strip() for line in match.group("body").splitlines() if line.strip()
+        )
+    return frozenset(found - {""})
+
+
+def _without_placeholders(revision: dict[str, Any]) -> dict[str, Any]:
+    """Drop what the planner copied from the template instead of writing.
+
+    A list keeps its real entries and loses only the skeleton lines; a list of
+    nothing else goes entirely, as does a string that is one. What is left then
+    meets the same "revised nothing" check an empty reply meets, so a template
+    echoed back costs a pass and changes no ticket — which is the outcome, and
+    the only safe one, because the alternative is a spec replaced by a caption.
+    """
+    cleaned: dict[str, Any] = {}
+    for field, value in revision.items():
+        if isinstance(value, list):
+            items = [item for item in value if item not in _placeholders()]
+            if items:
+                cleaned[field] = items
+        elif value not in _placeholders():
+            cleaned[field] = value
+    return cleaned
+
+
 def parse_respec(text: str) -> dict[str, Any]:
     """Parse a respec reply into the ticket fields it changes.
 
@@ -3277,6 +3336,8 @@ def parse_respec(text: str) -> dict[str, Any]:
             # deliberate "this ticket needs no criteria"; treat it as absent.
             if items:
                 revision[key] = items
+
+    revision = _without_placeholders(revision)
 
     # A ticket whose criteria cannot be satisfied has no revised spec to give,
     # and demanding one is what produced a planner that changed an xorshift
@@ -3822,7 +3883,7 @@ def parse_ratify_revision(text: str) -> dict[str, Any]:
     JSON string carrying Python source. JSON is still read when no block is
     present, so a model that has learned the older shape is not refused for it.
     """
-    blocks = _revision_blocks(text)
+    blocks = _without_placeholders(_revision_blocks(text))
     if blocks:
         if not set(blocks) - {"rationale", "responses"}:
             raise ValueError("planner reply revised nothing")
@@ -3844,6 +3905,7 @@ def parse_ratify_revision(text: str) -> dict[str, Any]:
             if items:
                 revision[key] = items
 
+    revision = _without_placeholders(revision)
     if not set(revision) - {"rationale", "responses"}:
         raise ValueError("planner reply revised nothing")
     return revision
