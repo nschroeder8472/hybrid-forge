@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from functools import cache
 from typing import Any, Collection, Sequence
 
 from .failures import distill
@@ -3256,6 +3257,64 @@ def _json_object(text: str, *, who: str = "model") -> dict[str, Any]:
     return data
 
 
+# One field of a reply template, as the templates themselves write it: a bare
+# field name, then a fence holding the example value. Indented, unlike the real
+# thing, which is why this cannot be `_FIELD_BLOCK`.
+_SKELETON_BLOCK = re.compile(
+    r"^[ \t]*(?:spec|criteria|allowed_files|reference_files|context|responses)"
+    r"[ \t]*\n[ \t]*(?P<fence>`{3,})[^\n]*\n(?P<body>.*?)"
+    r"^[ \t]*(?P=fence)[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+@cache
+def _placeholders() -> frozenset[str]:
+    """Every example value the reply templates show, as literal strings.
+
+    A planner that copies a skeleton back instead of filling it in has revised
+    nothing, and the loop must not write "the revised spec, exactly as it
+    should read" into a ticket over a spec a person wrote. It did once: a
+    ratify revision replaced a good spec with that sentence, all four roles
+    then refused a ticket that no longer said anything, and the backlog stopped
+    on a ticket whose real spec was still on disk in the original.
+
+    Read out of the templates rather than listed here, so editing a skeleton
+    cannot leave the guard behind pointing at wording nothing emits any more.
+    """
+    found: set[str] = set()
+    skeleton = re.search(r"^\{\n.*?^\}", RESPEC_SYSTEM, re.MULTILINE | re.DOTALL)
+    if skeleton:
+        for value in json.loads(skeleton.group(0)).values():
+            entries = value if isinstance(value, list) else [value]
+            found.update(str(entry).strip() for entry in entries)
+    for match in _SKELETON_BLOCK.finditer(RATIFY_REVISE_SYSTEM):
+        found.update(
+            line.strip() for line in match.group("body").splitlines() if line.strip()
+        )
+    return frozenset(found - {""})
+
+
+def _without_placeholders(revision: dict[str, Any]) -> dict[str, Any]:
+    """Drop what the planner copied from the template instead of writing.
+
+    A list keeps its real entries and loses only the skeleton lines; a list of
+    nothing else goes entirely, as does a string that is one. What is left then
+    meets the same "revised nothing" check an empty reply meets, so a template
+    echoed back costs a pass and changes no ticket — which is the outcome, and
+    the only safe one, because the alternative is a spec replaced by a caption.
+    """
+    cleaned: dict[str, Any] = {}
+    for field, value in revision.items():
+        if isinstance(value, list):
+            items = [item for item in value if item not in _placeholders()]
+            if items:
+                cleaned[field] = items
+        elif value not in _placeholders():
+            cleaned[field] = value
+    return cleaned
+
+
 def parse_respec(text: str) -> dict[str, Any]:
     """Parse a respec reply into the ticket fields it changes.
 
@@ -3277,6 +3336,8 @@ def parse_respec(text: str) -> dict[str, Any]:
             # deliberate "this ticket needs no criteria"; treat it as absent.
             if items:
                 revision[key] = items
+
+    revision = _without_placeholders(revision)
 
     # A ticket whose criteria cannot be satisfied has no revised spec to give,
     # and demanding one is what produced a planner that changed an xorshift
@@ -3781,6 +3842,88 @@ _LIST_FIELDS = ("criteria", "allowed_files", "reference_files", "responses")
 
 _BULLET = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+")
 
+_FIELDS = ("spec", "criteria", "allowed_files", "reference_files", "context",
+           "responses")
+
+# Every fenced block in a reply, whatever labels it or nothing does.
+# `_FIELD_BLOCK` reads the shape the template asks for; this reads the shape
+# that arrived, and only the recovery path below uses it.
+_ANY_FENCE = re.compile(
+    r"^[ \t]*(?P<fence>`{3,})[^\n]*\n(?P<body>.*?)^[ \t]*(?P=fence)`*[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
+
+# A field name alone on the last line before a fence opens.
+_LABEL_TAIL = re.compile(
+    r"(?:^|\n)[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*)?"
+    r"(?P<field>spec|criteria|allowed_files|reference_files|context|responses)"
+    r"(?:\*\*)?[ \t]*:?[ \t]*\n[ \t]*\Z"
+)
+
+
+def _keep(found: dict[str, Any], field: str, body: str) -> None:
+    """Record one field's value, read the way that field is written."""
+    body = _unwrap_double_fence(body)
+    if field in _LIST_FIELDS:
+        items = [
+            _BULLET.sub("", line).strip()
+            for line in body.splitlines()
+            if line.strip()
+        ]
+        if items:
+            found[field] = items
+    elif body.strip():
+        found[field] = body.strip()
+
+
+def _fenced_fields(text: str) -> list[tuple[str | None, str]]:
+    """Every fenced block, paired with the field it belongs to where that is
+    clear — from a label before it, or from a block that holds only a name."""
+    pairs: list[tuple[str | None, str]] = []
+    carried: str | None = None
+    for match in _ANY_FENCE.finditer(text):
+        labelled = _LABEL_TAIL.search(text[: match.start()])
+        body = match.group("body")
+        if labelled is None and carried is None and body.strip() in _FIELDS:
+            # A block holding nothing but a field name is that field's heading,
+            # fenced along with everything else.
+            carried = body.strip()
+            continue
+        pairs.append((labelled.group("field") if labelled else carried, body))
+        carried = None
+    return pairs
+
+
+def _recovered_blocks(text: str) -> dict[str, Any]:
+    """Fields read out of a reply that did not use the documented shape.
+
+    One live planner reproduced the template's example block *and then answered
+    underneath it*: the word `spec`, a fence holding "the revised spec, exactly
+    as it should read", then a second fence holding the real spec — and every
+    field after that with its own label fenced too, a block saying `criteria`
+    followed by a block holding them. All six fields were there, correct and
+    complete, and the documented parser saw one caption. This reads that reply.
+
+    Only reached when the documented shape yielded nothing, so a reply that
+    parses stays parsed exactly as it was.
+    """
+    pairs = _fenced_fields(text)
+    found: dict[str, Any] = {}
+    index = 0
+    while index < len(pairs):
+        field, body = pairs[index]
+        index += 1
+        if field is None:
+            continue
+        if body.strip() in _placeholders() and index < len(pairs):
+            following_field, following_body = pairs[index]
+            if following_field is None:
+                # A heading, the example under it, and the answer under that.
+                body = following_body
+                index += 1
+        _keep(found, field, body)
+    return found
+
 
 def _revision_blocks(text: str) -> dict[str, Any]:
     """Revised fields written as labelled blocks, or `{}` if none are.
@@ -3790,19 +3933,11 @@ def _revision_blocks(text: str) -> dict[str, Any]:
     """
     found: dict[str, Any] = {}
     for match in _FIELD_BLOCK.finditer(text):
-        field = match.group("field")
-        body = _unwrap_double_fence(match.group("body"))
-        if field in _LIST_FIELDS:
-            items = [
-                _BULLET.sub("", line).strip()
-                for line in body.splitlines()
-                if line.strip()
-            ]
-            if items:
-                found[field] = items
-        elif body.strip():
-            found[field] = body.strip()
-    return found
+        _keep(found, match.group("field"), match.group("body"))
+    found = _without_placeholders(found)
+    if found:
+        return found
+    return _without_placeholders(_recovered_blocks(text))
 
 
 def parse_ratify_revision(text: str) -> dict[str, Any]:
@@ -3844,6 +3979,7 @@ def parse_ratify_revision(text: str) -> dict[str, Any]:
             if items:
                 revision[key] = items
 
+    revision = _without_placeholders(revision)
     if not set(revision) - {"rationale", "responses"}:
         raise ValueError("planner reply revised nothing")
     return revision

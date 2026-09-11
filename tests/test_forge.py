@@ -1535,6 +1535,15 @@ class TestRespec(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_respec("I think the ticket is fine, actually.")
 
+    def test_the_templates_own_example_is_not_a_revised_spec(self):
+        """A planner that fills the skeleton's captions back in has revised
+        nothing, and a spec of "the revised spec" would replace a real one."""
+        with self.assertRaises(ValueError):
+            parse_respec(
+                '{"spec": "the revised spec", '
+                '"criteria": ["revised acceptance criteria"]}'
+            )
+
 
 class TestAutomaticRetryCycles(unittest.TestCase):
     """A backlog that ends blocked at 2am does nothing until somebody wakes up.
@@ -17298,6 +17307,71 @@ def _git_orchestrator(commands: dict[str, str] | None = None):
     return orch, root, run_id
 
 
+class TestAutoCommitCommitsWhatTheTicketWrote(unittest.TestCase):
+    """`git commit -a` stages tracked files, and a new one is not tracked.
+
+    A greenfield run verified five tickets and committed none of them: every
+    commit ended "nothing added to commit but untracked files present", and
+    because nothing reads the commit step, the run reported itself fine while
+    the repository stayed at the one commit a person had made by hand.
+    """
+
+    def _committed(self, root):
+        log = subprocess.run(
+            ["git", "log", "--oneline"],
+            cwd=root, capture_output=True, text=True, check=False,
+        )
+        return [line for line in log.stdout.splitlines() if line.strip()]
+
+    def _repo(self):
+        orch, root, run_id = _git_orchestrator()
+        for key, value in (("user.email", "t@example.com"), ("user.name", "T")):
+            subprocess.run(
+                ["git", "config", key, value], cwd=root, capture_output=True, check=False
+            )
+        return orch, root, run_id
+
+    def test_a_file_that_did_not_exist_before_is_committed(self):
+        orch, root, run_id = self._repo()
+        (root / "src").mkdir(parents=True, exist_ok=True)
+        (root / "src" / "game.py").write_text("x = 1\n", encoding="utf-8")
+
+        orch._commit(run_id, Ticket("T-1", title="a start",
+                                    allowed_files=["src/game.py"]))
+
+        self.assertEqual(len(self._committed(root)), 1)
+        self.assertIn("T-1: a start", self._committed(root)[0])
+
+    def test_a_file_outside_the_scope_is_left_alone(self):
+        """A build artifact sitting next to the work is not the ticket's."""
+        orch, root, run_id = self._repo()
+        (root / "src").mkdir(parents=True, exist_ok=True)
+        (root / "src" / "game.py").write_text("x = 1\n", encoding="utf-8")
+        (root / "Cargo.lock").write_text("generated\n", encoding="utf-8")
+
+        orch._commit(run_id, Ticket("T-1", title="a start",
+                                    allowed_files=["src/game.py"]))
+
+        tracked = subprocess.run(
+            ["git", "ls-files"], cwd=root, capture_output=True, text=True, check=False
+        ).stdout
+        self.assertIn("src/game.py", tracked)
+        self.assertNotIn("Cargo.lock", tracked)
+
+    def test_a_ticket_that_changed_nothing_is_not_recorded_as_failed(self):
+        orch, root, run_id = self._repo()
+        (root / "src").mkdir(parents=True, exist_ok=True)
+        (root / "src" / "game.py").write_text("x = 1\n", encoding="utf-8")
+        ticket = Ticket("T-1", title="a start", allowed_files=["src/game.py"])
+        orch._commit(run_id, ticket)
+
+        orch._commit(run_id, ticket)
+
+        commits = [s for s in orch.store.recent_steps(run_id) if s["name"] == "commit"]
+        self.assertEqual([s["status"] for s in commits], ["ok", "ok"])
+        self.assertEqual(len(self._committed(root)), 1)
+
+
 class TestAFailedTicketIsTakenBackOutOfTheTree(unittest.TestCase):
     """Nothing used to revert a failed ticket, on the grounds that a human may
     want to salvage what it wrote. The cost was paid by everything after it:
@@ -22664,15 +22738,91 @@ class TestARevisionArrivesInBlocks(unittest.TestCase):
     def test_json_is_still_read_when_no_block_is_present(self):
         """A model that has learned the older shape is not refused for it."""
         revision = parse_ratify_revision(
-            '{"spec": "the revised spec", "responses": ["widened the scope"]}'
+            '{"spec": "gravity runs before the death check", '
+            '"responses": ["widened the scope"]}'
         )
 
-        self.assertEqual(revision["spec"], "the revised spec")
+        self.assertEqual(revision["spec"], "gravity runs before the death check")
         self.assertEqual(revision["responses"], ["widened the scope"])
 
     def test_a_reply_that_changes_nothing_is_still_refused(self):
         with self.assertRaises(ValueError):
             parse_ratify_revision("responses\n```\n- nothing to do\n```\n")
+
+    def test_a_template_echoed_back_revises_nothing(self):
+        """PT-006 of the platformer run: the planner returned the skeleton.
+
+        The spec block came back holding the template's own caption, the loop
+        wrote it over a spec a person had written, and all four roles then
+        refused a ticket that said "the revised spec, exactly as it should
+        read". The backlog stopped there with the real spec still on disk in
+        `original_spec`. An echo has to read as a reply that changed nothing.
+        """
+        caption = "the revised spec, exactly as it should read"
+
+        with self.assertRaises(ValueError):
+            parse_ratify_revision(f"spec\n```\n{caption}\n```\n")
+
+    def test_a_real_field_beside_an_echoed_one_still_lands(self):
+        revision = parse_ratify_revision(
+            "spec\n```\nthe revised spec, exactly as it should read\n```\n"
+            "context\n```\n`World` owns the level now\n```\n"
+        )
+
+        self.assertEqual(set(revision), {"context"})
+
+    def test_an_echoed_list_entry_goes_and_its_neighbours_stay(self):
+        revision = parse_ratify_revision(
+            "allowed_files\n```\n- src/world.rs\n- path/one\n```\n"
+        )
+
+        self.assertEqual(revision["allowed_files"], ["src/world.rs"])
+
+    def test_an_example_answered_underneath_is_read_as_the_answer(self):
+        """PT-006's second revision, from the platformer run.
+
+        The planner reproduced the template's example block and then answered
+        below it. Before this, every field was lost: the labelled parser saw
+        the caption, the guard dropped it, and a complete revision was refused
+        as unparseable while the real spec sat two lines further down.
+        """
+        revision = parse_ratify_revision(
+            "spec\n```\nthe revised spec, exactly as it should read\n```\n"
+            "\n```\n`World` gains `level_data` and `spawn`.\n```\n"
+        )
+
+        self.assertEqual(revision["spec"], "`World` gains `level_data` and `spawn`.")
+
+    def test_a_label_fenced_with_everything_else_still_labels(self):
+        """The same reply fenced the labels too, from `criteria` onwards."""
+        revision = parse_ratify_revision(
+            "```\ncriteria\n```\n```\n- it parses\n- it round-trips\n```\n"
+        )
+
+        self.assertEqual(revision["criteria"], ["it parses", "it round-trips"])
+
+    def test_a_reply_in_the_documented_shape_is_read_that_way(self):
+        """Recovery is a fallback. A reply that parses must not be re-read by
+        a looser rule that could pair its blocks up differently."""
+        revision = parse_ratify_revision(
+            "spec\n```\nthe real spec\n```\n"
+            "\n```\nnot a field, and not the spec either\n```\n"
+        )
+
+        self.assertEqual(revision["spec"], "the real spec")
+
+    def test_an_unlabelled_reply_is_still_nothing(self):
+        with self.assertRaises(ValueError):
+            parse_ratify_revision("```\nsome prose nobody labelled\n```\n")
+
+    def test_the_placeholders_are_read_out_of_the_templates(self):
+        """Listing them by hand would let a reworded skeleton slip the guard,
+        so every example value the two templates show is derived from them."""
+        from forge.prompts import _placeholders
+
+        self.assertIn("the revised spec", _placeholders())
+        self.assertIn("the revised spec, exactly as it should read", _placeholders())
+        self.assertIn("revised acceptance criteria", _placeholders())
 
     def test_the_prompt_asks_for_blocks_and_says_to_omit_the_rest(self):
         ticket = Ticket(
