@@ -3842,6 +3842,88 @@ _LIST_FIELDS = ("criteria", "allowed_files", "reference_files", "responses")
 
 _BULLET = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+")
 
+_FIELDS = ("spec", "criteria", "allowed_files", "reference_files", "context",
+           "responses")
+
+# Every fenced block in a reply, whatever labels it or nothing does.
+# `_FIELD_BLOCK` reads the shape the template asks for; this reads the shape
+# that arrived, and only the recovery path below uses it.
+_ANY_FENCE = re.compile(
+    r"^[ \t]*(?P<fence>`{3,})[^\n]*\n(?P<body>.*?)^[ \t]*(?P=fence)`*[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
+
+# A field name alone on the last line before a fence opens.
+_LABEL_TAIL = re.compile(
+    r"(?:^|\n)[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*)?"
+    r"(?P<field>spec|criteria|allowed_files|reference_files|context|responses)"
+    r"(?:\*\*)?[ \t]*:?[ \t]*\n[ \t]*\Z"
+)
+
+
+def _keep(found: dict[str, Any], field: str, body: str) -> None:
+    """Record one field's value, read the way that field is written."""
+    body = _unwrap_double_fence(body)
+    if field in _LIST_FIELDS:
+        items = [
+            _BULLET.sub("", line).strip()
+            for line in body.splitlines()
+            if line.strip()
+        ]
+        if items:
+            found[field] = items
+    elif body.strip():
+        found[field] = body.strip()
+
+
+def _fenced_fields(text: str) -> list[tuple[str | None, str]]:
+    """Every fenced block, paired with the field it belongs to where that is
+    clear — from a label before it, or from a block that holds only a name."""
+    pairs: list[tuple[str | None, str]] = []
+    carried: str | None = None
+    for match in _ANY_FENCE.finditer(text):
+        labelled = _LABEL_TAIL.search(text[: match.start()])
+        body = match.group("body")
+        if labelled is None and carried is None and body.strip() in _FIELDS:
+            # A block holding nothing but a field name is that field's heading,
+            # fenced along with everything else.
+            carried = body.strip()
+            continue
+        pairs.append((labelled.group("field") if labelled else carried, body))
+        carried = None
+    return pairs
+
+
+def _recovered_blocks(text: str) -> dict[str, Any]:
+    """Fields read out of a reply that did not use the documented shape.
+
+    One live planner reproduced the template's example block *and then answered
+    underneath it*: the word `spec`, a fence holding "the revised spec, exactly
+    as it should read", then a second fence holding the real spec — and every
+    field after that with its own label fenced too, a block saying `criteria`
+    followed by a block holding them. All six fields were there, correct and
+    complete, and the documented parser saw one caption. This reads that reply.
+
+    Only reached when the documented shape yielded nothing, so a reply that
+    parses stays parsed exactly as it was.
+    """
+    pairs = _fenced_fields(text)
+    found: dict[str, Any] = {}
+    index = 0
+    while index < len(pairs):
+        field, body = pairs[index]
+        index += 1
+        if field is None:
+            continue
+        if body.strip() in _placeholders() and index < len(pairs):
+            following_field, following_body = pairs[index]
+            if following_field is None:
+                # A heading, the example under it, and the answer under that.
+                body = following_body
+                index += 1
+        _keep(found, field, body)
+    return found
+
 
 def _revision_blocks(text: str) -> dict[str, Any]:
     """Revised fields written as labelled blocks, or `{}` if none are.
@@ -3851,19 +3933,11 @@ def _revision_blocks(text: str) -> dict[str, Any]:
     """
     found: dict[str, Any] = {}
     for match in _FIELD_BLOCK.finditer(text):
-        field = match.group("field")
-        body = _unwrap_double_fence(match.group("body"))
-        if field in _LIST_FIELDS:
-            items = [
-                _BULLET.sub("", line).strip()
-                for line in body.splitlines()
-                if line.strip()
-            ]
-            if items:
-                found[field] = items
-        elif body.strip():
-            found[field] = body.strip()
-    return found
+        _keep(found, match.group("field"), match.group("body"))
+    found = _without_placeholders(found)
+    if found:
+        return found
+    return _without_placeholders(_recovered_blocks(text))
 
 
 def parse_ratify_revision(text: str) -> dict[str, Any]:
@@ -3883,7 +3957,7 @@ def parse_ratify_revision(text: str) -> dict[str, Any]:
     JSON string carrying Python source. JSON is still read when no block is
     present, so a model that has learned the older shape is not refused for it.
     """
-    blocks = _without_placeholders(_revision_blocks(text))
+    blocks = _revision_blocks(text)
     if blocks:
         if not set(blocks) - {"rationale", "responses"}:
             raise ValueError("planner reply revised nothing")

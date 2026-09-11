@@ -22778,6 +22778,43 @@ class TestARevisionArrivesInBlocks(unittest.TestCase):
 
         self.assertEqual(revision["allowed_files"], ["src/world.rs"])
 
+    def test_an_example_answered_underneath_is_read_as_the_answer(self):
+        """PT-006's second revision, from the platformer run.
+
+        The planner reproduced the template's example block and then answered
+        below it. Before this, every field was lost: the labelled parser saw
+        the caption, the guard dropped it, and a complete revision was refused
+        as unparseable while the real spec sat two lines further down.
+        """
+        revision = parse_ratify_revision(
+            "spec\n```\nthe revised spec, exactly as it should read\n```\n"
+            "\n```\n`World` gains `level_data` and `spawn`.\n```\n"
+        )
+
+        self.assertEqual(revision["spec"], "`World` gains `level_data` and `spawn`.")
+
+    def test_a_label_fenced_with_everything_else_still_labels(self):
+        """The same reply fenced the labels too, from `criteria` onwards."""
+        revision = parse_ratify_revision(
+            "```\ncriteria\n```\n```\n- it parses\n- it round-trips\n```\n"
+        )
+
+        self.assertEqual(revision["criteria"], ["it parses", "it round-trips"])
+
+    def test_a_reply_in_the_documented_shape_is_read_that_way(self):
+        """Recovery is a fallback. A reply that parses must not be re-read by
+        a looser rule that could pair its blocks up differently."""
+        revision = parse_ratify_revision(
+            "spec\n```\nthe real spec\n```\n"
+            "\n```\nnot a field, and not the spec either\n```\n"
+        )
+
+        self.assertEqual(revision["spec"], "the real spec")
+
+    def test_an_unlabelled_reply_is_still_nothing(self):
+        with self.assertRaises(ValueError):
+            parse_ratify_revision("```\nsome prose nobody labelled\n```\n")
+
     def test_the_placeholders_are_read_out_of_the_templates(self):
         """Listing them by hand would let a reworded skeleton slip the guard,
         so every example value the two templates show is derived from them."""
