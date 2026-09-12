@@ -3886,7 +3886,8 @@ _FIELDS = ("spec", "criteria", "allowed_files", "reference_files", "context",
 # `_FIELD_BLOCK` reads the shape the template asks for; this reads the shape
 # that arrived, and only the recovery path below uses it.
 _ANY_FENCE = re.compile(
-    r"^[ \t]*(?P<fence>`{3,})[^\n]*\n(?P<body>.*?)^[ \t]*(?P=fence)`*[ \t]*$",
+    r"^[ \t]*(?P<fence>`{3,})(?P<info>[^\n]*)\n(?P<body>.*?)"
+    r"^[ \t]*(?P=fence)`*[ \t]*$",
     re.MULTILINE | re.DOTALL,
 )
 
@@ -3921,6 +3922,16 @@ def _fenced_fields(text: str) -> list[tuple[str | None, str]]:
     for match in _ANY_FENCE.finditer(text):
         labelled = _LABEL_TAIL.search(text[: match.start()])
         body = match.group("body")
+        # A fence opened as ```spec carries the field where a language would
+        # go. The template puts the name on its own line above the fence and
+        # one planner wrote it here instead, which read as an unlabelled block
+        # and lost a revision that was otherwise complete. No field shares a
+        # name with a language, so this cannot swallow a ```rust.
+        info = match.group("info").strip()
+        if labelled is None and info in _FIELDS:
+            pairs.append((info, body))
+            carried = None
+            continue
         if labelled is None and body.strip() in _FIELDS:
             # A block holding nothing but a field name is that field's heading,
             # fenced along with everything else -- never a value, whatever

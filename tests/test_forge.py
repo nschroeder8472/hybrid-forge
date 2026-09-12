@@ -22934,6 +22934,26 @@ class TestARevisionArrivesInBlocks(unittest.TestCase):
         self.assertEqual(revision["spec"], "the real spec")
         self.assertNotIn("criteria", revision)
 
+    def test_a_field_named_where_a_language_goes_is_still_a_field(self):
+        """PT-015's revision opened its blocks as ```spec rather than putting
+        the name on the line above, and a complete rewrite was refused as
+        unparseable."""
+        revision = parse_ratify_revision(
+            "```spec\n`World` gains `pause_ms`.\n```\n"
+            "```criteria\n- it counts\n- it resets\n```\n"
+        )
+
+        self.assertEqual(revision["spec"], "`World` gains `pause_ms`.")
+        self.assertEqual(revision["criteria"], ["it counts", "it resets"])
+
+    def test_a_language_on_the_fence_is_not_mistaken_for_a_field(self):
+        revision = parse_ratify_revision(
+            "spec\n````\nAdd this:\n\n```rust\nlet x = 1;\n```\n````\n"
+        )
+
+        self.assertIn("let x = 1;", revision["spec"])
+        self.assertEqual(set(revision), {"spec"})
+
     def test_the_placeholders_are_read_out_of_the_templates(self):
         """Listing them by hand would let a reworded skeleton slip the guard,
         so every example value the two templates show is derived from them."""
