@@ -43,6 +43,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from . import (
+    __version__,
     evidence,
     llama,
     presets,
@@ -2431,6 +2432,16 @@ def cmd_ui(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="forge", description=__doc__)
+    # Asked from the machine the run is on, which is the machine whose build is
+    # in question. Two boxes pointed at one llama.cpp endpoint disagree about
+    # behaviour long before either of them disagrees about configuration, and
+    # the first thing worth ruling out is that they are not the same build.
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"forge {__version__}",
+        help="print the installed version and exit",
+    )
     parser.add_argument("--root", default=".", help="project directory (default: cwd)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
