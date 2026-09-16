@@ -1946,6 +1946,51 @@ class TestAutomaticRetryCycles(unittest.TestCase):
         self.assertEqual(ticket.spec, "old spec")
 
 
+class TestTheVersionIsStatedOnce(unittest.TestCase):
+    """The version lived in two files and they disagreed — pyproject.toml said
+    0.2.1 while `forge/__init__.py` said 0.2.0 — because nothing read the
+    second one, so nothing noticed. It is read now, by `forge --version`, and
+    the question it answers is asked across machines: whether the box running
+    the loop and the box serving the models are the same build."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def test_the_package_does_not_restate_the_number(self):
+        # Not a style point. Two literals is how the drift happened, and a
+        # test that only compared them would have kept passing right up until
+        # someone edited one of them.
+        source = (self.ROOT / "forge" / "__init__.py").read_text(encoding="utf-8")
+        for line in source.splitlines():
+            if line.startswith("__version__") and "=" in line:
+                value = line.split("=", 1)[1].strip()
+                self.assertIn(
+                    value.strip("\"'"),
+                    ("0+unknown",),
+                    "forge/__init__.py must read the version from the installed "
+                    "distribution, not restate pyproject.toml's",
+                )
+
+    def test_pyproject_carries_it(self):
+        text = (self.ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        declared = [
+            line.split("=", 1)[1].strip().strip("\"'")
+            for line in text.splitlines()
+            if line.startswith("version =")
+        ]
+        self.assertEqual(len(declared), 1, "pyproject.toml declares one version")
+        self.assertRegex(declared[0], r"^\d+\.\d+\.\d+")
+
+    def test_the_cli_prints_what_the_package_reports(self):
+        import forge
+
+        parser = cli.build_parser()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as caught:
+            parser.parse_args(["--version"])
+        self.assertEqual(caught.exception.code, 0)
+        self.assertEqual(out.getvalue().strip(), f"forge {forge.__version__}")
+
+
 class TestTheSampleConfigStaysHonest(unittest.TestCase):
     """`templates/config.sample.json` is what a person copies. A sample that
     does not load is worse than none — it sends the reader hunting through
