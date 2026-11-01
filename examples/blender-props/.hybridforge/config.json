@@ -1,0 +1,24 @@
+{
+  "room": "blender-props",
+  "workspaces": [
+    {
+      "root": "art",
+      "commands": {
+        "lint": { ".py": "python -m flake8 ." },
+        "typecheck": { ".py": "skip" },
+        "test": { ".py": "blender -b --factory-startup --python-exit-code 1 --python tests/run_checks.py" },
+        "capture": { ".py": "blender -b --factory-startup --python-exit-code 1 --python tools/capture.py" }
+      }
+    }
+  ],
+  "neverDelegate": [],
+  "memory": { "url": "", "room": "" },
+  "loop": {
+    "maxAttempts": 4,
+    "retryCycles": 1,
+    "autoCommit": false,
+    "viewRole": "reviewer",
+    "viewModel": "claude",
+    "exclusiveGpu": []
+  }
+}
