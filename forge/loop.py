@@ -380,6 +380,27 @@ class Stopped(Exception):
     """Raised internally when the control channel asks the loop to stop."""
 
 
+def _readable_contents(data: bytes) -> str:
+    """A file's contents as a reviewer should be shown them.
+
+    Text as text. Anything that is not UTF-8, or carries a NUL, is described
+    instead of decoded: a PNG decoded with replacement is thousands of
+    replacement characters that say nothing about the image and cost a context
+    window.
+    """
+    if b"\0" not in data[:8192]:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        else:
+            # Newlines translated as `read_text` did, so a text file reaches
+            # the reviewer exactly as it always has.
+            return text.replace("\r\n", "\n").replace("\r", "\n")
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    return f"(binary file, {len(data)} bytes, sha256 {digest}; written unchanged)"
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -5436,7 +5457,12 @@ class Orchestrator:
                 (w for w in self.config.workspaces if w.root == root),
                 self.config.root_workspace,
             )
-            before = {path: self._read_or_none(path) for path in group}
+            # Bytes, not decoded text: a formatter over `.png` (GIMP, in
+            # docs/CREATIVE-TOOLS.md phase 2) changes bytes that are not valid
+            # UTF-8, and two such files decode to the same replacement
+            # characters — so a text comparison reported a rewritten image as
+            # unchanged.
+            before = {path: self._bytes_or_none(path) for path in group}
             # The paths are appended, which is the one thing `format` does
             # differently from the verify kinds: those are whole commands, and
             # a formatter is a command plus the files to rewrite. Every
@@ -5472,7 +5498,7 @@ class Orchestrator:
             # tools/dump_decor_fixtures.gd`, and leave the rewrite unreported
             # sixty-odd times on one ticket.
             written = [
-                path for path in group if self._read_or_none(path) != before[path]
+                path for path in group if self._bytes_or_none(path) != before[path]
             ]
             changed.extend(written)
             if not result.ok:
@@ -5546,6 +5572,13 @@ class Orchestrator:
                 data={"ticket": ticket.ticket_id, "formatted": sorted(changed)},
             )
         return changed
+
+    def _bytes_or_none(self, path: str) -> bytes | None:
+        """A file's bytes, or `None` if it cannot be read. See `_read_or_none`."""
+        try:
+            return (self.config.root / path).read_bytes()
+        except OSError:
+            return None
 
     def _read_or_none(self, path: str) -> str | None:
         """A file's text, or `None` if it cannot be read.
@@ -8796,7 +8829,7 @@ class Orchestrator:
             candidate = (self.config.root / path).resolve()
             try:
                 if candidate.is_file():
-                    found[path] = candidate.read_text(encoding="utf-8", errors="replace")
+                    found[path] = _readable_contents(candidate.read_bytes())
             except OSError:
                 continue
         return found
