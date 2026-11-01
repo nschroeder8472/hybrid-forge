@@ -785,6 +785,20 @@ whose objection a reference file or the green suite already refutes is the same
 shape as the sign-off misfires in RATIFY.md, and is worth replaying there
 before changing anything.
 
+**Two defects no criterion caught, both in the reference code, not the
+model's.** Exporting the landed props to `.glb` showed every material as flat
+grey: `common.material()` set only `diffuse_color`, the viewport colour the
+Workbench capture shows, while the glTF exporter reads the Principled BSDF. And
+the barrel's UV layer held a single point, because the spec said its UVs "may
+stay at their defaults". Both looked right in every capture. The helper now
+sets both colours, the reference test reads the colour back out of an exported
+file, the spec gives the barrel a cylindrical unwrap with criteria for it, and
+`tools/export.py` writes each scene as `build/<scene>.glb` and `.blend`, so a
+landed ticket leaves an asset rather than only a script. The lesson for the
+image loop: a capture shows what the renderer shows, and a renderer reads
+different properties from the exporter. Criteria about an asset must check
+the asset.
+
 What phase 1 did not test: Cycles captures and the GPU lease, which Workbench
 did not need, and whether a seeing reviewer rejects a scene that is wrong. The
 next run should carry one ticket whose geometry passes its numeric criteria
