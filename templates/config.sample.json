@@ -116,6 +116,7 @@
     "voteThinking": true,
     "viewRole": "reviewer",
     "viewModel": "",
+    "exclusiveGpu": [],
     "reviseBetweenPasses": true,
     "majorityRepeats": true,
     "participationWindow": 20,

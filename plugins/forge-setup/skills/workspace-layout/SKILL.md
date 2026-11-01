@@ -18,9 +18,21 @@ repository, quietly.
     $XDG_CONFIG_HOME/hybrid-forge/…      POSIX, when set
     ~/.config/hybrid-forge/profile.json  POSIX default
 
-Holds `models`, `roles`, `memory`, and the dashboard port. Your executor lives
-at one address and your memory server at another; you decide once who plays
-which role, and every later repo starts from that.
+Holds `models`, `roles`, `memory`, the dashboard port, and `llamaServer`. Your
+executor lives at one address and your memory server at another; you decide
+once who plays which role, and every later repo starts from that.
+
+`llamaServer` is how this machine starts `llama-server`, when forge should run
+it: `{ "port": 8080, "modelsMax": 1 }`. With it, `forge go` starts the server
+on loopback before the run and stops it after, and every local model it serves
+needs a `modelPath`. It is refused in a repo config — a port and how many
+checkpoints fit on a card are facts about the machine. Without it, forge talks
+to a server you run yourself and never stops it.
+
+**On Windows, check which profile is read.** A Microsoft Store Python
+redirects `%APPDATA%` into its package's `LocalCache`, so the file at the
+visible path can be a stale twin nobody reads. `forge doctor` prints the path
+it actually used; edit that one.
 
 **Repo config** — `.hybridforge/config.json`, committed.
 

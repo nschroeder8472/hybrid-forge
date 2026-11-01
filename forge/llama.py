@@ -371,14 +371,26 @@ def server_binary(root: Path) -> Path | None:
     The layout differs by platform and has moved between builds — sometimes at
     the top level, sometimes under `build/bin`. Searching is cheaper than
     tracking it.
+
+    Returned resolved, and that is load-bearing on Windows. A Microsoft Store
+    Python silently redirects writes under `%LOCALAPPDATA%` into its package's
+    private `LocalCache`, and the redirect only exists inside that process.
+    Launched by its virtual path, the exe is found but its DLLs are not: the
+    loader looks for them in a directory that does not exist, falls back to
+    PATH, and a b10687 `llama-server` runs on the b10666 DLLs of whatever copy
+    PATH holds — measured on 2026-11-01, reporting `build 10666` from the
+    b10687 directory. With nothing on PATH it fails to start at all
+    (`0xC0000135`). `resolve()` returns the real location, which every other
+    process can see and the loader can search. Printing that path is the
+    second half of the fix: the old one could not be pasted into a shell.
     """
     name = "llama-server.exe" if sys.platform == "win32" else "llama-server"
     direct = root / name
     if direct.is_file():
-        return direct
+        return direct.resolve()
     for found in root.rglob(name):
         if found.is_file():
-            return found
+            return found.resolve()
     return None
 
 

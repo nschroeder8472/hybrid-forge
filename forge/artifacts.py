@@ -58,6 +58,11 @@ _GITIGNORE_LINES = (
     "run.db-shm",
     ARTIFACTS_DIR + "/",
     ABANDONED_DIR + "/",
+    # Written by `forge.servers`: which server processes forge started on this
+    # machine, and what they printed. Both name pids and local paths that mean
+    # nothing in anyone else's clone.
+    "servers.json",
+    "logs/",
 )
 
 # The same entries as one file body, for `forge init` to write on a fresh

@@ -34,6 +34,7 @@ import argparse
 import json
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -46,10 +47,12 @@ from . import (
     __version__,
     evidence,
     llama,
+    llama_server,
     presets,
     replay,
     respec,
     routes,
+    servers,
     signoff,
     toolchain,
     wizard,
@@ -85,6 +88,8 @@ from .memory import MemoryClient
 from .patch import matches_any
 from .prompts import bug_prompt, locate_prompt, parse_bug, parse_locate
 from .profile import Profile
+from .run_servers import RunServers
+from .servers import ServerError
 from .providers import Completion, Message, ProviderError
 from .state import (
     RUN_IDLE,
@@ -234,6 +239,10 @@ def cmd_llama(args: argparse.Namespace) -> int:
         return _llama_status(args)
     if action == "install":
         return _llama_install(args)
+    if action == "start":
+        return _llama_start(args)
+    if action == "stop":
+        return _llama_stop(args)
     if action == "list":
         for tag, binary in sorted(llama.installed().items()):
             print(f"  {tag:<10} {binary}")
@@ -271,6 +280,104 @@ def _llama_status(args: argparse.Namespace) -> int:
             f"Numbers measured against one build do not carry to another; "
             f"`forge llama install` fetches the pinned one alongside it."
         )
+    _llama_server_report(args.root)
+    return 0
+
+
+def _llama_server_report(root: str) -> None:
+    """Whether a `llama-server` is running for this project, and whose it is.
+
+    Best-effort: `forge llama status` is also run outside any project, where
+    there is no config to read and nothing to report.
+    """
+    try:
+        config = Config.load(root)
+    except ConfigError:
+        return
+    try:
+        settings = llama_server.settings_for(config)
+    except llama_server.LlamaServerError as exc:
+        print(f"\nmanaged:  the machine profile's llamaServer is unusable — {exc}")
+        return
+    if settings is None:
+        print(
+            "\nmanaged:  no — this machine runs its own llama-server. Add a "
+            "llamaServer block to the machine profile to have forge run it."
+        )
+        return
+    supervisor = servers.Supervisor(config.config_dir)
+    entry = supervisor.record(llama_server.NAME)
+    print(f"\nmanaged:  port {settings.port}, modelsMax {settings.models_max}")
+    if entry is not None:
+        print(
+            f"running:  yes, started by forge ({entry.get('owner')}), pid "
+            f"{entry.get('pid')} since {entry.get('startedAt')}"
+        )
+        print(f"log:      {entry.get('log')}")
+    elif servers.port_open("127.0.0.1", settings.port):
+        print(
+            "running:  yes, but not started by forge. A run uses it if it "
+            "serves this project's models, and never stops it."
+        )
+    else:
+        print("running:  no. `forge go` starts it, or `forge llama start`.")
+
+
+def _llama_start(args: argparse.Namespace) -> int:
+    """Start this project's `llama-server` and leave it running.
+
+    Owned by the CLI rather than by a run: a person asking for a server is
+    asking for one that outlives any one run, so a run uses it and only
+    `forge llama stop` ends it.
+    """
+    config = _load(args.root)
+    try:
+        settings = llama_server.settings_for(config)
+        if settings is None:
+            print(
+                "This machine's profile has no llamaServer block, so forge does "
+                "not run llama-server here. Add one to the profile, e.g.\n"
+                '  "llamaServer": { "port": 8080, "modelsMax": 1 }'
+            )
+            return 1
+        spec = llama_server.spec(config, settings)
+    except llama_server.LlamaServerError as exc:
+        print(f"error: {exc}")
+        return 1
+    if spec is None:
+        print(
+            f"No model in this config is served on port {settings.port}; "
+            f"nothing to start."
+        )
+        return 1
+    supervisor = servers.Supervisor(config.config_dir, owner=servers.OWNER_CLI)
+    try:
+        started = supervisor.ensure(spec)
+    except servers.ServerError as exc:
+        print(f"error: {exc}")
+        return 1
+    said = {
+        "started": "started",
+        "replaced": "restarted from the current preset",
+        "owned": "already running, started by forge",
+        "adopted": "already running, not started by forge; left as it is",
+    }[started.how]
+    print(f"llama-server on 127.0.0.1:{settings.port}: {said}.")
+    if started.pid:
+        print(f"pid {started.pid}, log {started.log}")
+    return 0
+
+
+def _llama_stop(args: argparse.Namespace) -> int:
+    config = _load(args.root)
+    pid = servers.Supervisor(config.config_dir).stop(llama_server.NAME)
+    if pid is None:
+        print(
+            "No llama-server started by forge is running for this project. "
+            "Forge does not stop a server it did not start."
+        )
+        return 0
+    print(f"Stopped llama-server (pid {pid}).")
     return 0
 
 
@@ -306,8 +413,11 @@ def _llama_install(args: argparse.Namespace) -> int:
 
     print(f"installed {llama.build_of(binary) or tag}: {binary}")
     print(
-        "\nForge uses this over anything on PATH. Serve a project's models with:\n"
-        f'  "{binary}" --models-preset .hybridforge/models/llamacpp.ini --models-max 1'
+        "\nForge uses this over anything on PATH. To have forge run it, add\n"
+        '  "llamaServer": { "port": 8080, "modelsMax": 1 }\n'
+        "to the machine profile; or serve a project's models yourself with:\n"
+        f'  "{binary}" --host 127.0.0.1 --models-preset '
+        ".hybridforge/models/llamacpp.ini --models-max 1"
     )
     return 0
 
@@ -381,6 +491,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"profile: {profile.path} (models: {', '.join(sorted(profile.models))})")
     print()
     _report_llama_build(config)
+    # Before the probes, because a forge-run server that is not up yet makes
+    # every local model below read as unreachable, and this says why.
+    _llama_server_report(str(config.root))
 
     failures = 0
     for name in sorted(config.models):
@@ -875,6 +988,31 @@ def cmd_go(args: argparse.Namespace) -> int:
             "  forge ingest plan.md      (or: forge go --plan plan.md)"
         )
 
+    # Before the dashboard and before the first run, so a server that cannot
+    # start refuses the queue before anything is called — not four tickets in,
+    # as an unreachable model. See `forge.run_servers`.
+    try:
+        local = RunServers.for_config(config)
+        for line in local.start() if local else []:
+            print(line)
+    except ServerError as exc:
+        sys.exit(f"error: {exc}")
+    try:
+        return _drain(args, config, store, runs, local)
+    finally:
+        if local is not None:
+            for name in local.stop():
+                print(f"Stopped {name}.")
+
+
+def _drain(
+    args: argparse.Namespace,
+    config: Config,
+    store: Store,
+    runs: list[sqlite3.Row],
+    local: RunServers | None,
+) -> int:
+    """Work the queue of runs. The body of `forge go` once its servers are up."""
     url = ""
     if config.ui.enabled and not args.no_ui:
         ui_server.serve(config, store)
@@ -915,7 +1053,7 @@ def cmd_go(args: argparse.Namespace) -> int:
         # tickets authored tests, whether project memory has gone away — and
         # carrying it into the next run would report the last run's tickets in
         # this one's coverage summary.
-        orchestrator = Orchestrator(config, store, started_at=started_at)
+        orchestrator = Orchestrator(config, store, started_at=started_at, servers=local)
         try:
             final = orchestrator.run(run_id)
         except KeyboardInterrupt:
@@ -2750,7 +2888,7 @@ def build_parser() -> argparse.ArgumentParser:
         "llama_command",
         nargs="?",
         default="status",
-        choices=("status", "install", "list"),
+        choices=("status", "install", "list", "start", "stop"),
         help="status (default): what this machine has and what it should have. "
              "install: fetch the pinned build. list: what is already fetched",
     )

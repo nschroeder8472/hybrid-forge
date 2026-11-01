@@ -218,6 +218,22 @@ spent on weights.
 
 ### 1.3 Serve the models in router mode
 
+**On a machine where the daemon and the GPU are the same box, forge can run
+the server for you.** Add this to the machine profile:
+
+```json
+"llamaServer": { "port": 8080, "modelsMax": 1 }
+```
+
+and give every local model a `modelPath`. `forge go` then writes the preset,
+starts `llama-server` on `127.0.0.1` from the pinned build, uses it for the run
+and stops it at the end; `forge llama start` and `forge llama stop` do the same
+by hand. Nothing below is needed in that case except the bind warning, which
+forge follows for you. See [CONFIG](CONFIG.md#forge-runs-llama-server).
+
+The rest of this section is for a server you run yourself — the split-machine
+layout above, or a box that serves more than one daemon.
+
 **Router mode is what lets forge swap checkpoints.** `--models-preset` reads an
 INI where each section is a model id; the router spawns one child server per
 model on an ephemeral port and proxies `/v1/chat/completions` by that id. The
@@ -263,7 +279,8 @@ role's child server exits trying to allocate. Forge's `exclusive` setting does
 the same thing per model; either is enough, both is fine.
 
 Run it under whatever keeps services up on this host — a systemd unit, a
-scheduled task, `tmux`. It owns the GPU and should outlive any one forge run.
+scheduled task, `tmux`. A server you run yourself owns the GPU and should
+outlive any one forge run; forge uses it and never stops it.
 
 Verify from the host, then from your workstation:
 
