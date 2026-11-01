@@ -717,6 +717,72 @@ useful.* The likely loop change from this run is a `/forge-spec-check` rule for
 the missing exit-code flag, and an EXECUTOR-CEILINGS-style list of `bpy`
 version traps fed through memory.
 
+*Run 2026-11-01, twice, on `examples/blender-props`.* Qwen3.8 executor and
+tester, Nemotron planner and reviewer, Claude Opus as `viewModel`, Blender
+5.2.3, forge running `llama-server`.
+
+| | Run 1 | Run 2 |
+|---|---|---|
+| Outcome | 3 / 3 done in 49.6 min | SCN-001, SCN-002 done; SCN-003 failed sign-off, run stopped at 49 min to free the GPU |
+| Attempts | SCN-001 2, SCN-002 1, SCN-003 2 | SCN-001 1, SCN-002 1 |
+| The view model saw the captures | **no** | yes, 4 images per ticket |
+| Review time | 24 s, 845 s, 18 s | 22 s, 25 s |
+
+**The executor lands `bpy` against 5.2.** Every scene was right on inspection
+of the captures. The predicted pile of version traps did not show up: one real
+API mistake in five landed scenes. Run 1's executor assumed
+`bmesh.ops.create_cube(size=1.0)` makes a 2 m cube, which is the convention of
+the `bpy.ops.mesh.primitive_cube_add` operator, and scaled each box by half its
+extent. The failing dimensions named the cause, and attempt 2 fixed it by
+reading `crate.py`. Run 2's executor used `size=2.0` with half-extents, which
+is also correct, and landed first time. The other failure was in the tester's
+code, not the executor's: it indexed a `mathutils.Vector` with a string, and
+that was fixed on the next attempt. The spec did most of the work: it named the
+`bmesh.ops` calls and their arguments, and every number in it was checked
+against a reference build before the run.
+
+**Run 1's reviewer never saw a capture, and accepted all three tickets
+anyway.** Three causes, all fixed in forge:
+
+- **A view model that cannot see was accepted.** The profile's `claude` block
+  had no `tools`, so claude-cli reported it could not see, and the loop sent the
+  capture filenames instead, as documented. `roleNeeds` could not catch it,
+  because `viewModel` is not a role. `validate()` now refuses a `viewModel` that
+  cannot be shown an image.
+- **claude-cli loaded the user's MCP servers.** `--tools ""` does not reach MCP,
+  so the reviewer tried to open the PNGs through a claude.ai Docs connector,
+  wrote that it "could not open the four capture PNGs" and that its "only file
+  tools were Claude Docs tools", and spent 845 s on SCN-002's review waiting for
+  reads that never returned. Forge now passes `--strict-mcp-config` unless
+  `allowAllTools` is set.
+- **The capture command guessed what changed from `git status`.** With
+  `autoCommit` off, that is every earlier ticket's work, so SCN-002's review
+  showed the anvil and SCN-003's showed all three props. The loop now names the
+  attempt's files in `FORGE_CAPTURE_FILES`, and the example renders from that.
+
+With all three fixed, run 2's reviewer read the four images and the reference
+files and ruled in 22-25 s. Both its verdicts were accepts of work that was
+right, so this run cannot say whether the capture *changes* a verdict, only
+that it now reaches one.
+
+**Sign-off parked SCN-003 on objections contradicted by its own reference
+files.** Nemotron, as planner and reviewer, objected that `common.clear_scene()`
+leaves the default cube, camera and light, so the scene could not hold exactly
+three meshes. It does not: it calls `read_factory_settings(use_empty=True)`,
+`common.py` was a reference file for the ticket, and every passing test relies
+on it. The planner also claimed an empty `scenes/__init__.py` makes
+`from scenes import …` unresolvable, which every passing test also disproves.
+The model's general knowledge of Blender won over the file in front of it.
+`SPEC.md` now states both as protected decisions. On the loop side, a vote
+whose objection a reference file or the green suite already refutes is the same
+shape as the sign-off misfires in RATIFY.md, and is worth replaying there
+before changing anything.
+
+What phase 1 did not test: Cycles captures and the GPU lease, which Workbench
+did not need, and whether a seeing reviewer rejects a scene that is wrong. The
+next run should carry one ticket whose geometry passes its numeric criteria
+while its capture shows the mistake, which is the case the capture exists for.
+
 **2 — GIMP through `commands`.** A Python-Fu tool ticket run live, and the
 `format` path confirmed against a binary file. If `format` does not hold up on a
 binary, the finding goes in here, and the fix is to `format`, not a new kind.

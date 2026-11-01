@@ -5754,9 +5754,20 @@ class Orchestrator:
     # `npm run screenshot` needs no wrapper to accept a positional it was never
     # written to take.
     CAPTURE_DIR_VAR = "FORGE_CAPTURE_DIR"
+    # The files this attempt wrote, relative to the capture command's own
+    # workspace and joined with `os.pathsep`. Without it a capture command can
+    # only guess what changed, and the obvious guess — `git status` — is wrong
+    # whenever `autoCommit` is off: every earlier ticket's work is still
+    # uncommitted, so phase 1's SCN-003 capture rendered the anvil and the
+    # barrel beside the workshop it was reviewing.
+    CAPTURE_FILES_VAR = "FORGE_CAPTURE_FILES"
 
     def _capture(
-        self, run_id: int, ticket: Ticket, attempt: int
+        self,
+        run_id: int,
+        ticket: Ticket,
+        attempt: int,
+        written: Sequence[str] = (),
     ) -> tuple[list[ImagePart], StepResult | None]:
         """Render what this ticket built, and return it as pictures.
 
@@ -5816,7 +5827,14 @@ class Orchestrator:
                     command,
                     ticket.ticket_id,
                     workspace=workspace,
-                    env={self.CAPTURE_DIR_VAR: str(into)},
+                    env={
+                        self.CAPTURE_DIR_VAR: str(into),
+                        self.CAPTURE_FILES_VAR: os.pathsep.join(
+                            path[len(workspace.prefix):]
+                            for path in sorted(written)
+                            if workspace.contains(path)
+                        ),
+                    },
                 )
                 if not result.ok:
                     return [], StepResult(ok=False, detail=result.detail)
@@ -6862,7 +6880,9 @@ class Orchestrator:
         # After verification on purpose: a page that does not compile is not a
         # page worth looking at, and the capture command would be reporting the
         # build's failure in its own words.
-        rendered, capture_failure = self._capture(run_id, ticket, ticket.attempts)
+        rendered, capture_failure = self._capture(
+            run_id, ticket, ticket.attempts, written
+        )
         if capture_failure is not None:
             return capture_failure
         images = [*images, *rendered]

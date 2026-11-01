@@ -199,6 +199,15 @@ ground line with clear space between them.
 
 ### Context
 
+Decision: `common.clear_scene()` leaves the scene with no objects at all. It
+calls `bpy.ops.wm.read_factory_settings(use_empty=True)`, which removes the
+default cube, camera and light, and every passing test in `art/tests/` relies
+on that.
+
+Decision: `art/scenes/` is a package with an empty `__init__.py`, and
+`from scenes import anvil, barrel, crate` resolves under the test runner,
+exactly as `crate_test.py`'s `from scenes import common, crate` does.
+
 World-space positions come from `obj.matrix_world @ vertex.co`. After setting
 `location` in a script, call `bpy.context.view_layer.update()` before reading
 `matrix_world`, or it still holds the old transform.
