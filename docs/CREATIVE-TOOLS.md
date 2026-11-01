@@ -685,11 +685,17 @@ so the supervisor is unaffected. But the printed path and the build number
 are both bugs, and running forge from a venv would remove the redirect
 entirely.
 
-**The profile's Qwen checkpoint is not on this machine.** The profile names
-`qwen3.8` as executor and tester, and no Qwen GGUF exists on any drive. The
-only checkpoint present is Nemotron at `C:\AIModels\`. A run today would fail
-at its first executor call. `forge models` also reports "no llama.cpp models
-in this config" when the models are defined only in the profile.
+**A checkpoint in a Hugging Face cache does not look like a checkpoint.** Both
+models are in `C:\AIModels\`. Qwen is in a Hugging Face cache layout:
+`snapshots\<rev>\Qwen3.8-27B-UD-Q4_K_M.gguf` is a 0-byte symlink, and the
+15.3 GB file it points to is under `blobs\` with no extension. A search for
+large `.gguf` files finds neither, and an earlier version of this section said
+Qwen was missing because of that search. A preset's `model =` should name the
+snapshot path, which llama.cpp follows. Anything forge ever does to find or
+size a checkpoint must resolve symlinks first, or it reports a 0-byte model.
+
+`forge models` reports "no llama.cpp models in this config" when the models are
+defined only in the profile.
 
 ---
 
