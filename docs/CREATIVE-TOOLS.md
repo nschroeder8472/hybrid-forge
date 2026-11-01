@@ -1,7 +1,8 @@
 # Blender, GIMP and ComfyUI in the loop — plan
 
-**Status:** plan. Nothing in this document is built and no ticket has run
-through any of these tools. It builds on [IMAGE-LOOP.md](IMAGE-LOOP.md), which
+**Status:** plan; phase 0 measured 2026-11-01 (see *Phase 0 — what was
+measured*). Nothing in this document is built and no ticket has run through
+any of these tools. It builds on [IMAGE-LOOP.md](IMAGE-LOOP.md), which
 designed an image ticket kind and left its first decision open (*which
 backend*), and on the capture step from *Looking at what it built* in
 [ROADMAP.md](ROADMAP.md), which is the half of that design that has evidence.
@@ -35,7 +36,7 @@ Recorded 2026-11-01, so later numbers can be read against it.
 | RAM | 94 GB |
 | Blender | 5.2, `C:\Program Files\Blender Foundation\Blender 5.2\blender.exe` |
 | GIMP | 3.2, `%LOCALAPPDATA%\Programs\GIMP 3\bin\gimp-console-3.exe` |
-| ComfyUI | `C:\Users\nschr\Documents\ComfyUI`, ComfyUI-Manager only, not running. Last launched as `python main.py` on the Microsoft Store Python 3.13 (`%LOCALAPPDATA%\Microsoft\WindowsApps\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\python.exe`), PyTorch 2.13 nightly, cu130. No venv |
+| ComfyUI | `C:\Users\nschr\Documents\ComfyUI`, 0.43.0, ComfyUI-Manager only. Its own venv at `.venv` on Python 3.13.16 with PyTorch 2.14.1+cu130, since phase 0; before that it ran on the shared Microsoft Store Python |
 
 ComfyUI models:
 
@@ -61,17 +62,19 @@ edit keeps missing.
 The README's known-good pairing keeps one ~25 GiB llama checkpoint resident at a
 time, `exclusive`, `--models-max 1`. That leaves about 7 GB.
 
-| Consumer | Rough VRAM | Fits beside a resident llama checkpoint |
-|---|---|---|
-| Blender Workbench / EEVEE capture | < 2 GB | yes |
-| Blender Cycles on GPU | scene-dependent, 2-10 GB | sometimes |
-| GIMP batch | none to speak of | yes |
-| ComfyUI SDXL + LoRA | ~8-10 GB | no |
-| ComfyUI Flux Kontext fp8 | ~12-16 GB | no |
-| ComfyUI Flux.2 fp8 | more than the card | no, and not beside anything |
+Peak whole-card usage, measured in phase 0. The desktop alone holds about
+1.7 GB, and a loaded Nemotron checkpoint brings the card to 26.9 GB:
 
-These are estimates, not measurements; phase 0 replaces them. What they already
-say is that the failure mode without arbitration is not an error. ComfyUI
+| Consumer | Peak card usage | Fits beside a resident llama checkpoint |
+|---|---|---|
+| Blender Workbench capture, 4 views at 1024² | not measured; small | yes |
+| Blender Cycles on GPU | not measured; scene-dependent | sometimes |
+| GIMP batch | none | yes |
+| ComfyUI SDXL + LoRA | 11.7 GB | no |
+| ComfyUI Flux Kontext fp8 | 21.5 GB | no |
+| ComfyUI Flux.2 fp8 | 31.8 GB, the whole card | no, and not beside anything |
+
+What the table says is that the failure mode without arbitration is not an error. ComfyUI
 offloads to system RAM when it cannot fit and gets an order of magnitude slower;
 llama-server reloads and races. A run that is merely slow reports nothing, which
 is the class of failure this repository keeps finding the expensive way.
@@ -444,7 +447,7 @@ for model paths:
 ```json
 "comfyui": {
   "root": "C:/Users/nschr/Documents/ComfyUI",
-  "python": "C:/Users/nschr/AppData/Local/Microsoft/WindowsApps/PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0/python.exe",
+  "python": "C:/Users/nschr/Documents/ComfyUI/.venv/Scripts/python.exe",
   "port": 8188,
   "args": []
 }
@@ -573,17 +576,130 @@ endpoint.
 
 ---
 
+## Phase 0 — what was measured
+
+Measured on this machine on 2026-11-01, with Blender 5.2.3 LTS, GIMP 3.2,
+ComfyUI 0.43.0 on PyTorch 2.14.1+cu130 in its own venv, and llama.cpp b10687.
+Each render is 1024², and "warm" means the model was already loaded.
+
+### ComfyUI renders
+
+| Model | Cold | Warm | Peak card usage |
+|---|---:|---:|---:|
+| SDXL + pixel-art LoRA, 30 steps | 34.0 s | 3.0 s | 11.7 GB |
+| Flux.1 Kontext fp8 edit, 20 steps | 28.4 s | 11.9 s | 21.5 GB |
+| Flux.2 dev fp8 + turbo LoRA, 8 steps | 60.6 s | 8.1 s | 31.8 GB |
+| Flux.2 dev fp8, 20 steps | | 19.8 s | 31.6 GB |
+
+ComfyUI took 18-35 s from launch to answering `/system_stats`; the 35 s start
+was the first one after an update. `POST /free` returned the card to 2.2-2.3 GB
+within 3 s every time, which leaves about 0.6 GB for ComfyUI's own CUDA context
+while idle.
+
+**Flux.2 is usable in a loop, which the plan doubted.** With the turbo LoRA,
+a warm render takes 8.1 s. The cost is that it needs the whole card, so every
+Flux.2 render is a lease.
+
+What the pictures showed matters more than the times:
+
+- **SDXL with the pixel-art LoRA did not draw an anvil.** The prompt asked for
+  an anvil on a workbench, and the result is a workbench with an unidentifiable
+  object on it. A visual criterion naming the subject would fail, correctly.
+  This model is for tiles, textures and icons whose subject is simple, not for
+  depicting a specific object.
+- **Kontext edits locally and keeps everything else identical.** Asked to
+  paint the anvil red, it changed the object and left the rest of the frame
+  untouched. That is the property the edit loop depends on. It also painted a
+  saw beside the object red, because it took the object it was told about to
+  include the saw. An edit instruction inherits whatever the previous image got
+  wrong.
+- **Flux.2 drew a convincing anvil, and put text on it.** It stamped "O-F" into
+  the anvil's face without being asked. Any image ticket with a "no glyphs"
+  criterion needs the OCR assertion in its check script, because this is
+  exactly the failure a vision reviewer would likely miss.
+
+### llama-server, pinned build
+
+Router start: 0.5 s. Nemotron Q4_K_M (22.8 GB on disk), three rounds each:
+**load 8.7-8.8 s**, unload **2.2 s** until the router reports `unloaded`.
+
+**The lease must wait for the router's status, not for VRAM.** VRAM drops
+0.2 s after `/models/unload`, while the router still reports the model as
+`loaded`. Loading again inside that window returns
+`400 model is already running`. `llamacpp._unload` already waits on status;
+the lease must use it rather than a VRAM check of its own.
+
+One lease therefore costs about 11 s of llama time — 2.2 s unload plus 8.8 s
+reload — on top of the image model's cold load, which phase 0 measured at
+28-61 s from launch. Grouping image tickets is worth roughly 40-70 s per lease
+avoided.
+
+### Blender and GIMP
+
+| Check | Result |
+|---|---|
+| Blender, script raises, no flag | exit **0** — confirmed: a failing check passes |
+| Blender, script raises, `--python-exit-code 1` | exit 1 |
+| Blender, 4-view Workbench capture at 1024², from launch | 3.8 s |
+| GIMP batch, Python-Fu, indexed conversion and PNG export | 21.4 s first run, 2.3 s warm, exits by itself with `--quit` |
+| GIMP batch, script raises | exit 64 |
+
+The working GIMP invocation:
+
+```
+gimp-console-3 -i -n --quit --batch-interpreter=python-fu-eval -b "exec(open('<script>').read())"
+```
+
+**`--factory-startup` does not mean an empty scene.** It still loads the default
+cube, camera and light. In the measured capture, the default cube hid the
+object being captured, so the reviewer would have been shown a box. A capture
+script must clear the scene first, with
+`bpy.ops.wm.read_factory_settings(use_empty=True)`, or delete what it did not
+create. The reference capture script in phase 1 starts from an empty scene.
+
+### What phase 0 found that was not about measurement
+
+**ComfyUI would not start.** Its system Python had `huggingface-hub` 2.1.1,
+which `transformers` 5.10.2 refuses. This was the shared-interpreter risk
+listed below, live before a single render. The fix applied: ComfyUI now has its
+own venv at `ComfyUI\.venv` on Python 3.13.16, and the profile's
+`comfyui.python` points there. ComfyUI itself was 862 commits behind and was
+updated to 0.43.0.
+
+**Installing CUDA PyTorch needs `--index-url`, not `--extra-index-url`.** With
+the extra index, pip picked PyPI's CPU-only `torch` 2.15.0, because its
+version number is higher than the newest cu130 build, 2.14.1. Nothing failed
+until a CUDA call raised `Torch not compiled with CUDA enabled`.
+
+**`forge llama install` reports a path no other process can open.** Forge runs
+on the Microsoft Store Python, which silently redirects writes under
+`%LOCALAPPDATA%` into the package's private `LocalCache`. The pinned build is
+really at
+`%LOCALAPPDATA%\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\Local\hybrid-forge\llama\b10687\llama-server.exe`.
+The command line `forge llama install` printed does not resolve from a shell.
+`cmd_doctor` already notes the same redirect for the profile under
+`%APPDATA%`. The install message also printed `installed b10666`, which is the
+build of the copy on PATH, not the one just installed. When forge starts
+`llama-server` itself (phase 3), the path resolves inside forge's own process,
+so the supervisor is unaffected. But the printed path and the build number
+are both bugs, and running forge from a venv would remove the redirect
+entirely.
+
+**The profile's Qwen checkpoint is not on this machine.** The profile names
+`qwen3.8` as executor and tester, and no Qwen GGUF exists on any drive. The
+only checkpoint present is Nemotron at `C:\AIModels\`. A run today would fail
+at its first executor call. `forge models` also reports "no llama.cpp models
+in this config" when the models are defined only in the profile.
+
+---
+
 ## Phases
 
 Each lands on its own. The first three need no ComfyUI and are worth doing if
 the rest is never built.
 
-**0 — Bring-up and measurements. No code.** Start ComfyUI and render each
-model's default workflow once, recording VRAM peak and seconds per image.
-Measure a llama unload and reload around it. Confirm `blender
---python-exit-code 1` exits non-zero on a raised exception on 5.2. Confirm the
-GIMP 3 batch invocation exits without hanging. Every estimate in this document
-is replaced by its measurement, here, in a table dated like the inventory.
+**0 — Bring-up and measurements. No code. Done 2026-11-01**; see *Phase 0 —
+what was measured*.
 
 **1 — Blender through `commands`.** A small example project with a Blender
 workspace, `tools/capture.py` and one reference scene, and a three-ticket
@@ -686,14 +802,12 @@ learnings recorded by respec so the loop stops rediscovering the same rename.
 lands, a run that includes any ComfyUI call should be run with llama-server
 stopped or on cloud roles.
 
-**ComfyUI's Python is not forge's.** It runs on a system Python with a nightly
-PyTorch build, and ComfyUI-Manager installs dependencies into that same
-interpreter. A Manager update can break ComfyUI between two runs without any
-change in this repository. The `/object_info` check catches a missing model but
-not a broken import. A crash on startup is the signal, which is why the start
-failure has to carry the log's tail rather than just an exit code. A venv just
-for ComfyUI would make this go away, and is worth doing before a long unattended
-run.
+**ComfyUI's Python must be its own.** Phase 0 found this live: on the shared
+Store Python, an unrelated upgrade left ComfyUI unable to start. It now has a
+venv. ComfyUI-Manager still installs node dependencies into that venv, so a
+Manager update can break ComfyUI between runs. The `/object_info` check catches
+a missing model but not a broken import, which is why a failed start has to
+report the log's tail rather than just an exit code.
 
 **ComfyUI custom nodes are arbitrary code.** A workflow that needs a custom node
 is a workflow that runs that node's Python on this machine. Workflows are project
