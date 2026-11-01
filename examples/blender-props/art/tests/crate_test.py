@@ -19,8 +19,14 @@ class CrateTest(unittest.TestCase):
         self.assertEqual([obj.name for obj in meshes], ["Crate"])
 
     def test_it_is_a_one_metre_cube_resting_on_the_ground(self):
-        for axis, size in zip("xyz", self.obj.dimensions):
-            self.assertAlmostEqual(size, 1.0, places=3, msg=f"{axis} dimension")
+        # A `mathutils.Vector` is indexed by integer — `dimensions[0]` or
+        # `dimensions.x` — never by the string "x". Both live runs' testers
+        # wrote `location["x"]` after reading a loop that paired "xyz" with a
+        # vector, so this one keeps the index an integer.
+        for index in range(3):
+            self.assertAlmostEqual(
+                self.obj.dimensions[index], 1.0, places=3, msg=f"{'xyz'[index]} dimension"
+            )
         lowest = min(vertex.co.z for vertex in self.obj.data.vertices)
         self.assertAlmostEqual(lowest, 0.0, places=4)
 

@@ -723,8 +723,8 @@ tester, Nemotron planner and reviewer, Claude Opus as `viewModel`, Blender
 
 | | Run 1 | Run 2 |
 |---|---|---|
-| Outcome | 3 / 3 done in 49.6 min | SCN-001, SCN-002 done; SCN-003 failed sign-off, run stopped at 49 min to free the GPU |
-| Attempts | SCN-001 2, SCN-002 1, SCN-003 2 | SCN-001 1, SCN-002 1 |
+| Outcome | 3 / 3 done in 49.6 min | SCN-001, SCN-002 done; SCN-003 failed sign-off, run stopped at 49 min to free the GPU. SCN-003 re-run alone with the spec corrected: done in 7.7 min, sign-off unanimous on the first pass |
+| Attempts | SCN-001 2, SCN-002 1, SCN-003 2 | SCN-001 1, SCN-002 1, SCN-003 2 |
 | The view model saw the captures | **no** | yes, 4 images per ticket |
 | Review time | 24 s, 845 s, 18 s | 22 s, 25 s |
 
@@ -736,8 +736,14 @@ the `bpy.ops.mesh.primitive_cube_add` operator, and scaled each box by half its
 extent. The failing dimensions named the cause, and attempt 2 fixed it by
 reading `crate.py`. Run 2's executor used `size=2.0` with half-extents, which
 is also correct, and landed first time. The other failure was in the tester's
-code, not the executor's: it indexed a `mathutils.Vector` with a string, and
-that was fixed on the next attempt. The spec did most of the work: it named the
+code, not the executor's, and it was **the one mistake that repeated**: SCN-003's
+tester wrote `obj.location["x"]` in both runs, which raises
+`TypeError: vector indices must be integers, not str`, and both times the next
+attempt fixed it. The reference test taught it: `crate_test.py` looped
+`for axis, size in zip("xyz", obj.dimensions)`, pairing a string with a vector,
+and the tester reused `axis` as the index. The reference now indexes by integer
+and says why. A reference file is copied more faithfully than any instruction,
+including its accidents. The spec did most of the work: it named the
 `bmesh.ops` calls and their arguments, and every number in it was checked
 against a reference build before the run.
 
@@ -773,7 +779,8 @@ three meshes. It does not: it calls `read_factory_settings(use_empty=True)`,
 on it. The planner also claimed an empty `scenes/__init__.py` makes
 `from scenes import …` unresolvable, which every passing test also disproves.
 The model's general knowledge of Blender won over the file in front of it.
-`SPEC.md` now states both as protected decisions. On the loop side, a vote
+`SPEC.md` now states both as protected decisions, and with them SCN-003 signed
+off unanimously on the first pass and landed in 7.7 minutes. On the loop side, a vote
 whose objection a reference file or the green suite already refutes is the same
 shape as the sign-off misfires in RATIFY.md, and is worth replaying there
 before changing anything.
