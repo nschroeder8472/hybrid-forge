@@ -7,10 +7,16 @@ Started by the workspace's capture command:
 forge sets `FORGE_CAPTURE_DIR` and attaches every image written there to the
 review. Without it (run by hand) images go to `capture_out/`.
 
-Which scenes: the ones `git status` reports changed under `scenes/`, because a
-review is about this attempt's work, and forge sends at most four images. One
-changed scene gets four views: front, side, top and three-quarter. Several get
-one three-quarter view each. With nothing changed, every scene gets one view.
+Which scenes: the ones this attempt wrote, because a review is about this
+attempt's work, and forge sends at most four images. forge names them in
+`FORGE_CAPTURE_FILES`. Run by hand, the scenes `git status` reports changed
+stand in. One scene gets four views: front, side, top and three-quarter.
+Several get one three-quarter view each. With none, every scene gets one view.
+
+A scene the attempt did not touch is left out even if it is uncommitted. With
+`autoCommit` off every earlier ticket's work is uncommitted, and the first
+version of this script, which asked git, rendered the whole backlog into each
+review.
 
 Everything that could make two captures of the same scene differ is pinned:
 Workbench engine, material colours, Standard view transform, fixed resolution,
@@ -55,6 +61,25 @@ def all_scenes():
     return sorted(name for name in names if name not in NOT_SCENES)
 
 
+def scene_names(paths):
+    """Scene module names among workspace-relative paths."""
+    names = set()
+    for path in paths:
+        path = path.replace("\\", "/")
+        base = os.path.basename(path)
+        if path.startswith("scenes/") and base.endswith(".py") and base[:-3] not in NOT_SCENES:
+            names.add(base[:-3])
+    return sorted(name for name in names if os.path.exists(os.path.join(SCENES, name + ".py")))
+
+
+def written_scenes():
+    """Scenes forge says this attempt wrote, or None when forge did not say."""
+    value = os.environ.get("FORGE_CAPTURE_FILES")
+    if value is None:
+        return None
+    return scene_names(path for path in value.split(os.pathsep) if path)
+
+
 def changed_scenes():
     """Scene modules git reports as modified or new, or [] if git cannot say."""
     try:
@@ -64,13 +89,7 @@ def changed_scenes():
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return []
-    names = set()
-    for line in out.splitlines():
-        path = line[3:].strip().strip('"')
-        base = os.path.basename(path)
-        if base.endswith(".py") and base[:-3] not in NOT_SCENES:
-            names.add(base[:-3])
-    return sorted(name for name in names if os.path.exists(os.path.join(SCENES, name + ".py")))
+    return scene_names(line[3:].strip().strip('"') for line in out.splitlines())
 
 
 def setup_render():
@@ -135,7 +154,8 @@ def main():
     out = os.environ.get("FORGE_CAPTURE_DIR") or os.path.join(ROOT, "capture_out")
     os.makedirs(out, exist_ok=True)
 
-    names = changed_scenes() or all_scenes()
+    written = written_scenes()
+    names = (written if written is not None else changed_scenes()) or all_scenes()
     if len(names) == 1:
         plan = [(names[0], view) for view in VIEWS]
     else:

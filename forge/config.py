@@ -1485,6 +1485,25 @@ class Config:
                 f"loop.viewModel is {self.loop.view_model!r}, which is not "
                 f"declared in `models` (have: {', '.join(sorted(self.models))})."
             )
+        if self.loop.view_model:
+            # Refused outright, not left to `roleNeeds`: a view model's only
+            # job is looking, and `roleNeeds` cannot reach it because it is
+            # not a role. Phase 1 of docs/CREATIVE-TOOLS.md ran three tickets
+            # with `viewModel: "claude"` on a claude-cli block with no tools.
+            # The loop sent the capture filenames, the reviewer said it could
+            # not open them, and accepted every ticket on the diff alone.
+            try:
+                sees = self.provider_for_model(self.loop.view_model).capabilities()
+            except Exception:
+                sees = None
+            if sees is not None and not sees.supports_images:
+                raise ConfigError(
+                    f"loop.viewModel is {self.loop.view_model!r}, which cannot "
+                    f"be shown an image, so every capture would reach it as a "
+                    f"filename. Give the model block what lets it see — "
+                    f'`"tools": "Read"` for claude-cli, `"multimodal": true` '
+                    f"for llamacpp — or name a model that can."
+                )
         for role in ROLES:
             name = self.roles.get(role)
             if not name:

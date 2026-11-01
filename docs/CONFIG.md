@@ -480,9 +480,19 @@ subscription rather than an API key.
 | `allowAllTools` | `false` | Skips permission prompts. Required for genuinely unattended runs, and a real grant of authority — hence opt-in. |
 | `contextWindow` / `maxOutputTokens` | `200000` / `32000` | |
 
-This adapter cannot be shown an image and has no key for it. The prompt reaches
-the CLI as text on stdin, and naming a file path instead would not help: with
-no tools it cannot open one, so the reviewer would be ruling on a filename.
+**It can be shown an image only with `"tools": "Read"`** (or `"default"`). The
+prompt reaches the CLI as text on stdin, so an image is passed as a path the
+model is told to open, and with no tools it cannot open one — the reviewer
+would be ruling on a filename. A block without `Read` reports that it cannot
+see, and a `loop.viewModel` naming one is refused at load.
+
+**No MCP server is loaded into a forge call.** `--tools` governs the CLI's
+built-in tools only; MCP servers you configured for Claude Code, claude.ai
+connectors among them, load regardless. Forge passes `--strict-mcp-config`, so
+a role has exactly the tools its block names. One reviewer without it tried to
+open its captures through a Claude Docs connector and spent 845 s on a single
+review. `allowAllTools: true` keeps your servers, since it asks for the whole
+agent back.
 
 `tools` deserves the warning it gets. `claude -p` with tools is an agent, not a
 completion call: it reads files on its own and bills for every turn. One
@@ -621,6 +631,12 @@ for a role to look at.
   image that appears there is attached to the review. A directory rather than a
   filename is what lets one command emit a screen per state without the loop
   knowing how many there will be.
+- **It is told what the attempt wrote, through `FORGE_CAPTURE_FILES`**: the
+  paths, relative to the command's own workspace, joined with the platform's
+  path separator (`;` on Windows, `:` elsewhere). Render from that, not from
+  `git status`. With `autoCommit` off every earlier ticket's work is still
+  uncommitted, and a Blender capture that asked git rendered the whole backlog
+  into each review. See `examples/blender-props/art/tools/capture.py`.
 - **Its failure *is* the ticket's**, unlike `format`. It is the project's own
   statement about the project's own tree, and a UI that cannot be rendered has
   not passed. A capture that succeeds and produces nothing is not a failure —
@@ -909,7 +925,7 @@ run some context, never the run.
 | `voteThinking` | `true` | Whether a sign-off vote may reason before it answers. Leave it on. It exists because the cost of vote reasoning is real — a four-line verdict costing thousands of tokens — and the question was worth testing rather than arguing; `scripts/vote_grading.py` builds the two arms, and the run on 2026-09-08 answered it. With reasoning off, all four roles signed off a ticket carrying a defect all four had refused on every previous run, at 20 completion tokens a vote, and the run cost 73,040 tokens *more* overall for the attempts that defect then caused. It moves the vote only; the planner's revision keeps its reasoning either way, which a per-model `reasoning-budget` cannot arrange because the roles share their servers. On a provider with no per-call reasoning switch it is accepted and ignored. See the *Sign-off cost* entry in [ROADMAP.md](ROADMAP.md). |
 | `reviseBetweenPasses` | `true` | Whether the planner rewrites the ticket between sign-off passes. Leave it on. Off, the roles vote again on the words they already refused — objections still travel, only the rewrite is gone — and the run on 2026-09-08 showed what that costs: all four roles refused a second time on unchanged text, the ticket parked without ever reaching a build call, and sign-off came to 47% *more* than the arm that revised, because a ticket that cannot be repaired cycles through the pass instead of leaving it. The revision is what converts a correct refusal into a shippable ticket. `scripts/vote_grading.py` builds the arm; see the *Sign-off cost* entry in [ROADMAP.md](ROADMAP.md). |
 | `viewRole` | `"reviewer"` | Which role is shown a ticket's captured rendering, and therefore reviews it. Only tickets whose workspace has a `capture` command produce one, so on every other ticket this changes nothing and the reviewer reviews as it always did. `reviewer` is the right default because that seat already rules on whether the work meets the criteria; a project whose reviewer is a strong text model and whose vision model is a different seat names that one. It is not a fifth seat — sign-off is counted over the four roles, so a new one would change what a majority is. Declare `roleNeeds` on whichever seat this names, or a model that cannot see is told the files exist and shown their names instead of being refused at startup. See *Looking at what it built* in [ROADMAP.md](ROADMAP.md). |
-| `viewModel` | `""` | Which model the viewing seat uses **for a capture review only**. Empty means the seat's own model, which is every run before this existed. It is the case `viewRole` alone cannot express: a backlog whose four roles are local checkpoints, where the one call that has to read a rendering wants the strongest vision model available. Naming a model rather than adding a seat keeps `ROLES` at four — sign-off is counted over it — and it is paid for only on tickets that produced a capture, so a backlog of ordinary tickets costs exactly what it did before. Must name a model declared in `models`. |
+| `viewModel` | `""` | Which model the viewing seat uses **for a capture review only**. Empty means the seat's own model, which is every run before this existed. It is the case `viewRole` alone cannot express: a backlog whose four roles are local checkpoints, where the one call that has to read a rendering wants the strongest vision model available. Naming a model rather than adding a seat keeps `ROLES` at four — sign-off is counted over it — and it is paid for only on tickets that produced a capture, so a backlog of ordinary tickets costs exactly what it did before. Must name a model declared in `models`, and one that can be shown an image: a view model that can only be sent filenames is refused at load, because `roleNeeds` cannot reach it — it is not a role. |
 | `exclusiveGpu` | `[]` | Command kinds that run with the GPU to themselves: every resident llama checkpoint is unloaded before the step starts, waiting on the router's status rather than on VRAM, which frees two seconds before the router will accept a reload. Today the one leasable kind is `capture` — a renderer started beside a resident checkpoint does not fail, it falls back to system RAM and runs an order of magnitude slower. The checkpoint reloads on the next call that needs it, about 9 s for a 23 GB one. A kind that cannot be leased is refused rather than ignored. See [CREATIVE-TOOLS](CREATIVE-TOOLS.md), *The GPU lease*. |
 | `majorityRepeats` | `true` | Whether a pass-1 `majority` is put to the roles a second time. A majority already ships the ticket, and across every recorded pass that reached a second vote on one — three tickets, 730,005 tokens — not one ended anywhere other than where it started. Off, the pass stops there. Unlike `voteThinking` and `reviseBetweenPasses` it removes no part of the mechanism: the vote still reasons, the revision still happens wherever the pass continues, and a `split` or `blocked` still gets its second look. Shipped on replay evidence and unit tests; no live arm exists, because two fixtures written to produce a pass-1 majority both went unanimous. See the *Sign-off cost* entry in [ROADMAP.md](ROADMAP.md). |
 | `ratifyOrder` | all four, in the order above | The order the roles vote in, within a pass. A permutation of the four — it sets the order they vote, not which of them vote, and an order omitting one is refused because sign-off is counted over all four. Two things ride on it. Votes accumulate as they are cast and every role sees the ones before it, so the first votes blind and the last answers three arguments. And on a backend serving one checkpoint at a time (`llamacpp` with `exclusive`, or a router started with `--models-max 1`), two roles sharing a model are free when adjacent and cost a reload when not — see below. |

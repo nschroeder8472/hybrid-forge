@@ -215,6 +215,17 @@ class ClaudeCLIProvider(Provider):
         # Passed even when empty — `--tools ""` is how the CLI is told to run
         # without any, and that is the default here.
         argv += ["--tools", self.tools]
+        # `--tools` governs the CLI's built-in tools and nothing else: MCP
+        # servers the user configured, claude.ai connectors among them, still
+        # load. In phase 1 of docs/CREATIVE-TOOLS.md a reviewer with no tools
+        # tried to open its captures through a Claude Docs connector, said so
+        # in its verdict, and spent 845 s on one review waiting for reads that
+        # never returned. A role is given exactly the tools its config names;
+        # `--strict-mcp-config` with no `--mcp-config` loads no MCP server.
+        # `allowAllTools` is the one setting that asks for the agent back, and
+        # keeps the user's servers with it.
+        if not self.allow_all_tools:
+            argv += ["--strict-mcp-config"]
         argv += self.extra_args
 
         prompt = "\n\n".join(
