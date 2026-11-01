@@ -84,6 +84,39 @@ def _start(
     )
 
 
+def kill_tree(pid: int) -> bool:
+    """End process `pid` and everything it started. True if the kill landed.
+
+    Takes a pid rather than a `Popen` so that a process this interpreter did
+    not start can be ended the same way — a server a previous daemon started
+    and recorded is only a pid to the daemon that resumes after it.
+    """
+    if WINDOWS:
+        try:
+            done = subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(pid)],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            return done.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    try:
+        # Ignored for the type checker rather than for the reader: these
+        # three exist on every platform this branch runs on, and do not
+        # exist in the stubs when it is checked from Windows. A
+        # `sys.platform` test would narrow them, and `WINDOWS` is one
+        # constant read by both branches — worth more than the annotation.
+        os.killpg(  # type: ignore[attr-defined]
+            os.getpgid(pid),  # type: ignore[attr-defined]
+            signal.SIGKILL,  # type: ignore[attr-defined]
+        )
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
 def _kill_tree(proc: subprocess.Popen) -> None:
     """End the process and everything it started, on either platform.
 
@@ -92,33 +125,8 @@ def _kill_tree(proc: subprocess.Popen) -> None:
     exists to replace — but it is better than returning while the shell itself
     still runs, and the caller is told the command timed out either way.
     """
-    if WINDOWS:
-        try:
-            done = subprocess.run(
-                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                capture_output=True,
-                timeout=30,
-                check=False,
-            )
-            if done.returncode == 0:
-                return
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    else:
-        try:
-            # Ignored for the type checker rather than for the reader: these
-            # three exist on every platform this branch runs on, and do not
-            # exist in the stubs when it is checked from Windows. A
-            # `sys.platform` test would narrow them, and `WINDOWS` is one
-            # constant read by both branches — worth more than the annotation.
-            os.killpg(  # type: ignore[attr-defined]
-                os.getpgid(proc.pid),  # type: ignore[attr-defined]
-                signal.SIGKILL,  # type: ignore[attr-defined]
-            )
-            return
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-
+    if kill_tree(proc.pid):
+        return
     try:
         proc.kill()
     except OSError:

@@ -26,6 +26,7 @@ respecs it from the recorded failures, and runs the whole backlog again.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -37,8 +38,9 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Collection, NamedTuple, Sequence
+from typing import Any, Collection, Iterator, NamedTuple, Sequence
 
+from . import gpu
 from . import imports
 from . import manifests
 from . import processes
@@ -97,6 +99,7 @@ from .providers import (
     ToolSpec,
 )
 from .repomap import repo_map
+from .run_servers import RunServers
 from .tools import TOOLS, Toolbox
 from . import split
 from .prompts import (
@@ -378,9 +381,19 @@ class Stopped(Exception):
 
 
 class Orchestrator:
-    def __init__(self, config: Config, store: Store, started_at: float | None = None):
+    def __init__(
+        self,
+        config: Config,
+        store: Store,
+        started_at: float | None = None,
+        servers: RunServers | None = None,
+    ):
         self.config = config
         self.store = store
+        # The servers `forge go` started for this queue, checked between
+        # tickets. None when forge runs no server here, which is every run
+        # before it could. See `forge.run_servers`.
+        self.servers = servers
         self.gate = BudgetGate(store, config.rate_limit_policies())
         self.memory = MemoryClient.from_config(config.memory, room=config.room)
         # `maxRuntimeSeconds` caps unattended wall-clock time, not one run's
@@ -799,6 +812,48 @@ class Orchestrator:
                 self.store.log(run_id, "Paused; waiting for resume.", kind="control")
                 announced = True
             time.sleep(self.config.loop.poll_seconds)
+
+    @contextlib.contextmanager
+    def _gpu_lease(self, run_id: int, kind: str, ticket_id: str = "") -> Iterator[None]:
+        """Run a step with every llama checkpoint off the card, if `kind` asks.
+
+        Only kinds named in `loop.exclusiveGpu`; every other step runs exactly
+        as it did. The release is in a `finally` because a step that raises
+        must still give the card back — today that releases nothing on the
+        llama side, which reloads on its next call, but the image provider's
+        release (`/free`) lands here and must not be skippable.
+        """
+        if kind not in self.config.loop.exclusive_gpu:
+            yield
+            return
+        unloaded, problems = gpu.clear_llama(self.config)
+        prefix = f"{ticket_id}: " if ticket_id else ""
+        self.store.log(
+            run_id,
+            f"{prefix}leased the GPU for {kind}"
+            + (f"; unloaded {', '.join(unloaded)}" if unloaded else "; nothing was resident")
+            + (f". Could not clear: {'; '.join(problems)}" if problems else "."),
+            level="warn" if problems else "info",
+            kind="gpu",
+        )
+        try:
+            yield
+        finally:
+            self.store.log(run_id, f"{prefix}released the GPU after {kind}.", kind="gpu")
+
+    def _keep_servers(self, run_id: int) -> None:
+        """Restart a server forge started that has died, once per run.
+
+        Between tickets, because that is where a dead server would otherwise
+        surface: as an unreachable model on the next ticket's first call,
+        which spends the ticket's attempts in seconds on a cause none of them
+        can fix. A second death raises `ServerError`, which ends the run with
+        the server's log in the record.
+        """
+        if self.servers is None:
+            return
+        for note in self.servers.keep():
+            self.store.log(run_id, note, level="warn", kind="lifecycle")
 
     def _check_runtime(self, run_id: int) -> None:
         limit = self.config.loop.max_runtime_seconds
@@ -1941,6 +1996,7 @@ class Orchestrator:
             while True:
                 self._honor_control(run_id)
                 self._check_runtime(run_id)
+                self._keep_servers(run_id)
 
                 # Checked before the halt and before any ticket, because it is
                 # not a fact about the backlog at all: the machine cannot run
@@ -5752,17 +5808,18 @@ class Orchestrator:
             )
             return [], None
 
-        for name, command, workspace in plan:
-            result = self._shell(
-                run_id,
-                name,
-                command,
-                ticket.ticket_id,
-                workspace=workspace,
-                env={self.CAPTURE_DIR_VAR: str(into)},
-            )
-            if not result.ok:
-                return [], StepResult(ok=False, detail=result.detail)
+        with self._gpu_lease(run_id, "capture", ticket.ticket_id):
+            for name, command, workspace in plan:
+                result = self._shell(
+                    run_id,
+                    name,
+                    command,
+                    ticket.ticket_id,
+                    workspace=workspace,
+                    env={self.CAPTURE_DIR_VAR: str(into)},
+                )
+                if not result.ok:
+                    return [], StepResult(ok=False, detail=result.detail)
 
         images: list[ImagePart] = []
         withheld: list[str] = []

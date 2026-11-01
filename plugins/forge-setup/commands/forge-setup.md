@@ -42,7 +42,11 @@ realistic shapes:
   `model` is the router's **id** for a checkpoint — a section name in the
   preset — not a path and not a file name. Ask for the `.gguf` path too and
   put it in `modelPath`: that is what lets `forge models` write the preset, so
-  `ctx-size` and `contextWindow` come from one source instead of two;
+  `ctx-size` and `contextWindow` come from one source instead of two. If the
+  daemon runs on the GPU box, offer to have forge run the server too: add
+  `"llamaServer": { "port": 8080, "modelsMax": 1 }` to the profile, and
+  `forge go` starts and stops it. For a Hugging Face cache, `modelPath` is the
+  `.gguf` under `snapshots/`, which is a symlink to an extensionless blob;
 - a hosted OpenAI-compatible endpoint (OpenAI, OpenRouter, LiteLLM, Together,
   DeepSeek) — adapter `openai`, `baseUrl` ending in `/v1`, key by env var;
 - an existing Claude subscription — adapter `claude-cli`, no key, requires

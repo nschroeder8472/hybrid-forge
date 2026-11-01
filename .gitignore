@@ -30,6 +30,12 @@ palace/
 .hybridforge/artifacts/
 .hybridforge/abandoned/
 
+# Written when forge runs llama-server: the pid record, the server's log, and
+# the preset generated from this machine's model paths.
+.hybridforge/servers.json
+.hybridforge/logs/
+.hybridforge/models/
+
 # MemPalace per-project files (issue #185)
 mempalace.yaml
 entities.json

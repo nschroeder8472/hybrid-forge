@@ -1144,7 +1144,7 @@ class TestForgeGoDrainsEveryQueuedRun(unittest.TestCase):
         worked: list[int] = []
 
         class _Loop:
-            def __init__(self, config, store, started_at=None):
+            def __init__(self, config, store, started_at=None, servers=None):
                 self.store = store
 
             def run(self, run_id):
@@ -1258,7 +1258,7 @@ class TestForgeGoDrainsEveryQueuedRun(unittest.TestCase):
         clocks: list[float] = []
 
         class _Loop:
-            def __init__(self, config, store, started_at=None):
+            def __init__(self, config, store, started_at=None, servers=None):
                 clocks.append(started_at)
                 self.store = store
 

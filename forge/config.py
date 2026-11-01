@@ -955,6 +955,14 @@ class LoopSettings:
     # adding a seat keeps `ROLES` at four — sign-off is counted over it — and
     # keeps the choice in the project's config, where the rest of this lives.
     view_model: str = ""
+    # Command kinds that run with the GPU to themselves: every resident llama
+    # checkpoint is unloaded before the step starts. Empty is every run before
+    # this existed. On one card, a renderer started beside a resident
+    # checkpoint does not fail — it falls back to system RAM and runs an order
+    # of magnitude slower — so the project says which steps need the card,
+    # because the loop cannot know which of its commands touch it. See
+    # `forge.gpu` and docs/CREATIVE-TOOLS.md, *The GPU lease*.
+    exclusive_gpu: tuple[str, ...] = ()
     # Whether the planner rewrites the ticket between sign-off passes. True is
     # every run before this existed. Off, the roles vote again on the words
     # they already refused, reading the objections but not a revision — which
@@ -1076,6 +1084,28 @@ def _workspace_from(block: Any, index: int) -> Workspace:
     return Workspace(root=root, commands=commands, excludes=list(excludes))
 
 
+def _exclusive_gpu(value: Any) -> tuple[str, ...]:
+    """`loop.exclusiveGpu`, checked: a list of command kinds the card is leased for.
+
+    A kind nothing leases is refused rather than ignored, because an ignored
+    one reads as configured and then runs beside a resident checkpoint anyway.
+    """
+    from .gpu import LEASABLE
+
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ConfigError(
+            f'loop.exclusiveGpu must be a list of command kinds, e.g. ["capture"]; '
+            f"got {value!r}."
+        )
+    unknown = [item for item in value if item not in LEASABLE]
+    if unknown:
+        raise ConfigError(
+            f"loop.exclusiveGpu names {', '.join(unknown)}; the card can be "
+            f"leased for {', '.join(LEASABLE)}."
+        )
+    return tuple(value)
+
+
 def _with_profile(data: dict[str, Any]) -> dict[str, Any]:
     """Fill `models` and `roles` from the machine profile where the repo omits them.
 
@@ -1099,11 +1129,22 @@ def _with_profile(data: dict[str, Any]) -> dict[str, Any]:
     profile holds preferences, not state, and a missing one must not turn a
     working repository into an error.
     """
+    if "llamaServer" in data:
+        # How a machine starts its server is the machine's answer, and a
+        # committed one would hand every clone this machine's port and card.
+        raise ConfigError(
+            "`llamaServer` is in .hybridforge/config.json; it belongs in the "
+            "machine profile (`forge doctor` prints its path), because the "
+            "port and how many checkpoints fit on the card are facts about "
+            "the machine, not the repository."
+        )
     profile = Profile.load()
-    if profile.is_empty and not profile.roles:
+    if profile.is_empty and not profile.roles and not profile.llama_server:
         return data
 
     merged = dict(data)
+    if profile.llama_server:
+        merged["llamaServer"] = profile.llama_server
     if profile.models:
         merged["models"] = {**profile.models, **(data.get("models") or {})}
     if profile.roles:
@@ -1124,6 +1165,10 @@ class Config:
     never_delegate: list[str] = field(default_factory=list)
     # Raw block; parsed by forge.memory so config.py stays free of MCP details.
     memory: dict[str, Any] = field(default_factory=dict)
+    # The machine profile's `llamaServer` block: how this machine starts
+    # `llama-server`, or empty when forge does not start it. Never read from
+    # the repository config. See `forge.llama_server`.
+    llama_server: dict[str, Any] = field(default_factory=dict)
     loop: LoopSettings = field(default_factory=LoopSettings)
     ui: UISettings = field(default_factory=UISettings)
     # What the config file declared, or `None` for a repository that declared
@@ -1214,6 +1259,7 @@ class Config:
             commands=data.get("commands", {}) or {},
             never_delegate=data.get("neverDelegate", []) or [],
             memory=data.get("memory", {}) or {},
+            llama_server=data.get("llamaServer", {}) or {},
         )
 
         declared = data.get("workspaces")
@@ -1278,6 +1324,7 @@ class Config:
             vote_thinking=bool(loop.get("voteThinking", True)),
             view_role=str(loop.get("viewRole", "reviewer")),
             view_model=str(loop.get("viewModel", "")),
+            exclusive_gpu=_exclusive_gpu(loop.get("exclusiveGpu", [])),
             revise_between_passes=bool(
                 loop.get("reviseBetweenPasses", True)
             ),
@@ -1314,6 +1361,13 @@ class Config:
             )
         _validate_commands(self.commands, "commands")
         self._validate_workspaces()
+        if self.llama_server:
+            from .llama_server import LlamaServerError, Settings
+
+            try:
+                Settings.from_block(self.llama_server)
+            except LlamaServerError as exc:
+                raise ConfigError(f"machine profile: {exc}") from exc
 
         if self.loop.bug_hypotheses < 1:
             raise ConfigError(
@@ -1824,6 +1878,7 @@ class Config:
                 "voteThinking": self.loop.vote_thinking,
                 "viewRole": self.loop.view_role,
                 "viewModel": self.loop.view_model,
+                "exclusiveGpu": list(self.loop.exclusive_gpu),
                 "reviseBetweenPasses": self.loop.revise_between_passes,
                 "majorityRepeats": self.loop.majority_repeats,
                 "ratifyOrder": list(self.loop.ratify_order),

@@ -5,11 +5,12 @@ memory server at another, and the roles you want them playing are a decision
 you make once — so `forge init` asks for them once and reuses them from here on
 every subsequent repo.
 
-What stays here is deliberately narrow: **models, roles, memory, and the UI
-port.** What does *not* is anything the repo decides — `commands`, `room`,
-`neverDelegate`. Those differ every time, and a `cargo test` carried into a
-Python repo does not fail loudly. It fails `maxAttempts` times per ticket and
-parks the whole backlog, which looks like a model problem and is not.
+What stays here is deliberately narrow: **models, roles, memory, the UI port,
+and how this machine starts its servers** (`llamaServer`). What does *not* is
+anything the repo decides — `commands`, `room`, `neverDelegate`. Those differ
+every time, and a `cargo test` carried into a Python repo does not fail loudly.
+It fails `maxAttempts` times per ticket and parks the whole backlog, which
+looks like a model problem and is not.
 
 **No credentials are ever written here.** Providers already resolve keys
 through `apiKeyEnv` — the *name* of an environment variable — so that name is
@@ -102,6 +103,16 @@ class Profile:
     roles: dict[str, str] = field(default_factory=dict)
     memory: dict[str, Any] = field(default_factory=dict)
     ui_port: int = 8799
+    # How this machine starts `llama-server`, or empty when it does not: a
+    # machine with no block keeps running its own server, exactly as before.
+    # A fact about the machine — the port, how many checkpoints fit on its
+    # card — so it lives here and never in a repository's config. See
+    # `forge.llama_server`.
+    llama_server: dict[str, Any] = field(default_factory=dict)
+    # Top-level keys this version does not read, kept on save. A profile is
+    # edited by hand and by newer forges; rewriting it must not delete what a
+    # person or a later version put there.
+    extra: dict[str, Any] = field(default_factory=dict)
     # Where it was loaded from, for messages like "reusing settings from …".
     path: Path | None = None
 
@@ -125,11 +136,14 @@ class Profile:
         if not isinstance(data, dict):
             return cls(path=path)
 
+        known = ("_comment", "models", "roles", "memory", "ui", "llamaServer")
         return cls(
             models=data.get("models") or {},
             roles=data.get("roles") or {},
             memory=data.get("memory") or {},
             ui_port=int(data.get("ui", {}).get("port", 8799) or 8799),
+            llama_server=data.get("llamaServer") or {},
+            extra={key: value for key, value in data.items() if key not in known},
             path=path,
         )
 
@@ -149,6 +163,10 @@ class Profile:
             "memory": strip_repo_scope(strip_secrets(self.memory)),
             "ui": {"port": self.ui_port},
         }
+        if self.llama_server:
+            payload["llamaServer"] = strip_secrets(self.llama_server)
+        for key, value in self.extra.items():
+            payload.setdefault(key, strip_secrets(value))
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         self.path = path
         return path

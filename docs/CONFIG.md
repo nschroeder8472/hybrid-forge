@@ -18,7 +18,8 @@ to edit by hand. This document is for the edit afterwards.
 | `.hybridforge/config.json` | everything below | yes, if you like — it carries no secrets |
 | `.hybridforge/run.db` | run state, steps, events, usage | no |
 | `.hybridforge/tickets/` | the backlog as markdown | yes |
-| `$FORGE_PROFILE`, else `%APPDATA%\hybrid-forge\profile.json` or `~/.config/hybrid-forge/profile.json` | machine-level answers reused across repos: `models`, `roles`, `memory`, the UI port | no — outside the repo |
+| `$FORGE_PROFILE`, else `%APPDATA%\hybrid-forge\profile.json` or `~/.config/hybrid-forge/profile.json` | machine-level answers reused across repos: `models`, `roles`, `memory`, the UI port, `llamaServer` | no — outside the repo |
+| `.hybridforge/servers.json`, `.hybridforge/logs/` | which servers forge started on this machine, and what they printed | no |
 
 The machine profile exists because endpoints do not change per repository. What
 it deliberately does **not** carry is anything the repo decides — `commands`,
@@ -399,6 +400,50 @@ llama-server --models-preset models.ini --models-max 1 --host 127.0.0.1 --port 8
 
 Two entries, one endpoint, one GPU: the router swaps between them as the loop
 alternates roles.
+
+#### Forge runs `llama-server`
+
+Optional, and off unless the **machine profile** says otherwise:
+
+```json
+"llamaServer": { "port": 8080, "modelsMax": 1, "args": [] }
+```
+
+With that block in the profile, `forge go` starts `llama-server` before the
+first run, checks between tickets that it is still alive, and stops it when the
+queue ends. `forge llama start` starts one that outlives any run, and
+`forge llama stop` ends it. `forge llama status` says whether one is running and
+who started it.
+
+| Key | Default | Notes |
+|---|---|---|
+| `port` | `8080` | Always bound to `127.0.0.1`. A server other machines must reach is one you run yourself. |
+| `modelsMax` | `1` | `--models-max`. One checkpoint resident at a time, not llama.cpp's default of four, which is fatal on a card that cannot hold four and reports nothing. |
+| `args` | `[]` | Anything else the machine needs, e.g. `["--threads", "8"]`. A flag forge sets — `--host`, `--port`, `--models-preset`, `--models-max`, `--models-dir` — is refused. |
+
+It belongs in the profile and is refused in `config.json`: the port and how
+many checkpoints fit on the card are facts about the machine, not the
+repository.
+
+**Which models it serves.** A `llamacpp` model whose `baseUrl` is absent, or
+names `127.0.0.1`/`localhost` at the managed port. Every such model needs a
+`modelPath`; a run refuses to start without one, naming the model. For a
+Hugging Face cache, name the `.gguf` under `snapshots/`, not the blob it links
+to. A model with any other `baseUrl` is external and forge only talks to it.
+
+**The preset is rewritten before every start**, from the same keys `forge
+models` reads. A server forge started from an older preset is restarted.
+
+**Forge only stops what it started.** A server already answering on the port
+with every model the project needs is used and left running. One answering
+with other models is refused by name, and a port held by something else is
+refused by number. Which servers forge started is recorded in
+`.hybridforge/servers.json`, so a daemon that was killed and resumed still
+owns its server and does not pay a reload for it.
+
+**One restart, then stop.** A server that dies mid-run is started again once.
+A second death fails the run with the end of `.hybridforge/logs/llama-server.log`
+in the record.
 
 ### `kind: "anthropic"`
 
@@ -865,6 +910,7 @@ run some context, never the run.
 | `reviseBetweenPasses` | `true` | Whether the planner rewrites the ticket between sign-off passes. Leave it on. Off, the roles vote again on the words they already refused — objections still travel, only the rewrite is gone — and the run on 2026-09-08 showed what that costs: all four roles refused a second time on unchanged text, the ticket parked without ever reaching a build call, and sign-off came to 47% *more* than the arm that revised, because a ticket that cannot be repaired cycles through the pass instead of leaving it. The revision is what converts a correct refusal into a shippable ticket. `scripts/vote_grading.py` builds the arm; see the *Sign-off cost* entry in [ROADMAP.md](ROADMAP.md). |
 | `viewRole` | `"reviewer"` | Which role is shown a ticket's captured rendering, and therefore reviews it. Only tickets whose workspace has a `capture` command produce one, so on every other ticket this changes nothing and the reviewer reviews as it always did. `reviewer` is the right default because that seat already rules on whether the work meets the criteria; a project whose reviewer is a strong text model and whose vision model is a different seat names that one. It is not a fifth seat — sign-off is counted over the four roles, so a new one would change what a majority is. Declare `roleNeeds` on whichever seat this names, or a model that cannot see is told the files exist and shown their names instead of being refused at startup. See *Looking at what it built* in [ROADMAP.md](ROADMAP.md). |
 | `viewModel` | `""` | Which model the viewing seat uses **for a capture review only**. Empty means the seat's own model, which is every run before this existed. It is the case `viewRole` alone cannot express: a backlog whose four roles are local checkpoints, where the one call that has to read a rendering wants the strongest vision model available. Naming a model rather than adding a seat keeps `ROLES` at four — sign-off is counted over it — and it is paid for only on tickets that produced a capture, so a backlog of ordinary tickets costs exactly what it did before. Must name a model declared in `models`. |
+| `exclusiveGpu` | `[]` | Command kinds that run with the GPU to themselves: every resident llama checkpoint is unloaded before the step starts, waiting on the router's status rather than on VRAM, which frees two seconds before the router will accept a reload. Today the one leasable kind is `capture` — a renderer started beside a resident checkpoint does not fail, it falls back to system RAM and runs an order of magnitude slower. The checkpoint reloads on the next call that needs it, about 9 s for a 23 GB one. A kind that cannot be leased is refused rather than ignored. See [CREATIVE-TOOLS](CREATIVE-TOOLS.md), *The GPU lease*. |
 | `majorityRepeats` | `true` | Whether a pass-1 `majority` is put to the roles a second time. A majority already ships the ticket, and across every recorded pass that reached a second vote on one — three tickets, 730,005 tokens — not one ended anywhere other than where it started. Off, the pass stops there. Unlike `voteThinking` and `reviseBetweenPasses` it removes no part of the mechanism: the vote still reasons, the revision still happens wherever the pass continues, and a `split` or `blocked` still gets its second look. Shipped on replay evidence and unit tests; no live arm exists, because two fixtures written to produce a pass-1 majority both went unanimous. See the *Sign-off cost* entry in [ROADMAP.md](ROADMAP.md). |
 | `ratifyOrder` | all four, in the order above | The order the roles vote in, within a pass. A permutation of the four — it sets the order they vote, not which of them vote, and an order omitting one is refused because sign-off is counted over all four. Two things ride on it. Votes accumulate as they are cast and every role sees the ones before it, so the first votes blind and the last answers three arguments. And on a backend serving one checkpoint at a time (`llamacpp` with `exclusive`, or a router started with `--models-max 1`), two roles sharing a model are free when adjacent and cost a reload when not — see below. |
 | `participationWindow` | `20` | How many ratified tickets `forge signoff` reads before it is willing to say a role has never blocked anything. Report only: nothing in the loop reads it, and no behaviour changes on a role that signs everything. Below the window the report stays silent, because a role that has seen three good tickets and blocked none of them has done nothing wrong. See [ADAPTIVE-TICKET-LOOP](ADAPTIVE-TICKET-LOOP.md) §8.2. |

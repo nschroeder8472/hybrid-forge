@@ -733,6 +733,31 @@ by hand is costing time now. SETUP §1.3 and `forge-setup`'s workspace-layout
 skill both say to run `llama-server` yourself, and both change in this
 phase.
 
+*Built 2026-11-01.* Where the build differs from the paragraph above:
+
+- The supervisor is its own module, `forge/servers.py`, not part of
+  `processes.py`, which stays about bounded commands. `processes.kill_tree`
+  now takes a pid, so a server a dead daemon started can be stopped by the one
+  that resumes. `forge/run_servers.py` is what `forge go` starts and stops.
+- A server forge owns is restarted when its preset changes. The record carries
+  a fingerprint of the argv and the preset, so one started from an older
+  config is not trusted.
+- `servers.json` records an owner. A server `forge llama start` started is
+  used by runs and stopped only by `forge llama stop`.
+- `loop.exclusiveGpu` accepts only `capture` until phase 4 adds `image`. Any
+  other kind is refused, because a lease nobody applies reads as configured.
+- **Building it found a worse version of phase 0's install bug.** Launched
+  through the Store Python's virtual `%LOCALAPPDATA%` path, the pinned b10687
+  `llama-server` loaded the b10666 DLLs from the winget copy on PATH, and with
+  nothing on PATH it did not start at all (`0xC0000135`). A forge that started
+  the server itself would have run a mix of two builds and reported the wrong
+  one. `llama.server_binary` now returns the resolved path, which fixes the
+  launch, the printed path and the reported build together.
+- Verified live: `forge llama start` brought up b10687 with a generated
+  preset, and `forge doctor` got an answer from both Nemotron and Qwen. Qwen was
+  served through its Hugging Face snapshot symlink. `forge llama stop` freed
+  the card.
+
 **4 — `ImageProvider` with a ComfyUI adapter, and forge running ComfyUI.**
 IMAGE-LOOP phase 2, plus the workflow-and-binding config, API-format refusal,
 and render seconds in `usage`. Also the managed process: the `comfyui` profile
