@@ -71,7 +71,8 @@ waist, a wider base, and a horn tapering to a point on the right.
 - The mesh has exactly one UV layer.
 - The object's materials are exactly `["Iron"]`.
 - `bpy.ops.export_scene.gltf(filepath=..., export_format="GLB")` writes a file
-  larger than 0 bytes.
+  larger than 0 bytes, and `common.exported_materials` read on that file gives
+  `Iron` the base colour (0.25, 0.25, 0.27, 1.0), each within 0.001.
 
 ### Context
 
@@ -102,8 +103,17 @@ rings each with one 16-sided face. That is 160 vertices and 146 faces, and
 every face's normal points outwards: call `bmesh.ops.recalc_face_normals` on all
 faces before linking.
 
-Add the UV layer with `bm.loops.layers.uv.new("UVMap")` before any geometry.
-UV values may stay at their defaults.
+Add the UV layer with `uv = bm.loops.layers.uv.new("UVMap")` before any
+geometry, and unwrap the barrel into it so a texture wraps around it. UVs live
+on face corners (loops), so set them per face after the faces exist:
+
+- **Sides:** for the quad joining ring `i` to ring `i + 1` between vertices `j`
+  and `j + 1`, each corner gets `u = j / 16` or `(j + 1) / 16` by which vertex
+  column it belongs to, and `v = z / 0.9` from its vertex's height. The last
+  column's far edge is `u = 1.0`, not `0.0`, so the texture does not smear
+  backwards across the seam.
+- **Caps:** a planar projection seen from above: `u = 0.5 + x / 0.6`,
+  `v = 0.5 + y / 0.6`.
 
 Give the object two materials, in this order:
 `common.material("Wood", (0.55, 0.36, 0.18, 1.0))` and
@@ -142,6 +152,16 @@ dark band at the top and the bottom.
   below 0.1 or above 0.8.
 - Both 16-sided faces have `material_index` 0.
 - The mesh has exactly one UV layer.
+- On every side face, each corner's UV `v` equals its vertex's z divided by 0.9,
+  within 0.0001.
+- Across all side-face corners, the UV `u` values are exactly the 17 values
+  0/16, 1/16, … 16/16, within 0.0001.
+- On both caps, each corner's UV equals (0.5 + x / 0.6, 0.5 + y / 0.6) of its
+  vertex, within 0.0001.
+- Exported with `bpy.ops.export_scene.gltf(..., export_format="GLB")` and read
+  back with `common.exported_materials`, `Wood` has base colour
+  (0.55, 0.36, 0.18, 1.0) and `Iron` has (0.25, 0.25, 0.27, 1.0), each within
+  0.001.
 
 ### Context
 

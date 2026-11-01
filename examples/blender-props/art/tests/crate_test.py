@@ -48,6 +48,23 @@ class CrateTest(unittest.TestCase):
             bpy.ops.export_scene.gltf(filepath=path, export_format="GLB")
             self.assertGreater(os.path.getsize(path), 0)
 
+    def test_its_wood_colour_survives_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "crate.glb")
+            bpy.ops.export_scene.gltf(filepath=path, export_format="GLB")
+            exported = common.exported_materials(path)
+        for got, want in zip(exported["Wood"], crate.WOOD):
+            self.assertAlmostEqual(got, want, places=3)
+
+    def test_its_uvs_span_the_texture(self):
+        # A UV layer that exists but holds one point maps a whole texture to
+        # a single texel; count the distinct coordinates, not the layers.
+        coords = {
+            (round(loop.uv[0], 3), round(loop.uv[1], 3))
+            for loop in self.obj.data.uv_layers.active.data
+        }
+        self.assertGreater(len(coords), 4)
+
 
 if __name__ == "__main__":
     unittest.main()

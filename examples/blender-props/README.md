@@ -13,6 +13,7 @@ art/
   tests/crate_test.py  the reference test
   tests/run_checks.py  runs tests/*_test.py inside Blender, exits non-zero on failure
   tools/capture.py     renders the scenes an attempt changed into FORGE_CAPTURE_DIR
+  tools/export.py      writes build/<scene>.glb and build/<scene>.blend for every scene
 SPEC.md                three tickets: an anvil, a barrel, a workshop using both
 ```
 
@@ -42,9 +43,23 @@ By hand, from `art/`:
 ```
 blender -b --factory-startup --python-exit-code 1 --python tests/run_checks.py
 blender -b --factory-startup --python tools/capture.py      # writes capture_out/
+blender -b --factory-startup --python tools/export.py       # writes build/
 ```
 
-## Three things that fail silently without this layout
+## What it produces
+
+The scene scripts are the source. `tools/export.py` turns each one into the two
+files you would actually use:
+
+- `build/<scene>.glb` — a glTF binary, the standard game asset: mesh, UVs and
+  materials in one file. Godot imports it natively; Unreal, Unity and three.js
+  import glTF.
+- `build/<scene>.blend` — the built scene, to open in Blender and keep working
+  on: texture it, light it, render it.
+
+`build/` is ignored by git and regenerated on demand.
+
+## Four things that fail silently without this layout
 
 - **`--python-exit-code 1`.** Without it Blender exits 0 when a script raises,
   so a test file that crashed on import passes verification. `run_checks.py`
@@ -56,3 +71,8 @@ blender -b --factory-startup --python tools/capture.py      # writes capture_out
   named the way the project names its tests, and a runner whose pattern does
   not collect it reads as a test command that does not run Python, so the run
   stops before it starts.
+- **Set the Principled BSDF's Base Color, not only `diffuse_color`.**
+  `diffuse_color` is the viewport colour, which is what the Workbench capture
+  shows, so every capture looks right; the glTF exporter reads the node, and
+  without it every material exports as flat grey. `common.material()` sets
+  both, and `crate_test.py` reads the colour back out of an exported `.glb`.
