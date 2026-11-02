@@ -1017,6 +1017,48 @@ converged without a stall.
 `MODE: edit` and `REGION` become a Kontext `INSTRUCTION`; a backend without an
 edit workflow degrades to regenerate. Stall detection is not optional here.
 
+*Built and run 2026-11-02.* `loop.editModel` (an `imageModels` entry with an
+`edit` workflow, refused otherwise), `loop.imageStall` (default 3), an
+`EDIT:` reply the executor may give instead of a prompt — offered only when an
+edit model exists and an earlier raw render does, since a prompt is a promise —
+and, on image tickets, a reviewer asked to end a rejection with `ISSUES:`
+short names and `MODE: edit | regenerate`. An edit starts from the newest
+earlier attempt's raw render, read from the artifacts, never from the finished
+file. The stall detector parks a ticket whose last `imageStall` rejections
+share an `ISSUES` name, before another render is paid for. The per-criterion
+verdict IMAGE-LOOP sketched became issue names: they are what the stall
+detector compares, and they need no mapping from prose to criteria.
+
+**The first run of it stopped at sign-off, correctly.** The spec asked for a
+red gem visible at 32x32, and the formatter's palette had no red. Planner,
+executor and reviewer each named the missing colour and the two remedies, and
+the ticket parked before a render was paid for. My spec's defect; the palette
+gained two reds and sign-off was unanimous on the first pass.
+
+**Then: 11.3 minutes, four attempts, two renders and two edits.**
+
+| Attempt | What happened |
+|---|---|
+| 1 | SDXL drew the chest small on a brick floor despite "plain white background"; the coverage check failed |
+| 2 | A good render; the gem was lost at 32x32. Rejected: `missing-gem, silver-lock, gold-wood`, `MODE: edit` |
+| 3 | `EDIT:` — Kontext kept the composition pixel for pixel, browned the wood, golded the lock frame; the gem was still too small. Rejected: `missing-gem` again |
+| 4 | `EDIT:` — "a large, solid, true-red gem ... sized to fill most of the plate so it reads as a distinct red block when scaled down". Accepted |
+
+- **The edit loop did what it is for.** A good composition was kept and fixed
+  rather than thrown away, twice, and the edits chained: attempt 4 edited
+  attempt 3's render, not attempt 2's.
+- **Kontext did not reframe here.** Phase 4's chest moved between edits; these
+  did not move at all. Its rescaling depends on the input's aspect and size, so
+  the phase 6 rule stands: never assume two attempts are pixel-aligned.
+- **The fix that worked is a pixel artist's fix.** A detail that has to read
+  at 32x32 has to be drawn far larger than life at 1024. The executor found
+  that on its second edit, from the reviewer's words alone; a prompt guide
+  could say it up front.
+- **The stall detector did not fire, and should not have.** `missing-gem`
+  appeared in two consecutive rejections and the third attempt fixed it. The
+  reviewer reused the name unprompted by anything but the note, which is the
+  behaviour the detector depends on. It has not yet seen a real stall.
+
 **7 — Pipelines and Flux.2.** The tile-set backlog end to end. Flux.2 only once
 phase 0 has measured whether a turbo-LoRA render is fast enough to sit in a loop
 at all.

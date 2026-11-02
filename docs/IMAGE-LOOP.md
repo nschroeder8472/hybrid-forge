@@ -1,7 +1,8 @@
 # Image generation loop — design spec
 
-**Status:** phases 1, 2 and 4 built; phase 3 built without the criteria gate;
-phases 5 and 6 designed, not built. A first image ticket ran end to end on
+**Status:** phases 1, 2, 4, 5 and 6 built; phase 3 built without the criteria
+gate. Phase 5's per-criterion verdict became `ISSUES:` names and `MODE:`; see
+phases 5 and 6 of [CREATIVE-TOOLS.md](CREATIVE-TOOLS.md). A first image ticket ran end to end on
 2026-11-01 — see phase 5 of [CREATIVE-TOOLS.md](CREATIVE-TOOLS.md). The rest
 of this paragraph describes the state before that: Multimodal messages
 ship on their own — a reviewer can be handed a screenshot on an ordinary code

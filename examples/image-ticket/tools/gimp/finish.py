@@ -18,6 +18,7 @@ SIZE = 32
 PALETTE = [
     "#000000", "#2b1d0e", "#4a2f1a", "#6e4526", "#94603a", "#c08552", "#e0b07a",
     "#3a3a3a", "#6b6b6b", "#a0a0a0", "#d4d4d4", "#ffffff", "#ffd23f", "#b8860b",
+    "#d02a2a", "#7a1414",
 ]
 
 for image in Gimp.get_images():

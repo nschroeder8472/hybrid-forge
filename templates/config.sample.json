@@ -118,6 +118,8 @@
     "viewModel": "",
     "exclusiveGpu": [],
     "imageModel": "",
+    "editModel": "",
+    "imageStall": 3,
     "reviseBetweenPasses": true,
     "majorityRepeats": true,
     "participationWindow": 20,

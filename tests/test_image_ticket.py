@@ -267,3 +267,159 @@ Draw a chest.
 
     def test_an_unknown_kind_is_kept_for_the_gate_to_refuse(self) -> None:
         self.assertEqual(self.kind_of("imag"), "imag")
+
+
+class EditLoopTests(unittest.TestCase):
+    """Phase 6: an EDIT reply edits the last raw render; a stall parks the ticket."""
+
+    def setup(self, edit_model: str = "kontext", stall: int = 3):
+        orch, root, run_id, fake, store = orchestrator()
+        orch.config.loop.edit_model = edit_model
+        orch.config.loop.image_stall = stall
+        edits: list[dict] = []
+
+        class FakeEditor(FakeImageModel):
+            def edit(self, prompt, *, image, mask=None, seed=None):
+                edits.append({"instruction": prompt, "image": image})
+                return Rendering(PNG, "image/png", 32, 32, 5,
+                                 usage=ImageUsage(images=1, seconds=4.0))
+
+        editor = FakeEditor()
+        orch.config.image_provider = (  # type: ignore[method-assign]
+            lambda name: editor if name == "kontext" else fake
+        )
+        return orch, root, run_id, fake, store, edits
+
+    def keep_render(self, root: Path, run_id: int, attempt: int, data: bytes) -> None:
+        folder = (
+            root / ".hybridforge" / "artifacts" / f"run-{run_id}" / "IMG-001"
+            / f"attempt-{attempt}"
+        )
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "render.png").write_bytes(data)
+
+    def replying(self, orch, text: str) -> list[str]:
+        sent: list[str] = []
+
+        def call(*args, **kwargs):
+            sent.append(args[2][-1].text)
+            return Completion(text=text, usage=Usage(), finish_reason="stop")
+
+        orch._call = call
+        return sent
+
+    def test_an_edit_reply_edits_the_last_raw_render(self) -> None:
+        orch, root, run_id, fake, store, edits = self.setup()
+        raw = PNG + b"raw-1024"
+        self.keep_render(root, run_id, 1, raw)
+        t = ticket()
+        t.attempts = 2
+        self.replying(orch, "EDIT: Make the lock plate gold. Keep everything else.")
+        written, refused = orch._render_attempt(run_id, t, "lock is silver", [])
+        self.assertIsNone(refused)
+        self.assertEqual(edits[0]["image"], raw)
+        self.assertEqual(edits[0]["instruction"], "Make the lock plate gold. Keep everything else.")
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(written, ["assets/chest.png"])
+
+    def test_the_edit_is_offered_only_with_an_edit_model_and_a_previous_render(self) -> None:
+        orch, root, run_id, _fake, _store, _edits = self.setup()
+        sent = self.replying(orch, "PROMPT: x")
+        orch._render_attempt(run_id, ticket(), "", [])
+        self.assertNotIn("EDIT:", sent[0])  # no previous render yet
+        self.keep_render(root, run_id, 1, PNG)
+        t = ticket()
+        t.attempts = 2
+        orch._render_attempt(run_id, t, "", [])
+        self.assertIn("EDIT:", sent[1])
+
+    def test_without_an_edit_model_an_edit_reply_is_not_rendered(self) -> None:
+        orch, root, run_id, fake, _store, edits = self.setup(edit_model="")
+        self.keep_render(root, run_id, 1, PNG)
+        t = ticket()
+        t.attempts = 2
+        self.replying(orch, "EDIT: make it gold")
+        _written, refused = orch._render_attempt(run_id, t, "", [])
+        self.assertIsNotNone(refused)
+        self.assertIn("PROMPT:", refused.detail)
+        self.assertEqual((edits, fake.calls), ([], []))
+
+    def test_the_same_issue_three_times_running_parks_without_a_render(self) -> None:
+        orch, _root, run_id, fake, _store, _edits = self.setup()
+        sent = self.replying(orch, "PROMPT: x")
+        rejections = [f"REJECT\nattempt {i}\nISSUES: silver-lock, other-{i}" for i in range(3)]
+        _written, refused = orch._render_attempt(run_id, ticket(), "", rejections)
+        self.assertTrue(refused.blocked)
+        self.assertIn("silver-lock", refused.detail)
+        self.assertEqual((sent, fake.calls), ([], []))
+
+    def test_changing_issues_do_not_park(self) -> None:
+        orch, _root, run_id, fake, _store, _edits = self.setup()
+        self.replying(orch, "PROMPT: x")
+        rejections = ["ISSUES: gold-wood", "ISSUES: too-small", "ISSUES: silver-lock"]
+        _written, refused = orch._render_attempt(run_id, ticket(), "", rejections)
+        self.assertIsNone(refused)
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_a_stall_window_of_zero_never_parks(self) -> None:
+        orch, _root, run_id, fake, _store, _edits = self.setup(stall=0)
+        self.replying(orch, "PROMPT: x")
+        _written, refused = orch._render_attempt(run_id, ticket(), "", ["ISSUES: a"] * 5)
+        self.assertIsNone(refused)
+
+    def test_the_image_reviewer_is_asked_for_issues_and_mode(self) -> None:
+        orch, _root, run_id, _fake, _store, _edits = self.setup()
+        seen: list[dict] = []
+        replies = [
+            "PROMPT: pixel art, a chest",
+            "tests/chest_test.py\n```python\ndef test_a():\n    assert True\n```",
+            "ACCEPT",
+        ]
+
+        def call(*args, **kwargs):
+            seen.append({"role": args[1], "messages": args[2]})
+            return Completion(text=replies[min(len(seen) - 1, 2)], usage=Usage(),
+                              finish_reason="stop")
+
+        orch._call = call
+        orch._attempt(run_id, ticket(), "")
+        review = next(c for c in seen if c["role"] == "reviewer")
+        note = review["messages"][-1].text
+        self.assertIn("ISSUES:", note)
+        self.assertIn("MODE: edit", note)
+
+    def test_issue_names_are_normalised(self) -> None:
+        from forge.prompts import review_issues
+
+        self.assertEqual(
+            review_issues("REJECT\n**ISSUES:** Gold Wood, silver_lock\nMODE: edit"),
+            {"gold-wood", "silver-lock"},
+        )
+
+
+class EditConfigTests(unittest.TestCase):
+    def test_an_edit_model_without_an_edit_workflow_is_refused(self) -> None:
+        import json
+        import os
+
+        from forge.config import ConfigError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".hybridforge" / "comfy").mkdir(parents=True)
+            graph = {"6": {"class_type": "CLIPTextEncode", "inputs": {"text": "x"}},
+                     "9": {"class_type": "SaveImage", "inputs": {}}}
+            (root / ".hybridforge" / "comfy" / "g.json").write_text(json.dumps(graph))
+            body = {
+                "models": {"m": TEXT},
+                "roles": {r: "m" for r in ("planner", "executor", "tester", "reviewer")},
+                "imageModels": {"pixel": {"kind": "comfyui", "url": "http://127.0.0.1:1",
+                                          "workflows": {"generate": ".hybridforge/comfy/g.json"},
+                                          "bind": {"prompt": ["6", "text"]}}},
+                "loop": {"editModel": "pixel"},
+            }
+            (root / ".hybridforge" / "config.json").write_text(json.dumps(body))
+            with unittest.mock.patch.dict(os.environ, {"FORGE_PROFILE": str(root / "p.json")}):
+                with self.assertRaises(ConfigError) as caught:
+                    Config.load(root)
+        self.assertIn("no `edit` workflow", str(caught.exception))

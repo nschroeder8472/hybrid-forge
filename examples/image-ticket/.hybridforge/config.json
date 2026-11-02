@@ -29,6 +29,26 @@
         ]
       },
       "promptGuide": "SDXL with a pixel-art LoRA. Start the prompt with 'pixel art'. Ask for exactly one object, centred, with a clear plain white margin on every side: the finisher clears the background by flood-filling inward from the edges, so an object that touches the frame is eaten into. No shadow, no floor. Describe the object's colours and shape plainly: this model follows composition loosely and takes colour words literally."
+    },
+    "kontext": {
+      "kind": "comfyui",
+      "workflows": {
+        "edit": ".hybridforge/comfy/flux-kontext-edit.json"
+      },
+      "bind": {
+        "prompt": [
+          "7",
+          "text"
+        ],
+        "seed": [
+          "11",
+          "seed"
+        ],
+        "image": [
+          "4",
+          "image"
+        ]
+      }
     }
   },
   "workspaces": [
@@ -64,6 +84,8 @@
     "imageModel": "pixel",
     "exclusiveGpu": [
       "image"
-    ]
+    ],
+    "editModel": "kontext",
+    "imageStall": 3
   }
 }
