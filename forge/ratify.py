@@ -44,6 +44,7 @@ from .providers import Completion, ProviderError
 from .respec import (
     _dropped_decisions,
     _drop_whole_file_claims,
+    _moved_numbers,
     _ground_references,
     _order_shared_scope,
     _preserve_plan_context,
@@ -566,6 +567,23 @@ def _apply(
                 level="warn",
                 kind="ticket",
                 data={"proposed": len(proposed_spec), "anchor": len(anchor)},
+            )
+
+    if "spec" in revision:
+        moved = _moved_numbers(ticket, revision["spec"], ())
+        if moved:
+            revision.pop("spec")
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: ratify changed {len(moved)} number(s) the "
+                f"plan's spec states; the spec revision was refused. A role "
+                f"objecting to a number does not make the number wrong — it was "
+                f"measured or chosen by the person who wrote it, and if it is "
+                f"wrong the objection will stand and a person will see it: "
+                + ", ".join(moved[:8]),
+                level="warn",
+                kind="ticket",
+                data={"numbers": moved},
             )
 
     if "spec" in revision:

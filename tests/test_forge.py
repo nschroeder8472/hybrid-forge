@@ -12551,9 +12551,16 @@ class TestRespecCannotQuietlyWalkAConstant(unittest.TestCase):
         step = store.start_step(run_id, "PF-005", "test")
         store.end_step(step, "failed", "AssertionError: expected 1 to be 2")
 
+        # The revision keeps the human's own numbers — `(seed << 1) | 1` — and
+        # restates the abandoned `3n` beside them. A revision that dropped the
+        # human's numbers would be refused for that, by `_moved_numbers`; this
+        # test is about the abandoned list, which must refuse nothing.
         def call(_messages, _budget):
             return Completion(
-                text=json.dumps({"spec": "Set #inc to 3n, state 0x14057b7ef767814f."}),
+                text=json.dumps({
+                    "spec": "Set #inc from the seed as (seed << 1) | 1, which is "
+                            "3n for seed 1, state 0x14057b7ef767814f."
+                }),
                 usage=Usage(),
             )
 

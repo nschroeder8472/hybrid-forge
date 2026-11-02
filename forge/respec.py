@@ -16,6 +16,7 @@ channel, and the CLI's must not wait on either.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
@@ -487,6 +488,62 @@ def _dropped_decisions(
         if len(_normalise(decision)) >= _DECISION_FLOOR
         and _normalise(decision) not in kept
     ]
+
+
+# A number as a spec states it: an optional sign, digits, an optional decimal
+# part. Not preceded by a letter or underscore, so `x2` and `attempt_3` are
+# names rather than numbers; not followed by one either, so `3d` is not `3`.
+_SPEC_NUMBER = re.compile(r"(?<![\w.])-?\d+(?:\.\d+)?(?![\w])")
+
+
+def spec_numbers(text: str) -> Counter[str]:
+    """Every number a spec states, as a multiset of normalised spellings.
+
+    Normalised so `0.10` and `0.1`, or `-0.0` and `0.0`, are the same number: a
+    reviser that reformats a value has not changed it. Counted, not just
+    collected, because a spec that gives two boxes the same corner and a
+    revision that moves one of them has lost a number while keeping its
+    spelling.
+    """
+    found: Counter[str] = Counter()
+    for match in _SPEC_NUMBER.finditer(text or ""):
+        try:
+            value = float(match.group(0))
+        except ValueError:
+            continue
+        found[repr(value + 0.0)] += 1
+    return found
+
+
+def _moved_numbers(
+    ticket: Ticket, proposed: str, ruled_out: Sequence[tuple[str, str]] = ()
+) -> list[str]:
+    """Numbers the human's spec stated that a revised spec no longer states.
+
+    A revision may say the spec better; it may not change what the numbers
+    are. Every number a person wrote into a spec is either one they measured or
+    one they chose, and a reviser reasoning from general knowledge has neither.
+    Twice running it "corrected" measured geometry: phase 7's sign-off rewrote
+    `create_grid(size=2.0)` as `size=4.0` and a UV offset of `(x + 2, y + 2)` as
+    `(x, y)`, and the sprite-sheet run's moved a keyhole from y -0.075 to -0.06
+    and then -0.065. Each revision was plausible next to the one before; each
+    broke the criteria the numbers were measured to satisfy, and in the second
+    case every role then objected to the revision's numbers and the ticket
+    parked twice. `Decision:` would have protected them, but only the sentences
+    an author thought to mark.
+
+    Judged against the human's text, through `_anchor`, so a chain of
+    revisions cannot walk a number away one plausible step at a time. Extra
+    numbers in a revision are not counted against it: restating a value, or
+    deriving one, adds without moving.
+    """
+    anchor = spec_numbers(_anchor(ticket, ruled_out))
+    kept = spec_numbers(proposed)
+    moved: list[str] = []
+    for value, count in sorted(anchor.items()):
+        if kept[value] < count:
+            moved.append(value)
+    return moved
 
 
 def _softened_values(ticket: Ticket, revision: dict) -> list[str]:
@@ -1195,6 +1252,20 @@ def revise(
     # revision tried to drop from the writable scope. Two unrelated lists under
     # one name in one function, the second silently overwriting the first.
     dropped_decisions: list[str] = []
+    if "spec" in revision:
+        moved = _moved_numbers(ticket, revision["spec"], ruled_out)
+        if moved:
+            revision.pop("spec")
+            store.log(
+                run_id,
+                f"{ticket.ticket_id}: respec changed {len(moved)} number(s) the "
+                f"plan's spec states; the spec revision was refused. A number a "
+                f"person wrote into a spec was measured or chosen, and a reviser "
+                f"has done neither: " + ", ".join(moved[:8]),
+                level="warn",
+                kind="ticket",
+                data={"numbers": moved},
+            )
     if "spec" in revision:
         dropped_decisions = _dropped_decisions(ticket, revision["spec"], ruled_out)
         if dropped_decisions:
