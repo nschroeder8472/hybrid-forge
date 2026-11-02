@@ -62,7 +62,15 @@ _RATIFICATION = re.compile(r"^#{1,4}\s*Ratification.*$", re.MULTILINE | re.IGNOR
 # "**Kind:** bug" — a ticket the loop must reproduce before it may fix it. Only
 # written when it is not the ordinary kind, so a plan a human wrote by hand
 # does not have to say "feature" on every section.
-_KIND = re.compile(r"^\*\*Kind:\*\*\s*(?P<kind>bug|feature)", re.MULTILINE | re.IGNORECASE)
+#
+# Any word is read and stored as written. This used to match `bug|feature`
+# only, so `**Kind:** image` — and any typo — silently became a feature
+# ticket and ran down the code path; phase 5 of docs/CREATIVE-TOOLS.md started
+# an image ticket that way. The loop's kind gate now parks a kind it cannot
+# run, by name, before any model is called.
+_KIND = re.compile(
+    r"^\*\*Kind:\*\*\s*(?P<kind>[A-Za-z][\w-]*)", re.MULTILINE | re.IGNORECASE
+)
 
 # Anything after the marker is captured, not just the values this version
 # knows. `routes.normalise` settles it — and a route nobody can parse

@@ -90,6 +90,7 @@ from .patch import (
     wrote_a_tool_call,
 )
 from .providers import (
+    ComfyConfigError,
     Completion,
     ContextOverflow,
     ImagePart,
@@ -124,6 +125,8 @@ from .prompts import (
     parse_stuck_review,
     stuck_review_prompt,
     parse_verdict,
+    image_prompt,
+    parse_image_reply,
     parse_bug,
     parse_scope_argument,
     record_prompt,
@@ -148,6 +151,8 @@ from .state import (
     RUN_WAITING_BUDGET,
     TICKET_BLOCKED,
     TICKET_BUG,
+    TICKET_FEATURE,
+    TICKET_IMAGE,
     TICKET_DONE,
     TICKET_FAILED,
     TICKET_PENDING,
@@ -411,6 +416,9 @@ class Orchestrator:
     ):
         self.config = config
         self.store = store
+        # The prompt block each image ticket's last attempt sent, so a revision
+        # starts from what was rendered. See `_render_attempt`.
+        self._image_prompts: dict[str, str] = {}
         # The servers `forge go` started for this queue, checked between
         # tickets. None when forge runs no server here, which is every run
         # before it could. See `forge.run_servers`.
@@ -886,6 +894,183 @@ class Orchestrator:
             return
         for note in self.servers.keep():
             self.store.log(run_id, note, level="warn", kind="lifecycle")
+
+    # The image formats an image ticket may write. PNG only: the image models
+    # forge reaches save PNG, and a check script asserts against one format.
+    IMAGE_OUTPUTS = (".png",)
+
+    def _image_target(self, ticket: Ticket) -> list[str]:
+        """The image paths among a ticket's allowed files."""
+        return [
+            path for path in ticket.allowed_files
+            if not any(ch in path for ch in "*?[")
+            and Path(path).suffix.lower() in self.IMAGE_OUTPUTS
+        ]
+
+    def _kind_gate(self, run_id: int, ticket: Ticket) -> bool:
+        """Park a ticket whose kind this loop cannot run. Returns False if parked.
+
+        An unknown kind used to run down the feature path, which on an image
+        ticket would ask the executor for source files and get nonsense
+        (docs/IMAGE-LOOP.md, "The ticket"). Checked before any model is called.
+        """
+        if ticket.kind not in (TICKET_FEATURE, TICKET_BUG, TICKET_IMAGE):
+            self._park(
+                run_id, ticket,
+                f"kind {ticket.kind!r} is not one this loop runs; it runs "
+                f"feature, bug and image tickets.",
+            )
+            return False
+        if ticket.kind != TICKET_IMAGE:
+            return True
+        problems = []
+        if not self.config.loop.image_model:
+            problems.append(
+                "no image model renders it: set `loop.imageModel` to an entry "
+                "in `imageModels`"
+            )
+        targets = self._image_target(ticket)
+        if len(targets) != 1:
+            problems.append(
+                f"it must name exactly one image to write ({', '.join(self.IMAGE_OUTPUTS)}) "
+                f"in Allowed files; it names {len(targets)}"
+            )
+        viewer = self.config.loop.view_role
+        try:
+            seeing = (
+                self.config.provider_for_model(self.config.loop.view_model)
+                if self.config.loop.view_model
+                else self.config.provider_for(viewer)
+            )
+            sees = seeing.capabilities().supports_images
+        except Exception:  # noqa: BLE001 - a seat that cannot be built cannot see
+            sees = False
+        if not sees:
+            problems.append(
+                f"the seat that reviews it ({viewer}, or `loop.viewModel`) cannot be "
+                f"shown an image, so it would judge a picture by its filename"
+            )
+        if problems:
+            self._park(run_id, ticket, "image ticket cannot run: " + "; ".join(problems) + ".")
+            return False
+        return True
+
+    def _render_attempt(
+        self,
+        run_id: int,
+        ticket: Ticket,
+        failure_context: str,
+        rejections: Sequence[str],
+    ) -> tuple[list[str], StepResult | None]:
+        """An image ticket's build and apply: a prompt, then a render.
+
+        The executor writes a PROMPT / NEGATIVE / SEED block and the image model
+        named by `loop.imageModel` renders it, under the GPU lease, into the
+        ticket's one image path. The rendering is recorded before anything
+        judges it — it has already been paid for — and copied into the
+        attempt's artifacts with the prompt and seed that made it, which is the
+        whole reproducibility story for an artifact that has no source.
+
+        Returns the written paths, or a `StepResult` that ends the attempt.
+        """
+        target = self._image_target(ticket)[0]
+        model = self.config.loop.image_model
+        guide = str(self.config.image_models.get(model, {}).get("promptGuide", ""))
+
+        step_id = self.store.start_step(run_id, ticket.ticket_id, "build")
+        try:
+            completion = self._converse(
+                run_id,
+                "executor",
+                image_prompt(
+                    ticket,
+                    failure_context,
+                    previous=self._image_prompts.get(ticket.ticket_id, ""),
+                    guide=guide,
+                ),
+                max_tokens=self._output_budget("executor"),
+                temperature=0.0,
+            )
+        except ProviderError as exc:
+            self.store.end_step(step_id, "failed", str(exc))
+            return [], StepResult(ok=False, detail=f"executor unavailable: {exc}")
+        reply = parse_image_reply(completion.text)
+        if reply.blocked:
+            self.store.end_step(step_id, "failed", reply.blocked)
+            return [], StepResult(ok=False, blocked=True, detail=reply.blocked)
+        if not reply.prompt:
+            self.store.end_step(step_id, "failed", clip(completion.text, DETAIL_CHARS))
+            return [], StepResult(
+                ok=False,
+                detail=(
+                    "the reply had no `PROMPT:` line, so there was nothing to render. "
+                    "Reply with PROMPT:, NEGATIVE: and SEED: lines and nothing else."
+                ),
+            )
+        self.store.end_step(step_id, "ok", reply.block())
+        self._image_prompts[ticket.ticket_id] = reply.block()
+
+        step_id = self.store.start_step(run_id, ticket.ticket_id, "render")
+        try:
+            provider = self.config.image_provider(model)
+            with self._gpu_lease(run_id, "image", ticket.ticket_id):
+                rendering = provider.generate(
+                    reply.prompt, seed=reply.seed, negative=reply.negative
+                )
+        except ComfyConfigError as exc:
+            self.store.end_step(step_id, "failed", str(exc))
+            return [], StepResult(ok=False, blocked=True, detail=str(exc))
+        except ProviderError as exc:
+            self.store.end_step(step_id, "failed", str(exc))
+            return [], StepResult(ok=False, detail=f"image model unavailable: {exc}")
+        self.gate.record_rendering(model, rendering.usage)
+
+        if not is_safe_path(self.config.root, target):
+            self.store.end_step(step_id, "failed", f"unsafe path {target}")
+            return [], StepResult(ok=False, blocked=True, detail=f"unsafe image path {target}")
+        destination = self.config.root / target
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(rendering.data)
+
+        attempt_dir = (
+            self.config.config_dir / ARTIFACTS_DIR / f"run-{run_id}"
+            / safe_name(ticket.ticket_id, "ticket")
+            / f"attempt-{max(1, ticket.attempt_number)}"
+        )
+        try:
+            attempt_dir.mkdir(parents=True, exist_ok=True)
+            (attempt_dir / f"render{Path(target).suffix}").write_bytes(rendering.data)
+        except OSError:
+            pass
+        summary = (
+            f"{target}: {rendering.width}x{rendering.height}, seed {rendering.seed}, "
+            f"{rendering.usage.seconds:.1f}s on {model}"
+        )
+        self.store.end_step(step_id, "ok", summary)
+        self.store.log(
+            run_id,
+            f"{ticket.ticket_id}: rendered {summary}",
+            kind="render",
+            data={
+                "prompt": reply.prompt, "negative": reply.negative,
+                "seed": rendering.seed, "model": model,
+                "seconds": rendering.usage.seconds,
+            },
+        )
+        return [target], None
+
+    def _rendered_parts(self, written: Sequence[str]) -> list[ImagePart]:
+        """The images an image ticket wrote, as parts for the review to look at."""
+        parts = []
+        for path in written:
+            suffix = Path(path).suffix.lower()
+            media_type = IMAGE_TYPES.get(suffix)
+            full = self.config.root / path
+            if media_type and full.is_file():
+                parts.append(
+                    ImagePart(media_type=media_type, data=full.read_bytes(), path=str(full))
+                )
+        return parts
 
     def _check_runtime(self, run_id: int) -> None:
         limit = self.config.loop.max_runtime_seconds
@@ -4398,6 +4583,9 @@ class Orchestrator:
             )
             return
 
+        if not self._kind_gate(run_id, ticket):
+            return
+
         if not self._scope_gate(run_id, ticket):
             return
 
@@ -6024,325 +6212,337 @@ class Orchestrator:
         reviewer is shown what failed before, so it judges the fix against the
         fault rather than against a green suite.
         """
-        # --- BUILD ---------------------------------------------------
-        # The files this ticket may write must reach the executor whole; it is
-        # about to send them back as whole files.
-        #
-        # The reproduction goes in read-only. It is the contract the attempt is
-        # judged against and the executor may not write it — but it was not
-        # shown either, so the executor was told "your fix is not done until
-        # `bug_001_test.java` passes" and handed a runner's summary of a file
-        # it had never seen. One replied `BLOCKED: ... I cannot determine the
-        # exact cause without seeing the test code`, which was exactly right.
-        # Reading a test you cannot edit is how you find out what it wants.
-        sources, oversized = self._sources_for(
-            ticket,
-            extra=[repro[0]] if repro else None,
-            whole=ticket.allowed_files,
-        )
-        # The same reading scope, in the form a picture survives. A reference
-        # `.png` has no text to show, so it reaches the prompt as something to
-        # look at or as a named file the model is told it cannot see.
-        images, images_withheld = self._reference_images(
-            ticket, extra=[repro[0]] if repro else None
-        )
-        if oversized:
-            detail = (
-                "This ticket cannot be delegated as written. It authorises "
-                "files too large to rewrite in full:\n"
-                + "\n".join(f"- {entry}" for entry in oversized)
-                + "\n\nThe executor returns whole files, so it would have to be "
-                "shown a partial copy and asked to reproduce all of it — which "
-                "deletes whatever it was not shown. Split the ticket so it "
-                "writes smaller files, or narrow its scope."
+        written: list[str]
+        if ticket.kind == TICKET_IMAGE:
+            # An image ticket's build is a prompt and its apply is a render;
+            # everything after this — tests, format, verify, review — is the
+            # same pipeline as any ticket. See `_render_attempt`.
+            written, refused = self._render_attempt(
+                run_id, ticket, failure_context, rejections or []
             )
-            self.store.log(
-                run_id,
-                f"{ticket.ticket_id}: blocked — {detail.splitlines()[0]}",
-                level="warn",
-                kind="ticket",
+            if refused is not None:
+                return refused
+            wrote_nothing, scope_note = False, ""
+        else:
+            # --- BUILD ---------------------------------------------------
+            # The files this ticket may write must reach the executor whole; it is
+            # about to send them back as whole files.
+            #
+            # The reproduction goes in read-only. It is the contract the attempt is
+            # judged against and the executor may not write it — but it was not
+            # shown either, so the executor was told "your fix is not done until
+            # `bug_001_test.java` passes" and handed a runner's summary of a file
+            # it had never seen. One replied `BLOCKED: ... I cannot determine the
+            # exact cause without seeing the test code`, which was exactly right.
+            # Reading a test you cannot edit is how you find out what it wants.
+            sources, oversized = self._sources_for(
+                ticket,
+                extra=[repro[0]] if repro else None,
+                whole=ticket.allowed_files,
             )
-            return StepResult(ok=False, blocked=True, detail=detail)
-
-        # Rebuilt from the step log on every call, so the transport stays
-        # stateless and a retry cycle inherits the thread — the daemon's state
-        # machine remains the only state machine. Empty unless the flag is set,
-        # which keeps the flat prompt the default.
-        prior_turns = (
-            self.store.ticket_turns(
-                run_id, ticket.ticket_id, limit=self.config.loop.executor_turns
+            # The same reading scope, in the form a picture survives. A reference
+            # `.png` has no text to show, so it reaches the prompt as something to
+            # look at or as a named file the model is told it cannot see.
+            images, images_withheld = self._reference_images(
+                ticket, extra=[repro[0]] if repro else None
             )
-            if self.config.loop.executor_turns
-            else []
-        )
-
-        step_id = self.store.start_step(run_id, ticket.ticket_id, "build")
-        # A reply that did not parse into files is a formatting mistake, not a
-        # failed implementation, and spending a whole attempt on one buys
-        # nothing: the next attempt re-reads the same spec and the model makes
-        # the same mistake. One ticket lost six of its nine attempts that way,
-        # every one to a fenced block with no path line above it, while the
-        # three that parsed drew specific and answerable review objections it
-        # never got the budget to address.
-        #
-        # So the reply is refused and asked for again inside the attempt, the
-        # way the tester already reprompts a rejected test file. Once only —
-        # a model that cannot follow the format twice will not follow it on the
-        # third ask, and the attempt should end while the evidence is fresh.
-        malformed = ""
-        for remaining in (1, 0):
-            try:
-                completion = self._converse(
-                    run_id,
-                    "executor",
-                    build_prompt(
-                        ticket,
-                        failure_context,
-                        retrieved,
-                        sources,
-                        toolchain=self._toolchain_for(ticket),
-                        learned_limit=self.config.loop.learned_limit,
-                        failure_classes=self.store.ticket_classes(
-                            run_id, ticket.ticket_id
-                        ),
-                        prior_failures=prior_failures,
-                        oscillation=oscillation,
-                        malformed=malformed,
-                        prior_turns=prior_turns,
-                        repository_map=self._repo_map(),
-                        can_read=self._can_read("executor"),
-                    ),
-                    **self._attachments(images, images_withheld),
-                    max_tokens=self._output_budget("executor"),
-                    # Stated rather than left to `_call`'s default, which is
-                    # how the executor came to sample at 0.2 — the highest in
-                    # the pipeline, on the one role whose output has to hit a
-                    # machine-readable format before any of it counts. Every
-                    # other call site chose a number; this one inherited one.
-                    # A model block's own `temperature` still overrides this,
-                    # which is the point of `Provider.temperature`.
-                    temperature=0.0,
+            if oversized:
+                detail = (
+                    "This ticket cannot be delegated as written. It authorises "
+                    "files too large to rewrite in full:\n"
+                    + "\n".join(f"- {entry}" for entry in oversized)
+                    + "\n\nThe executor returns whole files, so it would have to be "
+                    "shown a partial copy and asked to reproduce all of it — which "
+                    "deletes whatever it was not shown. Split the ticket so it "
+                    "writes smaller files, or narrow its scope."
                 )
-            except ContextOverflow as exc:
-                self.store.end_step(step_id, "failed", str(exc))
-                return StepResult(ok=False, blocked=True, detail=str(exc))
-            except ProviderError as exc:
-                self.store.end_step(step_id, "failed", str(exc))
-                self._record_step(ticket, "build", "failed", {"error": str(exc)})
-                return StepResult(ok=False, detail=f"executor unavailable: {exc}")
-
-            self._record_call(ticket, "build", "executor", completion)
-
-            # A response cut off at the output limit parses cleanly — the fence
-            # the model opened is simply never closed, or closes around half a
-            # function. Applying it writes a file that is syntactically wrong
-            # for a reason no reviewer would guess from the diff, so nothing is
-            # written and the attempt is spent instead. Not reprompted: the
-            # second call gets the same budget and runs out of it the same way.
-            if completion.truncated:
-                # Two ways to run out, needing opposite advice. A reply that
-                # named files and was cut off partway through them asked for
-                # too much in one response. A reply that never named one spent
-                # the budget on prose before it started — run 11's first
-                # attempt read correctly, identified everything it needed, and
-                # hit the limit describing that. Telling it to send fewer files
-                # is telling it to do less of the thing it never began.
-                if names_a_file(completion.text):
-                    detail = (
-                        "Your previous response was cut off at the output "
-                        "limit, so no files were written. Emit the same "
-                        "implementation in fewer output tokens — fewer files "
-                        "per response, no restated context — or reply BLOCKED: "
-                        "if the ticket cannot be implemented within that "
-                        "budget."
-                    )
-                else:
-                    detail = (
-                        "Your previous response was cut off at the output "
-                        "limit before it named a single file, so nothing was "
-                        "written. The whole budget went on prose. Blocks "
-                        "first, prose never: open with a path line and a "
-                        "fenced block, and send no summary of what you read, "
-                        "no plan, and no explanation. Reply BLOCKED: if you "
-                        "genuinely cannot proceed."
-                    )
-                self.store.end_step(step_id, "failed", clip(completion.text, DETAIL_CHARS))
-                return StepResult(ok=False, detail=detail)
-
-            parsed = parse_output(completion.text)
-            malformed = self._malformed_reply(parsed, completion.text, ticket)
-            if not malformed or not remaining:
-                break
-            self.store.log(
-                run_id,
-                f"{ticket.ticket_id}: the executor's reply did not parse into "
-                f"files; asking again before the attempt is spent.",
-                level="warn",
-                kind="ticket",
-                data={"complaint": malformed[:400]},
-            )
-
-        self.store.end_step(step_id, "ok", clip(completion.text, DETAIL_CHARS))
-
-        if parsed.is_blocked:
-            return StepResult(ok=False, blocked=True, detail=parsed.blocked_reason)
-
-        # Kept, never acted on here. `IMPOSSIBLE:` is a claim about the ticket
-        # from the party least able to judge it: an executor that cannot pass a
-        # ticket has every reason to conclude nobody can. So it is held for the
-        # escalation rung, where the planner is shown it beside the criteria
-        # and asked to confirm or refute it.
-        #
-        # Recorded even when the reply also carried files — that is the shape
-        # it actually arrives in. One executor implemented its best guess and
-        # wrote "there's a contradiction in the acceptance criteria" alongside
-        # it on attempt 58 of 430. It was right, the edits parsed, and the
-        # sentence was read by nothing.
-        if parsed.is_impossible:
-            first = ticket.ticket_id not in self._impossible_claims
-            self._impossible_claims[ticket.ticket_id] = parsed.impossible_reason
-            if first:
                 self.store.log(
                     run_id,
-                    f"{ticket.ticket_id}: the executor says this ticket cannot "
-                    f"be satisfied as written — {parsed.impossible_reason[:400]}. "
-                    f"Held for the planner to confirm or refute; the attempt "
-                    f"continues.",
+                    f"{ticket.ticket_id}: blocked — {detail.splitlines()[0]}",
                     level="warn",
                     kind="ticket",
-                    data={
-                        "ticket": ticket.ticket_id,
-                        "impossible": parsed.impossible_reason,
-                    },
                 )
+                return StepResult(ok=False, blocked=True, detail=detail)
 
-        # Still unreadable after being told exactly what was wrong with it —
-        # which for a local model is the common case rather than the rare one,
-        # because the format is usually not what it got wrong.
-        if malformed:
-            recovered = self._recover_unlabeled(run_id, ticket, completion.text)
-            if recovered is None:
-                return StepResult(ok=False, detail=malformed)
-            parsed, malformed = recovered, ""
-
-        # Everything that could not be read has already been refused above. What
-        # is left is a reply that parsed — possibly into no files at all, which
-        # is not the same thing. A ticket whose work is already on disk has
-        # nothing to write, and the executor is shown the current files, so
-        # "there is nothing to change" is sometimes the honest answer. Spending
-        # an attempt punishing it is how a finished ticket failed three times a
-        # cycle.
-        wrote_nothing = parsed.is_empty
-
-        # --- APPLY ---------------------------------------------------
-        written: list[str] = []
-        scope_note = ""
-        if not wrote_nothing:
-            scoped = enforce_scope(
-                parsed, ticket.allowed_files, self.config.never_delegate
+            # Rebuilt from the step log on every call, so the transport stays
+            # stateless and a retry cycle inherits the thread — the daemon's state
+            # machine remains the only state machine. Empty unless the flag is set,
+            # which keeps the flat prompt the default.
+            prior_turns = (
+                self.store.ticket_turns(
+                    run_id, ticket.ticket_id, limit=self.config.loop.executor_turns
+                )
+                if self.config.loop.executor_turns
+                else []
             )
-            # An echo of the prompt's own format example is not a scope
-            # request, and reporting it as one is worse than dropping it
-            # silently: the planner reads the log, and a path that exists
-            # nowhere in the repository sends it rewriting the spec to solve a
-            # scope problem the ticket does not have. See `EXAMPLE_PATH_PREFIX`.
-            echoed = [
-                entry
-                for entry in scoped.rejected
-                if entry.startswith(EXAMPLE_PATH_PREFIX)
-            ]
-            asked = [entry for entry in scoped.rejected if entry not in echoed]
-            if echoed:
+
+            step_id = self.store.start_step(run_id, ticket.ticket_id, "build")
+            # A reply that did not parse into files is a formatting mistake, not a
+            # failed implementation, and spending a whole attempt on one buys
+            # nothing: the next attempt re-reads the same spec and the model makes
+            # the same mistake. One ticket lost six of its nine attempts that way,
+            # every one to a fenced block with no path line above it, while the
+            # three that parsed drew specific and answerable review objections it
+            # never got the budget to address.
+            #
+            # So the reply is refused and asked for again inside the attempt, the
+            # way the tester already reprompts a rejected test file. Once only —
+            # a model that cannot follow the format twice will not follow it on the
+            # third ask, and the attempt should end while the evidence is fresh.
+            malformed = ""
+            for remaining in (1, 0):
+                try:
+                    completion = self._converse(
+                        run_id,
+                        "executor",
+                        build_prompt(
+                            ticket,
+                            failure_context,
+                            retrieved,
+                            sources,
+                            toolchain=self._toolchain_for(ticket),
+                            learned_limit=self.config.loop.learned_limit,
+                            failure_classes=self.store.ticket_classes(
+                                run_id, ticket.ticket_id
+                            ),
+                            prior_failures=prior_failures,
+                            oscillation=oscillation,
+                            malformed=malformed,
+                            prior_turns=prior_turns,
+                            repository_map=self._repo_map(),
+                            can_read=self._can_read("executor"),
+                        ),
+                        **self._attachments(images, images_withheld),
+                        max_tokens=self._output_budget("executor"),
+                        # Stated rather than left to `_call`'s default, which is
+                        # how the executor came to sample at 0.2 — the highest in
+                        # the pipeline, on the one role whose output has to hit a
+                        # machine-readable format before any of it counts. Every
+                        # other call site chose a number; this one inherited one.
+                        # A model block's own `temperature` still overrides this,
+                        # which is the point of `Provider.temperature`.
+                        temperature=0.0,
+                    )
+                except ContextOverflow as exc:
+                    self.store.end_step(step_id, "failed", str(exc))
+                    return StepResult(ok=False, blocked=True, detail=str(exc))
+                except ProviderError as exc:
+                    self.store.end_step(step_id, "failed", str(exc))
+                    self._record_step(ticket, "build", "failed", {"error": str(exc)})
+                    return StepResult(ok=False, detail=f"executor unavailable: {exc}")
+
+                self._record_call(ticket, "build", "executor", completion)
+
+                # A response cut off at the output limit parses cleanly — the fence
+                # the model opened is simply never closed, or closes around half a
+                # function. Applying it writes a file that is syntactically wrong
+                # for a reason no reviewer would guess from the diff, so nothing is
+                # written and the attempt is spent instead. Not reprompted: the
+                # second call gets the same budget and runs out of it the same way.
+                if completion.truncated:
+                    # Two ways to run out, needing opposite advice. A reply that
+                    # named files and was cut off partway through them asked for
+                    # too much in one response. A reply that never named one spent
+                    # the budget on prose before it started — run 11's first
+                    # attempt read correctly, identified everything it needed, and
+                    # hit the limit describing that. Telling it to send fewer files
+                    # is telling it to do less of the thing it never began.
+                    if names_a_file(completion.text):
+                        detail = (
+                            "Your previous response was cut off at the output "
+                            "limit, so no files were written. Emit the same "
+                            "implementation in fewer output tokens — fewer files "
+                            "per response, no restated context — or reply BLOCKED: "
+                            "if the ticket cannot be implemented within that "
+                            "budget."
+                        )
+                    else:
+                        detail = (
+                            "Your previous response was cut off at the output "
+                            "limit before it named a single file, so nothing was "
+                            "written. The whole budget went on prose. Blocks "
+                            "first, prose never: open with a path line and a "
+                            "fenced block, and send no summary of what you read, "
+                            "no plan, and no explanation. Reply BLOCKED: if you "
+                            "genuinely cannot proceed."
+                        )
+                    self.store.end_step(step_id, "failed", clip(completion.text, DETAIL_CHARS))
+                    return StepResult(ok=False, detail=detail)
+
+                parsed = parse_output(completion.text)
+                malformed = self._malformed_reply(parsed, completion.text, ticket)
+                if not malformed or not remaining:
+                    break
                 self.store.log(
                     run_id,
-                    f"{ticket.ticket_id}: the reply carried a copy of the "
-                    f"prompt's format example ({'; '.join(echoed)}) and it was "
-                    f"dropped. A formatting mistake, not a request for scope — "
-                    f"nothing in this ticket needs those paths.",
+                    f"{ticket.ticket_id}: the executor's reply did not parse into "
+                    f"files; asking again before the attempt is spent.",
                     level="warn",
-                    kind="scope",
+                    kind="ticket",
+                    data={"complaint": malformed[:400]},
                 )
-            if asked:
-                self.store.log(
-                    run_id,
-                    f"{ticket.ticket_id}: rejected out-of-scope edits: "
-                    f"{'; '.join(asked)}",
-                    level="warn",
-                    kind="scope",
+
+            self.store.end_step(step_id, "ok", clip(completion.text, DETAIL_CHARS))
+
+            if parsed.is_blocked:
+                return StepResult(ok=False, blocked=True, detail=parsed.blocked_reason)
+
+            # Kept, never acted on here. `IMPOSSIBLE:` is a claim about the ticket
+            # from the party least able to judge it: an executor that cannot pass a
+            # ticket has every reason to conclude nobody can. So it is held for the
+            # escalation rung, where the planner is shown it beside the criteria
+            # and asked to confirm or refute it.
+            #
+            # Recorded even when the reply also carried files — that is the shape
+            # it actually arrives in. One executor implemented its best guess and
+            # wrote "there's a contradiction in the acceptance criteria" alongside
+            # it on attempt 58 of 430. It was right, the edits parsed, and the
+            # sentence was read by nothing.
+            if parsed.is_impossible:
+                first = ticket.ticket_id not in self._impossible_claims
+                self._impossible_claims[ticket.ticket_id] = parsed.impossible_reason
+                if first:
+                    self.store.log(
+                        run_id,
+                        f"{ticket.ticket_id}: the executor says this ticket cannot "
+                        f"be satisfied as written — {parsed.impossible_reason[:400]}. "
+                        f"Held for the planner to confirm or refute; the attempt "
+                        f"continues.",
+                        level="warn",
+                        kind="ticket",
+                        data={
+                            "ticket": ticket.ticket_id,
+                            "impossible": parsed.impossible_reason,
+                        },
+                    )
+
+            # Still unreadable after being told exactly what was wrong with it —
+            # which for a local model is the common case rather than the rare one,
+            # because the format is usually not what it got wrong.
+            if malformed:
+                recovered = self._recover_unlabeled(run_id, ticket, completion.text)
+                if recovered is None:
+                    return StepResult(ok=False, detail=malformed)
+                parsed, malformed = recovered, ""
+
+            # Everything that could not be read has already been refused above. What
+            # is left is a reply that parsed — possibly into no files at all, which
+            # is not the same thing. A ticket whose work is already on disk has
+            # nothing to write, and the executor is shown the current files, so
+            # "there is nothing to change" is sometimes the honest answer. Spending
+            # an attempt punishing it is how a finished ticket failed three times a
+            # cycle.
+            wrote_nothing = parsed.is_empty
+
+            # --- APPLY ---------------------------------------------------
+            written = []
+            scope_note = ""
+            if not wrote_nothing:
+                scoped = enforce_scope(
+                    parsed, ticket.allowed_files, self.config.never_delegate
                 )
-            if not scoped.edits:
+                # An echo of the prompt's own format example is not a scope
+                # request, and reporting it as one is worse than dropping it
+                # silently: the planner reads the log, and a path that exists
+                # nowhere in the repository sends it rewriting the spec to solve a
+                # scope problem the ticket does not have. See `EXAMPLE_PATH_PREFIX`.
+                echoed = [
+                    entry
+                    for entry in scoped.rejected
+                    if entry.startswith(EXAMPLE_PATH_PREFIX)
+                ]
+                asked = [entry for entry in scoped.rejected if entry not in echoed]
+                if echoed:
+                    self.store.log(
+                        run_id,
+                        f"{ticket.ticket_id}: the reply carried a copy of the "
+                        f"prompt's format example ({'; '.join(echoed)}) and it was "
+                        f"dropped. A formatting mistake, not a request for scope — "
+                        f"nothing in this ticket needs those paths.",
+                        level="warn",
+                        kind="scope",
+                    )
+                if asked:
+                    self.store.log(
+                        run_id,
+                        f"{ticket.ticket_id}: rejected out-of-scope edits: "
+                        f"{'; '.join(asked)}",
+                        level="warn",
+                        kind="scope",
+                    )
+                if not scoped.edits:
+                    return StepResult(
+                        ok=False,
+                        detail=self._scope_guidance(
+                            ticket, asked, total_loss=True, echoed=echoed
+                        ),
+                    )
+
+                # Read before the write, because afterwards what the manifest used
+                # to declare is gone and git is no help: a manifest an earlier
+                # attempt on this same ticket already rewrote has no clean version
+                # left to compare against. See `forge.manifests`.
+                manifests_before = manifests.snapshot(
+                    self.config.root, [edit.path for edit in scoped.edits]
+                )
+                step_id = self.store.start_step(run_id, ticket.ticket_id, "apply")
+                try:
+                    written = apply_edits(self.config.root, scoped.edits)
+                except ValueError as exc:
+                    self.store.end_step(step_id, "failed", str(exc))
+                    return StepResult(ok=False, blocked=True, detail=str(exc))
+                self.store.end_step(step_id, "ok", "\n".join(written))
+                # Accumulated across every attempt, because quarantine happens
+                # once the ticket has given up and by then the attempt that wrote a
+                # file may be three failures ago. Recorded from `apply_edits`
+                # rather than derived from a diff: these are the literal paths that
+                # landed, so the revert needs no glob expansion and cannot reach a
+                # file this ticket never wrote. See `_quarantine`.
+                if touched is not None:
+                    touched.update(written)
+                self._record_step(
+                    ticket,
+                    "apply",
+                    "ok",
+                    {"written": written, "rejected": asked, "echoed": echoed},
+                )
+                # A partial rejection used to be logged and then dropped. The
+                # executor saw a successful apply, lint failed on the piece that
+                # never landed, and it had no way to connect the two — so it re-sent
+                # the same edit every attempt. Carry the rejection forward as
+                # verification evidence.
+                scope_note = (
+                    self._scope_guidance(
+                        ticket, asked, total_loss=False, echoed=echoed
+                    )
+                    if scoped.rejected
+                    else ""
+                )
+
+                # Before the imports check, because a manifest that lost its
+                # dependencies breaks every command in the project rather than one
+                # module, and because verification cannot see it: the commands run
+                # where the packages are already installed.
+                gutted = self._gutted_manifests(run_id, ticket, manifests_before)
+                if gutted:
+                    return StepResult(ok=False, detail=gutted)
+
+                # Before the truncation check, because a file cut short is a
+                # different complaint and this one is cheaper to act on: an import
+                # naming nothing is a fact about the tree, not about the reply.
+                dangling = self._dangling_imports(run_id, ticket, written)
+                if dangling:
+                    return StepResult(ok=False, detail=dangling)
+
+            # The clean files are on disk now, so the next attempt only has to send
+            # the ones that were cut short. Stopping here rather than carrying on to
+            # review: the response is known to be incomplete, and asking a reviewer
+            # to judge a diff the harness already knows is missing a file spends two
+            # model calls to be told so.
+            if parsed.truncated:
                 return StepResult(
-                    ok=False,
-                    detail=self._scope_guidance(
-                        ticket, asked, total_loss=True, echoed=echoed
-                    ),
+                    ok=False, detail=self._fence_guidance(parsed.truncated, written)
                 )
-
-            # Read before the write, because afterwards what the manifest used
-            # to declare is gone and git is no help: a manifest an earlier
-            # attempt on this same ticket already rewrote has no clean version
-            # left to compare against. See `forge.manifests`.
-            manifests_before = manifests.snapshot(
-                self.config.root, [edit.path for edit in scoped.edits]
-            )
-            step_id = self.store.start_step(run_id, ticket.ticket_id, "apply")
-            try:
-                written = apply_edits(self.config.root, scoped.edits)
-            except ValueError as exc:
-                self.store.end_step(step_id, "failed", str(exc))
-                return StepResult(ok=False, blocked=True, detail=str(exc))
-            self.store.end_step(step_id, "ok", "\n".join(written))
-            # Accumulated across every attempt, because quarantine happens
-            # once the ticket has given up and by then the attempt that wrote a
-            # file may be three failures ago. Recorded from `apply_edits`
-            # rather than derived from a diff: these are the literal paths that
-            # landed, so the revert needs no glob expansion and cannot reach a
-            # file this ticket never wrote. See `_quarantine`.
-            if touched is not None:
-                touched.update(written)
-            self._record_step(
-                ticket,
-                "apply",
-                "ok",
-                {"written": written, "rejected": asked, "echoed": echoed},
-            )
-            # A partial rejection used to be logged and then dropped. The
-            # executor saw a successful apply, lint failed on the piece that
-            # never landed, and it had no way to connect the two — so it re-sent
-            # the same edit every attempt. Carry the rejection forward as
-            # verification evidence.
-            scope_note = (
-                self._scope_guidance(
-                    ticket, asked, total_loss=False, echoed=echoed
-                )
-                if scoped.rejected
-                else ""
-            )
-
-            # Before the imports check, because a manifest that lost its
-            # dependencies breaks every command in the project rather than one
-            # module, and because verification cannot see it: the commands run
-            # where the packages are already installed.
-            gutted = self._gutted_manifests(run_id, ticket, manifests_before)
-            if gutted:
-                return StepResult(ok=False, detail=gutted)
-
-            # Before the truncation check, because a file cut short is a
-            # different complaint and this one is cheaper to act on: an import
-            # naming nothing is a fact about the tree, not about the reply.
-            dangling = self._dangling_imports(run_id, ticket, written)
-            if dangling:
-                return StepResult(ok=False, detail=dangling)
-
-        # The clean files are on disk now, so the next attempt only has to send
-        # the ones that were cut short. Stopping here rather than carrying on to
-        # review: the response is known to be incomplete, and asking a reviewer
-        # to judge a diff the harness already knows is missing a file spends two
-        # model calls to be told so.
-        if parsed.truncated:
-            return StepResult(
-                ok=False, detail=self._fence_guidance(parsed.truncated, written)
-            )
 
         # --- COMPILE GATE --------------------------------------------
         # Only when there is a turn left to spend on the answer. With none —
@@ -6932,6 +7132,9 @@ class Orchestrator:
         rendered, capture_failure = self._capture(run_id, ticket, written)
         if capture_failure is not None:
             return capture_failure
+        if ticket.kind == TICKET_IMAGE:
+            # The image is the work. It goes first, before any capture.
+            rendered = [*self._rendered_parts(written), *rendered]
         images = [*images, *rendered]
 
         # Which seat is shown it, and therefore which one reviews. `reviewer`

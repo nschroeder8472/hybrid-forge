@@ -221,6 +221,9 @@ def _criterion_key(criterion: str) -> str:
 # else is ordinary forward work.
 TICKET_FEATURE = "feature"
 TICKET_BUG = "bug"
+# An image ticket: the executor writes a prompt and an image model renders it
+# into the ticket's one image path. See docs/IMAGE-LOOP.md.
+TICKET_IMAGE = "image"
 
 TICKET_PENDING = "pending"
 TICKET_RUNNING = "running"

@@ -117,6 +117,7 @@
     "viewRole": "reviewer",
     "viewModel": "",
     "exclusiveGpu": [],
+    "imageModel": "",
     "reviseBetweenPasses": true,
     "majorityRepeats": true,
     "participationWindow": 20,
