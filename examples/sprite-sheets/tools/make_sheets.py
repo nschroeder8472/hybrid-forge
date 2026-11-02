@@ -2,12 +2,14 @@
 
     python tools/make_sheets.py [SCENE ...]        (default: key lock)
 
-1. Blender renders each scene from eight directions in each colourway
-   (`art/tools/turntable.py`), 256 px, on a #ff00ff key.
+1. Blender renders each scene in each colourway from eight isometric
+   directions and four flat, face-on views (`art/tools/turntable.py`),
+   256 px, on a #ff00ff key.
 2. GIMP turns every render into a 64x64 sprite on PALETTE, in one start
    (`tools/gimp/sprites.py`).
 3. `tools/pack_sheet.py` lays each scene's sprites out as `sheets/<scene>.png`,
-   one row per colour and one column per direction, with
+   one row per colour and one column per view (`0` ... `315`, then `flat_0`
+   ... `flat_270`), with
    `sheets/<scene>.json` describing every frame.
 
 Blender is found through BLENDER, then PATH, then the default Windows
@@ -31,6 +33,10 @@ FRAME = 64
 RENDER = 256
 COLOURS = ["red", "blue", "green"]
 ANGLES = [45 * step for step in range(8)]
+FLAT_ANGLES = [90 * step for step in range(4)]
+# (column name, file suffix) for every frame in a row, in sheet order.
+VIEWS = ([(str(a), f"{a:03d}") for a in ANGLES]
+         + [(f"flat_{a}", f"flat_{a:03d}") for a in FLAT_ANGLES])
 PALETTE = [
     "#000000", "#2a2a2e", "#5a5c62", "#8e9096", "#c8cad0",
     "#3d0a0a", "#7a1414", "#b82424", "#e85a4a", "#0a1740",
@@ -64,11 +70,11 @@ def main(names):
                    frames=frames, size=FRAME, palette=PALETTE)
         for name in names:
             grid = [
-                [os.path.join(sprites, f"{name}_{colour}_{angle:03d}.png") for angle in ANGLES]
+                [os.path.join(sprites, f"{name}_{colour}_{suffix}.png") for _, suffix in VIEWS]
                 for colour in COLOURS
             ]
             out = os.path.join(ROOT, "sheets", f"{name}.png")
-            pack_sheet.pack(grid, out, rows=COLOURS, columns=[str(a) for a in ANGLES])
+            pack_sheet.pack(grid, out, rows=COLOURS, columns=[column for column, _ in VIEWS])
             print(f"sheets/{name}.png and sheets/{name}.json")
 
 

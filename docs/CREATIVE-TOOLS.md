@@ -1120,6 +1120,18 @@ batch GIMP sprite tool and `tools/make_sheets.py`, which builds both sheets in
 about 25 s: 512 x 192 PNGs, rows by colour, columns 0-315 degrees, 64x64
 frames, and a JSON frame map beside each.
 
+**Flat views, added after.** Each sheet now also has four face-on columns,
+`flat_0` to `flat_270`, for side-on and top-down games and inventory icons,
+so the sheets are 768 x 192. "Face-on" means looking along the prop's
+thinnest axis, which `turntable.flat_elevation` reads from the mesh: the lock
+stands up and is seen at eye level (front, side, back, side); the key lies
+flat and is seen from straight above, since at eye level it is a line. No
+scene changed. The first build showed blue's face-on frames on the light-blue
+palette entry while red and green kept their shade: a face square to the
+camera catches Workbench's whole specular highlight. With specular off, a
+face-on face renders the same shade as the isometric lit face, (58, 93, 160)
+against (56, 90, 156) for blue.
+
 Choices that keep frames consistent, each from a defect in the first
 reference build: one scale per prop from its *projected* size (scaling by
 height clipped the lock's shackle), no cavity shading (its highlights became
@@ -1159,6 +1171,22 @@ rewriting the spec; it cannot stop it from blocking the vote. A planner that
 cannot add three intervals is a weak seat for geometry — the Claude seat
 already reviews captures, and seating it as the sign-off planner on tickets
 like this is the obvious next experiment, rather than another rule.
+
+**The experiment, run 2026-11-02.** Same ticket, same spec, sign-off back on
+at the default passes, the lock deleted, and one line of project config:
+`"roles": {"planner": "claude"}` — the per-project override, so the machine
+profile still seats Nemotron everywhere else. Result: **ratified unanimous on
+the first pass, landed on the first attempt, review passed**, and the sheet
+built from it matches the earlier lock frame for frame. Every role voted,
+including Nemotron as reviewer, which this time raised no depth objection.
+The two Claude calls (planner vote, capture review) cost $0.29; Qwen and
+Nemotron are local. Evidence: `sheet_forge_evidence/run-claude-signoff.db`.
+
+One run cannot say whether Claude's vote moved Nemotron's or the earlier
+objection was luck of sampling; it does say a Claude planner adds no false
+objection of its own on geometry, where Nemotron raised the same false one in
+every guarded vote before. For geometry tickets the recommended seat is Claude as planner, set per
+project; the guard on human numbers stays either way.
 
 ---
 
