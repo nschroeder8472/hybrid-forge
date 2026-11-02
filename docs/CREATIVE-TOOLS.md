@@ -1109,6 +1109,59 @@ backlog has image work.
 
 ---
 
+## Sprite sheets — built 2026-11-02
+
+Eight-direction sheets for a key and its padlock, each in red, blue and green:
+`examples/sprite-sheets`. Rendered from 3D, the way games build sprites from
+models — one prop, one fixed isometric camera, every angle and colour finished
+identically, so frames match. The loop wrote the art and the packer (SHT-001
+key, SHT-002 lock, SHT-003 packer); the project supplies the turntable, the
+batch GIMP sprite tool and `tools/make_sheets.py`, which builds both sheets in
+about 25 s: 512 x 192 PNGs, rows by colour, columns 0-315 degrees, 64x64
+frames, and a JSON frame map beside each.
+
+Choices that keep frames consistent, each from a defect in the first
+reference build: one scale per prop from its *projected* size (scaling by
+height clipped the lock's shackle), no cavity shading (its highlights became
+grain at 64x64), and no contrast stretch (computed per image, it would put
+the same red on different palette entries frame to frame).
+
+The key and the packer each landed first time. **The lock took four runs, and
+none of it was Blender.**
+
+1. **A sign-off revision moved measured numbers again** — the keyhole from y
+   -0.075 to -0.06, then -0.065 — and every role then objected, correctly, to
+   the revision's numbers. Parked twice. This was the third ticket in two runs
+   broken that way, so it became a loop rule: **a revision may not change a
+   number the human's spec states.** `respec._moved_numbers` compares the
+   multiset of numbers in a revised spec with the human's `original_spec`;
+   a revision that drops or moves one is refused in sign-off and in respec,
+   and the ticket keeps its text. Reformatting (`0.10` as `0.1`) and adding
+   numbers are allowed. If a human number really is wrong, the objection
+   stands and the ticket parks for a person.
+2. **With the guard on, it refused the planner's next attempt** to move the
+   body's -0.07 and 0.07 — and the planner and reviewer, both Nemotron, then
+   objected that the body is 0.14 deep so the lock cannot be 0.155. The
+   keyhole is what makes it 0.155. A protected decision saying exactly that,
+   body 0.14 plus keyhole to -0.085, did not change their vote: the same
+   objection came back word for word.
+3. **The tester's objection in that same vote was right.** Floating point puts
+   the posts' bottom faces at 0.23999999, so "centre z of 0.24 or more" would
+   fail correct geometry. The criteria now carry margins.
+4. **With sign-off off for that one rerun** (`loop.ratifyPasses: 0`, the test
+   project only), the lock landed on its first attempt and the reviewer
+   accepted it, matching the spec coordinate for coordinate.
+
+What the lock says about sign-off: it caught a real defect (the float
+margins) and invented a false one that no amount of spec text dislodged, from
+the same model, in the same vote. The guard stops the false objection from
+rewriting the spec; it cannot stop it from blocking the vote. A planner that
+cannot add three intervals is a weak seat for geometry — the Claude seat
+already reviews captures, and seating it as the sign-off planner on tickets
+like this is the obvious next experiment, rather than another rule.
+
+---
+
 ## Decisions to confirm
 
 1. **ComfyUI as the image backend.** Recommended: it reaches every model on this
