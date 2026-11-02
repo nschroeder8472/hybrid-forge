@@ -1,0 +1,69 @@
+{
+  "room": "image-forge-test",
+  "imageModels": {
+    "pixel": {
+      "kind": "comfyui",
+      "workflows": {
+        "generate": ".hybridforge/comfy/sdxl-pixel.json"
+      },
+      "bind": {
+        "prompt": [
+          "3",
+          "text"
+        ],
+        "negative": [
+          "4",
+          "text"
+        ],
+        "seed": [
+          "6",
+          "seed"
+        ],
+        "width": [
+          "5",
+          "width"
+        ],
+        "height": [
+          "5",
+          "height"
+        ]
+      },
+      "promptGuide": "SDXL with a pixel-art LoRA. Start the prompt with 'pixel art'. Ask for exactly one object, centred, with a clear plain white margin on every side: the finisher clears the background by flood-filling inward from the edges, so an object that touches the frame is eaten into. No shadow, no floor. Describe the object's colours and shape plainly: this model follows composition loosely and takes colour words literally."
+    }
+  },
+  "workspaces": [
+    {
+      "root": ".",
+      "commands": {
+        "lint": {
+          ".py": "python -m flake8 ."
+        },
+        "typecheck": {
+          ".py": "skip"
+        },
+        "test": {
+          ".py": "python -m unittest discover -s tests -p \"*_test.py\" -t ."
+        },
+        "format": {
+          ".png": "gimp-console-3 -i -n --quit --batch-interpreter=python-fu-eval -b \"exec(open('tools/gimp/finish.py').read())\""
+        }
+      }
+    }
+  ],
+  "neverDelegate": [],
+  "memory": {
+    "url": "",
+    "room": ""
+  },
+  "loop": {
+    "maxAttempts": 4,
+    "retryCycles": 1,
+    "autoCommit": false,
+    "viewRole": "reviewer",
+    "viewModel": "claude",
+    "imageModel": "pixel",
+    "exclusiveGpu": [
+      "image"
+    ]
+  }
+}

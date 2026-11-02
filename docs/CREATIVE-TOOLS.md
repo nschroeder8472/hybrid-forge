@@ -970,6 +970,49 @@ IMAGE-LOOP's risks section asks for — an icon or tile at fixed size on a fixed
 palette — with GIMP's quantise pass as `format`. Almost every criterion is
 mechanical, so it tests the loop rather than the judge.
 
+*Built and run 2026-11-01.* `**Kind:** image`, `loop.imageModel`, a kind gate
+that parks a kind the loop cannot run before any model is called, and an image
+attempt that replaces only build and apply: the executor writes a `PROMPT:` /
+`NEGATIVE:` / `SEED:` block (with the image model's `promptGuide`, and the
+last attempt's prompt on a retry), the model renders it under the GPU lease
+into the ticket's one `.png` path, and the rendering is recorded in images and
+seconds before anything judges it. Tests, format, verify and review are the
+code pipeline unchanged; the review is shown the image first, on the seat that
+can see. `examples/image-ticket` is the project it ran on.
+
+**IMG-001, a 32x32 treasure chest icon: done in 13.1 min, three attempts.**
+Forge started `llama-server` and ComfyUI, leased the card for each render
+(unloading Qwen, then releasing), rendered in 5.1-5.6 s, and stopped both at
+the end. SDXL rendered, GIMP finished each render as the `.png` formatter
+(clear the background by flood fill from the edges, crop, stretch, 32x32,
+fourteen-colour palette), the tester's Pillow script checked size,
+transparency, coverage and palette, and the reviewer looked.
+
+- **Attempt 1 passed every check and was rejected for the right reason.** The
+  reviewer said the chest read as gold, not brown wood. I guessed the
+  formatter's contrast stretch had pushed browns toward the palette's golds;
+  the raw render shows SDXL drew yellow wood. The reviewer, which only saw the
+  sprite, was right about the image, and the executor fixed it in the prompt.
+- **Attempt 2 failed a mechanical check, which caught a real defect.** Asked
+  to fill "most of the frame", SDXL drew the chest edge to edge, and the flood
+  fill from the edges ate into it: 82 opaque pixels against a floor of 250.
+  The executor's next prompt asked for a uniform background and an outline and
+  fixed the seed; the example's prompt guide now asks for a white margin.
+- **Attempt 3 was accepted, with one leniency.** The spec asked for a gold lock
+  plate and got a silver padlock; the reviewer called it "a small light lock
+  plate" and let it pass. A visual bar the spec states is still a bar the
+  reviewer weighs, not one it enforces.
+- **Ingest read `**Kind:** image` as `feature`.** Its regex matched only `bug`
+  and `feature`, so the first launch began down the code path; it was stopped
+  during preflight, before any model call. IMAGE-LOOP assumed ingest stored any
+  kind; it did not. It does now, and the kind gate parks what the loop cannot
+  run, so a typo is a parked ticket rather than a silent feature.
+
+Not built yet, and not needed by this run: the criteria gate (mechanical /
+visual / unverifiable classification at ingest) and stall detection. The
+visual bar went in the spec text, as in phases 1 and 2, and three attempts
+converged without a stall.
+
 **6 — Review and the Kontext edit loop.** IMAGE-LOOP phases 5-6. The reviewer's
 `MODE: edit` and `REGION` become a Kontext `INSTRUCTION`; a backend without an
 edit workflow degrades to regenerate. Stall detection is not optional here.

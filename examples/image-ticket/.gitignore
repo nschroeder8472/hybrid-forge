@@ -1,0 +1,10 @@
+__pycache__/
+go.log
+ingest.log
+.hybridforge/run.db*
+.hybridforge/artifacts/
+.hybridforge/tickets/
+.hybridforge/abandoned/
+.hybridforge/servers.json
+.hybridforge/logs/
+.hybridforge/models/

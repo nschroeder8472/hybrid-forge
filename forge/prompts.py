@@ -13,6 +13,7 @@ import json
 import re
 from collections import Counter
 from functools import cache
+from dataclasses import dataclass
 from typing import Any, Collection, Sequence
 
 from .failures import distill
@@ -4059,3 +4060,115 @@ code existed. The ticket above is the result, agreed {status}.
 This is settled. Work to the ticket as it now stands.
 """,
     )
+
+
+# ---------------------------------------------------------------------------
+# Image tickets: the executor writes the prompt, an image model renders it
+# ---------------------------------------------------------------------------
+
+IMAGE_SYSTEM = """You are the executor in a plan-and-execute pipeline, on an image ticket.
+
+You do not draw. An image model renders what you write, and your job is to
+write the prompt that makes it render what the ticket asks for. Reply with
+this block and nothing else:
+
+PROMPT: <the prompt, one paragraph>
+NEGATIVE: <what the image must not contain, comma separated, or empty>
+SEED: <an integer, or empty to let the pipeline choose>
+
+Write the PROMPT for an image model, not for a person: name the subject, the
+style, the composition, the background and the lighting, plainly and
+concretely. State what must be there; an image model often draws a word it
+is told to avoid, so put what must be absent in NEGATIVE.
+
+If an earlier attempt was rejected, you are shown its prompt and why. Revise
+the prompt to fix exactly that; keep what was right. Change the SEED when the
+composition was wrong, and keep it when only a detail was.
+
+If the ticket cannot be rendered as written, reply with one line:
+BLOCKED: <the specific reason>"""
+
+
+def image_prompt(
+    ticket: Ticket,
+    failure_context: str = "",
+    *,
+    previous: str = "",
+    guide: str = "",
+) -> list[Message]:
+    """The executor's prompt on an image ticket.
+
+    `previous` is the prompt block the last attempt sent, so a revision starts
+    from what was rendered rather than from nothing. `guide` is the image
+    model's own `promptGuide`, when its config gives one — a trigger word a
+    LoRA needs, a phrasing the checkpoint answers to.
+    """
+    parts = [
+        f"# {ticket.ticket_id}: {ticket.title}",
+        f"## What the image must be\n{ticket.spec.strip()}",
+        f"## Acceptance criteria\n{_criteria_block(ticket)}",
+    ]
+    if ticket.context.strip():
+        parts.append(f"## Context\n{ticket.context.strip()}")
+    if guide.strip():
+        parts.append(f"## How this image model is prompted\n{guide.strip()}")
+    if previous.strip():
+        parts.append(f"## The prompt the last attempt sent\n{previous.strip()}")
+    if failure_context.strip():
+        parts.append(f"## Why the last attempt failed\n{failure_context.strip()}")
+    parts.append("Reply with the PROMPT / NEGATIVE / SEED block.")
+    return [
+        Message("system", IMAGE_SYSTEM),
+        Message("user", "\n\n".join(parts)),
+    ]
+
+
+@dataclass
+class ImageReply:
+    """What the executor asked the image model for."""
+
+    prompt: str = ""
+    negative: str = ""
+    seed: int | None = None
+    blocked: str = ""
+
+    def block(self) -> str:
+        """The reply as the block it was written in, for the next attempt."""
+        seed = "" if self.seed is None else str(self.seed)
+        return f"PROMPT: {self.prompt}\nNEGATIVE: {self.negative}\nSEED: {seed}"
+
+
+# `PROMPT:`, `**PROMPT**:` and `**PROMPT:**` all occur; models bold labels.
+_IMAGE_FIELD = re.compile(
+    r"^\s*\**\s*(PROMPT|NEGATIVE|SEED|BLOCKED)\s*\**\s*:\s*\**\s*(.*)$", re.IGNORECASE
+)
+
+
+def parse_image_reply(text: str) -> ImageReply:
+    """Read a PROMPT / NEGATIVE / SEED block. Continuation lines join the field.
+
+    A reply with no PROMPT and no BLOCKED is returned empty, which the caller
+    treats as a malformed reply. A SEED that is not an integer is dropped
+    rather than guessed at: the pipeline then chooses one and records it.
+    """
+    reply = ImageReply()
+    fields: dict[str, list[str]] = {}
+    current = ""
+    # A reasoning model's hidden thinking can carry a draft PROMPT line.
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    for line in text.splitlines():
+        if line.strip().startswith("```"):
+            continue
+        match = _IMAGE_FIELD.match(line)
+        if match:
+            current = match.group(1).upper()
+            fields.setdefault(current, []).append(match.group(2).strip())
+        elif current and line.strip():
+            fields[current].append(line.strip())
+    reply.prompt = " ".join(fields.get("PROMPT", [])).strip()
+    reply.negative = " ".join(fields.get("NEGATIVE", [])).strip()
+    reply.blocked = " ".join(fields.get("BLOCKED", [])).strip()
+    seed = " ".join(fields.get("SEED", [])).strip()
+    if re.fullmatch(r"\d{1,10}", seed):
+        reply.seed = int(seed)
+    return reply

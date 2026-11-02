@@ -969,6 +969,11 @@ class LoopSettings:
     # because the loop cannot know which of its commands touch it. See
     # `forge.gpu` and docs/CREATIVE-TOOLS.md, *The GPU lease*.
     exclusive_gpu: tuple[str, ...] = ()
+    # Which `imageModels` entry renders an image ticket's prompt. The executor
+    # keeps its seat and writes the prompt; this names the model that draws
+    # it, the way `viewModel` names the one that looks. Empty means the
+    # project has no image tickets, and one that arrives is parked.
+    image_model: str = ""
     # Whether the planner rewrites the ticket between sign-off passes. True is
     # every run before this existed. Off, the roles vote again on the words
     # they already refused, reading the objections but not a revision — which
@@ -1351,6 +1356,7 @@ class Config:
             view_role=str(loop.get("viewRole", "reviewer")),
             view_model=str(loop.get("viewModel", "")),
             exclusive_gpu=_exclusive_gpu(loop.get("exclusiveGpu", [])),
+            image_model=str(loop.get("imageModel", "")),
             revise_between_passes=bool(
                 loop.get("reviseBetweenPasses", True)
             ),
@@ -1886,6 +1892,11 @@ class Config:
                 raise ConfigError(f"machine profile: {exc}") from exc
         if not isinstance(self.image_models, dict):
             raise ConfigError("`imageModels` must be an object of named image models.")
+        if self.loop.image_model and self.loop.image_model not in self.image_models:
+            raise ConfigError(
+                f"loop.imageModel is {self.loop.image_model!r}, which is not declared "
+                f"in `imageModels` (have: {', '.join(sorted(self.image_models)) or 'none'})."
+            )
         for name in self.image_models:
             try:
                 self.image_provider(name)
@@ -1975,6 +1986,7 @@ class Config:
                 "viewRole": self.loop.view_role,
                 "viewModel": self.loop.view_model,
                 "exclusiveGpu": list(self.loop.exclusive_gpu),
+                "imageModel": self.loop.image_model,
                 "reviseBetweenPasses": self.loop.revise_between_passes,
                 "majorityRepeats": self.loop.majority_repeats,
                 "ratifyOrder": list(self.loop.ratify_order),

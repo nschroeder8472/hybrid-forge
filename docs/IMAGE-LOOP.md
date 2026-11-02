@@ -1,6 +1,9 @@
 # Image generation loop — design spec
 
-**Status:** phase 1 built; phases 2-6 designed, not built. Multimodal messages
+**Status:** phases 1, 2 and 4 built; phase 3 built without the criteria gate;
+phases 5 and 6 designed, not built. A first image ticket ran end to end on
+2026-11-01 — see phase 5 of [CREATIVE-TOOLS.md](CREATIVE-TOOLS.md). The rest
+of this paragraph describes the state before that: Multimodal messages
 ship on their own — a reviewer can be handed a screenshot on an ordinary code
 ticket, with no image generation anywhere in the picture. Nothing else in this
 document exists in the code: there is no image provider, no `kind: image`, and
