@@ -746,6 +746,9 @@ class Store:
         ("usage", "cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
         ("usage", "cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
         ("usage", "cost_usd", "REAL NOT NULL DEFAULT 0"),
+        # An image call is accounted in images and seconds, never tokens.
+        ("usage", "images", "INTEGER NOT NULL DEFAULT 0"),
+        ("usage", "render_seconds", "REAL NOT NULL DEFAULT 0"),
         ("tickets", "attempt_base", "INTEGER NOT NULL DEFAULT 0"),
         ("tickets", "reference_files", "TEXT NOT NULL DEFAULT '[]'"),
         ("tickets", "original_spec", "TEXT NOT NULL DEFAULT ''"),
@@ -2139,12 +2142,14 @@ class Store:
         cache_creation_tokens: int = 0,
         cache_read_tokens: int = 0,
         cost_usd: float = 0.0,
+        images: int = 0,
+        render_seconds: float = 0.0,
     ) -> None:
         with self._write() as connection:
             connection.execute(
                 "INSERT INTO usage (model, ts, prompt_tokens, completion_tokens, "
-                "cache_creation_tokens, cache_read_tokens, cost_usd) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "cache_creation_tokens, cache_read_tokens, cost_usd, images, "
+                "render_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     model,
                     time.time(),
@@ -2153,6 +2158,8 @@ class Store:
                     cache_creation_tokens,
                     cache_read_tokens,
                     cost_usd,
+                    images,
+                    render_seconds,
                 ),
             )
 

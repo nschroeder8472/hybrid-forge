@@ -109,6 +109,9 @@ class Profile:
     # card — so it lives here and never in a repository's config. See
     # `forge.llama_server`.
     llama_server: dict[str, Any] = field(default_factory=dict)
+    # How this machine starts ComfyUI, or empty when forge does not run it.
+    # See `forge.comfy_server`.
+    comfyui: dict[str, Any] = field(default_factory=dict)
     # Top-level keys this version does not read, kept on save. A profile is
     # edited by hand and by newer forges; rewriting it must not delete what a
     # person or a later version put there.
@@ -136,13 +139,14 @@ class Profile:
         if not isinstance(data, dict):
             return cls(path=path)
 
-        known = ("_comment", "models", "roles", "memory", "ui", "llamaServer")
+        known = ("_comment", "models", "roles", "memory", "ui", "llamaServer", "comfyui")
         return cls(
             models=data.get("models") or {},
             roles=data.get("roles") or {},
             memory=data.get("memory") or {},
             ui_port=int(data.get("ui", {}).get("port", 8799) or 8799),
             llama_server=data.get("llamaServer") or {},
+            comfyui=data.get("comfyui") or {},
             extra={key: value for key, value in data.items() if key not in known},
             path=path,
         )
@@ -165,6 +169,8 @@ class Profile:
         }
         if self.llama_server:
             payload["llamaServer"] = strip_secrets(self.llama_server)
+        if self.comfyui:
+            payload["comfyui"] = strip_secrets(self.comfyui)
         for key, value in self.extra.items():
             payload.setdefault(key, strip_secrets(value))
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

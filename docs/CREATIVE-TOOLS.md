@@ -938,6 +938,32 @@ startup; an instance forge adopted is left running at run end; a process that
 dies twice parks the ticket.* The process tests use a stub server, not
 ComfyUI.
 
+*Built 2026-11-01.* `forge/providers/image.py` (the family),
+`forge/providers/comfyui.py` (the adapter), `forge/comfy_server.py` (the
+managed process, on phase 3's supervisor), `forge comfy start | stop | status |
+render`, `usage.images` and `usage.render_seconds`, `image` added to
+`loop.exclusiveGpu`, and image models in `forge doctor`. Verified live: forge
+started ComfyUI in 24 s, its readiness check passed every node class and model
+file of two real workflows, an SDXL pixel-art render took 12.3 s, a Kontext
+edit of it 15.8 s, the lease's `/free` brought the card from 18.4 GB to 1.9 GB
+with ComfyUI holding 64 MiB, and `forge comfy stop` ended it.
+
+Two findings from the live check:
+
+- **`/free` answers with an empty body.** The stub the adapter was first tested
+  against returned `{}`, so every test passed and the live release failed
+  parsing it. The stub now answers as the server does. A stub built from
+  assumptions tests the assumptions.
+- **Kontext reframes.** The edit changed only what it was told to, but its
+  input is rescaled to its preferred resolution, so the chest moved and grew
+  slightly between the two images. Phase 6's stall detection and any
+  before-and-after comparison must not assume two attempts are pixel-aligned.
+
+Not built, because there is nothing to call them yet: the `image` ticket kind
+that would start ComfyUI from `forge go`, and the lease around an image call.
+Both are phase 5. Until then the gate in `forge go` asks whether any queued
+ticket has kind `image`, and none can.
+
 **5 — The image kind, first ticket on SDXL pixel art.** IMAGE-LOOP phases 3-4
 with the executor writing the prompt block. The first ticket is the one
 IMAGE-LOOP's risks section asks for — an icon or tile at fixed size on a fixed

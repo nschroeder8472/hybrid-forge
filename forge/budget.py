@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
-from .providers import ContextOverflow, Message, Provider, Usage
+from .providers import ContextOverflow, ImageUsage, Message, Provider, Usage
 from .tokens import format_tokens
 
 
@@ -43,6 +43,8 @@ class UsageLedger(Protocol):
         cache_creation_tokens: int = 0,
         cache_read_tokens: int = 0,
         cost_usd: float = 0.0,
+        images: int = 0,
+        render_seconds: float = 0.0,
     ) -> None: ...
 
     def tokens_since(self, model: str, since: float) -> int: ...
@@ -195,6 +197,19 @@ class BudgetGate:
             usage.cost_usd,
         )
         # A successful call means the window is open again.
+        self._parked_until.pop(model, None)
+
+    def record_rendering(self, model: str, usage: ImageUsage) -> None:
+        """Record what an image call cost, before anything judges the image.
+
+        A rejected rendering has already been paid for — in money on a hosted
+        backend, in GPU seconds on a local one — so the record comes first,
+        exactly as token usage is recorded before a reply is parsed.
+        """
+        self.ledger.record_usage(
+            model, 0, 0, cost_usd=usage.cost_usd,
+            images=usage.images, render_seconds=usage.seconds,
+        )
         self._parked_until.pop(model, None)
 
     # ------------------------------------------------------------------

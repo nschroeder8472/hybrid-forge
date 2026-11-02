@@ -860,6 +860,17 @@ class Orchestrator:
         try:
             yield
         finally:
+            problems = gpu.release_images(self.config) if kind == "image" else []
+            for problem in problems:
+                note = self.servers.restart("comfyui") if self.servers else None
+                self.store.log(
+                    run_id,
+                    f"{prefix}{problem}" + (f"; {note}" if note else ""),
+                    level="warn",
+                    kind="gpu",
+                )
+                if note:
+                    break
             self.store.log(run_id, f"{prefix}released the GPU after {kind}.", kind="gpu")
 
     def _keep_servers(self, run_id: int) -> None:

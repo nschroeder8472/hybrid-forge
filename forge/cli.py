@@ -47,6 +47,7 @@ from . import (
     __version__,
     evidence,
     llama,
+    comfy_server,
     llama_server,
     presets,
     replay,
@@ -494,6 +495,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # Before the probes, because a forge-run server that is not up yet makes
     # every local model below read as unreachable, and this says why.
     _llama_server_report(str(config.root))
+    # Image models, by health rather than by a render: a render costs a model
+    # load, and whether the backend answers is the question doctor asks.
+    for name in sorted(config.image_models):
+        image_model = config.image_provider(name)
+        sees = image_model.capabilities()
+        try:
+            health = image_model.health()
+        except ProviderError as exc:
+            health = f"not answering — {exc}"
+            if config.comfyui:
+                health += " (`forge go` starts it for image work, or `forge comfy start`)"
+        print(
+            f"  image {name}: {image_model.kind}"
+            f"{', generate' if 'generate' in getattr(image_model, 'graphs', {}) else ''}"
+            f"{', edit' if sees.supports_edit else ''} — {health}"
+        )
 
     failures = 0
     for name in sorted(config.models):
@@ -992,7 +1009,13 @@ def cmd_go(args: argparse.Namespace) -> int:
     # start refuses the queue before anything is called — not four tickets in,
     # as an unreachable model. See `forge.run_servers`.
     try:
-        local = RunServers.for_config(config)
+        # ComfyUI only when some queued ticket needs an image model.
+        images = any(
+            ticket.kind == "image"
+            for run in runs
+            for ticket in store.list_tickets(int(run["id"]))
+        )
+        local = RunServers.for_config(config, images=images)
         for line in local.start() if local else []:
             print(line)
     except ServerError as exc:
@@ -2528,6 +2551,108 @@ def cmd_control(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_comfy(args: argparse.Namespace) -> int:
+    """Start, stop, inspect or render through the ComfyUI forge runs.
+
+    `start` leaves ComfyUI running for building workflows in its UI against the
+    configuration the loop will use; only `stop` ends it. `render` sends one
+    prompt through a declared image model and writes the image, which is how an
+    `imageModels` entry is checked end to end before any ticket depends on it.
+    """
+    config = _load(args.root)
+    action = args.comfy_command
+    supervisor = servers.Supervisor(
+        config.config_dir,
+        owner=servers.OWNER_CLI if action == "start" else servers.OWNER_RUN,
+    )
+    try:
+        settings = comfy_server.settings_for(config)
+    except comfy_server.ComfyServerError as exc:
+        print(f"error: {exc}")
+        return 1
+
+    if action == "stop":
+        pid = supervisor.stop(comfy_server.NAME)
+        print(
+            f"Stopped ComfyUI (pid {pid})." if pid
+            else "No ComfyUI started by forge is running for this project."
+        )
+        return 0
+
+    if action == "status":
+        if settings is None:
+            print("managed: no — add a comfyui block to the machine profile to have forge run it.")
+        else:
+            entry = supervisor.record(comfy_server.NAME)
+            print(f"managed: {settings.root} on port {settings.port}")
+            if entry:
+                print(
+                    f"running: yes, started by forge ({entry.get('owner')}), "
+                    f"pid {entry.get('pid')}"
+                )
+            elif servers.port_open("127.0.0.1", settings.port):
+                print("running: yes, not started by forge")
+            else:
+                print("running: no")
+        for name in sorted(config.image_models):
+            provider = config.image_provider(name)
+            caps = provider.capabilities()
+            try:
+                health = provider.health()
+            except ProviderError as exc:
+                health = f"not answering ({exc})"
+            print(
+                f"  {name}: {provider.kind}{', edits' if caps.supports_edit else ''}"
+                f" — {health}"
+            )
+        return 0
+
+    if action == "start":
+        if settings is None:
+            print(
+                "This machine's profile has no comfyui block, so forge does not run "
+                'ComfyUI here. Add one: "comfyui": {"root": "...", "python": "..."}'
+            )
+            return 1
+        try:
+            spec = comfy_server.spec(config, settings)
+            if spec is None:
+                print("No image model in this config is served by a forge-run ComfyUI.")
+                return 1
+            started = supervisor.ensure(spec)
+        except (comfy_server.ComfyServerError, servers.ServerError) as exc:
+            print(f"error: {exc}")
+            return 1
+        print(f"ComfyUI on 127.0.0.1:{settings.port}: {started.how}.")
+        if started.pid:
+            print(f"pid {started.pid}, log {started.log}")
+        return 0
+
+    # render
+    if not args.model or not args.prompt or not args.out:
+        print("error: render needs --model, --prompt and --out.")
+        return 1
+    provider = config.image_provider(args.model)
+    try:
+        if args.edit:
+            rendering = provider.edit(
+                args.prompt, image=Path(args.edit).read_bytes(), seed=args.seed
+            )
+        else:
+            rendering = provider.generate(
+                args.prompt, width=args.width, height=args.height, seed=args.seed
+            )
+    except (ProviderError, NotImplementedError, OSError) as exc:
+        print(f"error: {exc}")
+        return 1
+    Path(args.out).write_bytes(rendering.data)
+    print(
+        f"{args.out}: {rendering.width}x{rendering.height}, seed {rendering.seed}, "
+        f"{rendering.usage.seconds:.1f}s"
+    )
+    return 0
+
+
 def cmd_ui(args: argparse.Namespace) -> int:
     config = _load(args.root)
     store = _store(config)
@@ -2917,6 +3042,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="print what would be downloaded, with sizes, and stop",
     )
     p.set_defaults(func=cmd_llama)
+
+    p = sub.add_parser("comfy", help="start, stop, inspect or render through ComfyUI")
+    p.add_argument("comfy_command", choices=("start", "stop", "status", "render"))
+    p.add_argument("--model", default="", help="render: the imageModels entry to use")
+    p.add_argument("--prompt", default="", help="render: the prompt, or the edit instruction")
+    p.add_argument("--out", default="", help="render: where to write the PNG")
+    p.add_argument("--seed", type=int, default=None, help="render: a fixed seed")
+    p.add_argument("--width", type=int, default=0, help="render: width, if the workflow binds it")
+    p.add_argument("--height", type=int, default=0, help="render: height, if bound")
+    p.add_argument("--edit", default="", metavar="IMAGE",
+                   help="render: edit this image with the model's edit workflow")
+    p.set_defaults(func=cmd_comfy)
 
     p = sub.add_parser("ui", help="serve the dashboard without running the loop")
     p.add_argument("--open", action="store_true", help="open the dashboard in a browser")

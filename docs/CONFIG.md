@@ -862,6 +862,64 @@ mode is silent.
 
 ---
 
+## `imageModels`
+
+Image models, by name — a separate family from `models`, accounted in images
+and seconds rather than tokens. Today one kind, `comfyui`:
+
+```json
+"imageModels": {
+  "pixel": {
+    "kind": "comfyui",
+    "workflows": { "generate": ".hybridforge/comfy/sdxl-pixel.json" },
+    "bind": {
+      "prompt": ["3", "text"], "negative": ["4", "text"], "seed": ["6", "seed"],
+      "width": ["5", "width"], "height": ["5", "height"]
+    }
+  }
+}
+```
+
+| Key | Notes |
+|---|---|
+| `workflows` | `generate` and/or `edit`: paths, relative to the project, to workflows exported from ComfyUI with **Export (API)**. A UI-format export is refused by its shape at load. |
+| `bind` | Which node input receives each value forge sends: `prompt`, `negative`, `seed`, `width`, `height`, `image`, `mask`. Each is `["<node id>", "<input>"]`. A binding to an input the graph lacks, or a key forge never sends, is refused at load. An edit workflow needs `image`. |
+| `url` | Absent: the ComfyUI forge runs, at the profile's `comfyui.port`. Present: an external server forge only talks to. |
+| `timeoutSeconds` | `600`. A render that takes longer is interrupted. |
+
+Capabilities come from what is declared: an `edit` workflow means the model
+can edit; a bound `seed` means renders report the seed they used, which forge
+always chooses and so always knows. `forge comfy render` sends one prompt
+through a model and writes the image — the way to check an entry end to end
+before a ticket depends on it. `examples/comfyui-models` has two that work.
+
+#### Forge runs ComfyUI
+
+Optional, from the **machine profile**:
+
+```json
+"comfyui": {
+  "root": "C:/Users/me/Documents/ComfyUI",
+  "python": "C:/Users/me/Documents/ComfyUI/.venv/Scripts/python.exe",
+  "port": 8188,
+  "args": []
+}
+```
+
+The same rules as `llamaServer`: loopback only, adopt a server that already
+serves what is needed and never stop it, record what forge started in
+`servers.json`, one restart then stop. `python` is ComfyUI's own interpreter —
+give it a venv; phase 0 found it unable to start on a shared one after an
+unrelated upgrade. `forge go` starts it only when a queued ticket needs an
+image model, so a backlog of code tickets pays nothing. `forge comfy start |
+stop | status` run it by hand.
+
+**Ready means every workflow can run**: forge asks `/object_info` for each
+node class the workflows use and checks each model file they name against the
+files the loader lists. A missing checkpoint fails at startup, by name.
+
+---
+
 ## `memory`
 
 Optional. Without it the executor sees only what a ticket's own `context`
@@ -926,7 +984,7 @@ run some context, never the run.
 | `reviseBetweenPasses` | `true` | Whether the planner rewrites the ticket between sign-off passes. Leave it on. Off, the roles vote again on the words they already refused — objections still travel, only the rewrite is gone — and the run on 2026-09-08 showed what that costs: all four roles refused a second time on unchanged text, the ticket parked without ever reaching a build call, and sign-off came to 47% *more* than the arm that revised, because a ticket that cannot be repaired cycles through the pass instead of leaving it. The revision is what converts a correct refusal into a shippable ticket. `scripts/vote_grading.py` builds the arm; see the *Sign-off cost* entry in [ROADMAP.md](ROADMAP.md). |
 | `viewRole` | `"reviewer"` | Which role is shown a ticket's captured rendering, and therefore reviews it. Only tickets whose workspace has a `capture` command produce one, so on every other ticket this changes nothing and the reviewer reviews as it always did. `reviewer` is the right default because that seat already rules on whether the work meets the criteria; a project whose reviewer is a strong text model and whose vision model is a different seat names that one. It is not a fifth seat — sign-off is counted over the four roles, so a new one would change what a majority is. Declare `roleNeeds` on whichever seat this names, or a model that cannot see is told the files exist and shown their names instead of being refused at startup. See *Looking at what it built* in [ROADMAP.md](ROADMAP.md). |
 | `viewModel` | `""` | Which model the viewing seat uses **for a capture review only**. Empty means the seat's own model, which is every run before this existed. It is the case `viewRole` alone cannot express: a backlog whose four roles are local checkpoints, where the one call that has to read a rendering wants the strongest vision model available. Naming a model rather than adding a seat keeps `ROLES` at four — sign-off is counted over it — and it is paid for only on tickets that produced a capture, so a backlog of ordinary tickets costs exactly what it did before. Must name a model declared in `models`, and one that can be shown an image: a view model that can only be sent filenames is refused at load, because `roleNeeds` cannot reach it — it is not a role. |
-| `exclusiveGpu` | `[]` | Command kinds that run with the GPU to themselves: every resident llama checkpoint is unloaded before the step starts, waiting on the router's status rather than on VRAM, which frees two seconds before the router will accept a reload. Today the one leasable kind is `capture` — a renderer started beside a resident checkpoint does not fail, it falls back to system RAM and runs an order of magnitude slower. The checkpoint reloads on the next call that needs it, about 9 s for a 23 GB one. A kind that cannot be leased is refused rather than ignored. See [CREATIVE-TOOLS](CREATIVE-TOOLS.md), *The GPU lease*. |
+| `exclusiveGpu` | `[]` | Command kinds that run with the GPU to themselves: every resident llama checkpoint is unloaded before the step starts, waiting on the router's status rather than on VRAM, which frees two seconds before the router will accept a reload. The leasable kinds are `capture` — a renderer started beside a resident checkpoint does not fail, it falls back to system RAM and runs an order of magnitude slower — and `image`, the image-model call. After an `image` step forge sends ComfyUI `/free` and checks it gave the card back; a ComfyUI forge started that still holds more than 1 GiB is restarted. The checkpoint reloads on the next call that needs it, about 9 s for a 23 GB one. A kind that cannot be leased is refused rather than ignored. See [CREATIVE-TOOLS](CREATIVE-TOOLS.md), *The GPU lease*. |
 | `majorityRepeats` | `true` | Whether a pass-1 `majority` is put to the roles a second time. A majority already ships the ticket, and across every recorded pass that reached a second vote on one — three tickets, 730,005 tokens — not one ended anywhere other than where it started. Off, the pass stops there. Unlike `voteThinking` and `reviseBetweenPasses` it removes no part of the mechanism: the vote still reasons, the revision still happens wherever the pass continues, and a `split` or `blocked` still gets its second look. Shipped on replay evidence and unit tests; no live arm exists, because two fixtures written to produce a pass-1 majority both went unanimous. See the *Sign-off cost* entry in [ROADMAP.md](ROADMAP.md). |
 | `ratifyOrder` | all four, in the order above | The order the roles vote in, within a pass. A permutation of the four — it sets the order they vote, not which of them vote, and an order omitting one is refused because sign-off is counted over all four. Two things ride on it. Votes accumulate as they are cast and every role sees the ones before it, so the first votes blind and the last answers three arguments. And on a backend serving one checkpoint at a time (`llamacpp` with `exclusive`, or a router started with `--models-max 1`), two roles sharing a model are free when adjacent and cost a reload when not — see below. |
 | `participationWindow` | `20` | How many ratified tickets `forge signoff` reads before it is willing to say a role has never blocked anything. Report only: nothing in the loop reads it, and no behaviour changes on a role that signs everything. Below the window the report stays silent, because a role that has seen three good tickets and blocked none of them has done nothing wrong. See [ADAPTIVE-TICKET-LOOP](ADAPTIVE-TICKET-LOOP.md) §8.2. |

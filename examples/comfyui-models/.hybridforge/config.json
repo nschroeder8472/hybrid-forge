@@ -1,0 +1,52 @@
+{
+  "imageModels": {
+    "pixel": {
+      "kind": "comfyui",
+      "workflows": {
+        "generate": ".hybridforge/comfy/sdxl-pixel.json"
+      },
+      "bind": {
+        "prompt": [
+          "3",
+          "text"
+        ],
+        "negative": [
+          "4",
+          "text"
+        ],
+        "seed": [
+          "6",
+          "seed"
+        ],
+        "width": [
+          "5",
+          "width"
+        ],
+        "height": [
+          "5",
+          "height"
+        ]
+      }
+    },
+    "kontext": {
+      "kind": "comfyui",
+      "workflows": {
+        "edit": ".hybridforge/comfy/flux-kontext-edit.json"
+      },
+      "bind": {
+        "prompt": [
+          "7",
+          "text"
+        ],
+        "seed": [
+          "11",
+          "seed"
+        ],
+        "image": [
+          "4",
+          "image"
+        ]
+      }
+    }
+  }
+}
