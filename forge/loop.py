@@ -5799,7 +5799,6 @@ class Orchestrator:
         self,
         run_id: int,
         ticket: Ticket,
-        attempt: int,
         written: Sequence[str] = (),
     ) -> tuple[list[ImagePart], StepResult | None]:
         """Render what this ticket built, and return it as pictures.
@@ -5838,7 +5837,13 @@ class Orchestrator:
             / ARTIFACTS_DIR
             / f"run-{run_id}"
             / ticket.ticket_id
-            / f"attempt-{attempt}"
+            # `attempt_number`, never `attempts`: the second restarts at 1 on
+            # every retry cycle, and phase 2's SPR-003 lost the capture its
+            # reviewer rejected that way — the accepted attempt three wrote
+            # into `attempt-1/capture`, over the image the rejection was
+            # about. The ticket carries the number so no call site can pass
+            # the wrong one; `_record` already reads it for the same reason.
+            / f"attempt-{max(1, ticket.attempt_number)}"
             / "capture"
         )
         try:
@@ -6913,9 +6918,7 @@ class Orchestrator:
         # After verification on purpose: a page that does not compile is not a
         # page worth looking at, and the capture command would be reporting the
         # build's failure in its own words.
-        rendered, capture_failure = self._capture(
-            run_id, ticket, ticket.attempts, written
-        )
+        rendered, capture_failure = self._capture(run_id, ticket, written)
         if capture_failure is not None:
             return capture_failure
         images = [*images, *rendered]

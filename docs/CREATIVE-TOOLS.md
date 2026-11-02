@@ -808,6 +808,51 @@ while its capture shows the mistake, which is the case the capture exists for.
 `format` path confirmed against a binary file. If `format` does not hold up on a
 binary, the finding goes in here, and the fix is to `format`, not a new kind.
 
+*Run 2026-11-01 on `examples/gimp-sprites`.* Same seats as phase 1. Three
+Python-Fu tool tickets, a key-out, a palette snap and a sprite tool chaining
+them, fed by a Blender render of phase 1's anvil.
+
+**3 / 3 done in 50.0 min, one retry cycle.** SPR-001 and SPR-002 landed on the
+first attempt. The executor had no trouble with GIMP 3.2's Python API: the spec
+named each call, and the four traps that cost the reference implementation
+attempts were written into it beforehand. Those four are a palette passed by
+name, `Gimp.Palette.new` renaming on collision, palettes persisting in the
+user's profile, and transparency living on a spare palette slot. No palette was
+left in the profile afterwards.
+
+**The format path holds for a binary file.** GIMP opens the paths a `format`
+command appends, so a Python-Fu script over `Gimp.get_images()` is a working
+`.png` formatter. Two parts of forge's format step assumed text, and both are
+fixed: change detection compared files decoded with replacement, so two PNGs
+differing only in invalid-UTF-8 bytes read as unchanged; and an unchanged
+binary file was shown to the reviewer decoded.
+
+**The seeing reviewer rejected work that passed every criterion, on what the
+capture showed.** This is the case phase 1 could not test. SPR-003's first
+attempt passed all four acceptance tests. Its capture showed opaque pink
+speckles across the sprite's background, and the reviewer rejected it:
+near-magenta pixels survive an exact key, and the palette step snaps them to
+PICO-8 pink. It inferred the cause without reading a pixel value, and the
+inference was right. The fixture, which I had called an exact `#ff00ff`
+background after checking one corner, holds 8,163 pixels of `(254, 0, 254)`
+and `(255, 1, 255)`, from Blender's render dithering. The synthetic test
+inputs were flat, so no test could see it.
+
+The executor's response was the right one, and it took a respec to get there.
+It found that the reviewer's suggested fix contradicted SPR-001's landed spec
+and test, which pin the key to an exact match, and it said so rather than
+breaking a landed ticket. The resolution kept SPR-001's behaviour as the
+default: `key_out` gained an optional threshold, and `sprite` passes 0.1. The
+spec now carries that, with the dithering as its reason and a criterion over a
+noisy background.
+
+**Forge lost the evidence of that rejection.** `_capture` named its directory
+from `ticket.attempts`, which restarts at 1 on every retry cycle, so attempt
+three's accepted capture was written into `attempt-1/capture`, over the image
+the rejection was about. `_record` already read `attempt_number` for exactly
+this reason, with a comment saying so. `_capture` now takes the number from
+the ticket, so no call site can pass the wrong one.
+
 **3 — Forge runs `llama-server`, and the GPU lease.** First the supervisor in
 `processes.py` with the shared rules: profile opt-in, ownership by address,
 loopback bind, readiness by model id, adopt-never-steal, `servers.json`, one

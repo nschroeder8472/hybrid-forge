@@ -13,7 +13,8 @@ tools/gimp/ops.py        shared operations, imported inside GIMP; the tickets ad
 tools/gimp/grayscale.py  the reference tool
 tests/grayscale_test.py  the reference test: Pillow in, GIMP once per class, Pillow out
 tools/capture.py         runs the tools an attempt wrote on fixtures/anvil.png
-fixtures/anvil.png       the phase 1 anvil, rendered by Blender on #ff00ff, no anti-aliasing
+fixtures/anvil.png       the phase 1 anvil, rendered by Blender on #ff00ff, no anti-aliasing,
+                         with Blender's dither noise left in on purpose
 ```
 
 ## Requirements

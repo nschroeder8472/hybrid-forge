@@ -132,7 +132,7 @@ class CaptureIsToldWhatWasWrittenTests(unittest.TestCase):
         )
         written = ["art/scenes/anvil.py", "art/tests/anvil_test.py", "README.md"]
 
-        orchestrator._capture(store.create_run("goal"), ticket, 1, written)
+        orchestrator._capture(store.create_run("goal"), ticket, written)
 
         recorded = next(config.config_dir.rglob("files.txt")).read_text(encoding="utf-8")
         self.assertEqual(

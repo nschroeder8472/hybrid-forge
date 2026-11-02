@@ -15,23 +15,26 @@ nothing in forge knows it is there.
 
 ### Spec
 
-Add `key_out(image, key)` to `tools/gimp/ops.py`, and a tool
+Add `key_out(image, key, threshold=0.0)` to `tools/gimp/ops.py`, and a tool
 `tools/gimp/key_out.py` that applies it, following `tools/gimp/grayscale.py`.
 
-`key_out` makes every pixel of exactly the colour `key` (a `"#rrggbb"` string)
-fully transparent and leaves every other pixel as it was. In order:
+`key_out` makes every pixel within `threshold` of the colour `key` (a
+`"#rrggbb"` string) fully transparent and leaves every other pixel as it was.
+`threshold` is GIMP's sample threshold, from 0.0 to 1.0; at the default of 0.0
+only the exact colour goes. In order:
 
 1. `layer = image.get_layers()[0]`, then `layer.add_alpha()`.
-2. `Gimp.context_set_sample_threshold(0.0)`,
+2. `Gimp.context_set_sample_threshold(threshold)`,
    `Gimp.context_set_antialias(False)` and `Gimp.context_set_feather(False)`,
-   so the selection takes the exact colour and nothing near it.
+   so the selection has a hard edge and takes nothing beyond the threshold.
 3. `image.select_color(Gimp.ChannelOps.REPLACE, layer, Gegl.Color.new(key))`.
 4. `layer.edit_clear()`, then `Gimp.Selection.none(image)`.
 
 Import `Gegl` beside `Gimp`: `from gi.repository import Gegl, Gimp, Gio`.
 
-The tool takes the arguments `input`, `output` and `key`, reads them with
-`ops.args()`, loads, applies `key_out`, and saves.
+The tool takes the arguments `input`, `output`, `key` and, optionally,
+`threshold` (default 0.0), reads them with `ops.args()`, loads, applies
+`key_out`, and saves.
 
 ### Allowed files
 
@@ -56,6 +59,8 @@ The tool takes the arguments `input`, `output` and `key`, reads them with
 - Pixel (5, 5) is (200, 40, 40, 255).
 - Exactly 47 pixels have alpha 0: the 64 pixels less the 16 of the block and
   the one near-key pixel.
+- Run on the same input with `threshold=0.1`, pixel (1, 1) has alpha 0 and
+  pixel (5, 5) is still (200, 40, 40, 255).
 
 ### Context
 
@@ -134,10 +139,18 @@ sprite.
 
 `sprite.py` takes the arguments `input`, `output`, `key`, `size` and
 `palette`, reads them with `ops.args()`, loads the image, and applies, in this
-order, `ops.key_out(image, key)`, `ops.pixelate(image, size)` and
+order, `ops.key_out(image, key, 0.1)`, `ops.pixelate(image, size)` and
 `ops.to_palette(image, palette)`, then saves. Keying out first matters: scaling
 first would blend the key colour into the edges, and the blended pixels would
 no longer match it.
+
+Key out with a threshold of 0.1, not 0.0. A render is not one flat colour:
+Blender dithers its output, so a `#ff00ff` background arrives with thousands
+of `(254, 0, 254)` and `(255, 1, 255)` pixels. An exact key leaves them, and
+the palette step then snaps each one to the palette's nearest pink, which
+scatters opaque speckles across the background. 0.1 clears that noise; it also
+clears anything within about 25 steps of the key, so art for this tool keeps
+away from magenta.
 
 What the capture should show: the anvil, small and blocky, its greys snapped
 to the PICO-8 palette, on a transparent background with no magenta left
@@ -165,6 +178,8 @@ anywhere, including at its edges.
   `key="#ff00ff"`, `size=8` and
   `palette=["#000000", "#cc2222", "#2222cc", "#ffffff"]`: the output opens in
   Pillow with mode `P` and size (8, 8).
+- With the background pixels in rows y 0–7 set to (254, 0, 254) in that input,
+  every pixel of the output's rows y 0 and 1 has alpha 0.
 - Converted to RGBA, row y 3 reads: alpha 0 at x 0 and 1; (0, 0, 0, 255) at
   x 2; (204, 34, 34, 255) at x 3; (34, 34, 204, 255) at x 4;
   (255, 255, 255, 255) at x 5; alpha 0 at x 6 and 7.

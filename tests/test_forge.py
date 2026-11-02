@@ -8041,7 +8041,7 @@ class TestTheLoopLooksAtWhatItBuilt(unittest.TestCase):
     def test_the_command_is_told_where_to_write_and_the_result_is_attached(self):
         orch, _root, run_id = self._orchestrator(self._WRITER)
 
-        images, failure = orch._capture(run_id, self._ticket(), 1)
+        images, failure = orch._capture(run_id, self._ticket())
 
         self.assertIsNone(failure)
         self.assertEqual(len(images), 1)
@@ -8052,7 +8052,7 @@ class TestTheLoopLooksAtWhatItBuilt(unittest.TestCase):
         # The same rule lint has: no command, no step.
         orch, _root, run_id = self._orchestrator("")
 
-        images, failure = orch._capture(run_id, self._ticket(), 1)
+        images, failure = orch._capture(run_id, self._ticket())
 
         self.assertEqual((images, failure), ([], None))
 
@@ -8061,7 +8061,7 @@ class TestTheLoopLooksAtWhatItBuilt(unittest.TestCase):
         # project's own statement about its own tree.
         orch, _root, run_id = self._orchestrator('python -c "raise SystemExit(3)"')
 
-        images, failure = orch._capture(run_id, self._ticket(), 1)
+        images, failure = orch._capture(run_id, self._ticket())
 
         self.assertEqual(images, [])
         self.assertIsNotNone(failure)
@@ -8072,7 +8072,7 @@ class TestTheLoopLooksAtWhatItBuilt(unittest.TestCase):
         # review then happens exactly as it did before captures existed.
         orch, _root, run_id = self._orchestrator('python -c "pass"')
 
-        images, failure = orch._capture(run_id, self._ticket(), 1)
+        images, failure = orch._capture(run_id, self._ticket())
 
         self.assertEqual((images, failure), ([], None))
 
@@ -8085,17 +8085,32 @@ class TestTheLoopLooksAtWhatItBuilt(unittest.TestCase):
             '"'
         )
 
-        images, failure = orch._capture(run_id, self._ticket(), 1)
+        images, failure = orch._capture(run_id, self._ticket())
 
         self.assertEqual((images, failure), ([], None))
 
     def test_the_capture_lands_under_this_attempt_in_the_artifact_tree(self):
         orch, _root, run_id = self._orchestrator(self._WRITER)
+        ticket = self._ticket()
+        ticket.attempts = 2
 
-        images, _ = orch._capture(run_id, self._ticket(), 2)
+        images, _ = orch._capture(run_id, ticket)
 
         self.assertIn("attempt-2", images[0].path)
         self.assertIn("AB-001", images[0].path)
+
+    def test_a_retry_cycle_does_not_capture_over_an_earlier_attempt(self):
+        # Phase 2's SPR-003: attempt 1 was rejected on its capture, a retry
+        # cycle restarted `attempts` at 1, and attempt 3's capture landed in
+        # `attempt-1/capture`, over the image the rejection was about.
+        orch, _root, run_id = self._orchestrator(self._WRITER)
+        ticket = self._ticket()
+        ticket.attempt_base, ticket.attempts = 2, 1
+
+        images, _ = orch._capture(run_id, ticket)
+
+        self.assertIn("attempt-3", images[0].path)
+        self.assertNotIn("attempt-1", images[0].path)
 
     def test_the_review_call_carries_the_rendering(self):
         """The call site, which the tests above do not reach.
