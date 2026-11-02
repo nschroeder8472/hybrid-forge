@@ -2,10 +2,11 @@
 
 Three tickets. Two Blender props built in three colourways — a key and the
 padlock it opens — and the packer that lays rendered frames out as a sheet.
-Once they land, `python tools/make_sheets.py` renders each prop from eight
-directions in red, blue and green, finishes every frame into a 64x64 sprite in
-GIMP, and writes `sheets/key.png` and `sheets/lock.png`: one row per colour,
-one column per direction, with a JSON file beside each describing its frames.
+Once they land, `python tools/make_sheets.py` renders each prop in red, blue
+and green from eight isometric directions and four flat, face-on views,
+finishes every frame into a 64x64 sprite in GIMP, and writes `sheets/key.png`
+and `sheets/lock.png`: one row per colour, one column per view, with a JSON
+file beside each describing its frames.
 
 ## SHT-001: A key in three colours
 

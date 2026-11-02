@@ -1120,6 +1120,18 @@ batch GIMP sprite tool and `tools/make_sheets.py`, which builds both sheets in
 about 25 s: 512 x 192 PNGs, rows by colour, columns 0-315 degrees, 64x64
 frames, and a JSON frame map beside each.
 
+**Flat views, added after.** Each sheet now also has four face-on columns,
+`flat_0` to `flat_270`, for side-on and top-down games and inventory icons,
+so the sheets are 768 x 192. "Face-on" means looking along the prop's
+thinnest axis, which `turntable.flat_elevation` reads from the mesh: the lock
+stands up and is seen at eye level (front, side, back, side); the key lies
+flat and is seen from straight above, since at eye level it is a line. No
+scene changed. The first build showed blue's face-on frames on the light-blue
+palette entry while red and green kept their shade: a face square to the
+camera catches Workbench's whole specular highlight. With specular off, a
+face-on face renders the same shade as the isometric lit face, (58, 93, 160)
+against (56, 90, 156) for blue.
+
 Choices that keep frames consistent, each from a defect in the first
 reference build: one scale per prop from its *projected* size (scaling by
 height clipped the lock's shackle), no cavity shading (its highlights became

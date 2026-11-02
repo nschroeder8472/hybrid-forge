@@ -1,10 +1,11 @@
-"""Show the reviewing seat a changed prop from all eight directions, per colour.
+"""Show the reviewing seat a changed prop from every view the sheet holds, per colour.
 
 Run by forge as the capture command. For each scene the attempt wrote (from
 `FORGE_CAPTURE_FILES`; every scene by hand), renders the turntable and lays
-its eight frames side by side, one strip per colourway, into
-`FORGE_CAPTURE_DIR` (`capture_out/` by hand). Three strips per scene: the
-reviewer sees every angle and every colour the sheet will hold.
+its twelve frames (eight isometric, then four flat) side by side, one strip
+per colourway, into `FORGE_CAPTURE_DIR` (`capture_out/` by hand). Three
+strips per scene: the reviewer sees every view and every colour the sheet
+will hold.
 """
 
 import os
