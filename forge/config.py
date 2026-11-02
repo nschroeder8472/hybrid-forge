@@ -43,7 +43,13 @@ from .budget import RateLimitPolicy
 # nothing from this package, so this cannot cycle.
 from .patch import matches_any
 from .profile import Profile
-from .providers import Provider, build_provider
+from .providers import (
+    ImageProvider,
+    Provider,
+    ProviderError,
+    build_image_provider,
+    build_provider,
+)
 
 CONFIG_DIR = ".hybridforge"
 CONFIG_FILE = "config.json"
@@ -1129,6 +1135,13 @@ def _with_profile(data: dict[str, Any]) -> dict[str, Any]:
     profile holds preferences, not state, and a missing one must not turn a
     working repository into an error.
     """
+    for machine_key in ("comfyui",):
+        if machine_key in data:
+            raise ConfigError(
+                f"`{machine_key}` is in .hybridforge/config.json; it belongs in "
+                f"the machine profile, because where ComfyUI is installed and "
+                f"which Python runs it are facts about the machine."
+            )
     if "llamaServer" in data:
         # How a machine starts its server is the machine's answer, and a
         # committed one would hand every clone this machine's port and card.
@@ -1139,12 +1152,17 @@ def _with_profile(data: dict[str, Any]) -> dict[str, Any]:
             "the machine, not the repository."
         )
     profile = Profile.load()
-    if profile.is_empty and not profile.roles and not profile.llama_server:
+    if (
+        profile.is_empty and not profile.roles
+        and not profile.llama_server and not profile.comfyui
+    ):
         return data
 
     merged = dict(data)
     if profile.llama_server:
         merged["llamaServer"] = profile.llama_server
+    if profile.comfyui:
+        merged["comfyui"] = profile.comfyui
     if profile.models:
         merged["models"] = {**profile.models, **(data.get("models") or {})}
     if profile.roles:
@@ -1169,6 +1187,12 @@ class Config:
     # `llama-server`, or empty when forge does not start it. Never read from
     # the repository config. See `forge.llama_server`.
     llama_server: dict[str, Any] = field(default_factory=dict)
+    # Image models, by name: the project's `imageModels`. Each names a backend
+    # and the workflow files it runs, which are project files. See
+    # `forge.providers.comfyui`.
+    image_models: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # The machine profile's `comfyui` block, or empty. See `forge.comfy_server`.
+    comfyui: dict[str, Any] = field(default_factory=dict)
     loop: LoopSettings = field(default_factory=LoopSettings)
     ui: UISettings = field(default_factory=UISettings)
     # What the config file declared, or `None` for a repository that declared
@@ -1260,6 +1284,8 @@ class Config:
             never_delegate=data.get("neverDelegate", []) or [],
             memory=data.get("memory", {}) or {},
             llama_server=data.get("llamaServer", {}) or {},
+            image_models=data.get("imageModels", {}) or {},
+            comfyui=data.get("comfyui", {}) or {},
         )
 
         declared = data.get("workspaces")
@@ -1361,6 +1387,7 @@ class Config:
             )
         _validate_commands(self.commands, "commands")
         self._validate_workspaces()
+        self._validate_image_models()
         if self.llama_server:
             from .llama_server import LlamaServerError, Settings
 
@@ -1818,6 +1845,53 @@ class Config:
         name = self.roles[role]
         return build_provider(name, self.model_block(name))
 
+    def image_model_block(self, name: str) -> dict[str, Any]:
+        """An image model's config, with its workflow root and address filled in.
+
+        `root` is the project, which workflow paths are relative to. A block
+        with no `url` is served by the ComfyUI forge runs, at the port the
+        machine profile names. See `forge.comfy_server`.
+        """
+        from .comfy_server import url_for
+
+        block = dict(self.image_models[name])
+        block.setdefault("root", str(self.root))
+        if not block.get("url"):
+            block["url"] = url_for(self)
+        return block
+
+    def image_provider(self, name: str) -> ImageProvider:
+        """Build an image model by the name it is declared under in `imageModels`."""
+        if name not in self.image_models:
+            raise ConfigError(
+                f"no image model named {name!r} (have: "
+                f"{', '.join(sorted(self.image_models)) or 'none'})."
+            )
+        return build_image_provider(name, self.image_model_block(name))
+
+    def _validate_image_models(self) -> None:
+        """Refuse an image model whose workflows or bindings cannot work.
+
+        Built here, at load, because building one reads its workflow files and
+        checks every binding against them: a UI-format export, a bound node
+        that is not in the graph, an edit workflow with no image input. Each
+        would otherwise surface as `node_errors` on the first render of a run.
+        """
+        if self.comfyui:
+            from .comfy_server import ComfyServerError, Settings as ComfySettings
+
+            try:
+                ComfySettings.from_block(self.comfyui)
+            except ComfyServerError as exc:
+                raise ConfigError(f"machine profile: {exc}") from exc
+        if not isinstance(self.image_models, dict):
+            raise ConfigError("`imageModels` must be an object of named image models.")
+        for name in self.image_models:
+            try:
+                self.image_provider(name)
+            except (ValueError, ProviderError) as exc:
+                raise ConfigError(f"imageModels.{name}: {exc}") from exc
+
     def provider_for_model(self, name: str) -> Provider:
         """Build a provider by the name it is declared under.
 
@@ -1868,6 +1942,9 @@ class Config:
             "commands": self.commands,
             "neverDelegate": self.never_delegate,
             "memory": self.memory,
+            # Written whenever declared: a config saved by `forge init` or the
+            # dashboard must not lose the image models it was loaded with.
+            **({"imageModels": self.image_models} if self.image_models else {}),
             "loop": {
                 "maxAttempts": self.loop.max_attempts,
                 "commandTimeoutSeconds": self.loop.command_timeout_seconds,

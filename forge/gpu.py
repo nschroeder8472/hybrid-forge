@@ -31,7 +31,10 @@ from .providers import LlamaCppProvider
 # renderer runs under; `image` joins it with the image provider. A kind
 # outside this set is refused at `validate()` rather than silently never
 # leased.
-LEASABLE = ("capture",)
+LEASABLE = ("capture", "image")
+# What ComfyUI's PyTorch may still hold after `/free` and count as released:
+# phase 0 measured about 0.6 GiB of context on an idle server.
+RELEASED_BYTES = 1 << 30
 
 
 def llama_routers(config: Any) -> list[LlamaCppProvider]:
@@ -72,3 +75,26 @@ def clear_llama(config: Any) -> tuple[list[str], list[str]]:
             except Exception as exc:  # noqa: BLE001
                 problems.append(f"{model}: {exc}")
     return unloaded, problems
+
+
+def release_images(config: Any) -> list[str]:
+    """Ask every image backend the config uses to give the card back.
+
+    Returns one line per backend that did not: unreachable, or still holding
+    more than `RELEASED_BYTES` after `/free`. Never raises; the caller decides
+    whether to restart a server it owns.
+    """
+    problems: list[str] = []
+    for name in sorted(getattr(config, "image_models", {}) or {}):
+        try:
+            provider = config.image_provider(name)
+            provider.free()
+            stats = provider.system_stats() if hasattr(provider, "system_stats") else {}
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"{name}: {exc}")
+            continue
+        devices = stats.get("devices") or [{}]
+        held = int(devices[0].get("torch_vram_total", 0) or 0)
+        if held > RELEASED_BYTES:
+            problems.append(f"{name}: still holding {held / 2**30:.1f} GiB after /free")
+    return problems

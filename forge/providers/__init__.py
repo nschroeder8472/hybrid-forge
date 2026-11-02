@@ -43,7 +43,9 @@ from .base import (
     Usage,
 )
 from .claude_cli import ClaudeCLIProvider
+from .comfyui import ComfyConfigError, ComfyUIProvider
 from .gemini import GeminiProvider
+from .image import ImageCapabilities, ImageProvider, ImageUsage, Rendering
 from .llamacpp import LlamaCppProvider
 from .openai_compat import OpenAICompatProvider
 
@@ -151,7 +153,35 @@ def build_provider(name: str, config: dict[str, Any]) -> Provider:
     return provider_class(name, config)
 
 
+# Image models are a separate family with a separate registry
+# (forge/providers/image.py): they return pixels and are accounted in images and
+# seconds, never in the tokens the budget gate reasons about.
+_IMAGE_REGISTRY: dict[str, type[ImageProvider]] = {
+    ComfyUIProvider.kind: ComfyUIProvider,
+}
+
+
+def build_image_provider(name: str, config: dict[str, Any]) -> ImageProvider:
+    """Construct an image model from its `imageModels` block."""
+    kind = str(config.get("kind", "")).lower()
+    try:
+        provider_class = _IMAGE_REGISTRY[kind]
+    except KeyError:
+        raise ValueError(
+            f"image model {name!r} has kind {kind or '(none)'!r}; image kinds: "
+            f"{', '.join(sorted(_IMAGE_REGISTRY))}"
+        ) from None
+    return provider_class(name, config)
+
+
 __all__ = [
+    "ComfyConfigError",
+    "ComfyUIProvider",
+    "ImageCapabilities",
+    "ImageProvider",
+    "ImageUsage",
+    "Rendering",
+    "build_image_provider",
     "Capabilities",
     "Completion",
     "ContextOverflow",
