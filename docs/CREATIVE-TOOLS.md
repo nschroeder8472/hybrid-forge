@@ -846,6 +846,34 @@ default: `key_out` gained an optional threshold, and `sprite` passes 0.1. The
 spec now carries that, with the dithering as its reason and a criterion over a
 noisy background.
 
+**The sprite it accepted was a flat blob, and a person caught it.** Opened in
+GIMP afterwards, the accepted sprite had a clean background and one colour: 985
+pixels of PICO-8's `#5f574f` and ten black. The anvil's faces were greys 48 to
+90, and the palette's nearest grey to every one of them was the same entry, so
+top, front and side merged. Nothing failed. The criteria checked that colours
+landed in the palette, and the spec told the reviewer to expect "greys snapped
+to the PICO-8 palette", which is what it got. Three changes, verified on the
+real fixture:
+
+- `sprite` stretches contrast (`levels_stretch()`, which ignores transparent
+  pixels) between key and pixelate, and a criterion now holds three faces of
+  greys 60, 75 and 90 apart as black, grey and white. That test fails without
+  the stretch.
+- The capture's demo palette is a ten-step grey ramp plus four accents, not
+  PICO-8.
+- The spec's visual bar says what matters: the faces stay different greys and
+  each face is flat. "Every pixel is a palette colour" was a bar a blob passes.
+
+The stretch also magnified Blender's ±1 dither noise into grain on every face,
+so the fixture is now rendered with `dither_intensity = 0`. The resulting
+sprite uses five tones, with distinct top, front and shadow faces and a bright
+horn.
+
+This is phase 1's export finding again, from the other side. There a capture
+looked right while the asset was wrong; here the asset met every criterion and
+looked wrong. Either way the bar was in my head and not in the spec, and the
+reviewer can only hold work to the bar it is given.
+
 **Forge lost the evidence of that rejection.** `_capture` named its directory
 from `ticket.attempts`, which restarts at 1 on every retry cycle, so attempt
 three's accepted capture was written into `attempt-1/capture`, over the image

@@ -29,10 +29,14 @@ from tools.gimp import runner  # noqa: E402
 
 FIXTURE = os.path.join(ROOT, "fixtures", "anvil.png")
 NOT_TOOLS = {"__init__.py", "ops.py", "runner.py"}
-# PICO-8's sixteen colours: a palette with greys, so the anvil survives it.
+# A ten-step grey ramp and four accents. Pixel art reads by contrast, so a
+# palette needs several shades of each material it draws: the first demo
+# palette, PICO-8, has one grey near an iron anvil's shading, and every face
+# of the sprite came out that one grey.
 PALETTE = [
-    "#000000", "#1d2b53", "#7e2553", "#008751", "#ab5236", "#5f574f", "#c2c3c7", "#fff1e8",
-    "#ff004d", "#ffa300", "#ffec27", "#00e436", "#29adff", "#83769c", "#ff77a8", "#ffccaa",
+    "#000000", "#1c1c1c", "#383838", "#555555", "#717171",
+    "#8d8d8d", "#aaaaaa", "#c6c6c6", "#e2e2e2", "#ffffff",
+    "#8f563b", "#d9a066", "#ac3232", "#5b6ee1",
 ]
 DEMO = {"key": "#ff00ff", "size": 64, "palette": PALETTE}
 MIN_SIDE = 256

@@ -13,8 +13,8 @@ tools/gimp/ops.py        shared operations, imported inside GIMP; the tickets ad
 tools/gimp/grayscale.py  the reference tool
 tests/grayscale_test.py  the reference test: Pillow in, GIMP once per class, Pillow out
 tools/capture.py         runs the tools an attempt wrote on fixtures/anvil.png
-fixtures/anvil.png       the phase 1 anvil, rendered by Blender on #ff00ff, no anti-aliasing,
-                         with Blender's dither noise left in on purpose
+fixtures/anvil.png       the phase 1 anvil, rendered by Blender on #ff00ff with
+                         anti-aliasing and dithering off
 ```
 
 ## Requirements
@@ -52,6 +52,26 @@ python tools/capture.py          # writes capture_out/
 - **An indexed PNG's transparency lives on an unused palette slot**, or on one
   GIMP adds. A transparent pixel's RGB is whatever that slot holds, so tests
   compare transparent pixels by alpha alone.
+- **`levels_stretch()` ignores transparent pixels**, so stretching after the
+  key measures only the art.
 - **A batch session needs `--quit`**, or it waits for more commands after the
   script finishes. A script that raises exits 64, which `runner.py` turns into
   an exception carrying GIMP's output.
+
+## What makes a sprite read
+
+Learned from the first sprite this produced, a flat grey anvil-shaped blob
+that passed every test:
+
+- **Contrast, not colour accuracy.** Pixel art reads by the difference between
+  light, mid and shadow faces. `sprite.py` stretches contrast before snapping
+  to the palette, so a dark material's shading spreads across the palette
+  rather than landing on one entry.
+- **A palette with a ramp.** Several shades of each material the art uses.
+  `tools/capture.py` demos with a ten-step grey ramp plus four accents.
+- **A clean render.** Turn off Blender's dithering for sprite renders: its
+  noise survives a key and turns into grain once contrast is stretched.
+- **A visual bar in the spec.** The reviewer accepted the flat blob because
+  the spec only asked for colours snapped to the palette. It now says the
+  faces must stay different greys, and a test holds three close greys apart.
+

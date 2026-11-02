@@ -129,9 +129,17 @@ The tool takes the arguments `input`, `output` and `palette`, reads them with
 
 ### Spec
 
-Add `pixelate(image, size)` to `tools/gimp/ops.py`, and a tool
-`tools/gimp/sprite.py` that turns a render on a key colour into a pixel-art
-sprite.
+Add `stretch(image)` and `pixelate(image, size)` to `tools/gimp/ops.py`, and a
+tool `tools/gimp/sprite.py` that turns a render on a key colour into a
+pixel-art sprite.
+
+`stretch` stretches the image's contrast so its darkest and lightest pixels
+span the full range: `image.get_layers()[0].levels_stretch()`. GIMP ignores
+transparent pixels, so the keyed-out background does not count. It exists
+because a render's shading sits in a narrow band, and pixel art reads by
+contrast: the first sprite this backlog produced came from an anvil whose faces
+were greys 48 to 90, every one nearest the same palette entry, and the whole
+sprite was one flat colour.
 
 `pixelate` scales the image to `size` × `size` pixels with no interpolation:
 `Gimp.context_set_interpolation(Gimp.InterpolationType.NONE)`, then
@@ -139,8 +147,9 @@ sprite.
 
 `sprite.py` takes the arguments `input`, `output`, `key`, `size` and
 `palette`, reads them with `ops.args()`, loads the image, and applies, in this
-order, `ops.key_out(image, key, 0.1)`, `ops.pixelate(image, size)` and
-`ops.to_palette(image, palette)`, then saves. Keying out first matters: scaling
+order, `ops.key_out(image, key, 0.1)`, `ops.stretch(image)`,
+`ops.pixelate(image, size)` and `ops.to_palette(image, palette)`, then saves.
+Stretch after keying, so the key colour is gone before contrast is measured. Keying out first matters: scaling
 first would blend the key colour into the edges, and the blended pixels would
 no longer match it.
 
@@ -152,9 +161,12 @@ scatters opaque speckles across the background. 0.1 clears that noise; it also
 clears anything within about 25 steps of the key, so art for this tool keeps
 away from magenta.
 
-What the capture should show: the anvil, small and blocky, its greys snapped
-to the PICO-8 palette, on a transparent background with no magenta left
-anywhere, including at its edges.
+What the capture should show: the anvil, small and blocky, on a transparent
+background with no magenta left anywhere, including at its edges. Its top,
+front and side faces must be **different greys from each other**, each face
+flat rather than grainy, with the horn lighter than the body. A sprite whose
+faces have merged into one colour is a failure even if every pixel is a
+palette colour.
 
 ### Allowed files
 
@@ -186,8 +198,21 @@ anywhere, including at its edges.
 - Converted to RGBA, all four corner pixels have alpha 0.
 - Converted to RGBA, every pixel with alpha 255 is one of the four palette
   colours.
+- For a 48×48 RGB input filled with (255, 0, 255) with three blocks spanning
+  y 16–31, x 0–15 (60, 60, 60), x 16–31 (75, 75, 75) and x 32–47
+  (90, 90, 90), run with `size=3` and
+  `palette=["#000000", "#808080", "#ffffff"]`: converted to RGBA, row y 1 is
+  (0, 0, 0, 255), (128, 128, 128, 255), (255, 255, 255, 255), and every pixel
+  of rows y 0 and 2 has alpha 0. Three faces a few greys apart stay three
+  colours.
 
 ### Context
+
+Render sprites with Blender's dithering off
+(`scene.render.dither_intensity = 0`): dither adds ±1 noise to every pixel,
+which the stretch magnifies into grain across each face. The fixture is
+rendered that way. The 0.1 key threshold stays as a margin for renders that
+were not.
 
 Transparent pixels are compared by alpha only. GIMP's PNG export stores
 transparency on whichever palette slot the image leaves unused, or adds one, so
