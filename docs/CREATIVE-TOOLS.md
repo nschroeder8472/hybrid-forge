@@ -1172,6 +1172,22 @@ cannot add three intervals is a weak seat for geometry — the Claude seat
 already reviews captures, and seating it as the sign-off planner on tickets
 like this is the obvious next experiment, rather than another rule.
 
+**The experiment, run 2026-11-02.** Same ticket, same spec, sign-off back on
+at the default passes, the lock deleted, and one line of project config:
+`"roles": {"planner": "claude"}` — the per-project override, so the machine
+profile still seats Nemotron everywhere else. Result: **ratified unanimous on
+the first pass, landed on the first attempt, review passed**, and the sheet
+built from it matches the earlier lock frame for frame. Every role voted,
+including Nemotron as reviewer, which this time raised no depth objection.
+The two Claude calls (planner vote, capture review) cost $0.29; Qwen and
+Nemotron are local. Evidence: `sheet_forge_evidence/run-claude-signoff.db`.
+
+One run cannot say whether Claude's vote moved Nemotron's or the earlier
+objection was luck of sampling; it does say a Claude planner adds no false
+objection of its own on geometry, where Nemotron raised the same false one in
+every guarded vote before. For geometry tickets the recommended seat is Claude as planner, set per
+project; the guard on human numbers stays either way.
+
 ---
 
 ## Decisions to confirm
