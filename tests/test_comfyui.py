@@ -323,6 +323,20 @@ class ServerTests(ComfyCase):
         servers = RunServers.for_config(config, images=True)
         self.assertEqual([spec.name for spec in servers.specs], ["comfyui"])
 
+    def test_a_run_with_image_work_clears_the_card_before_anything_loads(self) -> None:
+        # Phase 7: an adopted ComfyUI still held 28 GB of Flux.2, Qwen loaded
+        # beside it into system RAM, and sign-off ran six times slower.
+        config = self.config({"p": self.block()})
+        servers = RunServers.for_config(config, images=True)
+        self.assertIsNotNone(servers)
+        servers.start()
+        self.assertEqual(self.stub.freed, 1)
+
+    def test_a_run_without_image_work_leaves_comfyui_alone(self) -> None:
+        config = self.config({"p": self.block()})
+        self.assertIsNone(RunServers.for_config(config, images=False))
+        self.assertEqual(self.stub.freed, 0)
+
     def test_owned_flags_are_refused_in_args(self) -> None:
         with self.assertRaises(comfy_server.ComfyServerError):
             comfy_server.Settings.from_block({"root": "r", "python": "p", "args": ["--port", "1"]})

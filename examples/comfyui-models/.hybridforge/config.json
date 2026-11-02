@@ -47,6 +47,30 @@
           "image"
         ]
       }
+    },
+    "flux2": {
+      "kind": "comfyui",
+      "workflows": {
+        "generate": ".hybridforge/comfy/flux2-turbo.json"
+      },
+      "bind": {
+        "prompt": [
+          "6",
+          "text"
+        ],
+        "seed": [
+          "25",
+          "noise_seed"
+        ],
+        "width": [
+          "47",
+          "width"
+        ],
+        "height": [
+          "47",
+          "height"
+        ]
+      }
     }
   }
 }

@@ -1,11 +1,11 @@
 # Blender, GIMP and ComfyUI in the loop — plan
 
-**Status:** plan; phase 0 measured 2026-11-01 (see *Phase 0 — what was
-measured*). Nothing in this document is built and no ticket has run through
-any of these tools. It builds on [IMAGE-LOOP.md](IMAGE-LOOP.md), which
-designed an image ticket kind and left its first decision open (*which
-backend*), and on the capture step from *Looking at what it built* in
-[ROADMAP.md](ROADMAP.md), which is the half of that design that has evidence.
+**Status:** built, phases 0-7, and each phase run live on this machine
+between 2026-11-01 and 2026-11-02. Blender and GIMP enter through `commands`;
+ComfyUI is an image model forge runs; image tickets render, finish, check,
+review, edit and park on a stall; one backlog crosses all three tools. Not
+built: the criteria gate at ingest, and multi-view sprite sheets. The phase
+sections below keep the plan as written, with what each run found after it.
 
 The three tools enter the loop in three different places, and most of the
 plan is about not treating them as one thing:
@@ -1062,6 +1062,50 @@ gained two reds and sign-off was unanimous on the first pass.
 **7 — Pipelines and Flux.2.** The tile-set backlog end to end. Flux.2 only once
 phase 0 has measured whether a turbo-LoRA render is fast enough to sit in a loop
 at all.
+
+*Run 2026-11-02 on `examples/tile-pipeline`.* Flux.2 first.
+
+**Flux.2 earns its place for textures.** On one texture prompt, SDXL with the
+pixel-art LoRA rendered in 5.9 s and drew a dark border frame — the opposite
+of seamless — and orange blobs where the prompt asked for a few tiny flowers.
+Flux.2 with the turbo LoRA rendered in 43.5 s cold and 8.1 s warm and drew an
+even field with a few tiny flowers. A tile's pixel-art look comes from GIMP
+anyway, so the model that follows the prompt is the one to use. The cost is
+the whole card: every render is a lease, and in the run a cold Flux.2 load
+after a lease took 25-39 s.
+
+**3/3 done in 88.8 min across all three tools.**
+
+| Ticket | Tool | Attempts | What it took |
+|---|---|---:|---|
+| ART-001 seamless tile op | GIMP | 4 + cycle | GIMP's `Palette.add_entry`: the spec named the call but not its first argument; the executor guessed an int, then a `to_string()` that does not exist |
+| ART-002 grass tile | Flux.2 + GIMP formatter | 2 | the first render was darker, and the greens criterion had left out the darkest green |
+| ART-003 meadow | Blender | 4 + 1 | a sign-off revision rewrote two measured facts; the executor caught one, the tests caught the other, and the retry cycle's respec learned "to obtain a 4 m square the size must be 2.0" |
+
+The seamless tile tiles with no visible grid, and the meadow renders it 4x4
+with hard pixel edges. Every handoff worked: ART-001's operation became
+ART-002's formatter the moment it landed, and ART-003 loaded ART-002's tile.
+
+**A sign-off revision corrupted a verified spec.** I had measured
+`create_grid(size=2.0)` at -2 to 2 m and written UVs as `(x + 2, y + 2)`.
+The planner's revision during sign-off changed them to `size=4.0` and
+`(x, y)` — an 8 m plane with UVs from -2 — and nothing stopped it, because
+neither was marked as a decision. The executor flagged the UV contradiction as
+`IMPOSSIBLE` and trusted the wrong size; the tests caught it; the run
+recovered only because a retry cycle was left. The example now marks both as
+protected decisions. The rule it argues for is broader than Blender: **any
+number a spec author measured belongs under `Decision:`**, because a planner
+revising from general knowledge will "correct" it.
+
+**Run start did not clear the card, and it cost 25 minutes.** The run adopted
+a ComfyUI that still held 28 GB of Flux.2 from my comparison renders. Qwen
+loaded beside it, the Windows driver put what did not fit in system RAM, and
+sign-off took 1,184 s instead of about 200 with nothing reporting why — the
+silent slowdown this plan opened with. Freeing ComfyUI did not help, because
+Qwen's spilled memory stayed where it was; unloading Qwen so it reloaded into
+free VRAM did, at the cost of one attempt. `RunServers.start` now asks every
+image backend to release the card before any text model loads, whenever the
+backlog has image work.
 
 ---
 

@@ -8,6 +8,7 @@ machine (docs/CREATIVE-TOOLS.md) through forge:
 |---|---|---|---|
 | `pixel` | SDXL base + pixel-art-xl LoRA, 30 steps | generate | 12.3 s, first render after start |
 | `kontext` | Flux.1 Kontext dev fp8, 20 steps | edit by instruction | 15.8 s |
+| `flux2` | Flux.2 dev fp8 + turbo LoRA, 8 steps | generate | 43.5 s cold, 8.1 s warm; the whole card |
 
 ```
 forge comfy start
@@ -29,7 +30,7 @@ forge comfy stop
 Every model file a workflow names must be on disk: forge checks them against
 ComfyUI's loaders before it calls the server ready.
 
-## What the two models are good for
+## What the three models are good for
 
 From phase 0 and this check, on the same machine:
 
@@ -40,3 +41,9 @@ From phase 0 and this check, on the same machine:
 - **Kontext** changes what it is told to and keeps the rest — the bands went
   gold, the wood did not. It also reframes slightly (its input is rescaled to
   its preferred resolution), so two edits of one image are not pixel-aligned.
+- **Flux.2 with the turbo LoRA** follows a prompt closely and draws even
+  textures: asked for a meadow texture with "a few tiny flowers", it drew an
+  even field with a few tiny flowers, where SDXL drew a dark border frame and
+  orange blobs everywhere. Use it where the prompt matters and let GIMP supply
+  the pixel-art look. It needs all 32 GB, so every render is a lease.
+

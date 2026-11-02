@@ -25,6 +25,9 @@ from .servers import OWNER_RUN, ServerError, ServerSpec, Started, Supervisor
 class RunServers:
     supervisor: Supervisor
     specs: list[ServerSpec] = field(default_factory=list)
+    # The config, when the run has image work: `start` then asks every image
+    # backend to release the card before any text model loads.
+    config: Any = None
 
     @classmethod
     def for_config(cls, config: Any, *, images: bool = False) -> "RunServers | None":
@@ -49,9 +52,12 @@ class RunServers:
                 specs.append(comfy_spec)
         except (llama_server.LlamaServerError, comfy_server.ComfyServerError) as exc:
             raise ServerError(str(exc)) from exc
-        if not specs:
+        if not specs and not (images and config.image_models):
             return None
-        return cls(Supervisor(config.config_dir, owner=OWNER_RUN), specs)
+        return cls(
+            Supervisor(config.config_dir, owner=OWNER_RUN), specs,
+            config=config if images else None,
+        )
 
     def start(self) -> list[str]:
         """Bring every server up. Returns one line per server to print."""
@@ -59,6 +65,17 @@ class RunServers:
         for spec in self.specs:
             started = self.supervisor.ensure(spec)
             lines.append(_describe(spec, started))
+        if self.config is not None:
+            # An image backend may already hold the card when the run starts:
+            # one forge adopted, or one a person rendered through by hand.
+            # Phase 7's run adopted a ComfyUI still holding 28 GB of Flux.2;
+            # Qwen then loaded beside it, the driver put what did not fit in
+            # system RAM, and sign-off took 1,184 s instead of about 200 —
+            # with nothing reporting why. So the card is cleared first.
+            from . import gpu
+
+            for problem in gpu.release_images(self.config):
+                lines.append(f"warning: {problem}")
         return lines
 
     def keep(self) -> list[str]:
