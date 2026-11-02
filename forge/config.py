@@ -974,6 +974,16 @@ class LoopSettings:
     # it, the way `viewModel` names the one that looks. Empty means the
     # project has no image tickets, and one that arrives is parked.
     image_model: str = ""
+    # Which `imageModels` entry edits an image ticket's last render, when the
+    # executor answers a rejection with `EDIT:` rather than a new prompt.
+    # Empty means every retry re-renders from scratch: a worse loop, but a
+    # working one. Must name a model with an `edit` workflow.
+    edit_model: str = ""
+    # Consecutive rejections naming the same ISSUES entry before an image
+    # ticket is parked rather than tried again. The terminating condition of
+    # an image ticket is usually an opinion, and an opinion that keeps saying
+    # the same thing will not be changed by another render. 0 never parks.
+    image_stall: int = 3
     # Whether the planner rewrites the ticket between sign-off passes. True is
     # every run before this existed. Off, the roles vote again on the words
     # they already refused, reading the objections but not a revision — which
@@ -1357,6 +1367,8 @@ class Config:
             view_model=str(loop.get("viewModel", "")),
             exclusive_gpu=_exclusive_gpu(loop.get("exclusiveGpu", [])),
             image_model=str(loop.get("imageModel", "")),
+            edit_model=str(loop.get("editModel", "")),
+            image_stall=int(loop.get("imageStall", 3)),
             revise_between_passes=bool(
                 loop.get("reviseBetweenPasses", True)
             ),
@@ -1892,6 +1904,26 @@ class Config:
                 raise ConfigError(f"machine profile: {exc}") from exc
         if not isinstance(self.image_models, dict):
             raise ConfigError("`imageModels` must be an object of named image models.")
+        if self.loop.image_stall < 0:
+            raise ConfigError(
+                f"loop.imageStall is {self.loop.image_stall}; expected 0 (never "
+                f"park) or more."
+            )
+        if self.loop.edit_model:
+            if self.loop.edit_model not in self.image_models:
+                raise ConfigError(
+                    f"loop.editModel is {self.loop.edit_model!r}, which is not "
+                    f"declared in `imageModels`."
+                )
+            try:
+                editable = self.image_provider(self.loop.edit_model).capabilities()
+            except (ValueError, ProviderError) as exc:
+                raise ConfigError(f"imageModels.{self.loop.edit_model}: {exc}") from exc
+            if not editable.supports_edit:
+                raise ConfigError(
+                    f"loop.editModel is {self.loop.edit_model!r}, which has no "
+                    f"`edit` workflow, so an EDIT: reply would have nowhere to go."
+                )
         if self.loop.image_model and self.loop.image_model not in self.image_models:
             raise ConfigError(
                 f"loop.imageModel is {self.loop.image_model!r}, which is not declared "
@@ -1987,6 +2019,8 @@ class Config:
                 "viewModel": self.loop.view_model,
                 "exclusiveGpu": list(self.loop.exclusive_gpu),
                 "imageModel": self.loop.image_model,
+                "editModel": self.loop.edit_model,
+                "imageStall": self.loop.image_stall,
                 "reviseBetweenPasses": self.loop.revise_between_passes,
                 "majorityRepeats": self.loop.majority_repeats,
                 "ratifyOrder": list(self.loop.ratify_order),

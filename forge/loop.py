@@ -126,7 +126,9 @@ from .prompts import (
     stuck_review_prompt,
     parse_verdict,
     image_prompt,
+    image_review_note,
     parse_image_reply,
+    review_issues,
     parse_bug,
     parse_scope_argument,
     record_prompt,
@@ -977,6 +979,14 @@ class Orchestrator:
         model = self.config.loop.image_model
         guide = str(self.config.image_models.get(model, {}).get("promptGuide", ""))
 
+        stalled = self._image_stalled(ticket, rejections)
+        if stalled:
+            self.store.log(run_id, f"{ticket.ticket_id}: {stalled}", level="warn", kind="render")
+            return [], StepResult(ok=False, blocked=True, detail=stalled)
+
+        previous = self._previous_render(run_id, ticket)
+        can_edit = bool(self.config.loop.edit_model) and previous is not None
+
         step_id = self.store.start_step(run_id, ticket.ticket_id, "build")
         try:
             completion = self._converse(
@@ -987,6 +997,7 @@ class Orchestrator:
                     failure_context,
                     previous=self._image_prompts.get(ticket.ticket_id, ""),
                     guide=guide,
+                    can_edit=can_edit,
                 ),
                 max_tokens=self._output_budget("executor"),
                 temperature=0.0,
@@ -998,7 +1009,8 @@ class Orchestrator:
         if reply.blocked:
             self.store.end_step(step_id, "failed", reply.blocked)
             return [], StepResult(ok=False, blocked=True, detail=reply.blocked)
-        if not reply.prompt:
+        editing = bool(reply.edit) and can_edit and previous is not None
+        if not reply.prompt and not editing:
             self.store.end_step(step_id, "failed", clip(completion.text, DETAIL_CHARS))
             return [], StepResult(
                 ok=False,
@@ -1011,12 +1023,21 @@ class Orchestrator:
         self._image_prompts[ticket.ticket_id] = reply.block()
 
         step_id = self.store.start_step(run_id, ticket.ticket_id, "render")
+        if editing:
+            model = self.config.loop.edit_model
         try:
             provider = self.config.image_provider(model)
             with self._gpu_lease(run_id, "image", ticket.ticket_id):
-                rendering = provider.generate(
-                    reply.prompt, seed=reply.seed, negative=reply.negative
-                )
+                if editing and previous is not None:
+                    # The last *raw* render, not the finished file: the
+                    # formatter has already reduced that to a sprite.
+                    rendering = provider.edit(
+                        reply.edit, image=previous.read_bytes(), seed=reply.seed
+                    )
+                else:
+                    rendering = provider.generate(
+                        reply.prompt, seed=reply.seed, negative=reply.negative
+                    )
         except ComfyConfigError as exc:
             self.store.end_step(step_id, "failed", str(exc))
             return [], StepResult(ok=False, blocked=True, detail=str(exc))
@@ -1043,21 +1064,70 @@ class Orchestrator:
         except OSError:
             pass
         summary = (
-            f"{target}: {rendering.width}x{rendering.height}, seed {rendering.seed}, "
+            f"{target}: {'edited' if editing else 'rendered'} "
+            f"{rendering.width}x{rendering.height}, seed {rendering.seed}, "
             f"{rendering.usage.seconds:.1f}s on {model}"
         )
         self.store.end_step(step_id, "ok", summary)
         self.store.log(
             run_id,
-            f"{ticket.ticket_id}: rendered {summary}",
+            f"{ticket.ticket_id}: {summary}",
             kind="render",
             data={
+                "mode": "edit" if editing else "generate",
+                "edit": reply.edit if editing else "",
                 "prompt": reply.prompt, "negative": reply.negative,
                 "seed": rendering.seed, "model": model,
                 "seconds": rendering.usage.seconds,
             },
         )
         return [target], None
+
+    def _previous_render(self, run_id: int, ticket: Ticket) -> Path | None:
+        """The newest raw render an earlier attempt of this ticket kept, if any.
+
+        Read from the artifacts rather than held in memory, so a retry cycle
+        and a resumed daemon both find it.
+        """
+        folder = (
+            self.config.config_dir / ARTIFACTS_DIR / f"run-{run_id}"
+            / safe_name(ticket.ticket_id, "ticket")
+        )
+        current = max(1, ticket.attempt_number)
+        best: tuple[int, Path] | None = None
+        for render in folder.glob("attempt-*/render.*"):
+            try:
+                number = int(render.parent.name.split("-", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            if number < current and (best is None or number > best[0]):
+                best = (number, render)
+        return best[1] if best else None
+
+    def _image_stalled(self, ticket: Ticket, rejections: Sequence[str]) -> str:
+        """Why this image ticket should stop, or "" while it is still moving.
+
+        Stalled when the last `loop.imageStall` rejections all name one
+        ISSUES entry. The terminating condition of an image ticket is usually
+        an opinion; one that has said the same thing that many times running
+        will not be changed by another render, and every further attempt costs
+        a render and a vision review (docs/IMAGE-LOOP.md, problem 5).
+        """
+        window = self.config.loop.image_stall
+        if window <= 0 or len(rejections) < window:
+            return ""
+        recent = [review_issues(verdict) for verdict in list(rejections)[-window:]]
+        if not all(recent):
+            return ""
+        common = set.intersection(*recent)
+        if not common:
+            return ""
+        return (
+            f"stalled: the last {window} reviews all rejected it for "
+            f"{', '.join(sorted(common))}. Another render is unlikely to change "
+            f"that; the spec, the prompt guide or the image model needs a person. "
+            f"The last render is kept in this attempt's artifacts."
+        )
 
     def _rendered_parts(self, written: Sequence[str]) -> list[ImagePart]:
         """The images an image ticket wrote, as parts for the review to look at."""
@@ -7142,29 +7212,35 @@ class Orchestrator:
         # different seat names that one, which is the whole of the
         # configuration story — see `loop.viewRole`.
         viewer = self.config.loop.view_role if rendered else "reviewer"
+        review_messages = review_prompt(
+            ticket,
+            diff,
+            retrieved,
+            toolchain=self._toolchain_for(ticket),
+            repository_map=self._repo_map(),
+            can_read=self._can_read(viewer),
+            # Its own earlier rejections of this same ticket. Without
+            # them a reviewer can object to X, get X fixed, then object
+            # to Y it never raised — three attempts, three unrelated
+            # objections, and no signal that the spec was the problem.
+            prior_verdicts=list(rejections or [])[-self._PRIOR_VERDICTS :],
+            state=state,
+            unchanged=invisible,
+            reproduced=repro,
+            unchecked=unchecked,
+        )
+        if ticket.kind == TICKET_IMAGE:
+            # Asked for ISSUES and MODE, which the stall detector and the
+            # executor read; `edit` offered only when an edit model exists.
+            note = image_review_note(can_edit=bool(self.config.loop.edit_model))
+            review_messages = [*review_messages, Message("user", note)]
 
         step_id = self.store.start_step(run_id, ticket.ticket_id, "review")
         try:
             completion = self._converse(
                 run_id,
                 viewer,
-                review_prompt(
-                    ticket,
-                    diff,
-                    retrieved,
-                    toolchain=self._toolchain_for(ticket),
-                    repository_map=self._repo_map(),
-                    can_read=self._can_read(viewer),
-                    # Its own earlier rejections of this same ticket. Without
-                    # them a reviewer can object to X, get X fixed, then object
-                    # to Y it never raised — three attempts, three unrelated
-                    # objections, and no signal that the spec was the problem.
-                    prior_verdicts=list(rejections or [])[-self._PRIOR_VERDICTS :],
-                    state=state,
-                    unchanged=invisible,
-                    reproduced=repro,
-                    unchecked=unchecked,
-                ),
+                review_messages,
                 **self._attachments(images, images_withheld),
                 max_tokens=self._output_budget(viewer),
                 temperature=0.0,

@@ -31,6 +31,23 @@ forge go
 `forge go` starts `llama-server` and ComfyUI, because the backlog has an image
 ticket, and stops both at the end.
 
+## The edit loop (phase 6)
+
+`loop.editModel` names `kontext`, a Flux Kontext workflow that edits an image
+by instruction. When a rejection is about a detail, the reviewer ends it with
+`MODE: edit`, and the executor may answer with `EDIT: <instruction>` instead
+of a new prompt; Kontext edits the previous attempt's raw render and the
+result goes through the same formatter, checks and review. Rejections also
+name `ISSUES:`, and `loop.imageStall` (3) parks a ticket whose last three
+rejections share one.
+
+The current `SPEC.md` asks for a red gem on the lock plate — a detail SDXL
+draws too small to survive 32x32. Its run: 11.3 minutes, four attempts. A
+render on a brick floor failed the coverage check; a good render lost its gem
+at 32x32 (`missing-gem`, `MODE: edit`); a Kontext edit kept the composition
+pixel for pixel and fixed the wood and the lock but not the gem; a second edit
+made the gem a large solid red block, which survived, and was accepted.
+
 ## What the first run did
 
 13.1 minutes, three attempts, done. Attempt 1 drew a clean chest with yellow

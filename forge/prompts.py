@@ -4089,12 +4089,26 @@ If the ticket cannot be rendered as written, reply with one line:
 BLOCKED: <the specific reason>"""
 
 
+_IMAGE_EDIT_OFFER = """## Editing instead of re-rendering
+If the last image was right except for a local detail — a colour, a missing
+part, one wrong element — reply with one line instead of the block:
+
+EDIT: <one instruction for an image editor>
+
+The editor changes only what the instruction names and keeps the rest of the
+last image, so a good composition is not thrown away to fix a detail. Write
+the instruction as a command about the image: "Make the lock plate gold. Keep
+everything else exactly the same." Re-render with a new PROMPT when the
+composition, the subject or the framing was wrong."""
+
+
 def image_prompt(
     ticket: Ticket,
     failure_context: str = "",
     *,
     previous: str = "",
     guide: str = "",
+    can_edit: bool = False,
 ) -> list[Message]:
     """The executor's prompt on an image ticket.
 
@@ -4116,7 +4130,14 @@ def image_prompt(
         parts.append(f"## The prompt the last attempt sent\n{previous.strip()}")
     if failure_context.strip():
         parts.append(f"## Why the last attempt failed\n{failure_context.strip()}")
-    parts.append("Reply with the PROMPT / NEGATIVE / SEED block.")
+    # Offered only when an edit model is configured and there is a previous
+    # image to edit: a prompt is a promise the harness has to keep
+    # (docs/LOOP-INVARIANTS.md section 6).
+    if can_edit:
+        parts.append(_IMAGE_EDIT_OFFER)
+        parts.append("Reply with the PROMPT / NEGATIVE / SEED block, or one EDIT: line.")
+    else:
+        parts.append("Reply with the PROMPT / NEGATIVE / SEED block.")
     return [
         Message("system", IMAGE_SYSTEM),
         Message("user", "\n\n".join(parts)),
@@ -4131,16 +4152,19 @@ class ImageReply:
     negative: str = ""
     seed: int | None = None
     blocked: str = ""
+    edit: str = ""
 
     def block(self) -> str:
         """The reply as the block it was written in, for the next attempt."""
+        if self.edit and not self.prompt:
+            return f"EDIT: {self.edit}"
         seed = "" if self.seed is None else str(self.seed)
         return f"PROMPT: {self.prompt}\nNEGATIVE: {self.negative}\nSEED: {seed}"
 
 
 # `PROMPT:`, `**PROMPT**:` and `**PROMPT:**` all occur; models bold labels.
 _IMAGE_FIELD = re.compile(
-    r"^\s*\**\s*(PROMPT|NEGATIVE|SEED|BLOCKED)\s*\**\s*:\s*\**\s*(.*)$", re.IGNORECASE
+    r"^\s*\**\s*(PROMPT|NEGATIVE|SEED|BLOCKED|EDIT)\s*\**\s*:\s*\**\s*(.*)$", re.IGNORECASE
 )
 
 
@@ -4168,7 +4192,56 @@ def parse_image_reply(text: str) -> ImageReply:
     reply.prompt = " ".join(fields.get("PROMPT", [])).strip()
     reply.negative = " ".join(fields.get("NEGATIVE", [])).strip()
     reply.blocked = " ".join(fields.get("BLOCKED", [])).strip()
+    reply.edit = " ".join(fields.get("EDIT", [])).strip()
     seed = " ".join(fields.get("SEED", [])).strip()
     if re.fullmatch(r"\d{1,10}", seed):
         reply.seed = int(seed)
     return reply
+
+
+def image_review_note(*, can_edit: bool) -> str:
+    """What an image ticket's reviewer adds to a rejection.
+
+    `ISSUES` is what the stall detector reads: short names, reused across
+    attempts for the same problem, so "the same thing failed three times" is
+    a comparison of names rather than of prose. `MODE` is the reviewer's
+    advice to the executor, offered as `edit` only when an edit model exists.
+    """
+    lines = [
+        "## This ticket's work is an image",
+        "Judge the attached image against the spec: it is the work, and the diff "
+        "only says that a binary file changed. If you reject, end your verdict "
+        "with these lines:",
+        "",
+        "ISSUES: <short names for each problem, comma separated, e.g. "
+        "gold-wood, silver-lock>",
+    ]
+    if can_edit:
+        lines.append(
+            "MODE: edit — when the image is right except for a local detail an "
+            "image editor could change; or MODE: regenerate — when the "
+            "composition, subject or framing is wrong."
+        )
+    else:
+        lines.append("MODE: regenerate")
+    lines.append(
+        "Reuse an ISSUES name from an earlier verdict when it is the same "
+        "problem, so a problem that persists can be seen to persist."
+    )
+    return "\n".join(lines)
+
+
+_ISSUES = re.compile(
+    r"^\s*\**\s*ISSUES\s*\**\s*:\s*\**\s*(.+)$", re.IGNORECASE | re.MULTILINE
+)
+
+
+def review_issues(verdict: str) -> set[str]:
+    """The ISSUES names a rejection carried, normalised; empty if it named none."""
+    found: set[str] = set()
+    for match in _ISSUES.finditer(verdict):
+        for name in match.group(1).split(","):
+            name = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+            if name:
+                found.add(name)
+    return found
