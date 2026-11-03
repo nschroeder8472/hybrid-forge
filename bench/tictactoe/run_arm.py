@@ -137,9 +137,11 @@ def forge_metrics(repo: Path) -> dict:
             "SELECT ticket_id, status, attempts + attempt_base, kind, route FROM tickets "
             "ORDER BY run_id, position")
     ]
-    overrules = c.execute("SELECT COUNT(*) FROM contract_log WHERE field = 'overrule'").fetchone()[0]
+    overrules = c.execute(
+        "SELECT COUNT(*) FROM contract_log WHERE field = 'overrule'").fetchone()[0]
     revisions = c.execute(
-        "SELECT COUNT(*) FROM contract_log WHERE field NOT IN ('created', 'overrule')").fetchone()[0]
+        "SELECT COUNT(*) FROM contract_log "
+        "WHERE field NOT IN ('created', 'overrule')").fetchone()[0]
     jobs = dict(c.execute("SELECT kind, COUNT(*) FROM jobs GROUP BY kind").fetchall())
     return {"usage": usage, "tickets": tickets, "overrules": overrules,
             "revisions": revisions, "jobs": jobs}

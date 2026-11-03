@@ -38,7 +38,8 @@ def row(result: dict) -> dict:
         "renders": sum(v.get("images", 0) for v in seats.values()),
         "turns": host.get("turns"),
         "wall": f"{result.get('wall_seconds', 0) / 60:.0f}m",
-        "tickets": f"{sum(1 for t in tickets if t['status'] == 'done')}/{len(tickets)}" if tickets else "-",
+        "tickets": (f"{sum(1 for t in tickets if t['status'] == 'done')}/{len(tickets)}"
+                    if tickets else "-"),
         "attempts": sum(t["attempts"] for t in tickets) if tickets else "-",
         "overrules": forge.get("overrules", "-"),
         "own tests": f"{result.get('own_tests', {}).get('js_tests', 0)}"
