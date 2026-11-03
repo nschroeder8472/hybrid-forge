@@ -76,14 +76,14 @@ def check(root: Path) -> dict:
         for c in range(12):
             f = frame(sheet, r, c)
             alpha = f.getchannel("A")
-            corners_ok &= all(alpha.getpixel(p) == 0 for p in ((0, 0), (F - 1, 0), (0, F - 1), (F - 1, F - 1)))
+            edges = ((0, 0), (F - 1, 0), (0, F - 1), (F - 1, F - 1))
+            corners_ok &= all(alpha.getpixel(p) == 0 for p in edges)
             share = sum(1 for a in pixels(alpha) if a > 128) / (F * F)
             shares.append(share)
             box = alpha.point(lambda a: 255 if a > 128 else 0).getbbox()
             sizes.append(max(box[2] - box[0], box[3] - box[1]) if box else 0)
     results["every frame has transparent corners"] = corners_ok
     results["every frame holds a chest (3-85% opaque)"] = all(0.03 <= s <= 0.85 for s in shares)
-    iso_sizes = [sizes[r * 12 + c] for r in range(3) for c in range(8)]
     closed_iso = [sizes[c] for c in range(8)]
     median = sorted(closed_iso)[4] if closed_iso else 0
     results["steady scale across the closed iso turn (within 30%)"] = bool(median) and all(
