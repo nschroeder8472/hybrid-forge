@@ -9,7 +9,8 @@ The restructure in docs/FORGE-AS-A-TOOL.md moves the attempt pipeline out of
 the output looked like; this asserts that the same recordings still read the
 same way (LOOP-INVARIANTS §9).
 
-    python scripts/replay_snapshot.py save  --out build/replay-snapshot.json ../new_forge_test ../sheet_forge_test
+    python scripts/replay_snapshot.py save --out build/replay-snapshot.json
+        ../new_forge_test ../sheet_forge_test   # (one line)
     python scripts/replay_snapshot.py check --snapshot build/replay-snapshot.json
 
 Exit status 1 when anything reads differently than the snapshot.

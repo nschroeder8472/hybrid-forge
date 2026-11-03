@@ -204,6 +204,10 @@ RUN_BLOCKED = "blocked"
 RUN_DONE = "done"
 RUN_FAILED = "failed"
 RUN_STOPPED = "stopped"
+# A run a host model works through the tool surface (docs/FORGE-AS-A-TOOL.md).
+# Never terminal and never resumable: the host decides when each ticket in it
+# is worked, so `forge go` must not drain it on its own.
+RUN_HOST = "host"
 
 
 def _criterion_key(criterion: str) -> str:
@@ -889,8 +893,8 @@ class Store:
         second clears when a human edits the ticket.
         """
         return self._connection.execute(
-            "SELECT * FROM runs WHERE status NOT IN (?, ?, ?) ORDER BY id DESC LIMIT 1",
-            (RUN_DONE, RUN_FAILED, RUN_STOPPED),
+            "SELECT * FROM runs WHERE status NOT IN (?, ?, ?, ?) ORDER BY id DESC LIMIT 1",
+            (RUN_DONE, RUN_FAILED, RUN_STOPPED, RUN_HOST),
         ).fetchone()
 
     def unstarted_run(self) -> sqlite3.Row | None:
@@ -970,10 +974,10 @@ class Store:
         """
         return list(
             self._connection.execute(
-                "SELECT r.* FROM runs r WHERE r.status NOT IN (?, ?) AND EXISTS ("
+                "SELECT r.* FROM runs r WHERE r.status NOT IN (?, ?, ?) AND EXISTS ("
                 "  SELECT 1 FROM tickets t WHERE t.run_id = r.id AND t.status IN (?, ?)"
                 ") ORDER BY r.id",
-                (RUN_DONE, RUN_FAILED, TICKET_PENDING, TICKET_RUNNING),
+                (RUN_DONE, RUN_FAILED, RUN_HOST, TICKET_PENDING, TICKET_RUNNING),
             ).fetchall()
         )
 

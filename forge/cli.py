@@ -2693,6 +2693,41 @@ def cmd_ui(args: argparse.Namespace) -> int:
 # ----------------------------------------------------------------------
 
 
+def cmd_mcp(args: argparse.Namespace) -> int:
+    from .mcp import server as mcp_server
+
+    return mcp_server.main(args.root)
+
+
+def cmd_tool(args: argparse.Namespace) -> int:
+    """The MCP tool surface from a shell, for a host without MCP or a person.
+
+    Same table, same handlers, same JSON. Exit status 1 when the tool refused.
+    """
+    from .mcp.server import call_tool
+    from .mcp.tools import BY_NAME, TOOLS
+
+    if not args.name:
+        for tool in TOOLS:
+            print(f"{tool.name:<16} {tool.description.split('. ')[0]}.")
+        return 0
+    if args.name not in BY_NAME:
+        sys.exit(f"error: no tool {args.name!r} (have: {', '.join(BY_NAME)})")
+    raw = sys.stdin.read() if args.arguments == "-" else args.arguments
+    try:
+        arguments = json.loads(raw or "{}")
+    except ValueError as exc:
+        sys.exit(f"error: arguments are not JSON: {exc}")
+    if not isinstance(arguments, dict):
+        sys.exit("error: arguments must be a JSON object")
+    result = call_tool(Path(args.root).resolve(), args.name, arguments)
+    if result["isError"]:
+        print(result["content"][0]["text"], file=sys.stderr)
+        return 1
+    print(json.dumps(result["structuredContent"], indent=1, ensure_ascii=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="forge", description=__doc__)
     # Asked from the machine the run is on, which is the machine whose build is
@@ -3074,6 +3109,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="port for this invocation only (default: ui.port from config)",
     )
     p.set_defaults(func=cmd_ui)
+
+    p = sub.add_parser(
+        "mcp",
+        help="serve the tool surface to a host model over MCP (stdio)",
+    )
+    p.set_defaults(func=cmd_mcp)
+
+    p = sub.add_parser(
+        "tool",
+        help="call one host tool and print its JSON — the MCP surface, from a shell",
+    )
+    p.add_argument("name", nargs="?", default="", help="tool name; omit to list them")
+    p.add_argument(
+        "arguments",
+        nargs="?",
+        default="{}",
+        help="the tool's arguments as a JSON object, or - to read them from stdin",
+    )
+    p.set_defaults(func=cmd_tool)
 
     return parser
 
