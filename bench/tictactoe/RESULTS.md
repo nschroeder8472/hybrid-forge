@@ -83,3 +83,35 @@ Opus alone on a small task, where host mode cost 3x. It does not show they make
 the code better — nothing could here, every arm scores 49/49 — and it does not
 test the cheap-model tools (bellows, striker), which need a task where bulk
 dominates.
+
+---
+
+# Blind art rating — 2026-11-03
+
+One rater (the project owner, who had not seen any results), a blind page:
+the five finished games as anonymous letters, all ten pairings once in random
+order with random sides, then pick-one-of-five for the X, the O and the board.
+Letters were reshuffled per section; the key stayed on disk.
+
+**Whole game, pairwise (wins-losses):**
+
+| Build | Art made by | Record |
+|---|---|---|
+| B-2 | Opus alone, Pillow | 4-0 |
+| B-1 | Opus alone, Pillow | 3-1 (lost only to B-2) |
+| A-1 | Flux 2 via host mode, local seats | 2-2 |
+| D-1 | Flux 2 via `mold`, Opus choosing | 1-3 |
+| C-1 | Flux 2 via host mode, Claude seats | 0-4 |
+
+No ties, and the ten choices form a strict order with no cycles, so the
+preferences were consistent. In the six matchups between an Opus-alone build
+and a Flux build, Opus alone won all six (1 in 64 by chance).
+
+**Pieces:** X — B-2. Board — B-2. O — D-1, the one Flux pick.
+
+**What it says.** On this task the image pipeline did not buy better art.
+Opus drawing chalk from code was preferred over Flux 2 every time it met it,
+including when Opus itself chose the Flux candidates through `mold`. With
+correctness tied and cost lower, Opus alone wins this task outright. The case
+left for `mold` is art Opus cannot plausibly draw from code — painted
+characters, scenes, textures — which this task did not ask for.
