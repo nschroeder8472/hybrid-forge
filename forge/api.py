@@ -256,6 +256,10 @@ class Forge:
                 for s in steps
             ],
             "artifacts": str(self._artifact_dir(run_id, ticket_id)),
+            "contract_history": [
+                {**entry, "old": _clip(entry["old"], 300), "new": _clip(entry["new"], 300)}
+                for entry in contract_rules.history(self.store, run_id, ticket_id)
+            ],
         }
 
     def _find_ticket(self, run_id: int, ticket_id: str) -> Ticket:

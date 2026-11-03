@@ -3,7 +3,9 @@
 A restructuring of hybrid-forge from a daemon that drives models into a tool a
 frontier model drives. The standards stay. The driver changes.
 
-This is a design, not a description. Nothing here is built.
+Built on branch `feat/forge-as-a-tool`, 2026-11-02, with every decision below
+confirmed. Where the build differs from the design, *Status* at the end says
+so and why.
 
 ---
 
@@ -457,7 +459,7 @@ Measured from the ledger, per landed ticket, against the recorded runs:
 
 ---
 
-## Decisions to confirm
+## Decisions — confirmed 2026-11-02
 
 1. **MCP as the primary surface, CLI `--json` as the mirror.** Recommended. The
    alternative — only the CLI, driven through a shell tool — works today and is
@@ -477,3 +479,48 @@ Measured from the ledger, per landed ticket, against the recorded runs:
 6. **The guard hook is on by default in the plugin.** It will occasionally block
    a host edit that was legitimate; the fix is to close or abandon the ticket
    first, which is the order of operations it should have used anyway.
+
+---
+
+## Status — what is built, and where it differs
+
+**Built.** All eleven tools, over MCP (`forge mcp`) and from a shell (`forge
+tool <name> '<json>'`), in `forge/api.py`, `forge/contract.py`,
+`forge/engine.py`, `forge/jobs.py`, `forge/consult.py` and `forge/mcp/`. The
+`forge` plugin registers the server, the `forge-protocol` and
+`claim-verification` skills, and the guard hook. Host tickets live in a run with
+status `host`, which `forge go` never drains. `jobs` and `contract_log` are new
+tables; existing databases gain them on open.
+
+**Measured.** `tests/test_api.py` covers the surface end to end with scripted
+seats over a real git repository and real verify commands: a correct
+implementation lands, a wrong one fails and is quarantined, an overrule needs a
+`path:line` and a green re-verify, and every ratchet refuses what it should.
+`scripts/replay_snapshot.py` holds the refactor to the recordings: 803 replay
+records across eight evidence projects read identically before and after. One
+live delegation, `SP-001` of the sample project with the `claude` seats:
+landed on attempt 1 in 25 s for $0.23, lint and test green, the reviewer's
+reasons quoting the diff.
+
+**Different from the design, on purpose:**
+
+- **The engine is a facade, not an extraction (phase 2).** `engine.delegate`
+  runs `Orchestrator._work_ticket` for one ticket with sign-off and
+  stop-on-block off; respec, split and retry cycles live in `run` and are never
+  entered. That put every gate behind the tool without moving 9,000 lines, and
+  callers depend on `engine.delegate`, so the extraction can happen behind it
+  later with replay as the check.
+- **Decisions are a queue over parked tickets, not a new park mechanism.**
+  `forge_decide` lists every autopilot ticket a retry would reopen, with its
+  note as the question, and answers through the existing return channel
+  (advise, release, retry) or abandons. Autopilot itself still asks its local
+  planner at respec; making it file a decision instead when a host is
+  configured is not built.
+- **`forge_review` reviews against `HEAD`.** A host ticket has no
+  `baseline_tree` because nothing snapshotted it; the diff is the ticket's
+  scope as it differs from the last commit.
+- **The `host_edits` table is not built.** The guard hook refuses the edits
+  instead of the ledger noticing them afterwards.
+- **`forge-spec` stays.** The new `forge` plugin sits beside it; folding its
+  skills in is left until host mode has carried real backlogs (phase 7, with
+  pruning `ratify.py` and `respec.py`'s judge paths).
