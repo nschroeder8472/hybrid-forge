@@ -30,7 +30,14 @@ class RunServers:
     config: Any = None
 
     @classmethod
-    def for_config(cls, config: Any, *, images: bool = False) -> "RunServers | None":
+    def for_config(
+        cls,
+        config: Any,
+        *,
+        images: bool = False,
+        owner: str = OWNER_RUN,
+        llama: bool = True,
+    ) -> "RunServers | None":
         """What this run must start, or None when forge runs nothing here.
 
         `images` is whether the backlog has work for an image model. ComfyUI is
@@ -39,10 +46,17 @@ class RunServers:
         Raises `ServerError` for a configuration that cannot be started — a
         managed model with no path, no binary — so the run refuses before any
         model is called rather than failing at its first one.
+
+        `owner` is who stops them. `forge go` owns its servers for the run;
+        host mode starts them as `cli`, like `forge llama start`, so they
+        outlive the tool call that needed them and a host's next delegation
+        does not pay a reload. `forge llama stop` and `forge comfy stop` end
+        them. `llama=False` leaves `llama-server` out, for a caller whose
+        seats are not served by it.
         """
         specs: list[ServerSpec] = []
         try:
-            settings = llama_server.settings_for(config)
+            settings = llama_server.settings_for(config) if llama else None
             spec = llama_server.spec(config, settings) if settings else None
             if spec is not None:
                 specs.append(spec)
@@ -55,7 +69,7 @@ class RunServers:
         if not specs and not (images and config.image_models):
             return None
         return cls(
-            Supervisor(config.config_dir, owner=OWNER_RUN), specs,
+            Supervisor(config.config_dir, owner=owner), specs,
             config=config if images else None,
         )
 

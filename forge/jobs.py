@@ -20,7 +20,8 @@ import time
 import traceback
 from typing import Any, Callable
 
-from .servers import pid_alive
+from .providers import ProviderError
+from .servers import ServerError, pid_alive
 from .state import TICKET_PENDING, TICKET_RUNNING, Store
 
 RUNNING = "running"
@@ -143,6 +144,15 @@ def start(
             handle = open_store()
             result = work(handle)
             finish(handle.store, job_id, DONE, result)
+        except (ProviderError, ServerError) as exc:
+            # A model or server that is not there is an answer, not a crash:
+            # the host needs the reason, not the stack that carried it.
+            if handle is not None:
+                finish(handle.store, job_id, ERROR, {
+                    "status": "unavailable",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "hint": "forge_status with probe: true shows which seats answer",
+                })
         except Exception as exc:  # noqa: BLE001 - a job records why it died
             if handle is not None:
                 finish(handle.store, job_id, ERROR, {

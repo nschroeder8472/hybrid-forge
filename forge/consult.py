@@ -21,7 +21,7 @@ from typing import Any
 
 from . import ratify as ratification
 from .config import Config, ConfigError
-from .engine import DELEGATE_ROLES, HostOrchestrator
+from .engine import DELEGATE_ROLES, HostOrchestrator, servers_for
 from .failures import clip
 from .patch import is_safe_path
 from .prompts import parse_verdict, review_prompt
@@ -35,7 +35,9 @@ _FENCE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
 
 
 def _runner(config: Config, store: Store, job_id: int) -> HostOrchestrator:
-    return HostOrchestrator(config, store, job_id)
+    # The managed servers, as a delegation starts them. A ServerError is left
+    # to the job, which reports it without a traceback.
+    return HostOrchestrator(config, store, job_id, servers=servers_for(config, images=False))
 
 
 # ----------------------------------------------------------------------
@@ -96,11 +98,15 @@ def objections(
     runner = _runner(config, store, job_id)
     sources = sources_for(config.root, ticket)
 
+    replies: dict[str, list[str]] = {}
+
     def call(
         role: str, messages: list[Message], max_tokens: int, *, thinking: bool = True
     ) -> Completion:
-        return runner._call(run_id, role, messages, max_tokens=max_tokens,
-                            temperature=0.0, thinking=thinking)
+        completion = runner._call(run_id, role, messages, max_tokens=max_tokens,
+                                  temperature=0.0, thinking=thinking)
+        replies.setdefault(role, []).append(completion.text)
+        return completion
 
     answers = []
     for role in DELEGATE_ROLES:
@@ -124,6 +130,19 @@ def objections(
             answer["suggestions"] = list(vote.suggestions)
         if vote.error:
             answer["error"] = vote.error
+        # What the seat actually said, every reply, so an objection — or an
+        # answer that could not be read — can be checked rather than weighed.
+        said = "\n\n--- asked again ---\n\n".join(replies.get(role, []))
+        if not said.strip() and not vote.signed and not vote.error:
+            # Nothing to read is not an objection to weigh; say which it was.
+            answer["objections"] = [
+                f"the seat returned an empty reply {len(replies.get(role, []))} "
+                f"time(s); this is no objection to the contract, but a seat that "
+                f"answers nothing is worth watching"
+            ]
+        step_id = store.start_step(run_id, ticket.ticket_id, f"host-objection-{role}")
+        store.end_step(step_id, "ok" if vote.signed else "failed", clip(said, _STEP_LIMIT))
+        answer["step_id"] = step_id
         answers.append(answer)
     return {
         "status": "asked",

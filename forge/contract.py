@@ -116,8 +116,10 @@ def tickets_from_document(text: str) -> list[Ticket]:
     """
     if not looks_like_plan(text):
         raise ContractError(
-            ["the document is not ticket-shaped ('## ID: title' sections with "
-             "'### Spec'); write the contracts with fields instead"]
+            ["the document is not ticket-shaped: it needs '## ID: title' "
+             "sections, where an ID is capital letters or digits, a hyphen and "
+             "a number (ART-1, SP-001 — not TTT-A1), each with a '### Spec'. "
+             "/forge-spec-check says what the parser sees"]
         )
     tickets = parse_plan(text)
     if not tickets:

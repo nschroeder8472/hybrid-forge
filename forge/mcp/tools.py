@@ -103,9 +103,10 @@ TOOLS: tuple[Tool, ...] = (
             "`criteria` (what the tester encodes; never 'tests pass', the harness "
             "runs those), optional `reference_files`, `needs`, `kind` "
             "(code|bug|image), `route` (delegate | withheld:<reason>). Or "
-            "`spec_file`: a ticket-shaped markdown document, opened verbatim as "
-            "a person's words. To revise: an existing `id`, the fields to change, "
-            "and `reason`. Revisions are ratcheted: numbers a person wrote never "
+            "`spec_file`: a ticket-shaped markdown document, opened verbatim — as "
+            "a person's words, or pass `author: \"host\"` if you wrote it. To "
+            "revise: an existing `id`, the fields to change, and `reason`. "
+            "Revisions are ratcheted: numbers a person wrote never "
             "move, a contract may never excuse a failing check, and once an "
             "attempt exists a criterion can be sharpened but never dropped. "
             "Returns the contract as delegates will see it (reading scope "
@@ -115,6 +116,7 @@ TOOLS: tuple[Tool, ...] = (
             {
                 "id": _STRING,
                 "spec_file": _STRING,
+                "author": {"type": "string", "enum": ["human", "host"]},
                 "reason": _STRING,
                 "title": _STRING,
                 "kind": {"type": "string", "enum": ["code", "bug", "image"]},

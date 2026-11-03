@@ -21,6 +21,29 @@ from forge.mcp.server import Server
 from forge.mcp.tools import TOOLS
 from forge.state import RUN_HOST, Store, Ticket
 
+
+def setUpModule():
+    # Never this machine's profile. It can name a llama-server and ComfyUI that
+    # forge manages, and a host-mode delegation starts what it names: an
+    # earlier version of these tests loaded a real 25 GB checkpoint that way.
+    import os
+
+    global _PROFILE_BEFORE
+    _PROFILE_BEFORE = os.environ.get("FORGE_PROFILE")
+    os.environ["FORGE_PROFILE"] = str(Path(tempfile.mkdtemp()) / "profile.json")
+
+
+def tearDownModule():
+    import os
+
+    if _PROFILE_BEFORE is None:
+        os.environ.pop("FORGE_PROFILE", None)
+    else:
+        os.environ["FORGE_PROFILE"] = _PROFILE_BEFORE
+
+
+_PROFILE_BEFORE: str | None = None
+
 # A lint command whose output is whatever `errors.txt` holds, in flake8's
 # shape, and which fails when there is any. Lets a test choose exactly which
 # diagnostics exist before and after an "edit".
@@ -752,6 +775,56 @@ class TestDecisions(unittest.TestCase):
                 forge.decide(run_id, "A-1", "retry", "")
         finally:
             forge.close()
+
+
+class TestNegatedCriterionPinsNothing(unittest.TestCase):
+    """Found by the tic-tac-toe host-mode run: a prohibition's code span is what
+    must not happen, and a correct test asserts its opposite."""
+
+    CRITERION = (
+        "Exhaustive check: with O always playing `bestMove` and X trying every "
+        "legal move from `newGame()`, no finished game has `winner: \"X\"`."
+    )
+
+    def test_a_negated_value_is_not_pinned(self):
+        from forge.patch import pinned_values
+
+        self.assertEqual(pinned_values(self.CRITERION), [])
+
+    def test_an_honest_test_of_a_prohibition_is_not_called_softened(self):
+        from forge.patch import weakened_criteria
+
+        honest = "walk(newGame()); assert.notEqual(game.winner, 'X');"
+        self.assertEqual(weakened_criteria(honest, [self.CRITERION]), [])
+
+    def test_an_affirmative_criterion_still_pins_its_value(self):
+        from forge.patch import weakened_criteria
+
+        criterion = "`bestMove(newGame())` returns `4`."
+        softened = "assert.equal(bestMove(newGame()), 0);"
+        self.assertTrue(weakened_criteria(softened, [criterion]))
+
+
+class TestServersFollowTheSeats(unittest.TestCase):
+    """A machine profile can declare a managed llama-server and local models.
+    Host mode starts it only when a delegate seat is served by it."""
+
+    def _config(self, executor_kind: str):
+        from forge.config import Config
+
+        config = Config.load(_project())
+        config.llama_server = {"port": 8080}
+        config.models["local"] = {"kind": "llamacpp", "baseUrl": "http://127.0.0.1:8080/v1",
+                                  "model": "q", "modelPath": "C:/q.gguf"}
+        if executor_kind == "local":
+            config.roles["executor"] = "local"
+        return config
+
+    def test_no_seat_on_the_server_starts_nothing(self):
+        self.assertFalse(engine._seats_need_llama(self._config("cloud")))
+
+    def test_a_seat_on_the_server_needs_it(self):
+        self.assertTrue(engine._seats_need_llama(self._config("local")))
 
 
 if __name__ == "__main__":

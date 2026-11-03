@@ -2717,7 +2717,20 @@ def cmd_tool(args: argparse.Namespace) -> int:
         return 0
     if args.name not in BY_NAME:
         sys.exit(f"error: no tool {args.name!r} (have: {', '.join(BY_NAME)})")
-    raw = sys.stdin.read() if args.arguments == "-" else args.arguments
+    # Read as UTF-8 whatever the console code page says. A Windows shell hands
+    # argv over in the ANSI code page, which turns an em dash in a spec into
+    # U+FFFD for good: pass anything non-ASCII through `-` (stdin) or `@file`.
+    if args.arguments == "-":
+        raw = sys.stdin.buffer.read().decode("utf-8")
+    elif args.arguments.startswith("@"):
+        raw = Path(args.arguments[1:]).read_text(encoding="utf-8")
+    else:
+        raw = args.arguments
+    if "�" in raw:
+        sys.exit(
+            "error: the arguments contain U+FFFD, a character lost in transit. "
+            "Pass them as @file or on stdin with -, which are read as UTF-8."
+        )
     try:
         arguments = json.loads(raw or "{}")
     except ValueError as exc:
@@ -2731,7 +2744,9 @@ def cmd_tool(args: argparse.Namespace) -> int:
     if result["isError"]:
         print(result["content"][0]["text"], file=sys.stderr)
         return 1
-    print(json.dumps(result["structuredContent"], indent=1, ensure_ascii=False))
+    text = json.dumps(result["structuredContent"], indent=1, ensure_ascii=False)
+    sys.stdout.buffer.write(text.encode("utf-8") + b"\n")
+    sys.stdout.flush()
     return 0
 
 
@@ -3132,7 +3147,8 @@ def build_parser() -> argparse.ArgumentParser:
         "arguments",
         nargs="?",
         default="{}",
-        help="the tool's arguments as a JSON object, or - to read them from stdin",
+        help="the tool's arguments as a JSON object; - reads them from stdin and "
+        "@path from a file, both as UTF-8",
     )
     p.set_defaults(func=cmd_tool)
 

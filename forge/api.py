@@ -143,7 +143,22 @@ class Forge:
             if probe:
                 entry["health"] = self._probe(name, block)
             models[name] = entry
-        return {"roles": roles, "models": models}
+        images: dict[str, Any] = {}
+        for name in sorted(self.config.image_models):
+            block = self.config.image_model_block(name)
+            images[name] = {
+                "kind": block.get("kind", ""),
+                "workflows": sorted((block.get("workflows") or {})),
+            }
+        seats: dict[str, Any] = {"roles": roles, "models": models}
+        if images:
+            seats["image_models"] = images
+            loop = self.config.loop
+            seats["image_seats"] = {
+                "render": loop.image_model, "edit": loop.edit_model,
+                "view": loop.view_model or roles.get(loop.view_role, ""),
+            }
+        return seats
 
     @staticmethod
     def _probe(name: str, block: dict[str, Any]) -> str:
@@ -403,9 +418,15 @@ class Forge:
         id: str = "",
         spec_file: str = "",
         reason: str = "",
+        author: str = "",
         **fields: Any,
     ) -> dict[str, Any]:
         """Open a contract, or revise one.
+
+        `author` applies to `spec_file` only: `human` (the default) for a
+        document a person wrote, `host` for one the host wrote itself. It can
+        only be declared, never verified, so the honest default is the
+        stricter one — a human document's numbers never move.
 
         - `spec_file`: open every ticket in a ticket-shaped document, verbatim.
           Its words are a person's, so its numbers and criteria never move.
@@ -438,8 +459,12 @@ class Forge:
                 except OSError as exc:
                     raise ContractError([f"cannot read {spec_file}: {exc}"]) from exc
                 tickets = contract_rules.tickets_from_document(text)
-                author = contract_rules.HUMAN
+                author = author or contract_rules.HUMAN
+                if author not in (contract_rules.HUMAN, contract_rules.HOST):
+                    raise ContractError(["author is `human` or `host`"])
             else:
+                if author:
+                    raise ContractError(["`author` is for `spec_file`; fields are the host's"])
                 if reason:
                     raise ContractError([f"no ticket {id!r} to revise; omit `reason` to open it"])
                 tickets = contract_rules.tickets_from_fields({"id": id, **fields})
@@ -510,6 +535,16 @@ class Forge:
         running = jobs.running_for(self.store, run_id, id)
         if running is not None:
             raise ApiError(f"{id} is already being worked by job {running}")
+        # One delegation at a time per project. Verification is whole-project,
+        # so a second ticket's half-applied files would be attributed to the
+        # first, and its baseline would excuse them (LOOP-INVARIANTS 5, 14).
+        busy = [j for j in jobs.active(self.store) if j["kind"] == "delegate"]
+        if busy:
+            raise ApiError(
+                f"job {busy[0]['job']} is delegating {busy[0]['ticket']}; one "
+                f"delegation at a time, because verification reads the whole "
+                f"tree. Wait for it with forge_job"
+            )
         unmet = self.store.unmet_needs(run_id, ticket)
         if unmet:
             raise ApiError(f"{id} needs {', '.join(unmet)} to land first")

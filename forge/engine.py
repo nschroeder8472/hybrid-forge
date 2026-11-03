@@ -27,7 +27,11 @@ from .artifacts import Artifacts
 from .config import Config, ConfigError
 from .failures import distill, signatures
 from .loop import CONTROL_RUN, CONTROL_STOP, Orchestrator, Stopped
+from . import llama_server
+from .run_servers import RunServers
+from .servers import OWNER_CLI, ServerError
 from .state import (
+    TICKET_IMAGE,
     TICKET_BLOCKED,
     TICKET_DONE,
     TICKET_FAILED,
@@ -48,8 +52,10 @@ _VERIFY_NAME = re.compile(r"^(lint|typecheck|test)(\[.*\])?$")
 class HostOrchestrator(Orchestrator):
     """The orchestrator, stopped by its job rather than by the run's control row."""
 
-    def __init__(self, config: Config, store: Store, job_id: int):
-        super().__init__(config, store)
+    def __init__(
+        self, config: Config, store: Store, job_id: int, servers: RunServers | None = None
+    ):
+        super().__init__(config, store, servers=servers)
         self.job_id = job_id
 
     def _command(self) -> str:
@@ -89,11 +95,51 @@ def configure(config: Config, attempts: int, ticket: Ticket, seats: dict[str, st
         config.roles[role] = model
 
 
+def _seats_need_llama(config: Config) -> bool:
+    """Whether any delegate seat is served by the `llama-server` forge runs.
+
+    Asked per seat, not per declared model: the machine profile merges every
+    model it knows into the config, and starting a server because some model
+    on this machine could use it is how a test suite came to load a 25 GB
+    checkpoint onto the card (tic-tac-toe run, 2026-11-02).
+    """
+    settings = llama_server.settings_for(config)
+    if settings is None:
+        return False
+    for role in DELEGATE_ROLES:
+        name = config.roles.get(role, "")
+        if name in config.models and llama_server.is_managed(
+            config.model_block(name), settings.port
+        ):
+            return True
+    return False
+
+
+def servers_for(config: Config, *, images: bool) -> RunServers | None:
+    """Start the servers forge manages on this machine, if they are not up.
+
+    The same servers `forge go` starts — `llama-server` when the machine
+    profile opts in, ComfyUI when there is image work — adopted when already
+    running, and owned as `cli` so they outlive this call. Raises
+    `ServerError` when one cannot start.
+    """
+    local = RunServers.for_config(
+        config, images=images, owner=OWNER_CLI, llama=_seats_need_llama(config)
+    )
+    if local is not None:
+        local.start()
+    return local
+
+
 def delegate(config: Config, store: Store, run_id: int, ticket: Ticket, job_id: int) -> dict:
     """Work `ticket` and return what a host needs to decide its next move."""
     started = time.time()
     first_step = _last_step_id(store)
-    runner = HostOrchestrator(config, store, job_id)
+    try:
+        local = servers_for(config, images=ticket.kind == TICKET_IMAGE)
+    except ServerError as exc:
+        return {"status": "halted", "reason": f"a server forge manages could not start: {exc}"}
+    runner = HostOrchestrator(config, store, job_id, servers=local)
     runner.artifacts = Artifacts(config.config_dir, run_id)
 
     unreachable = runner._preflight(run_id)
