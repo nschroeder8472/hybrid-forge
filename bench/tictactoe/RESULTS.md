@@ -49,3 +49,37 @@ tokens on bulk — needs bulk to exist. Next, in order:
 2. A task where bulk dominates (a 10-15 ticket backlog on an existing repo),
    where Opus alone fills its own context.
 3. Three repetitions per arm before believing any gap that is not this large.
+
+---
+
+# Run 2 — arm D, the smith's tools, and a second Opus-alone run
+
+| arm | accept | game | assets | page | opus $ | seat $ | claude $ | opus out tok | opus in+cache | local tok | renders | turns | wall | tickets | attempts | overrules | own tests | uncommitted |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A-1 | 49/49 | 19/19 | 16/16 | 14/14 | 2.68 | 0.85 | 3.53 | 40,442 | 5,602,877 | 458,076 | 9 | 101 | 56m | 6/8 | 13 | 1 | 20 | 1 |
+| B-1 | 49/49 | 19/19 | 16/16 | 14/14 | 0.95 | 0.00 | 0.95 | 23,262 | 891,252 | 0 | 0 | 44 | 3m | - | - | - | 29 | 0 |
+| B-2 | 49/49 | 19/19 | 16/16 | 14/14 | 1.64 | 0.00 | 1.64 | 43,856 | 1,115,419 | 0 | 0 | 67 | 7m | - | - | - | 40 | 0 |
+| C-1 | 49/49 | 19/19 | 16/16 | 14/14 | 2.90 | 1.24 | 4.13 | 42,434 | 6,104,711 | 0 | 15 | 101 | 25m | 7/8 | 18 | 0 | 33 | 0 |
+| D-1 | 49/49 | 19/19 | 16/16 | 14/14 | 1.39 | 0.00 | 1.39 | 28,692 | 1,101,687 | 0 | 0 | 68 | 11m | - | - | 0 | 36 | 1 |
+
+D-1's `renders` reads 0 because mold did not yet meter its renders; it made
+28 in five batches (4, 6, 6, 6, 6), and ran anvil twice. Mold now records each
+render in the usage table.
+
+**D: $1.39, 11 minutes, 49/49.** Opus did the work itself and used mold for the
+art and anvil to check. Against Opus alone ($0.95 and $1.64 over two runs, mean
+$1.30) that is 1.07x — inside the 1.3x the design predicted, and inside the
+baseline's own spread: B's two runs differ by 73%. Against the host arms it is
+about a third of the cost and a fifth to a half of the time.
+
+**What D bought for that:** Flux 2 art chosen from 28 finished, measured
+candidates, at the price of Opus alone. Whether that art beats Opus drawing
+chalk with Pillow is the open question, and it is a matter of taste: B-2's
+procedural chalk is clean and coherent; D-1's is photographic, pieces well
+seated in the drawn grid. Compare forge-bench/*/screenshot.png side by side.
+
+**What this settles, at n = 1-2:** the smith's tools cost roughly nothing over
+Opus alone on a small task, where host mode cost 3x. It does not show they make
+the code better — nothing could here, every arm scores 49/49 — and it does not
+test the cheap-model tools (bellows, striker), which need a task where bulk
+dominates.

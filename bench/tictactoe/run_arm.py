@@ -8,6 +8,8 @@ Arms (see README.md):
   B  Opus alone: no forge, no image model.
   C  Opus as host through forge; Claude seats (Sonnet executor and reviewer,
      Haiku tester, Sonnet viewer), Flux 2 renders.
+  D  Opus doing the work itself with the smith's tools: anvil, gauge, mold
+     (Flux 2 renders, Opus chooses).
 
 Every arm gets the same TASK.md, starts from the same seed repository, runs
 headless as `claude -p --model opus`, and is scored by acceptance/, which no
@@ -35,9 +37,11 @@ SKILLS = [
     FORGE_ROOT / "plugins" / "forge" / "skills" / "claim-verification" / "SKILL.md",
 ]
 ARMS = {
-    "A": {"forge": True, "config": "A-forge-local.config.json"},
+    "A": {"forge": True, "config": "A-forge-local.config.json", "kit": "host"},
     "B": {"forge": False},
-    "C": {"forge": True, "config": "C-forge-claude.config.json"},
+    "C": {"forge": True, "config": "C-forge-claude.config.json", "kit": "host"},
+    # The smith's tools (docs/THE-FORGE.md): no delegation, no seats.
+    "D": {"forge": True, "config": "D-smith.config.json", "kit": "smith"},
 }
 BASE_TOOLS = [
     "Read", "Edit", "Write", "Glob", "Grep", "TodoWrite",
@@ -77,9 +81,9 @@ def prepare(arm: str, run_dir: Path) -> Path:
 
 
 def system_prompt(arm: str, run_dir: Path) -> Path:
-    parts = [(HERE / "arms" / ("host.md" if ARMS[arm]["forge"] else "alone.md")).read_text(
-        encoding="utf-8")]
-    if ARMS[arm]["forge"]:
+    prompt = {"host": "host.md", "smith": "smith.md"}.get(ARMS[arm].get("kit", ""), "alone.md")
+    parts = [(HERE / "arms" / prompt).read_text(encoding="utf-8")]
+    if ARMS[arm].get("kit") == "host":
         parts += [strip_frontmatter(p.read_text(encoding="utf-8")) for p in SKILLS]
     path = run_dir / "system-prompt.md"
     path.write_text("\n\n".join(parts), encoding="utf-8")
@@ -100,15 +104,18 @@ def claude_argv(arm: str, run_dir: Path, repo: Path, budget: float) -> list[str]
     if ARMS[arm]["forge"]:
         mcp = run_dir / "mcp.json"
         mcp.write_text(json.dumps({"mcpServers": {"forge": {
-            "type": "stdio", "command": "forge", "args": ["--root", str(repo), "mcp"],
+            "type": "stdio", "command": "forge",
+            "args": ["--root", str(repo), "mcp", "--kit", ARMS[arm]["kit"]],
         }}}), encoding="utf-8")
+        argv += ["--mcp-config", str(mcp)]
+        tools.append("mcp__forge")
+    if ARMS[arm].get("kit") == "host":
         settings = run_dir / "settings.json"
         settings.write_text(json.dumps({"hooks": {"PreToolUse": [{
             "matcher": "Edit|Write|MultiEdit|NotebookEdit",
             "hooks": [{"type": "command", "command": f'python "{HOOK}"'}],
         }]}}), encoding="utf-8")
-        argv += ["--mcp-config", str(mcp), "--settings", str(settings)]
-        tools.append("mcp__forge")
+        argv += ["--settings", str(settings)]
     argv += ["--allowedTools", ",".join(tools)]
     return argv
 

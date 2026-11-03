@@ -7,6 +7,7 @@ The same task, three ways, scored by one hidden acceptance suite.
 | A | Opus, as forge host | Qwen executor and tester, Nemotron reviewer (local) | Flux 2 via ComfyUI; Opus looks at it |
 | B | Opus, alone | Opus | Opus draws it from code; no image model |
 | C | Opus, as forge host | Sonnet executor, Haiku tester, Sonnet reviewer | Flux 2 via ComfyUI; Sonnet looks at it |
+| D | Opus, with the smith's tools (anvil, gauge, mold) | Opus | Flux 2 candidates via `mold`; Opus chooses |
 
 Every arm gets `TASK.md` verbatim on stdin, starts from `seed/` as a fresh git
 repository, and runs headless as `claude -p --model opus` with user settings

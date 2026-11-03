@@ -89,6 +89,11 @@ def mold(
             except ProviderError as exc:
                 candidates.append({"k": k, "error": str(exc)})
                 continue
+            # Metered like any render the loop makes, so the ledger counts it.
+            forge.store.record_usage(
+                model, 0, 0, cost_usd=rendering.usage.cost_usd, images=1,
+                render_seconds=rendering.usage.seconds,
+            )
             raw = folder / f"{safe}-{k}.raw.png"
             raw.write_bytes(rendering.data)
             final = folder / f"{safe}-{k}.png"
