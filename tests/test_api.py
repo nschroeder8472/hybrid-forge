@@ -550,5 +550,69 @@ class TestJobs(unittest.TestCase):
             forge.close()
 
 
+class TestGuardHook(unittest.TestCase):
+    """The plugin's PreToolUse hook: the host does not edit what judges a
+    delegated ticket (LOOP-INVARIANTS section 3, applied to the host)."""
+
+    HOOK = Path(__file__).resolve().parent.parent / "plugins" / "forge" / "hooks" / (
+        "guard_judging_files.py"
+    )
+
+    def _ask(self, root: Path, path: str) -> str:
+        payload = json.dumps(
+            {"cwd": str(root), "tool_name": "Edit", "tool_input": {"file_path": path}}
+        )
+        proc = subprocess.run(
+            [sys.executable, str(self.HOOK)], input=payload, capture_output=True,
+            text=True, check=True,
+        )
+        if not proc.stdout.strip():
+            return ""
+        return json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def _project_with_contract(self) -> tuple[Path, Forge]:
+        root = _git_project()
+        forge = Forge(root)
+        forge.contract(**_CONTRACT)
+        return root, forge
+
+    def test_a_test_judging_an_open_ticket_is_refused(self):
+        root, forge = self._project_with_contract()
+        forge.close()
+        self.assertIn("graded by", self._ask(root, "tests/calc_test.py"))
+
+    def test_the_implementation_file_of_an_idle_ticket_is_allowed(self):
+        root, forge = self._project_with_contract()
+        forge.close()
+        self.assertEqual(self._ask(root, "calc.py"), "")
+
+    def test_any_file_of_a_ticket_being_worked_is_refused(self):
+        from forge import jobs
+
+        root, forge = self._project_with_contract()
+        try:
+            jobs.create(forge.store, forge._host_run(), "H-1")
+        finally:
+            forge.close()
+        self.assertIn("is working right now", self._ask(root, str(root / "calc.py")))
+
+    def test_a_landed_tickets_test_is_the_hosts_to_edit_again(self):
+        from forge.state import TICKET_DONE
+
+        root, forge = self._project_with_contract()
+        try:
+            run_id = forge._host_run()
+            ticket = forge._find_ticket(run_id, "H-1")
+            ticket.status = TICKET_DONE
+            forge.store.update_ticket(run_id, ticket)
+        finally:
+            forge.close()
+        self.assertEqual(self._ask(root, "tests/calc_test.py"), "")
+
+    def test_a_project_without_forge_state_is_never_blocked(self):
+        root = Path(tempfile.mkdtemp()).resolve()
+        self.assertEqual(self._ask(root, "tests/anything_test.py"), "")
+
+
 if __name__ == "__main__":
     unittest.main()

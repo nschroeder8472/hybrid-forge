@@ -1,0 +1,16 @@
+{
+  "name": "forge",
+  "displayName": "Forge",
+  "version": "0.1.0",
+  "description": "hybrid-forge as a tool: delegate bulk work to cheaper local or cloud models under the loop's enforced standards — scope, attribution, baselines, ratchets — while you keep the judgement. Registers the forge MCP server and a guard that stops you editing the files that judge a delegated ticket.",
+  "author": {
+    "name": "NMS App Works LLC"
+  },
+  "keywords": [
+    "delegation",
+    "local-models",
+    "verification",
+    "mcp",
+    "tickets"
+  ]
+}

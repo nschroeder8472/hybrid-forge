@@ -5,6 +5,12 @@
   },
   "plugins": [
     {
+      "name": "forge",
+      "displayName": "Forge",
+      "source": "./plugins/forge",
+      "description": "hybrid-forge as a tool for a large model: delegate bulk work to cheaper models through MCP, under the loop's enforced standards, with a guard on the files that judge delegated work."
+    },
+    {
       "name": "forge-setup",
       "displayName": "Forge Setup",
       "source": "./plugins/forge-setup",
@@ -14,7 +20,7 @@
       "name": "forge-spec",
       "displayName": "Forge Spec",
       "source": "./plugins/forge-spec",
-      "description": "Design a specification the loop can execute verbatim — ticket-shaped, criteria written by you, parsed by `forge ingest` without a planner model touching it."
+      "description": "Design a specification the loop can execute verbatim â€” ticket-shaped, criteria written by you, parsed by `forge ingest` without a planner model touching it."
     }
   ]
 }
