@@ -1288,6 +1288,7 @@ def write_tests_prompt(
     *,
     test_path: str,
     test_command: str = "",
+    lint_command: str = "",
     example_test: tuple[str, str] | None = None,
     failure_context: str = "",
     sources: dict[str, str] | None = None,
@@ -1348,6 +1349,26 @@ project.
 ```
 Your tests must be collected and executed by that command. A file it does not
 collect is worse than no file: it reports zero tests and fails the ticket.
+"""
+
+    if lint_command and lint_command.strip().lower() not in ("skip", "none"):
+        # Shown because nobody else can fix the test file. On an image ticket
+        # the executor only writes a prompt, and a lint error in this file
+        # blocked a ticket twice with a good render on disk (tic-tac-toe run,
+        # 2026-11-02, ART-2: a path constant named `O`, flake8 E741).
+        body += f"""
+## Your file is linted too
+```
+{lint_command}
+```
+The file must pass that linter as written. No other role can edit it, so a lint
+error in it fails the ticket however good the work it tests is.
+"""
+
+    if ticket.context.strip():
+        body += f"""
+## Context from the ticket
+{ticket.context.strip()}
 """
 
     if sources:

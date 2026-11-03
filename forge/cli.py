@@ -2270,6 +2270,11 @@ def cmd_release(args: argparse.Namespace) -> int:
     store.set_route(run_id, ticket, routes.DELEGATE)
     if ticket.status == TICKET_WITHHELD:
         store.reset_tickets(run_id, ticket_ids=[ticket.ticket_id])
+        # A run that finished holding this ticket is not in `forge go`'s queue
+        # until it is reopened, as `forge retry` reopens one.
+        from .api import _reopen_run
+
+        _reopen_run(store, run_id, f"{ticket.ticket_id} released")
 
     store.log(
         run_id,

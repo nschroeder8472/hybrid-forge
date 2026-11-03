@@ -827,5 +827,49 @@ class TestServersFollowTheSeats(unittest.TestCase):
         self.assertTrue(engine._seats_need_llama(self._config("local")))
 
 
+class TestRunFindingsPart2(unittest.TestCase):
+    """More from the tic-tac-toe host-mode run."""
+
+    def test_an_abandoned_ticket_is_never_delegated_again(self):
+        forge = Forge(_git_project())
+        try:
+            forge.contract(**_CONTRACT)
+            forge.close_ticket("H-1", "abandon", argument="not wanted")
+            with self.assertRaisesRegex(ApiError, "was abandoned"):
+                forge.delegate("H-1")
+        finally:
+            forge.close()
+
+    def test_releasing_a_ticket_reopens_a_finished_run(self):
+        from forge.state import RUN_DONE
+
+        root = _git_project()
+        store = Store(root / ".hybridforge" / "run.db")
+        try:
+            run_id = store.create_run("autopilot")
+            store.add_tickets(run_id, [Ticket("D-1", route="withheld:unresolved",
+                                              status="withheld")])
+            store.set_run_status(run_id, RUN_DONE)
+        finally:
+            store.close()
+        forge = Forge(root)
+        try:
+            forge.decide(run_id, "D-1", "release", "it is resolved")
+            resumable = [int(r["id"]) for r in forge.store.resumable_runs()]
+        finally:
+            forge.close()
+        self.assertIn(run_id, resumable)
+
+    def test_a_rendered_ticket_names_the_seat_that_looked(self):
+        from forge.config import Config
+
+        config = Config.load(_project())
+        config.loop.view_model = "m"
+        config.roles["reviewer"] = "other"
+        image = Ticket("I-1", kind="image")
+        self.assertEqual(engine._review_seat(config, image, set()), "m")
+        self.assertEqual(engine._review_seat(config, Ticket("C-1"), set()), "other")
+
+
 if __name__ == "__main__":
     unittest.main()

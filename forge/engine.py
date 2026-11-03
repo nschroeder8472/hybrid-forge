@@ -165,6 +165,14 @@ def delegate(config: Config, store: Store, run_id: int, ticket: Ticket, job_id: 
     try:
         runner._work_ticket(run_id, ticket)
     except Stopped:
+        # The step the cancel interrupted never ended; close it, or the ledger
+        # shows it running for ever (tic-tac-toe run, 2026-11-02, TTT-5).
+        with store._write() as connection:
+            connection.execute(
+                "UPDATE steps SET status = 'cancelled', ended_at = ? WHERE run_id = ? "
+                "AND ticket_id = ? AND status = 'running' AND id > ?",
+                (time.time(), run_id, ticket.ticket_id, first_step),
+            )
         ticket.status = TICKET_PENDING
         ticket.blocked_note = "cancelled by the host"
         store.update_ticket(run_id, ticket)
@@ -228,6 +236,7 @@ def _result(
                 pass  # the diff is evidence, not the result
 
     # The newest outcome of each verify step, failures distilled.
+    names = {row["name"] for row in steps}
     verify: dict[str, dict[str, Any]] = {}
     review: dict[str, Any] | None = None
     for row in steps:
@@ -243,7 +252,7 @@ def _result(
             detail = (row["detail"] or "").strip()
             review = {
                 "verdict": "accept" if row["status"] == "ok" else "reject",
-                "seat": runner.config.roles.get("reviewer", ""),
+                "seat": _review_seat(runner.config, ticket, names),
                 "step_id": row["id"],
                 "reasons": distill(detail, limit=1500),
             }
@@ -259,6 +268,15 @@ def _result(
     result["steps"] = [{"id": r["id"], "name": r["name"], "status": r["status"]}
                        for r in steps][-15:]
     return result
+
+
+def _review_seat(config: Config, ticket: Ticket, step_names: set[str]) -> str:
+    """Which model read the work. A rendering is read by `loop.viewModel`."""
+    rendered = ticket.kind == TICKET_IMAGE or any(n.startswith("capture") for n in step_names)
+    if rendered:
+        seat = config.loop.view_role or "reviewer"
+        return config.loop.view_model or config.roles.get(seat, "")
+    return config.roles.get("reviewer", "")
 
 
 def _diff_stat(diff: str) -> str:

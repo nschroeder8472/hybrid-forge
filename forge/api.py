@@ -35,7 +35,11 @@ from .failures import (
     signatures,
 )
 from .state import (
+    RUN_DONE,
+    RUN_FAILED,
     RUN_HOST,
+    RUN_IDLE,
+    TICKET_BLOCKED,
     TICKET_DONE,
     TICKET_FAILED,
     TICKET_PENDING,
@@ -532,6 +536,14 @@ class Forge:
             )
         if ticket.status == TICKET_DONE:
             raise ApiError(f"{id} is done")
+        if ticket.status == TICKET_SKIPPED:
+            # Abandoned is a decision on the record, not a failure to retry.
+            # Treating it as one rebuilt work the host had just given up
+            # (tic-tac-toe run, 2026-11-02, TTT-6).
+            raise ApiError(
+                f"{id} was abandoned ({ticket.blocked_note or 'no reason recorded'}). "
+                f"Open a new contract if the work is wanted after all"
+            )
         running = jobs.running_for(self.store, run_id, id)
         if running is not None:
             raise ApiError(f"{id} is already being worked by job {running}")
@@ -649,6 +661,8 @@ class Forge:
             self.store.update_ticket(run_id, ticket)
         else:
             raise ApiError("action must be one of advise, release, retry, abandon")
+        if action in ("release", "retry"):
+            _reopen_run(self.store, run_id, f"{id} requeued by the host")
         self.store.log(
             run_id, f"{id}: the host decided to {action} — {text[:200]}",
             level="warn", kind="ticket", data={"ticket": id, "author": "host", "action": action},
@@ -787,20 +801,26 @@ class Forge:
         verification is not overruled — the work is put back and re-verified,
         and anything red refuses the overrule and takes the work out again.
         """
-        if ticket.status != TICKET_FAILED:
+        if ticket.status not in (TICKET_FAILED, TICKET_BLOCKED):
             raise ApiError(
-                f"{ticket.ticket_id} is {ticket.status}; only a failed ticket is overruled"
+                f"{ticket.ticket_id} is {ticket.status}; only a ticket that failed "
+                f"or stalled on review is overruled"
             )
-        last_review = self.store._connection.execute(
-            "SELECT status, detail FROM steps WHERE run_id = ? AND ticket_id = ? "
-            "AND name = 'review' ORDER BY id DESC LIMIT 1",
+        # The verdict being overruled has to be what stopped the ticket: the
+        # newest failed step is a review. A ticket whose last failure was a
+        # verify step failed on evidence, and evidence is never overruled.
+        last_failed = self.store._connection.execute(
+            "SELECT name, detail FROM steps WHERE run_id = ? AND ticket_id = ? "
+            "AND status = 'failed' AND name NOT LIKE 'host-%' ORDER BY id DESC LIMIT 1",
             (run_id, ticket.ticket_id),
         ).fetchone()
-        if last_review is None or last_review["status"] == "ok":
+        if last_failed is None or last_failed["name"] != "review":
             raise ApiError(
-                f"{ticket.ticket_id} did not fail on review; there is no verdict "
-                f"to overrule. Verification is never overruled"
+                f"{ticket.ticket_id} did not stop on a review"
+                + (f" (its last failure was {last_failed['name']})" if last_failed else "")
+                + "; there is no verdict to overrule. Verification is never overruled"
             )
+        last_review = last_failed
         if not _CITES_LOCATION.search(argument or ""):
             raise ApiError(
                 "an overrule must cite the file and line that answers the "
@@ -809,8 +829,10 @@ class Forge:
             )
         salvage = self._abandoned(run_id, ticket)
         restored = self._restore(salvage)
-        if not restored:
-            raise ApiError(f"nothing of {ticket.ticket_id}'s work was set aside to restore")
+        if not restored and not self._differs_from_head(ticket):
+            raise ApiError(
+                f"nothing of {ticket.ticket_id}'s work was set aside or is in the tree"
+            )
         before = {path: data for path, data in restored.items()}
         result = self.verify(ticket=ticket.ticket_id)
         if not result["ok"]:
@@ -891,6 +913,11 @@ class Forge:
             target.write_bytes(source.read_bytes())
         return previous
 
+    def _differs_from_head(self, ticket: Ticket) -> bool:
+        runner = self._runner()
+        changed = runner._git("status", "--porcelain", "--", *ticket.allowed_files)
+        return bool(changed.stdout.strip())
+
     def _overrule_count(self, run_id: int) -> int:
         row = self.store._connection.execute(
             "SELECT COUNT(*) AS n FROM contract_log WHERE run_id = ? AND field = 'overrule'",
@@ -940,6 +967,18 @@ class Forge:
 
 
 HOST_RUN_KEY = "host_run"
+
+
+def _reopen_run(store: Store, run_id: int, note: str) -> None:
+    """Put a finished run back in `forge go`'s queue, as `forge retry` does.
+
+    A run can finish `done` while holding a withheld ticket; requeueing that
+    ticket without reopening the run leaves it where `resumable_runs` never
+    looks (tic-tac-toe run, 2026-11-02, DOC-1).
+    """
+    run = store.get_run(run_id)
+    if run is not None and run["status"] in (RUN_DONE, RUN_FAILED):
+        store.set_run_status(run_id, RUN_IDLE, note=note)
 
 
 def _clip(text: str | None, limit: int) -> str:
