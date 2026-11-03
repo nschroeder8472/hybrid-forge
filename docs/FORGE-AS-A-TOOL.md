@@ -524,3 +524,62 @@ reasons quoting the diff.
 - **`forge-spec` stays.** The new `forge` plugin sits beside it; folding its
   skills in is left until host mode has carried real backlogs (phase 7, with
   pruning `ratify.py` and `respec.py`'s judge paths).
+
+---
+
+## The tic-tac-toe run — 2026-11-02/03
+
+The test before merging: a browser tic-tac-toe game built entirely through the
+tool surface, with the host (Claude Code) driving `forge tool` — the same
+handlers MCP serves — and every call logged. The project is
+`tictactoe_forge_test` beside this checkout; `host-session/` holds all 59 tool
+calls and their answers.
+
+**What was built.** Game rules, a perfect-play computer opponent and view
+helpers (JS, `node:test`), delegated to Qwen with Nemotron reviewing; three
+chalkboard assets — X, O and board — written as prompts by Qwen, rendered by
+Flux 2 through ComfyUI, cut out by the project's GIMP finisher, tested with
+Pillow by the tester and looked at by Claude; the page itself, withheld and
+implemented by the host, then reviewed and discharged; a README through
+autopilot. 12 contracts: 11 landed, one abandoned. 29 JS tests and the asset
+tests green; checked in a browser and by a headless screenshot.
+
+**What it cost.** Qwen 104 calls, 578k in / 196k out; Nemotron 22 calls,
+89k / 46k; 13 renders (9 Flux 2, 4 Kontext edits); Claude 11 calls as the
+viewing seat, $1.00. Everything but the viewing was local.
+
+**Every tool was exercised**: status (with probe), verify (capture, against,
+an attributed setup failure), offload (schema-validated, checked by hand),
+contract (fields, `spec_file` both authors, revisions, a ratchet refusal),
+objections, delegate, job (wait and cancel), inspect, review, close (land,
+overrule, discharge — refused once before a review existed — and abandon),
+decide (list and release), the guard hook against a running job and an open
+ticket's test, and the one-delegation-at-a-time refusal.
+
+**What the host had to decide**, which is the case for this design: a
+contract stating a prohibition the softening check misread (reworded, and the
+check fixed); a minimax scoring from the wrong side, verified by running the
+set-aside code before revising; an O whose opaque centre would show on the
+board (finisher changed, a tightened follow-up contract); a board whose cells
+are not equal, which the reviewer correctly refused three times — accepted by
+overrule because the page now sizes its grid from the measured lines, with the
+argument and the measurements on the record.
+
+**Twenty findings.** Fixed on this branch: managed servers never started by
+host mode; the test suite starting a real llama-server through the machine
+profile; tracebacks for an outage; image models missing from status; Windows
+argv mangling non-ASCII; `spec_file` always `human`; objections leaving no
+record of what a seat said; concurrent delegations; a negated criterion read
+as a pinned value; a refusal not saying what an ID looks like; the tester never
+shown the lint command or the ticket context; a stalled render not
+quarantined; overrule unreachable for a review stall; the review naming the
+wrong seat; a cancelled step left running; an abandoned ticket rebuilt on
+delegate; a released ticket stranded in a finished run.
+
+Open, and small: a block note that says a criterion "contradicts code this
+ticket may not write" when the code is in scope; a ratchet refusal worded
+"ratified into"; `diff_stat` omitting binary files; a cancelled attempt
+counted against the ticket; and autopilot finishing a run `done` while a
+ticket in it is withheld. One more is about contracts, not the tool: "names
+the command" let the README invent `hybrid-forge serve`, and Nemotron passed
+it — a criterion has to pin the value it means.
