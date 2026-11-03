@@ -1,0 +1,76 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>probe</title>
+<style>body{margin:0;background:#fff}iframe{width:700px;height:900px;border:0}</style>
+</head>
+<body>
+<iframe id="app" src="index.html"></iframe>
+<pre id="result">pending</pre>
+<script>
+// Drives TASK.md's pinned page through headless Edge with a virtual time
+// budget, and writes the verdict into #result for --dump-dom to carry out.
+const results = {};
+const errors = [];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const frame = document.getElementById("app");
+
+function check(name, ok, detail) { results[name] = ok ? true : (detail ?? false); }
+
+frame.addEventListener("load", async () => {
+  const w = frame.contentWindow;
+  const d = frame.contentDocument;
+  w.addEventListener("error", (e) => errors.push(String(e.message)));
+  const origError = w.console.error;
+  w.console.error = (...a) => { errors.push(a.map(String).join(" ")); origError.apply(w.console, a); };
+  await sleep(500);
+
+  const cells = () => Array.from(d.querySelectorAll("#board button.cell"));
+  const status = () => (d.getElementById("status")?.textContent ?? "").trim();
+  const mark = (i) => {
+    const img = cells()[i]?.querySelector("img");
+    if (!img) return null;
+    const src = img.getAttribute("src") || "";
+    return src.endsWith("assets/x.png") ? "X" : src.endsWith("assets/o.png") ? "O" : "?";
+  };
+  try {
+    check("nine button.cell in #board", cells().length === 9, cells().length);
+    check("status starts 'X to move'", status() === "X to move", status());
+    check("no img in empty cells", [0,1,2,3,4,5,6,7,8].every((i) => mark(i) === null));
+
+    cells()[4].click(); await sleep(100);
+    check("click places X image", mark(4) === "X", mark(4));
+    check("status 'O to move'", status() === "O to move", status());
+    cells()[0].click(); await sleep(100);
+    check("second click places O image", mark(0) === "O", mark(0));
+    cells()[4].click(); await sleep(100);
+    check("taken cell ignored", mark(4) === "X" && status() === "X to move", status());
+
+    // X wins down the middle column: X 4, O 0, X 1, O 2, X 7
+    cells()[1].click(); await sleep(50); cells()[2].click(); await sleep(50);
+    cells()[7].click(); await sleep(100);
+    check("status 'X wins'", status() === "X wins", status());
+
+    d.getElementById("new-game").click(); await sleep(100);
+    check("new game clears the board", cells().every((_, i) => mark(i) === null) && status() === "X to move", status());
+
+    // Draw: X0 O1 X2 O4 X3 O5 X7 O6 X8
+    for (const i of [0,1,2,4,3,5,7,6,8]) { cells()[i].click(); await sleep(50); }
+    check("status 'Draw'", status() === "Draw", status());
+
+    d.getElementById("new-game").click(); await sleep(100);
+    const box = d.getElementById("vs-computer");
+    if (!box.checked) { box.click(); await sleep(100); }
+    cells()[0].click(); await sleep(1100);
+    check("computer answers a corner with the centre", mark(4) === "O", mark(4));
+    cells()[1].click(); await sleep(1100);
+    check("computer blocks", mark(2) === "O", mark(2));
+    check("status back to 'X to move'", status() === "X to move", status());
+  } catch (e) {
+    errors.push("probe: " + e);
+  }
+  check("no console errors", errors.length === 0, errors);
+  document.getElementById("result").textContent = JSON.stringify(results);
+});
+</script>
+</body>
+</html>

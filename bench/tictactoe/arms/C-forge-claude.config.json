@@ -1,0 +1,107 @@
+{
+  "room": "forge-bench",
+  "roles": {
+    "planner": "sonnet",
+    "executor": "sonnet",
+    "tester": "haiku",
+    "reviewer": "sonnet"
+  },
+  "imageModels": {
+    "flux2": {
+      "kind": "comfyui",
+      "workflows": {
+        "generate": ".hybridforge/comfy/flux2-turbo.json"
+      },
+      "bind": {
+        "prompt": [
+          "6",
+          "text"
+        ],
+        "seed": [
+          "25",
+          "noise_seed"
+        ],
+        "width": [
+          "47",
+          "width"
+        ],
+        "height": [
+          "47",
+          "height"
+        ]
+      },
+      "promptGuide": "Flux 2 (turbo). It follows long, literal descriptions well and renders clean flat shapes. For a game piece (X or O): ask for exactly one symbol, centred, on a plain pure-white background, with a wide empty white margin on every side \u2014 the finisher flood-fills the background inward from the frame edges, so anything touching the frame is eaten. No shadow, no floor, no text, no border. For the board: ask for the whole square filled edge to edge, seen straight from above, flat, no perspective, no pieces on it."
+    },
+    "kontext": {
+      "kind": "comfyui",
+      "workflows": {
+        "edit": ".hybridforge/comfy/flux-kontext-edit.json"
+      },
+      "bind": {
+        "prompt": [
+          "7",
+          "text"
+        ],
+        "seed": [
+          "11",
+          "seed"
+        ],
+        "image": [
+          "4",
+          "image"
+        ]
+      }
+    }
+  },
+  "workspaces": [
+    {
+      "root": ".",
+      "commands": {
+        "lint": {
+          ".py": "python -m flake8 tests tools",
+          ".js": "skip"
+        },
+        "typecheck": {
+          ".py": "skip",
+          ".js": "skip"
+        },
+        "test": {
+          ".js": "node --test \"tests/*.test.js\"",
+          ".py": "python -m unittest discover -s tests -p \"*_test.py\" -t ."
+        },
+        "format": {
+          ".png": "\"C:\\Users\\nschr\\AppData\\Local\\Programs\\GIMP 3\\bin\\gimp-console-3.exe\" -i -n --quit --batch-interpreter=python-fu-eval -b \"exec(open('tools/gimp/finish.py').read())\""
+        }
+      }
+    }
+  ],
+  "neverDelegate": [],
+  "memory": {
+    "url": "",
+    "room": ""
+  },
+  "loop": {
+    "maxAttempts": 3,
+    "retryCycles": 0,
+    "autoCommit": false,
+    "viewRole": "reviewer",
+    "viewModel": "sonnet",
+    "imageModel": "flux2",
+    "editModel": "kontext",
+    "exclusiveGpu": [
+      "image"
+    ],
+    "imageStall": 3
+  },
+  "models": {
+    "sonnet": {
+      "kind": "claude-cli",
+      "model": "sonnet",
+      "tools": "Read"
+    },
+    "haiku": {
+      "kind": "claude-cli",
+      "model": "haiku"
+    }
+  }
+}
