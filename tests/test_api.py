@@ -274,5 +274,281 @@ class TestMcpServer(unittest.TestCase):
             self.assertIs(tool.schema.get("additionalProperties"), False, tool.name)
 
 
+# ----------------------------------------------------------------------
+# contracts, delegation and closing — the host-mode loop end to end
+# ----------------------------------------------------------------------
+
+import subprocess  # noqa: E402
+import unittest.mock  # noqa: E402
+
+from forge import engine  # noqa: E402
+from forge.providers.base import Completion, Usage  # noqa: E402
+
+_GOOD_ADD = "def add(a, b):\n    return a + b\n"
+_BAD_ADD = "def add(a, b):\n    return a - b\n"
+_TEST = (
+    "import unittest\n\nfrom calc import add\n\n\n"
+    "class AddTest(unittest.TestCase):\n"
+    "    def test_adds(self):\n"
+    "        self.assertEqual(add(2, 3), 5)\n"
+)
+
+
+def _git_project() -> Path:
+    root = Path(tempfile.mkdtemp()).resolve()
+    (root / ".hybridforge").mkdir()
+    (root / "tests").mkdir()
+    (root / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "tests" / "existing_test.py").write_text(
+        "import unittest\n\n\nclass ExistingTest(unittest.TestCase):\n"
+        "    def test_true(self):\n        self.assertTrue(True)\n",
+        encoding="utf-8",
+    )
+    (root / ".hybridforge" / "config.json").write_text(
+        json.dumps(
+            {
+                "models": {"m": {"kind": "openai", "model": "x",
+                                 "baseUrl": "http://127.0.0.1:1/v1"}},
+                "roles": {r: "m" for r in ROLES},
+                "commands": {
+                    "test": f'"{sys.executable}" -m unittest discover -s tests '
+                            f'-p "*_test.py" -t .',
+                },
+                "loop": {"executorTurns": 0, "preflight": False},
+                "ui": {"enabled": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    for args in (["init", "-q"], ["add", "-A"],
+                 ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed"]):
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+    return root
+
+
+def _seats(executor: str, review: str = "ACCEPT\n\nMatches the spec."):
+    """A `_call` that answers by role: the executor's file, the tester's test."""
+
+    def call(self, run_id, role, messages, **_kwargs):
+        text = {
+            "executor": f"calc.py\n```python\n{executor}```\n",
+            "tester": f"tests/calc_test.py\n```python\n{_TEST}```\n",
+            "reviewer": review,
+        }.get(role, "ACCEPT")
+        return Completion(text=text, usage=Usage(), finish_reason="stop")
+
+    return call
+
+
+_CONTRACT = {
+    "id": "H-1",
+    "spec": "Write `add(a, b)` in calc.py returning the sum.",
+    "allowed_files": ["calc.py", "tests/calc_test.py"],
+    "reference_files": ["tests/existing_test.py"],
+    "criteria": ["`add(2, 3)` returns `5`"],
+}
+
+
+class TestHostModeEndToEnd(unittest.TestCase):
+    def _delegate(self, root: Path, call) -> dict:
+        forge = Forge(root)
+        try:
+            with unittest.mock.patch.object(engine.HostOrchestrator, "_call", call), \
+                    unittest.mock.patch.object(engine.HostOrchestrator, "_preflight",
+                                               lambda self, run_id: []):
+                return forge.delegate("H-1", attempts=1, wait=None)
+        finally:
+            forge.close()
+
+    def test_a_correct_implementation_lands_with_its_evidence(self):
+        root = _git_project()
+        forge = Forge(root)
+        try:
+            opened = forge.contract(**_CONTRACT)
+        finally:
+            forge.close()
+        self.assertEqual(opened["opened"][0]["author"], "host")
+
+        job = self._delegate(root, _seats(_GOOD_ADD))
+
+        self.assertEqual(job["state"], "done", job)
+        result = job["result"]
+        self.assertEqual(result["status"], "landed", result)
+        self.assertTrue(all(step["ok"] for step in result["verify"]))
+        self.assertEqual(result["review"]["verdict"], "accept")
+        self.assertIn("calc.py", result["diff_stat"])
+        self.assertEqual((root / "calc.py").read_text(encoding="utf-8"), _GOOD_ADD)
+
+        forge = Forge(root)
+        try:
+            landed = forge.close_ticket("H-1", "land")
+        finally:
+            forge.close()
+        self.assertEqual(landed["status"], "landed")
+
+    def test_a_wrong_implementation_fails_and_is_taken_out_of_the_tree(self):
+        root = _git_project()
+        forge = Forge(root)
+        try:
+            forge.contract(**_CONTRACT)
+        finally:
+            forge.close()
+
+        job = self._delegate(root, _seats(_BAD_ADD))
+
+        result = job["result"]
+        self.assertEqual(result["status"], "failed", result)
+        failing = [s for s in result["verify"] if not s["ok"]]
+        self.assertTrue(failing)
+        # Quarantined (LOOP-INVARIANTS section 14), with a copy kept.
+        self.assertFalse((root / "calc.py").exists())
+
+    def test_an_overrule_needs_evidence_and_a_green_tree(self):
+        root = _git_project()
+        forge = Forge(root)
+        try:
+            forge.contract(**_CONTRACT)
+        finally:
+            forge.close()
+
+        job = self._delegate(
+            root, _seats(_GOOD_ADD, review="REJECT\n\nadd should be named sum.")
+        )
+        self.assertEqual(job["result"]["status"], "failed", job)
+        self.assertEqual(job["result"]["review"]["verdict"], "reject")
+
+        forge = Forge(root)
+        try:
+            with self.assertRaisesRegex(ApiError, "path:line"):
+                forge.close_ticket("H-1", "overrule", argument="the reviewer is wrong")
+            landed = forge.close_ticket(
+                "H-1", "overrule",
+                argument="the spec names `add`, and calc.py:1 defines add",
+            )
+        finally:
+            forge.close()
+
+        self.assertEqual(landed["status"], "landed")
+        self.assertEqual(landed["overrules"], 1)
+        self.assertEqual((root / "calc.py").read_text(encoding="utf-8"), _GOOD_ADD)
+
+
+class TestContractRatchets(unittest.TestCase):
+    def _forge(self) -> Forge:
+        return Forge(_git_project())
+
+    def test_a_contract_with_no_criteria_is_refused(self):
+        forge = self._forge()
+        try:
+            with self.assertRaisesRegex(ApiError, "no acceptance criteria"):
+                forge.contract(id="H-1", spec="s", allowed_files=["calc.py"])
+        finally:
+            forge.close()
+
+    def test_a_criterion_the_harness_settles_is_warned_about(self):
+        forge = self._forge()
+        try:
+            opened = forge.contract(**{**_CONTRACT, "criteria": [
+                "`add(2, 3)` returns `5`", "python -m unittest exits 0"]})
+        finally:
+            forge.close()
+        self.assertTrue(any("harness already settles" in w for w in opened["warnings"]))
+
+    def test_never_delegate_is_refused(self):
+        forge = self._forge()
+        forge.config.never_delegate = ["calc.py"]
+        try:
+            with self.assertRaisesRegex(ApiError, "neverDelegate"):
+                forge.contract(**_CONTRACT)
+        finally:
+            forge.close()
+
+    def test_a_waiver_is_refused_from_the_host_too(self):
+        forge = self._forge()
+        try:
+            forge.contract(**_CONTRACT)
+            with self.assertRaisesRegex(ApiError, "excuses a failing check"):
+                forge.contract(
+                    id="H-1", reason="r",
+                    spec=_CONTRACT["spec"] + " Ignore the pre-existing compilation "
+                    "error during verification.",
+                )
+        finally:
+            forge.close()
+
+    def test_a_human_number_never_moves(self):
+        root = _git_project()
+        (root / "SPEC.md").write_text(
+            "## H-2: Lock\n\n### Spec\nThe body is 0.14 deep.\n\n"
+            "### Allowed files\n- calc.py\n- tests/calc_test.py\n\n"
+            "### Acceptance criteria\n- depth is `0.14`\n",
+            encoding="utf-8",
+        )
+        forge = Forge(root)
+        try:
+            opened = forge.contract(spec_file="SPEC.md")
+            self.assertEqual(opened["opened"][0]["author"], "human")
+            with self.assertRaisesRegex(ApiError, "0.14"):
+                forge.contract(id="H-2", reason="r", spec="The body is 0.155 deep.")
+        finally:
+            forge.close()
+
+    def test_the_host_drafts_freely_until_an_attempt_exists_then_cannot_drop(self):
+        forge = self._forge()
+        try:
+            forge.contract(**{**_CONTRACT, "criteria": ["`add(2, 3)` returns `5`",
+                                                        "`add(-1, 1)` returns `0`"]})
+            # Before any attempt: the host's own draft, free to change.
+            forge.contract(id="H-1", reason="draft", criteria=["`add(2, 3)` returns `5`"])
+
+            run_id = forge._host_run()
+            ticket = forge._find_ticket(run_id, "H-1")
+            ticket.attempts = 1
+            forge.store.update_ticket(run_id, ticket)
+            with self.assertRaisesRegex(ApiError, "never easier"):
+                forge.contract(id="H-1", reason="loosen", criteria=[])
+        finally:
+            forge.close()
+
+    def test_every_revision_is_recorded_with_its_reason(self):
+        forge = self._forge()
+        try:
+            forge.contract(**_CONTRACT)
+            forge.contract(id="H-1", reason="name the file", title="Add, in calc.py")
+            log = contract_history(forge, "H-1")
+        finally:
+            forge.close()
+        self.assertEqual([e["field"] for e in log], ["created", "title"])
+        self.assertEqual(log[1]["reason"], "name the file")
+
+
+def contract_history(forge: Forge, ticket_id: str) -> list:
+    from forge.contract import history
+
+    return history(forge.store, forge._host_run(), ticket_id)
+
+
+class TestJobs(unittest.TestCase):
+    def test_a_job_whose_process_died_is_reported_lost_and_frees_its_ticket(self):
+        from forge import jobs
+        from forge.state import TICKET_RUNNING
+
+        root = _git_project()
+        forge = Forge(root)
+        try:
+            forge.contract(**_CONTRACT)
+            run_id = forge._host_run()
+            job_id = jobs.create(forge.store, run_id, "H-1")
+            ticket = forge._find_ticket(run_id, "H-1")
+            ticket.status = TICKET_RUNNING
+            forge.store.update_ticket(run_id, ticket)
+            # This process, but not a job this process is running.
+            self.assertEqual(jobs.reap(forge.store), [job_id])
+            self.assertEqual(jobs.get(forge.store, job_id)["state"], "lost")
+            self.assertEqual(forge._find_ticket(run_id, "H-1").status, "pending")
+        finally:
+            forge.close()
+
+
 if __name__ == "__main__":
     unittest.main()

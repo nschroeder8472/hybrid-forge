@@ -18,11 +18,15 @@ the same code.
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from . import contract as contract_rules
+from . import engine, jobs, routes
 from .config import Config, ConfigError
+from .contract import ContractError
 from .failures import (
     distill,
     environment_failure,
@@ -30,7 +34,15 @@ from .failures import (
     reported_test_count,
     signatures,
 )
-from .state import RUN_HOST, Store, Ticket
+from .state import (
+    RUN_HOST,
+    TICKET_DONE,
+    TICKET_FAILED,
+    TICKET_PENDING,
+    TICKET_SKIPPED,
+    Store,
+    Ticket,
+)
 
 # Output caps. Generous enough that a host rarely needs a second call, small
 # enough that a forgetful one cannot fill its window with a test log.
@@ -41,6 +53,9 @@ NOTE_LIMIT = 400
 # Baselines a host captured, by label, live in the control table: one row each,
 # `baseline:<label>` -> {"at", "steps": {name: [signature, ...]}, "counts"}.
 _BASELINE_PREFIX = "baseline:"
+
+# `path/to/file.ext:42` — the shape an argument from the tree has to take.
+_CITES_LOCATION = re.compile(r"[\w./\\-]+\.\w+:\d+")
 
 
 class ApiError(Exception):
@@ -56,6 +71,9 @@ class Forge:
         except ConfigError as exc:
             raise ApiError(f"no usable forge config at {root}: {exc}") from exc
         self.store = Store(self.config.db_path)
+        # A job whose process died says so the next time anyone opens the
+        # project, and its ticket becomes workable again.
+        jobs.reap(self.store)
 
     def close(self) -> None:
         self.store.close()
@@ -158,6 +176,12 @@ class Forge:
         """
         if step:
             return self._step(int(step), limit)
+        if ticket and not run:
+            host = self._existing_host_run()
+            if host is not None and any(
+                t.ticket_id == ticket for t in self.store.list_tickets(host)
+            ):
+                return self._ticket(host, ticket)
         run_id = int(run) or self._current_run_id()
         if ticket:
             return self._ticket(run_id, ticket)
@@ -365,6 +389,340 @@ class Forge:
         return found
 
     # ------------------------------------------------------------------
+    # contract
+    # ------------------------------------------------------------------
+
+    def contract(
+        self,
+        id: str = "",
+        spec_file: str = "",
+        reason: str = "",
+        **fields: Any,
+    ) -> dict[str, Any]:
+        """Open a contract, or revise one.
+
+        - `spec_file`: open every ticket in a ticket-shaped document, verbatim.
+          Its words are a person's, so its numbers and criteria never move.
+        - `id` naming an existing ticket in the host run, with `reason`:
+          revise it. The ratchets in `forge.contract.revise` apply.
+        - otherwise: open one ticket from the fields given.
+
+        Returns the contract as the delegates will see it, including the
+        widened reading scope, and any warnings. Refusals are raised.
+        """
+        run_id = self._host_run()
+        backlog = self.store.list_tickets(run_id)
+        existing = next((t for t in backlog if t.ticket_id == id), None) if id else None
+
+        try:
+            if existing is not None:
+                if spec_file:
+                    raise ContractError(["revise with fields, not with `spec_file`"])
+                ticket, warnings = contract_rules.revise(
+                    self.config, self.store, run_id, existing, fields, reason, backlog
+                )
+                return {"revised": self._contract_view(run_id, ticket), "warnings": warnings}
+
+            if spec_file:
+                if fields or id:
+                    raise ContractError(["`spec_file` opens tickets on its own; drop the fields"])
+                path = (self.config.root / spec_file).resolve()
+                try:
+                    text = path.read_text(encoding="utf-8")
+                except OSError as exc:
+                    raise ContractError([f"cannot read {spec_file}: {exc}"]) from exc
+                tickets = contract_rules.tickets_from_document(text)
+                author = contract_rules.HUMAN
+            else:
+                if reason:
+                    raise ContractError([f"no ticket {id!r} to revise; omit `reason` to open it"])
+                tickets = contract_rules.tickets_from_fields({"id": id, **fields})
+                author = contract_rules.HOST
+
+            for ticket in tickets:
+                contract_rules.widen_reading(self.config, ticket)
+            refusals, warnings = contract_rules.check(self.config, backlog, tickets)
+            if refusals:
+                raise ContractError(refusals)
+        except ContractError as exc:
+            raise ApiError("contract refused:\n- " + "\n- ".join(exc.problems)) from exc
+
+        for ticket in tickets:
+            ticket.position = self.store.next_position(run_id)
+            self.store.add_tickets(run_id, [ticket])
+            contract_rules.log_change(
+                self.store, run_id, ticket.ticket_id, author, "created", "",
+                ticket.spec, spec_file or "opened by the host",
+            )
+        return {
+            "opened": [self._contract_view(run_id, t) for t in tickets],
+            "warnings": warnings,
+        }
+
+    def _contract_view(self, run_id: int, ticket: Ticket) -> dict[str, Any]:
+        return {
+            "id": ticket.ticket_id,
+            "title": ticket.title,
+            "kind": ticket.kind,
+            "route": ticket.route,
+            "status": ticket.status,
+            "author": contract_rules.author_of(self.store, run_id, ticket.ticket_id),
+            "spec": ticket.spec,
+            "criteria": list(ticket.criteria),
+            "allowed_files": list(ticket.allowed_files),
+            "reference_files": list(ticket.reference_files),
+            "needs": list(ticket.needs),
+        }
+
+    # ------------------------------------------------------------------
+    # delegate / job
+    # ------------------------------------------------------------------
+
+    def delegate(
+        self,
+        id: str,
+        attempts: int = 3,
+        seats: dict[str, str] | None = None,
+        wait: float | None = 0,
+    ) -> dict[str, Any]:
+        """Work one ticket with the delegate seats, in the background.
+
+        Returns the job at once, or its result if it finishes within `wait`
+        seconds. `wait=None` waits for as long as it takes, which is what a
+        shell caller wants: its process cannot outlive the call anyway.
+        """
+        run_id = self._host_run()
+        ticket = self._find_ticket(run_id, id)
+        if routes.is_withheld(ticket.route):
+            raise ApiError(
+                f"{id} is {routes.describe(ticket.route)}: a person, or you, "
+                f"implements it. Do the work, then forge_close with "
+                f"outcome: discharge"
+            )
+        if ticket.status == TICKET_DONE:
+            raise ApiError(f"{id} is done")
+        running = jobs.running_for(self.store, run_id, id)
+        if running is not None:
+            raise ApiError(f"{id} is already being worked by job {running}")
+        unmet = self.store.unmet_needs(run_id, ticket)
+        if unmet:
+            raise ApiError(f"{id} needs {', '.join(unmet)} to land first")
+        try:
+            engine.configure(self.config, attempts, ticket, dict(seats or {}))
+        except ConfigError as exc:
+            raise ApiError(str(exc)) from exc
+        if ticket.status != TICKET_PENDING:
+            # A host re-delegating a failed or blocked ticket is a retry: the
+            # spent attempts roll into the base so artifacts do not collide.
+            (ticket,) = self.store.reset_tickets(run_id, [id])
+
+        job_id = jobs.create(self.store, run_id, id)
+        root = self.config.root
+        settings = (attempts, dict(seats or {}))
+
+        def work(handle: Forge) -> dict[str, Any]:
+            fresh = handle._find_ticket(run_id, id)
+            engine.configure(handle.config, settings[0], fresh, settings[1])
+            return engine.delegate(handle.config, handle.store, run_id, fresh, job_id)
+
+        jobs.start(lambda: Forge(root), job_id, work)
+        return self.job(job_id, wait=wait)
+
+    def job(self, job: int, wait: float | None = 0, cancel: bool = False) -> dict[str, Any]:
+        """A job's progress or result. `cancel` stops it after the current step."""
+        if cancel:
+            jobs.request_cancel(self.store, int(job))
+        found = jobs.wait(self.store, int(job), 10**9 if wait is None else float(wait or 0))
+        if found is None:
+            raise ApiError(f"no job {job}")
+        if found["state"] == jobs.RUNNING:
+            found["progress"] = self._progress(found["ticket"])
+        return found
+
+    def _progress(self, ticket_id: str) -> dict[str, Any]:
+        run_id = self._host_run()
+        row = self.store._connection.execute(
+            "SELECT name, status FROM steps WHERE run_id = ? AND ticket_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (run_id, ticket_id),
+        ).fetchone()
+        ticket = self._find_ticket(run_id, ticket_id)
+        return {
+            "attempt": ticket.attempts,
+            "step": f"{row['name']} ({row['status']})" if row else "starting",
+        }
+
+    # ------------------------------------------------------------------
+    # close
+    # ------------------------------------------------------------------
+
+    def close_ticket(
+        self,
+        id: str,
+        outcome: str = "",
+        argument: str = "",
+        against: str = "",
+        commit: bool = False,
+    ) -> dict[str, Any]:
+        """Settle a ticket: land, abandon, overrule, or discharge."""
+        run_id = self._host_run()
+        ticket = self._find_ticket(run_id, id)
+        if jobs.running_for(self.store, run_id, id) is not None:
+            raise ApiError(f"{id} is being worked; cancel its job first")
+        handlers: dict[str, Callable[..., dict[str, Any]]] = {
+            "land": self._land,
+            "abandon": self._abandon,
+            "overrule": self._overrule,
+            "discharge": self._discharge,
+        }
+        if outcome not in handlers:
+            raise ApiError(f"outcome must be one of {', '.join(handlers)}")
+        return handlers[outcome](run_id, ticket, argument=argument, against=against,
+                                 commit=commit)
+
+    def _land(self, run_id: int, ticket: Ticket, *, commit: bool, **_: Any) -> dict[str, Any]:
+        if ticket.status != TICKET_DONE:
+            raise ApiError(
+                f"{ticket.ticket_id} is {ticket.status}, not done. Only a ticket "
+                f"that passed verification and review lands; see `overrule` for a "
+                f"review you can answer from the tree"
+            )
+        result: dict[str, Any] = {"id": ticket.ticket_id, "status": "landed"}
+        if commit and not self.config.loop.auto_commit:
+            runner = self._runner()
+            runner._commit(run_id, ticket)
+            step = self.store._connection.execute(
+                "SELECT id, status, detail FROM steps WHERE run_id = ? AND ticket_id = ? "
+                "AND name = 'commit' ORDER BY id DESC LIMIT 1",
+                (run_id, ticket.ticket_id),
+            ).fetchone()
+            result["commit"] = {"ok": step["status"] == "ok", "detail": _clip(step["detail"], 600)}
+        self.store.log(run_id, f"{ticket.ticket_id}: landed by the host.", kind="ticket")
+        return result
+
+    def _abandon(self, run_id: int, ticket: Ticket, *, argument: str, **_: Any) -> dict[str, Any]:
+        if ticket.status == TICKET_DONE:
+            raise ApiError(
+                f"{ticket.ticket_id} is done; its work is in the tree. Revert it "
+                f"with git if it should not be"
+            )
+        ticket.status = TICKET_SKIPPED
+        ticket.blocked_note = f"abandoned by the host: {argument}".strip().rstrip(":")
+        self.store.update_ticket(run_id, ticket)
+        contract_rules.log_change(self.store, run_id, ticket.ticket_id, contract_rules.HOST,
+                                  "abandoned", "", "", argument)
+        return {"id": ticket.ticket_id, "status": "abandoned",
+                "salvage": str(self._abandoned(run_id, ticket))}
+
+    def _overrule(self, run_id: int, ticket: Ticket, *, argument: str, **_: Any) -> dict[str, Any]:
+        """Accept a ticket the reviewer rejected, on an argument from the tree.
+
+        Held to the shape invariant 3 holds a GRANT to: the argument must name
+        the file and line that answers the objection, or it is refused. And
+        verification is not overruled — the work is put back and re-verified,
+        and anything red refuses the overrule and takes the work out again.
+        """
+        if ticket.status != TICKET_FAILED:
+            raise ApiError(
+                f"{ticket.ticket_id} is {ticket.status}; only a failed ticket is overruled"
+            )
+        last_review = self.store._connection.execute(
+            "SELECT status, detail FROM steps WHERE run_id = ? AND ticket_id = ? "
+            "AND name = 'review' ORDER BY id DESC LIMIT 1",
+            (run_id, ticket.ticket_id),
+        ).fetchone()
+        if last_review is None or last_review["status"] == "ok":
+            raise ApiError(
+                f"{ticket.ticket_id} did not fail on review; there is no verdict "
+                f"to overrule. Verification is never overruled"
+            )
+        if not _CITES_LOCATION.search(argument or ""):
+            raise ApiError(
+                "an overrule must cite the file and line that answers the "
+                "reviewer (path:line). An argument that names no evidence is "
+                "recorded as nothing"
+            )
+        salvage = self._abandoned(run_id, ticket)
+        restored = self._restore(salvage)
+        if not restored:
+            raise ApiError(f"nothing of {ticket.ticket_id}'s work was set aside to restore")
+        before = {path: data for path, data in restored.items()}
+        result = self.verify(ticket=ticket.ticket_id)
+        if not result["ok"]:
+            for path, data in before.items():
+                target = self.config.root / path
+                if data is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    target.write_bytes(data)
+            raise ApiError(
+                "overrule refused: the restored work does not verify now\n"
+                + json.dumps([s for s in result["steps"] if not s["ok"]], indent=1)[:4000]
+            )
+        ticket.status = TICKET_DONE
+        ticket.blocked_note = ""
+        self.store.update_ticket(run_id, ticket)
+        contract_rules.log_change(
+            self.store, run_id, ticket.ticket_id, contract_rules.HOST, "overrule",
+            distill(last_review["detail"] or "", limit=2000), argument,
+            "host overruled the reviewer",
+        )
+        self.store.log(run_id, f"{ticket.ticket_id}: review overruled by the host.",
+                       level="warn", kind="ticket", data={"argument": argument})
+        return {"id": ticket.ticket_id, "status": "landed", "restored": sorted(restored),
+                "overrules": self._overrule_count(run_id)}
+
+    def _discharge(self, run_id: int, ticket: Ticket, *, against: str, argument: str,
+                   **_: Any) -> dict[str, Any]:
+        """Close a ticket the host implemented itself.
+
+        Verified the way the host's own edits always are: against a baseline it
+        captured before starting, with nothing introduced.
+        """
+        if ticket.status == TICKET_DONE:
+            raise ApiError(f"{ticket.ticket_id} is already done")
+        if not against:
+            raise ApiError(
+                "discharge needs `against`: the baseline label you captured with "
+                "forge_verify before you started the work"
+            )
+        result = self.verify(against=against, ticket=ticket.ticket_id)
+        if not result["clean"]:
+            raise ApiError(
+                "discharge refused: your work introduced failures\n"
+                + json.dumps([s for s in result["steps"] if not s["ok"]], indent=1)[:4000]
+            )
+        ticket.status = TICKET_DONE
+        ticket.blocked_note = "implemented by the host"
+        self.store.update_ticket(run_id, ticket)
+        contract_rules.log_change(self.store, run_id, ticket.ticket_id, contract_rules.HOST,
+                                  "discharged", "", argument, f"verified against {against}")
+        return {"id": ticket.ticket_id, "status": "discharged", "verify": result["steps"]}
+
+    def _abandoned(self, run_id: int, ticket: Ticket) -> Path:
+        return self._runner()._abandoned_dir(run_id, ticket)
+
+    def _restore(self, salvage: Path) -> dict[str, bytes | None]:
+        """Copy a ticket's set-aside files back. Returns what each held before."""
+        if not salvage.is_dir():
+            return {}
+        previous: dict[str, bytes | None] = {}
+        for source in sorted(p for p in salvage.rglob("*") if p.is_file()):
+            relative = source.relative_to(salvage).as_posix()
+            target = self.config.root / relative
+            previous[relative] = target.read_bytes() if target.is_file() else None
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+        return previous
+
+    def _overrule_count(self, run_id: int) -> int:
+        row = self.store._connection.execute(
+            "SELECT COUNT(*) AS n FROM contract_log WHERE run_id = ? AND field = 'overrule'",
+            (run_id,),
+        ).fetchone()
+        return int(row["n"])
+
+    # ------------------------------------------------------------------
     # plumbing
     # ------------------------------------------------------------------
 
@@ -383,6 +741,12 @@ class Forge:
         runner._toolchain = None
         return runner
 
+    def _existing_host_run(self) -> int | None:
+        recorded = self.store.get_control(HOST_RUN_KEY, "")
+        if recorded.isdigit() and self.store.get_run(int(recorded)) is not None:
+            return int(recorded)
+        return None
+
     def _host_run(self) -> int:
         """The run a host's own steps are recorded against.
 
@@ -390,9 +754,9 @@ class Forge:
         its verify output recorded, so `inspect(step=...)` can read it back and
         the dashboard shows it. One host run per project, reused.
         """
-        recorded = self.store.get_control(HOST_RUN_KEY, "")
-        if recorded.isdigit() and self.store.get_run(int(recorded)) is not None:
-            return int(recorded)
+        existing = self._existing_host_run()
+        if existing is not None:
+            return existing
         run_id = self.store.create_run("host session", source="host")
         self.store.set_run_status(run_id, RUN_HOST)
         self.store.set_control(HOST_RUN_KEY, str(run_id))

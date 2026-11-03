@@ -132,6 +132,9 @@ def call_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str, Any
             f"{name} does not take {', '.join(unknown)}; "
             f"it takes: {', '.join(tool.schema['properties']) or 'nothing'}"
         )
+    missing = [k for k in tool.schema.get("required", []) if k not in arguments]
+    if missing:
+        return _tool_error(f"{name} needs {', '.join(missing)}")
     try:
         forge = Forge(root)
     except ApiError as exc:

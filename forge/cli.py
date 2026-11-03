@@ -2720,6 +2720,9 @@ def cmd_tool(args: argparse.Namespace) -> int:
         sys.exit(f"error: arguments are not JSON: {exc}")
     if not isinstance(arguments, dict):
         sys.exit("error: arguments must be a JSON object")
+    if args.name in ("forge_delegate", "forge_job") and "wait" not in arguments:
+        # A shell's process cannot outlive the job anyway; wait for it.
+        arguments["wait"] = 1800
     result = call_tool(Path(args.root).resolve(), args.name, arguments)
     if result["isError"]:
         print(result["content"][0]["text"], file=sys.stderr)

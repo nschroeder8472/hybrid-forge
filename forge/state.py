@@ -187,6 +187,39 @@ CREATE TABLE IF NOT EXISTS control (
     value TEXT NOT NULL
 );
 
+-- Host mode (docs/FORGE-AS-A-TOOL.md). A job is one delegation a host started;
+-- its row outlives the process that ran it, so a host can read the result of
+-- a job whose server has since restarted, and a job whose process died is
+-- found and reported rather than left `running` for ever.
+CREATE TABLE IF NOT EXISTS jobs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      INTEGER NOT NULL,
+    ticket_id   TEXT NOT NULL DEFAULT '',
+    kind        TEXT NOT NULL DEFAULT 'delegate',
+    state       TEXT NOT NULL DEFAULT 'running',
+    pid         INTEGER NOT NULL DEFAULT 0,
+    cancel      INTEGER NOT NULL DEFAULT 0,
+    started_at  REAL NOT NULL,
+    ended_at    REAL,
+    result      TEXT NOT NULL DEFAULT '{}'
+);
+
+-- Every change to a contract, and who made it. The first row for a ticket is
+-- its creation and says whose words it was opened from: `human` (a document
+-- a person wrote) or `host`. Provenance decides what is immutable
+-- (LOOP-INVARIANTS section 2).
+CREATE TABLE IF NOT EXISTS contract_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id     INTEGER NOT NULL,
+    ticket_id  TEXT NOT NULL,
+    author     TEXT NOT NULL,
+    field      TEXT NOT NULL,
+    old        TEXT NOT NULL DEFAULT '',
+    new        TEXT NOT NULL DEFAULT '',
+    reason     TEXT NOT NULL DEFAULT '',
+    at         REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_run  ON events(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_usage_model ON usage(model, ts);
 CREATE INDEX IF NOT EXISTS idx_steps_run   ON steps(run_id, id);

@@ -27,6 +27,8 @@ from pathlib import Path
 try:
     from forge.ingest import (
         _FIELD,
+        HARNESS_CRITERION,
+        VAGUE,
         _TICKET_HEADER,
         derive_needs,
         graph_problems,
@@ -43,26 +45,11 @@ except ImportError:
         "  pipx install hybrid-forge   (or: pip install -e . from a clone)"
     )
 
-# A criterion that hedges instead of asserting. Not an error — a prompt.
-VAGUE = re.compile(
-    r"\b(gracefully|properly|correctly|as expected|appropriate(?:ly)?|"
-    r"reasonable|sensible|works|handles?)\b",
-    re.IGNORECASE,
-)
-
 BULLET = re.compile(r"^\s*[-*+]\s+\S")
 HEADING = re.compile(r"^#{1,6}\s+(?P<text>.+?)\s*$")
 
 # The route spelling that names the party who decided instead of the objection.
 RETIRED_ROUTE = re.compile(r"^\*\*Route:\*\*\s*claude-only\b", re.IGNORECASE)
-
-# A criterion about the project's own commands rather than about its code.
-HARNESS_CRITERION = re.compile(
-    r"\b(?:npm|npx|yarn|pnpm|bun|cargo|go|make|just|uv|poetry|pip|python|pytest|"
-    r"tox|dotnet|gradle|gradlew|mvn|swift|mix|composer|deno)\b"
-    r"[^.]{0,140}?\bexits?\b[^.]{0,40}?\b0\b",
-    re.IGNORECASE,
-)
 
 # A test file is written by the tester and read by nobody, so one that no other
 # ticket names is the ordinary case rather than a loose end.
