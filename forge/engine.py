@@ -115,7 +115,9 @@ def _seats_need_llama(config: Config) -> bool:
     return False
 
 
-def servers_for(config: Config, *, images: bool) -> RunServers | None:
+def servers_for(
+    config: Config, *, images: bool, llama: bool | None = None
+) -> RunServers | None:
     """Start the servers forge manages on this machine, if they are not up.
 
     The same servers `forge go` starts — `llama-server` when the machine
@@ -124,7 +126,8 @@ def servers_for(config: Config, *, images: bool) -> RunServers | None:
     `ServerError` when one cannot start.
     """
     local = RunServers.for_config(
-        config, images=images, owner=OWNER_CLI, llama=_seats_need_llama(config)
+        config, images=images, owner=OWNER_CLI,
+        llama=_seats_need_llama(config) if llama is None else llama,
     )
     if local is not None:
         local.start()

@@ -229,7 +229,7 @@ class TestMcpServer(unittest.TestCase):
     def _exchange(self, root: Path, *messages: dict) -> list[dict]:
         reader = io.StringIO("".join(json.dumps(m) + "\n" for m in messages))
         writer = io.StringIO()
-        Server(root).serve(reader, writer)
+        Server(root, "host").serve(reader, writer)
         return [json.loads(line) for line in writer.getvalue().splitlines()]
 
     def test_initialize_list_and_call(self):

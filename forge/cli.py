@@ -2701,7 +2701,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
 def cmd_mcp(args: argparse.Namespace) -> int:
     from .mcp import server as mcp_server
 
-    return mcp_server.main(args.root)
+    return mcp_server.main(args.root, args.kit)
 
 
 # Tools that answer with a job. From a shell, wait for the job by default.
@@ -2714,7 +2714,10 @@ def cmd_tool(args: argparse.Namespace) -> int:
     Same table, same handlers, same JSON. Exit status 1 when the tool refused.
     """
     from .mcp.server import call_tool
-    from .mcp.tools import BY_NAME, TOOLS
+    from .mcp.server import by_name, kit
+
+    BY_NAME = by_name()
+    TOOLS = kit("all")
 
     if not args.name:
         for tool in TOOLS:
@@ -3140,6 +3143,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser(
         "mcp",
         help="serve the tool surface to a host model over MCP (stdio)",
+    )
+    p.add_argument(
+        "--kit",
+        choices=("smith", "host", "all"),
+        default="smith",
+        help="smith: anvil, gauge, mold (docs/THE-FORGE.md). host: the contract "
+        "and delegation tools (docs/FORGE-AS-A-TOOL.md). all: both",
     )
     p.set_defaults(func=cmd_mcp)
 

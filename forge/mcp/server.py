@@ -22,7 +22,7 @@ from typing import IO, Any
 
 from .. import __version__
 from ..api import ApiError, Forge
-from .tools import BY_NAME, TOOLS
+from .tools import TOOLS, Tool
 
 # The newest revision this server was written against. A client asking for
 # another is answered with its own, since nothing used here differs between
@@ -44,9 +44,34 @@ INSTRUCTIONS = (
 )
 
 
+SMITH_INSTRUCTIONS = (
+    "hybrid-forge, the smith's tools: anvil (run the project's checks with "
+    "failures attributed to whoever caused them; mark a baseline first), gauge "
+    "(measure images and the tree; contact sheets), mold (render art candidates "
+    "with the project's image model, finished and measured, for you to choose "
+    "from). Every tool is optional; none of them decides anything for you."
+)
+
+
+def kit(name: str) -> tuple[Tool, ...]:
+    """The tool table a server presents: `smith` (default), `host`, or `all`."""
+    from ..smith.tools import SMITH_TOOLS
+
+    kits = {"smith": SMITH_TOOLS, "host": TOOLS, "all": SMITH_TOOLS + TOOLS}
+    if name not in kits:
+        raise ValueError(f"no tool kit {name!r} (have: {', '.join(kits)})")
+    return kits[name]
+
+
+def by_name() -> dict[str, Tool]:
+    return {tool.name: tool for tool in kit("all")}
+
+
 class Server:
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, kit_name: str = "smith"):
         self.root = Path(root).resolve()
+        self.kit_name = kit_name
+        self.tools = kit(kit_name)
 
     # ------------------------------------------------------------------
     # dispatch
@@ -67,7 +92,7 @@ class Server:
             if method == "ping":
                 return _result(ident, {})
             if method == "tools/list":
-                return _result(ident, {"tools": [_describe(t) for t in TOOLS]})
+                return _result(ident, {"tools": [_describe(t) for t in self.tools]})
             if method == "tools/call":
                 return _result(ident, self._call(params))
             return _error(ident, _METHOD_NOT_FOUND, f"unknown method {method!r}")
@@ -82,12 +107,15 @@ class Server:
             "protocolVersion": params.get("protocolVersion") or PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": "hybrid-forge", "version": __version__},
-            "instructions": INSTRUCTIONS,
+            "instructions": SMITH_INSTRUCTIONS if self.kit_name == "smith" else INSTRUCTIONS,
         }
 
     def _call(self, params: dict[str, Any]) -> dict[str, Any]:
         name = params.get("name")
-        tool = BY_NAME.get(name) if isinstance(name, str) else None
+        tool = (
+            next((t for t in self.tools if t.name == name), None)
+            if isinstance(name, str) else None
+        )
         if tool is None:
             raise _InvalidParams(f"unknown tool {name!r}")
         arguments = params.get("arguments") or {}
@@ -123,7 +151,7 @@ def call_tool(root: Path, name: str, arguments: dict[str, Any]) -> dict[str, Any
     baseline by that name". Each call opens the project fresh, so an edited
     config is read on the next call rather than after a restart.
     """
-    tool = BY_NAME[name]
+    tool = by_name()[name]
     unknown = sorted(set(arguments) - set(tool.schema.get("properties", {})))
     if unknown:
         # Refused rather than ignored: a misspelt argument silently dropped is
@@ -174,10 +202,10 @@ def _error(ident: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": ident, "error": {"code": code, "message": message}}
 
 
-def main(root: str | Path = ".") -> int:
+def main(root: str | Path = ".", kit_name: str = "smith") -> int:
     # Stdout is the protocol channel; force UTF-8 and line endings the client
     # expects regardless of the console code page.
     stdin = open(sys.stdin.fileno(), "r", encoding="utf-8", newline="\n", closefd=False)
     stdout = open(sys.stdout.fileno(), "w", encoding="utf-8", newline="\n", closefd=False)
-    Server(root).serve(stdin, stdout)
+    Server(root, kit_name).serve(stdin, stdout)
     return 0
