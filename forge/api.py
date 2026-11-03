@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import contract as contract_rules
-from . import engine, jobs, routes
+from . import consult, engine, jobs, routes
 from .config import Config, ConfigError
 from .contract import ContractError
 from .failures import (
@@ -124,6 +124,8 @@ class Forge:
                 ],
                 "control": state["control"],
             }
+        result["jobs"] = jobs.active(self.store)
+        result["decisions"] = len(self.decisions())
         result["usage"] = [
             {"model": row["model"], "calls": row["calls"], "tokens": row["display"]}
             for row in state["usage"]
@@ -553,6 +555,130 @@ class Forge:
         }
 
     # ------------------------------------------------------------------
+    # decisions — autopilot's park points, answered by the host
+    # ------------------------------------------------------------------
+
+    def decisions(self) -> list[dict[str, Any]]:
+        """Every autopilot ticket parked for someone to decide on.
+
+        A parked ticket is a question the loop could not answer by itself: a
+        block, exhausted attempts, a withheld route. `forge go` keeps working
+        what does not depend on it; these wait for an answer. Host-run tickets
+        are not listed — the host settles those directly.
+        """
+        host = self._existing_host_run()
+        found: list[dict[str, Any]] = []
+        for run in self.store.list_runs(limit=50):
+            if int(run["id"]) == host or run["status"] == RUN_HOST:
+                continue
+            for ticket in self.store.list_tickets(int(run["id"])):
+                if ticket.status not in Store.RETRYABLE:
+                    continue
+                found.append({
+                    "run": int(run["id"]),
+                    "id": ticket.ticket_id,
+                    "status": ticket.status,
+                    "route": ticket.route,
+                    "question": _clip(ticket.blocked_note, 600) or ticket.status,
+                })
+        return found
+
+    def decide(self, run: int, id: str, action: str, text: str = "") -> dict[str, Any]:
+        """Answer a parked autopilot ticket. `forge go` acts on it next pass."""
+        ticket = self._find_ticket(int(run), id)
+        if ticket.status not in Store.RETRYABLE:
+            raise ApiError(f"{id} in run {run} is {ticket.status}; nothing to decide")
+        if not text.strip():
+            raise ApiError("a decision needs `text`: what you decided and why, for the record")
+        run_id = int(run)
+        if action == "advise":
+            self.store.advise(run_id, ticket, text)
+        elif action == "release":
+            if not routes.is_withheld(ticket.route):
+                raise ApiError(f"{id} is not withheld")
+            self.store.advise(
+                run_id, ticket, f"Released from {routes.describe(ticket.route)}: {text}"
+            )
+            self.store.set_route(run_id, ticket, routes.DELEGATE)
+            self.store.reset_tickets(run_id, ticket_ids=[id])
+        elif action == "retry":
+            self.store.advise(run_id, ticket, text)
+            self.store.reset_tickets(run_id, ticket_ids=[id])
+        elif action == "abandon":
+            ticket.status = TICKET_SKIPPED
+            ticket.blocked_note = f"abandoned by the host: {text}"
+            self.store.update_ticket(run_id, ticket)
+        else:
+            raise ApiError("action must be one of advise, release, retry, abandon")
+        self.store.log(
+            run_id, f"{id}: the host decided to {action} — {text[:200]}",
+            level="warn", kind="ticket", data={"ticket": id, "author": "host", "action": action},
+        )
+        return {"run": run_id, "id": id, "action": action,
+                "status": self._find_ticket(run_id, id).status,
+                "next": "forge go picks this up on its next pass" if action != "abandon" else ""}
+
+    # ------------------------------------------------------------------
+    # review / objections / offload
+    # ------------------------------------------------------------------
+
+    def review(self, id: str, seat: str = "", wait: float | None = 0) -> dict[str, Any]:
+        """An independent review of a ticket's files against HEAD, by a seat."""
+        run_id = self._host_run()
+        self._find_ticket(run_id, id)
+        return self._consult("review", id, {"seat": seat}, wait)
+
+    def objections(self, id: str, wait: float | None = 0) -> dict[str, Any]:
+        """Ask the delegate seats whether the contract is buildable. Advice only."""
+        run_id = self._host_run()
+        self._find_ticket(run_id, id)
+        return self._consult("objections", id, {}, wait)
+
+    def offload(
+        self,
+        prompt: str,
+        seat: str = "executor",
+        files: list[str] | None = None,
+        schema: dict[str, Any] | None = None,
+        max_tokens: int = 0,
+        wait: float | None = 0,
+    ) -> dict[str, Any]:
+        """Bulk text work on a delegate model. Nothing is written to disk."""
+        if not prompt.strip():
+            raise ApiError("offload needs a `prompt`")
+        try:
+            consult._seat(self.config, seat)
+        except ConfigError as exc:
+            raise ApiError(str(exc)) from exc
+        return self._consult(
+            "offload", "",
+            {"prompt": prompt, "seat": seat, "files": list(files or []),
+             "schema": schema, "max_tokens": int(max_tokens or 0)},
+            wait,
+        )
+
+    def _consult(
+        self, kind: str, ticket_id: str, options: dict[str, Any], wait: float | None
+    ) -> dict[str, Any]:
+        run_id = self._host_run()
+        job_id = jobs.create(self.store, run_id, ticket_id, kind=kind)
+        root = self.config.root
+
+        def work(handle: Forge) -> dict[str, Any]:
+            config, store = handle.config, handle.store
+            if kind == "offload":
+                return consult.offload(config, store, run_id, job_id, **options)
+            ticket = handle._find_ticket(run_id, ticket_id)
+            if kind == "review":
+                if options.get("seat"):
+                    engine.configure(config, 1, ticket, {"reviewer": options["seat"]})
+                return consult.review(config, store, run_id, ticket, job_id)
+            return consult.objections(config, store, run_id, ticket, job_id)
+
+        jobs.start(lambda: Forge(root), job_id, work)
+        return self.job(job_id, wait=wait)
+
+    # ------------------------------------------------------------------
     # close
     # ------------------------------------------------------------------
 
@@ -685,6 +811,17 @@ class Forge:
             raise ApiError(
                 "discharge needs `against`: the baseline label you captured with "
                 "forge_verify before you started the work"
+            )
+        reviewed = self.store._connection.execute(
+            "SELECT status FROM steps WHERE run_id = ? AND ticket_id = ? "
+            "AND name = 'host-review' ORDER BY id DESC LIMIT 1",
+            (run_id, ticket.ticket_id),
+        ).fetchone()
+        if reviewed is None or reviewed["status"] != "ok":
+            raise ApiError(
+                "discharge needs an accepting forge_review of this ticket on record: "
+                "the host is never the only reader of what it wrote"
+                + ("" if reviewed is None else " (the last review rejected it)")
             )
         result = self.verify(against=against, ticket=ticket.ticket_id)
         if not result["clean"]:

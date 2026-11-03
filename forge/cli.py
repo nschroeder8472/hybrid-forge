@@ -2699,6 +2699,10 @@ def cmd_mcp(args: argparse.Namespace) -> int:
     return mcp_server.main(args.root)
 
 
+# Tools that answer with a job. From a shell, wait for the job by default.
+_JOB_TOOLS = ("forge_delegate", "forge_job", "forge_review", "forge_objections", "forge_offload")
+
+
 def cmd_tool(args: argparse.Namespace) -> int:
     """The MCP tool surface from a shell, for a host without MCP or a person.
 
@@ -2720,7 +2724,7 @@ def cmd_tool(args: argparse.Namespace) -> int:
         sys.exit(f"error: arguments are not JSON: {exc}")
     if not isinstance(arguments, dict):
         sys.exit("error: arguments must be a JSON object")
-    if args.name in ("forge_delegate", "forge_job") and "wait" not in arguments:
+    if args.name in _JOB_TOOLS and "wait" not in arguments:
         # A shell's process cannot outlive the job anyway; wait for it.
         arguments["wait"] = 1800
     result = call_tool(Path(args.root).resolve(), args.name, arguments)

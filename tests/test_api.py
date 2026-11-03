@@ -614,5 +614,145 @@ class TestGuardHook(unittest.TestCase):
         self.assertEqual(self._ask(root, "tests/anything_test.py"), "")
 
 
+class TestConsultations(unittest.TestCase):
+    """Review, objections and offload: model calls that are not a delegation."""
+
+    def _answering(self, replies: dict):
+        def call(self, run_id, role, messages, **kwargs):
+            reply = replies[kwargs.get("model") or role]
+            text = reply.pop(0) if isinstance(reply, list) else reply
+            return Completion(text=text, usage=Usage(), finish_reason="stop")
+
+        return unittest.mock.patch.object(engine.HostOrchestrator, "_call", call)
+
+    def test_a_host_implemented_ticket_discharges_only_after_review_and_a_clean_verify(self):
+        root = _git_project()
+        forge = Forge(root)
+        try:
+            forge.contract(**{**_CONTRACT, "route": "withheld:interface"})
+            forge.verify(capture="start")
+            (root / "calc.py").write_text(_GOOD_ADD, encoding="utf-8")
+            (root / "tests" / "calc_test.py").write_text(_TEST, encoding="utf-8")
+
+            with self.assertRaisesRegex(ApiError, "accepting forge_review"):
+                forge.close_ticket("H-1", "discharge", against="start")
+
+            with self._answering({"reviewer": "ACCEPT\n\nMatches."}):
+                reviewed = forge.review("H-1", wait=None)
+            self.assertEqual(reviewed["result"]["verdict"], "accept", reviewed)
+
+            closed = forge.close_ticket("H-1", "discharge", against="start")
+        finally:
+            forge.close()
+        self.assertEqual(closed["status"], "discharged")
+
+    def test_a_withheld_ticket_is_not_delegated(self):
+        root = _git_project()
+        forge = Forge(root)
+        try:
+            forge.contract(**{**_CONTRACT, "route": "withheld:security"})
+            with self.assertRaisesRegex(ApiError, "withheld"):
+                forge.delegate("H-1")
+        finally:
+            forge.close()
+
+    def test_offload_recovers_json_and_validates_it(self):
+        root = _git_project()
+        forge = Forge(root)
+        schema = {"type": "object", "required": ["names"],
+                  "properties": {"names": {"type": "array", "items": {"type": "string"}}}}
+        try:
+            with self._answering({"executor": [
+                "Sure! Here it is: {\"names\": [\"a\", 2]}",
+                "```json\n{\"names\": [\"a\", \"b\"]}\n```",
+            ]}):
+                job = forge.offload("list two names", schema=schema, wait=None)
+        finally:
+            forge.close()
+        self.assertEqual(job["result"]["value"], {"names": ["a", "b"]}, job)
+
+    def test_objections_are_advice_and_park_nothing(self):
+        root = _git_project()
+        forge = Forge(root)
+        try:
+            forge.contract(**_CONTRACT)
+            refusal = (
+                "SIGN-OFF: no\nBLOCKING:\n- the spec does not say what add returns "
+                "for strings\nSUGGESTIONS:\n- none\n"
+            )
+            with self._answering({"executor": refusal, "tester": refusal,
+                                  "reviewer": refusal}):
+                job = forge.objections("H-1", wait=None)
+            ticket = forge._find_ticket(forge._host_run(), "H-1")
+        finally:
+            forge.close()
+        answers = job["result"]["answers"]
+        self.assertEqual([a["seat"] for a in answers], ["executor", "tester", "reviewer"])
+        self.assertEqual(ticket.status, "pending")
+
+
+class TestSchemaSubset(unittest.TestCase):
+    def test_types_required_and_items(self):
+        from forge.consult import validate
+
+        schema = {"type": "object", "required": ["n"],
+                  "properties": {"n": {"type": "integer"},
+                                 "tags": {"type": "array", "items": {"type": "string"}}}}
+        self.assertEqual(validate({"n": 1, "tags": ["x"]}, schema), [])
+        self.assertEqual(validate({}, schema), ["$.n is required"])
+        self.assertEqual(validate({"n": True}, schema), ["$.n should be integer"])
+        self.assertEqual(validate({"n": 1, "tags": [3]}, schema), ["$.tags[0] should be string"])
+
+
+class TestDecisions(unittest.TestCase):
+    """Autopilot's park points as a queue the host answers."""
+
+    def _parked(self) -> tuple[Path, int]:
+        root = _git_project()
+        store = Store(root / ".hybridforge" / "run.db")
+        try:
+            run_id = store.create_run("autopilot")
+            store.add_tickets(run_id, [
+                Ticket("A-1", status="blocked", blocked_note="BLOCKED: which file?"),
+                Ticket("A-2", route="withheld:security", status="withheld"),
+                Ticket("A-3", status="done"),
+            ])
+        finally:
+            store.close()
+        return root, run_id
+
+    def test_parked_tickets_are_listed_with_their_question(self):
+        root, run_id = self._parked()
+        forge = Forge(root)
+        try:
+            listed = forge.decisions()
+        finally:
+            forge.close()
+        self.assertEqual([d["id"] for d in listed], ["A-1", "A-2"])
+        self.assertEqual(listed[0]["question"], "BLOCKED: which file?")
+
+    def test_release_and_retry_requeue_for_forge_go(self):
+        root, run_id = self._parked()
+        forge = Forge(root)
+        try:
+            released = forge.decide(run_id, "A-2", "release", "scope no longer touches auth")
+            retried = forge.decide(run_id, "A-1", "retry", "the file is src/a.py")
+            resumable = [int(r["id"]) for r in forge.store.resumable_runs()]
+        finally:
+            forge.close()
+        self.assertEqual(released["status"], "pending")
+        self.assertEqual(retried["status"], "pending")
+        self.assertIn(run_id, resumable)
+
+    def test_a_decision_without_a_reason_is_refused(self):
+        root, run_id = self._parked()
+        forge = Forge(root)
+        try:
+            with self.assertRaisesRegex(ApiError, "needs `text`"):
+                forge.decide(run_id, "A-1", "retry", "")
+        finally:
+            forge.close()
+
+
 if __name__ == "__main__":
     unittest.main()

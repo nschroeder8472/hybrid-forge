@@ -209,6 +209,103 @@ TOOLS: tuple[Tool, ...] = (
             commit=bool(a.get("commit", False)),
         ),
     ),
+    Tool(
+        name="forge_objections",
+        description=(
+            "Before delegating a ticket you are unsure of: ask the executor, "
+            "tester and reviewer seats whether they can do their part as "
+            "written. Returns each seat's objections and suggestions. Advice, "
+            "not a vote — nothing is parked on it. Check an objection against "
+            "the tree before acting on it; seats are sometimes confidently wrong. "
+            "Runs as a job like forge_delegate."
+        ),
+        schema=_object(
+            {"id": _STRING, "wait": {"type": "number", "minimum": 0, "maximum": 1800}},
+            required=("id",),
+        ),
+        handler=lambda forge, a: forge.objections(
+            id=str(a["id"]), wait=float(a.get("wait", 0) or 0)
+        ),
+    ),
+    Tool(
+        name="forge_review",
+        description=(
+            "An independent review, by the reviewer seat, of a ticket's files as "
+            "they differ from HEAD, against its contract. Use it on work you did "
+            "yourself — forge_close discharge requires an accepting review on "
+            "record — or for a second opinion. `seat` picks another model for "
+            "this review. Runs as a job."
+        ),
+        schema=_object(
+            {
+                "id": _STRING,
+                "seat": _STRING,
+                "wait": {"type": "number", "minimum": 0, "maximum": 1800},
+            },
+            required=("id",),
+        ),
+        handler=lambda forge, a: forge.review(
+            id=str(a["id"]), seat=str(a.get("seat", "")), wait=float(a.get("wait", 0) or 0)
+        ),
+    ),
+    Tool(
+        name="forge_offload",
+        description=(
+            "Bulk text work that needs tokens, not judgement: summarise files, "
+            "generate fixture data, draft docstrings or descriptions. `prompt`, "
+            "optional `files` to include (project paths), `seat` (a delegate "
+            "seat or a model name; default executor), and optional `schema` — a "
+            "JSON schema the reply is parsed and validated against, with one "
+            "corrective retry. Writes nothing to disk. Runs as a job."
+        ),
+        schema=_object(
+            {
+                "prompt": _STRING,
+                "seat": _STRING,
+                "files": {"type": "array", "items": _STRING},
+                "schema": {"type": "object"},
+                "max_tokens": _INTEGER,
+                "wait": {"type": "number", "minimum": 0, "maximum": 1800},
+            },
+            required=("prompt",),
+        ),
+        handler=lambda forge, a: forge.offload(
+            prompt=str(a["prompt"]),
+            seat=str(a.get("seat") or "executor"),
+            files=list(a.get("files") or []),
+            schema=a.get("schema"),
+            max_tokens=int(a.get("max_tokens", 0) or 0),
+            wait=float(a.get("wait", 0) or 0),
+        ),
+    ),
+    Tool(
+        name="forge_decide",
+        description=(
+            "Answer an autopilot (`forge go`) ticket that parked: blocked, out of "
+            "attempts, or withheld. Without arguments, lists the open decisions "
+            "with the question each one asks. With `run`, `id`, `action` and "
+            "`text`: `advise` (a note the planner and executor read next pass), "
+            "`release` (a withheld ticket goes back to the executor), `retry` "
+            "(requeue, with your note), or `abandon`. `forge go` acts on it next "
+            "pass. Tickets you opened with forge_contract are settled with "
+            "forge_close instead."
+        ),
+        schema=_object(
+            {
+                "run": _INTEGER,
+                "id": _STRING,
+                "action": {"type": "string",
+                           "enum": ["advise", "release", "retry", "abandon"]},
+                "text": _STRING,
+            }
+        ),
+        handler=lambda forge, a: (
+            {"decisions": forge.decisions()}
+            if not a.get("id")
+            else forge.decide(int(a.get("run", 0) or 0), str(a["id"]),
+                              str(a.get("action", "")), str(a.get("text", "")))
+        ),
+    ),
 )
 
 
