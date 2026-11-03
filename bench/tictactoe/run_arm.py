@@ -166,11 +166,16 @@ def own_tests(repo: Path) -> dict:
 
 def score(repo: Path, run_dir: Path) -> dict:
     env = {**os.environ, "PROJECT": str(repo)}
-    game = subprocess.run(["node", "--test", str(HERE / "acceptance" / "game.accept.mjs")],
+    # TAP, because the counting below reads `ok` / `not ok` lines; node's
+    # default reporter on a pipe is `spec`, which has neither (every arm of
+    # the first run scored 0/19 on that).
+    game = subprocess.run(["node", "--test", "--test-reporter=tap",
+                           str(HERE / "acceptance" / "game.accept.mjs")],
                           env=env, capture_output=True, text=True, encoding="utf-8",
                           errors="replace")
-    passed = sum(1 for line in game.stdout.splitlines() if line.startswith("ok "))
-    failed = [line[7:].strip() for line in game.stdout.splitlines() if line.startswith("not ok ")]
+    lines = [line.strip() for line in game.stdout.splitlines()]
+    passed = sum(1 for line in lines if line.startswith("ok "))
+    failed = [line.split(" - ", 1)[-1] for line in lines if line.startswith("not ok ")]
     assets = json.loads(subprocess.run(
         [sys.executable, str(HERE / "acceptance" / "assets_accept.py"), str(repo)],
         capture_output=True, text=True, encoding="utf-8").stdout or "{}")
@@ -185,6 +190,14 @@ def score(repo: Path, run_dir: Path) -> dict:
         "total": {"passed": passed + assets.get("passed", 0) + page.get("passed", 0),
                   "of": 19 + 16 + 14},
     }
+
+
+def rescore(run_dir: Path) -> dict:
+    """Score a finished run again with today's acceptance suite."""
+    result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+    result["acceptance"] = score(run_dir / "repo", run_dir)
+    (run_dir / "result.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
+    return result["acceptance"]
 
 
 def main() -> int:
