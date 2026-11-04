@@ -22,7 +22,7 @@ sys.path.insert(0, str(HERE.parent / "tictactoe"))
 import run_arm as base  # noqa: E402
 
 base.HERE = HERE
-base.DEFAULT_OUT = Path(r"D:\Users\Nik\Documents\Projects\forge-bench\chest")
+base.DEFAULT_OUT = Path(r"D:\Users\Nik\Documents\Projects\forge-bench\icons")
 base.ARMS = {
     "B": {"forge": False},
     "D": {"forge": True, "config": "D-smith.config.json", "kit": "smith"},
