@@ -21,7 +21,7 @@ ROWS = ["closed", "ajar", "open"]
 COLS = ["iso_0", "iso_45", "iso_90", "iso_135", "iso_180", "iso_225", "iso_270",
         "iso_315", "flat_front", "flat_right", "flat_back", "flat_left"]
 F = 128
-TOTAL = 14
+TOTAL = 13
 
 
 def pixels(img: Image.Image) -> list:

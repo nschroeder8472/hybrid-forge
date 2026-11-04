@@ -37,7 +37,7 @@ def score(repo: Path, run_dir: Path) -> dict:
     if built.is_file():
         shutil.copy(built, run_dir / "chest.png")
     return {"sheet": sheet,
-            "total": {"passed": sheet.get("passed", 0), "of": sheet.get("total", 14)}}
+            "total": {"passed": sheet.get("passed", 0), "of": sheet.get("total", 13)}}
 
 
 base.score = score
