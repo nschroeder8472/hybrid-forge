@@ -5,7 +5,7 @@
   B  Opus alone: Python with Pillow, and Blender 5.2. No image model.
   D  The same, plus the smith's tools: mold (Flux 2, Kontext), gauge, anvil.
 
-Results in D:\\Users\\Nik\\Documents\\Projects\\forge-bench\\chest\\<arm>-<rep>.
+Results in D:\\Users\\Nik\\Documents\\Projects\\forge-bench\\icons\\<arm>-<rep>.
 """
 
 from __future__ import annotations
