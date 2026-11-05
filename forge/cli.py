@@ -2701,11 +2701,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
 def cmd_mcp(args: argparse.Namespace) -> int:
     from .mcp import server as mcp_server
 
-    return mcp_server.main(args.root, args.kit)
-
-
-# Tools that answer with a job. From a shell, wait for the job by default.
-_JOB_TOOLS = ("forge_delegate", "forge_job", "forge_review", "forge_objections", "forge_offload")
+    return mcp_server.main(args.root)
 
 
 def cmd_tool(args: argparse.Namespace) -> int:
@@ -2717,7 +2713,7 @@ def cmd_tool(args: argparse.Namespace) -> int:
     from .mcp.server import by_name, kit
 
     BY_NAME = by_name()
-    TOOLS = kit("all")
+    TOOLS = kit()
 
     if not args.name:
         for tool in TOOLS:
@@ -2745,9 +2741,6 @@ def cmd_tool(args: argparse.Namespace) -> int:
         sys.exit(f"error: arguments are not JSON: {exc}")
     if not isinstance(arguments, dict):
         sys.exit("error: arguments must be a JSON object")
-    if args.name in _JOB_TOOLS and "wait" not in arguments:
-        # A shell's process cannot outlive the job anyway; wait for it.
-        arguments["wait"] = 1800
     result = call_tool(Path(args.root).resolve(), args.name, arguments)
     if result["isError"]:
         print(result["content"][0]["text"], file=sys.stderr)
@@ -3142,20 +3135,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "mcp",
-        help="serve the tool surface to a host model over MCP (stdio)",
-    )
-    p.add_argument(
-        "--kit",
-        choices=("smith", "host", "all"),
-        default="smith",
-        help="smith: anvil, gauge, mold (docs/THE-FORGE.md). host: the contract "
-        "and delegation tools (docs/FORGE-AS-A-TOOL.md). all: both",
+        help="serve the smith's tools (anvil, gauge, mold) over MCP (stdio)",
     )
     p.set_defaults(func=cmd_mcp)
 
     p = sub.add_parser(
         "tool",
-        help="call one host tool and print its JSON — the MCP surface, from a shell",
+        help="call one of the smith's tools and print its JSON, from a shell",
     )
     p.add_argument("name", nargs="?", default="", help="tool name; omit to list them")
     p.add_argument(

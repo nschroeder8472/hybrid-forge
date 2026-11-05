@@ -16,6 +16,10 @@ guard hook, and the `forge-protocol` and `claim-verification` skills as an
 appended system prompt (`arms/host.md` says how to use them); B gets
 `arms/alone.md`. Nobody intervenes.
 
+Arms A and C used host mode, which `feat/smith-toolkit` retired after these
+results (see docs/VERDICT.md). Their runs stay recorded here; to repeat them,
+check out the tag `archive/host-mode`.
+
 ## Scoring
 
 `acceptance/` is never copied into an arm's repository (the page probe is

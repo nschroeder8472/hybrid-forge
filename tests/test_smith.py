@@ -203,8 +203,8 @@ class TestMold(unittest.TestCase):
         try:
             with unittest.mock.patch.object(type(forge.config), "image_provider",
                                             lambda self, name: fake), \
-                    unittest.mock.patch.object(mold_module, "servers_for",
-                                               lambda config, images, llama=None: None), \
+                    unittest.mock.patch.object(mold_module, "image_servers",
+                                               lambda config: None), \
                     unittest.mock.patch.object(mold_module.gpu, "clear_llama",
                                                lambda config: ([], [])), \
                     unittest.mock.patch.object(mold_module.gpu, "release_images",

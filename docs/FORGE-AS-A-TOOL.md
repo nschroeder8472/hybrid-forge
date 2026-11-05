@@ -1,4 +1,9 @@
-# Forge as a tool — design
+# Forge as a tool — design (retired)
+
+> **Retired.** Host mode was built, benchmarked and found to cost about 3x
+> Opus alone for the same result; see [VERDICT.md](VERDICT.md). The code is kept
+> at the tag `archive/host-mode`. What replaced it is
+> [THE-FORGE.md](THE-FORGE.md).
 
 A restructuring of hybrid-forge from a daemon that drives models into a tool a
 frontier model drives. The standards stay. The driver changes.

@@ -2,7 +2,7 @@
 
 The protocol here is newline-delimited JSON-RPC 2.0 on stdin and stdout. A
 host (Claude Code, or any MCP client) starts `forge mcp` as a subprocess and
-calls the tools in `forge.mcp.tools`. Stdout carries protocol messages only;
+calls the tools in `forge.smith.tools`. Stdout carries protocol messages only;
 anything a person should see goes to stderr.
 
 Only what a tool server needs is implemented: `initialize`, `ping`,
@@ -22,7 +22,7 @@ from typing import IO, Any
 
 from .. import __version__
 from ..api import ApiError, Forge
-from .tools import TOOLS, Tool
+from .tools import Tool
 
 # The newest revision this server was written against. A client asking for
 # another is answered with its own, since nothing used here differs between
@@ -36,15 +36,6 @@ _INVALID_PARAMS = -32602
 _INTERNAL_ERROR = -32603
 
 INSTRUCTIONS = (
-    "hybrid-forge: delegate bulk work to cheaper models under enforced "
-    "standards. Call forge_status first. Use forge_verify with `capture` before "
-    "editing and `against` after, so failures are attributed to whoever caused "
-    "them. Verify results are measured, not opinions: a red `introduced` "
-    "failure is yours to fix."
-)
-
-
-SMITH_INSTRUCTIONS = (
     "hybrid-forge, the smith's tools: anvil (run the project's checks with "
     "failures attributed to whoever caused them; mark a baseline first), gauge "
     "(measure images and the tree; contact sheets), mold (render art candidates "
@@ -53,25 +44,21 @@ SMITH_INSTRUCTIONS = (
 )
 
 
-def kit(name: str) -> tuple[Tool, ...]:
-    """The tool table a server presents: `smith` (default), `host`, or `all`."""
+def kit() -> tuple[Tool, ...]:
+    """The tools this server presents."""
     from ..smith.tools import SMITH_TOOLS
 
-    kits = {"smith": SMITH_TOOLS, "host": TOOLS, "all": SMITH_TOOLS + TOOLS}
-    if name not in kits:
-        raise ValueError(f"no tool kit {name!r} (have: {', '.join(kits)})")
-    return kits[name]
+    return SMITH_TOOLS
 
 
 def by_name() -> dict[str, Tool]:
-    return {tool.name: tool for tool in kit("all")}
+    return {tool.name: tool for tool in kit()}
 
 
 class Server:
-    def __init__(self, root: str | Path, kit_name: str = "smith"):
+    def __init__(self, root: str | Path):
         self.root = Path(root).resolve()
-        self.kit_name = kit_name
-        self.tools = kit(kit_name)
+        self.tools = kit()
 
     # ------------------------------------------------------------------
     # dispatch
@@ -107,7 +94,7 @@ class Server:
             "protocolVersion": params.get("protocolVersion") or PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": "hybrid-forge", "version": __version__},
-            "instructions": SMITH_INSTRUCTIONS if self.kit_name == "smith" else INSTRUCTIONS,
+            "instructions": INSTRUCTIONS,
         }
 
     def _call(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -202,10 +189,10 @@ def _error(ident: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": ident, "error": {"code": code, "message": message}}
 
 
-def main(root: str | Path = ".", kit_name: str = "smith") -> int:
+def main(root: str | Path = ".") -> int:
     # Stdout is the protocol channel; force UTF-8 and line endings the client
     # expects regardless of the console code page.
     stdin = open(sys.stdin.fileno(), "r", encoding="utf-8", newline="\n", closefd=False)
     stdout = open(sys.stdout.fileno(), "w", encoding="utf-8", newline="\n", closefd=False)
-    Server(root, kit_name).serve(stdin, stdout)
+    Server(root).serve(stdin, stdout)
     return 0

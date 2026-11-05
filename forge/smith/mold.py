@@ -25,12 +25,12 @@ from .. import gpu
 from ..artifacts import Artifacts
 from ..api import ApiError, Forge
 from ..config import ConfigError
-from ..engine import servers_for
 from ..patch import is_safe_path
 from ..providers import ProviderError
 from ..servers import ServerError
 from ..state import Ticket
 from .gauge import contact_sheet, measure
+from .servers import image_servers
 
 MAX_CANDIDATES = 8
 
@@ -67,7 +67,7 @@ def mold(
 
     try:
         provider = config.image_provider(model)
-        servers_for(config, images=True, llama=False)  # mold needs no text model
+        image_servers(config)
     except (ConfigError, ServerError) as exc:
         raise ApiError(f"the image model cannot run: {exc}") from exc
 

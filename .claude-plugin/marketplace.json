@@ -8,7 +8,7 @@
       "name": "forge",
       "displayName": "Forge",
       "source": "./plugins/forge",
-      "description": "hybrid-forge as a tool for a large model: delegate bulk work to cheaper models through MCP, under the loop's enforced standards, with a guard on the files that judge delegated work."
+      "description": "The smith's tools: render and choose art with a local image model (mold), measure images (gauge), and attribute check failures (anvil)."
     },
     {
       "name": "forge-setup",

@@ -9,23 +9,19 @@ The point is not to replace Claude with a local model. It is to spend expensive
 reasoning tokens on the parts that need reasoning, and let a cheaper model
 absorb the token-heavy bulk generation for the cost of electricity.
 
-## Use it as a tool
+## Tools for Claude
 
-Forge also runs the other way round: a large model drives it, and the loop's
-standards apply to everything that passes through. `forge mcp` serves eleven
-tools to an MCP host — Claude Code through the `forge` plugin, or anything
-else that speaks MCP — and `forge tool <name> '<json>'` is the same surface
-from a shell. The host writes contracts and decides; executor, tester and
-reviewer seats build; scope, attribution, baselines, quarantine and the
-contract ratchets are enforced by the tool, on the host's own edits too. See
-[docs/FORGE-AS-A-TOOL.md](docs/FORGE-AS-A-TOOL.md).
+`forge mcp` serves three tools to Claude (or any MCP client), through the
+`forge` plugin: **mold** renders art candidates with a local image model,
+finished and measured, on one contact sheet for Claude to choose from;
+**gauge** measures images; **anvil** runs the project's checks with failures
+attributed against a baseline. `forge tool <name> '<json>'` is the same from a
+shell.
 
-```bash
-forge tool                               # list the tools
-forge tool forge_status                  # seats, verify plan, tickets, jobs
-forge tool forge_contract '{"spec_file": "SPEC.md"}'
-forge tool forge_delegate '{"id": "SP-001"}'
-```
+They are what survived benchmarking: an earlier design that had Claude
+delegate work to cheaper models cost about 3x Opus alone for the same result.
+[docs/VERDICT.md](docs/VERDICT.md) has the numbers, and `bench/` the harness
+that produced them.
 
 ## Measured throughput
 
@@ -329,8 +325,8 @@ forge prune                 # delete the artifact trees of old runs
 forge pause | resume | stop # applied after the current step, never mid-patch
 forge ui                    # dashboard without running the loop
 forge ui --host IP --port N # bind it elsewhere, this run only (no auth!)
-forge mcp                   # serve the host tools over MCP (stdio)
-forge tool [name] [json]    # call one host tool from a shell, print JSON
+forge mcp                   # serve anvil, gauge and mold over MCP (stdio)
+forge tool [name] [json]    # call one of them from a shell, print JSON
 ```
 
 `advise`, `release` and `discharge` are the return channel: a run that parks a

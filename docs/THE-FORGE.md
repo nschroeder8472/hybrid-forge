@@ -2,9 +2,9 @@
 
 Claude is the blacksmith. Every tool here exists to make one of the smith's
 motions faster or more precise, and none of them takes a decision away from the
-smith. This replaces host mode ([FORGE-AS-A-TOOL.md](FORGE-AS-A-TOOL.md)) as the
-direction for forge-as-a-tool; the overnight autopilot (`forge go`) stays a
-separate product.
+smith. This replaced host mode ([FORGE-AS-A-TOOL.md](FORGE-AS-A-TOOL.md)); the
+overall result is in [VERDICT.md](VERDICT.md). The overnight daemon
+(`forge go`) stays a separate product.
 
 ## Why the change
 
@@ -70,22 +70,14 @@ returns their numbers and one contact sheet. `mold(pick=…, to=…)` puts the
 chosen one in place. The smith writes the prompt and makes the choice; the
 model only renders.
 
-### Later, and only with evidence
+### Not built, and why
 
-- **quench** — test the tests: run a suite against mutants of the code and
-  report which survive.
-- **tongs** — try a patch in a throwaway worktree, run anvil there, keep or
-  discard.
-- **bellows** — a local model fills one bounded artifact N times; only the
-  candidates that pass a predicate come back.
-- **striker** — a large mechanical transform across files, scope-enforced,
-  run inside tongs, accepted only by anvil.
-- **ledger** — cost per call and whether its output was kept.
-
-These are the ones that put cheap models to work. They are built when a
-benchmark task exists where they can win: one where the bulk of the work is
-large, boring and mechanically checkable, and Opus alone fills its own
-context doing it.
+quench, tongs, bellows and striker — the tools that would have put cheap
+models to work — were planned for a task where bulk dominates. The benches
+since ([VERDICT.md](VERDICT.md)) gave no reason to expect them to pay: every
+cheaper model's judgement that entered a loop cost more than it saved, and a
+local decision model was at chance on the one decision that mattered. They
+stay unbuilt unless a large-backlog bench says otherwise.
 
 ## How it is measured
 

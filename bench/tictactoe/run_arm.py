@@ -105,7 +105,7 @@ def claude_argv(arm: str, run_dir: Path, repo: Path, budget: float) -> list[str]
         mcp = run_dir / "mcp.json"
         mcp.write_text(json.dumps({"mcpServers": {"forge": {
             "type": "stdio", "command": "forge",
-            "args": ["--root", str(repo), "mcp", "--kit", ARMS[arm]["kit"]],
+            "args": ["--root", str(repo), "mcp"],
         }}}), encoding="utf-8")
         argv += ["--mcp-config", str(mcp)]
         tools.append("mcp__forge")
@@ -216,6 +216,11 @@ def main() -> int:
     parser.add_argument("--timeout-hours", type=float, default=5.0)
     args = parser.parse_args()
 
+    if ARMS[args.arm].get("kit") == "host":
+        sys.exit(
+            f"arm {args.arm} needs host mode (contracts and delegation), which this "
+            f"branch retired; run it from the tag archive/host-mode"
+        )
     run_dir = args.out / f"{args.arm}-{args.rep}"
     if run_dir.exists():
         sys.exit(f"{run_dir} exists; pick another --rep")
