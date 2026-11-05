@@ -59,13 +59,14 @@ objections, review and decision tools for a host, the guard hook and the host
 skills. Kept intact at the tag `archive/host-mode` with the design
 ([FORGE-AS-A-TOOL.md](FORGE-AS-A-TOOL.md)) and its benchmark arms.
 
-## What is not decided
+## What is kept as it was
 
-**The overnight daemon (`forge go`).** It spends no frontier tokens, which is
-its one advantage, and the runs behind it needed a person about once a ticket
-on hard backlogs. Whether that is worth keeping is a question about who runs it
-and why — local-only work that cannot leave the machine is the strongest case
-— not one these benches answer.
+**The overnight daemon (`forge go`).** Kept, decided 2026-11-04. It spends no
+frontier tokens, which is its one advantage, and its strongest case is work
+that cannot leave the machine. The benches did not test it and do not argue
+against it; the loop fixes found while benchmarking make it better.
+
+## What is not decided
 
 **A large backlog.** No bench gave Opus a task big enough to fill its own
 context, the one regime where offloading bulk might still pay. If that case
