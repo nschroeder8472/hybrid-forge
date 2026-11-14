@@ -1,0 +1,586 @@
+{
+ "model": "opus-ceiling",
+ "usd": 0.7778698000000001,
+ "first_try": {
+  "n": 109,
+  "base_rate": 0.303,
+  "auc": 0.693,
+  "brier": 0.1903,
+  "brier_base_rate": 0.2111,
+  "logloss": 0.5607,
+  "logloss_base_rate": 0.6132,
+  "calibration": [
+   {
+    "range": "0.0-0.2",
+    "n": 21,
+    "mean_p": 0.13,
+    "landed": 0.143
+   },
+   {
+    "range": "0.2-0.4",
+    "n": 51,
+    "mean_p": 0.276,
+    "landed": 0.275
+   },
+   {
+    "range": "0.4-0.6",
+    "n": 36,
+    "mean_p": 0.458,
+    "landed": 0.417
+   },
+   {
+    "range": "0.6-0.8",
+    "n": 5,
+    "mean_p": 0.61,
+    "landed": 0.8
+   }
+  ],
+  "items": [
+   {
+    "id": "alllocal2#TT-001",
+    "label": true,
+    "p": 0.4
+   },
+   {
+    "id": "alllocal2#TT-002",
+    "label": true,
+    "p": 0.35
+   },
+   {
+    "id": "alllocal2#TT-003",
+    "label": false,
+    "p": 0.2
+   },
+   {
+    "id": "alllocal2#TT-004",
+    "label": true,
+    "p": 0.3
+   },
+   {
+    "id": "alllocal2#TT-005",
+    "label": false,
+    "p": 0.45
+   },
+   {
+    "id": "alllocal2#TT-006",
+    "label": false,
+    "p": 0.5
+   },
+   {
+    "id": "alllocal2#BUG-001",
+    "label": false,
+    "p": 0.25
+   },
+   {
+    "id": "alllocal2#BUG-002",
+    "label": false,
+    "p": 0.3
+   },
+   {
+    "id": "alllocal#TT-001",
+    "label": false,
+    "p": 0.4
+   },
+   {
+    "id": "alllocal#TT-002",
+    "label": false,
+    "p": 0.35
+   },
+   {
+    "id": "alllocal#TT-003",
+    "label": false,
+    "p": 0.2
+   },
+   {
+    "id": "alllocal#TT-004",
+    "label": true,
+    "p": 0.3
+   },
+   {
+    "id": "alllocal#TT-005",
+    "label": true,
+    "p": 0.45
+   },
+   {
+    "id": "alllocal#TT-006",
+    "label": false,
+    "p": 0.5
+   },
+   {
+    "id": "alllocal#BUG-001",
+    "label": false,
+    "p": 0.3
+   },
+   {
+    "id": "blender_forge_test#SCN-003",
+    "label": false,
+    "p": 0.45
+   },
+   {
+    "id": "forge-bench/A-1#game",
+    "label": true,
+    "p": 0.5
+   },
+   {
+    "id": "forge-bench/A-1#ai",
+    "label": true,
+    "p": 0.4
+   },
+   {
+    "id": "forge-bench/A-1#art-x",
+    "label": true,
+    "p": 0.25
+   },
+   {
+    "id": "forge-bench/A-1#art-o",
+    "label": false,
+    "p": 0.2
+   },
+   {
+    "id": "forge-bench/A-1#art-board",
+    "label": false,
+    "p": 0.1
+   },
+   {
+    "id": "forge-bench/C-1#game",
+    "label": false,
+    "p": 0.5
+   },
+   {
+    "id": "forge-bench/C-1#ai",
+    "label": false,
+    "p": 0.3
+   },
+   {
+    "id": "forge-bench/C-1#art-x",
+    "label": true,
+    "p": 0.3
+   },
+   {
+    "id": "forge-bench/C-1#art-o",
+    "label": false,
+    "p": 0.25
+   },
+   {
+    "id": "forge-bench/C-1#art-board",
+    "label": false,
+    "p": 0.1
+   },
+   {
+    "id": "forge-bench/C-1#art-x2",
+    "label": true,
+    "p": 0.3
+   },
+   {
+    "id": "gimp_forge_test#SPR-001",
+    "label": true,
+    "p": 0.5
+   },
+   {
+    "id": "gimp_forge_test#SPR-002",
+    "label": true,
+    "p": 0.45
+   },
+   {
+    "id": "gimp_forge_test#SPR-003",
+    "label": false,
+    "p": 0.35
+   },
+   {
+    "id": "hybrid-forge#HD-001",
+    "label": false,
+    "p": 0.15
+   },
+   {
+    "id": "hybrid-forge#HD-001",
+    "label": false,
+    "p": 0.35
+   },
+   {
+    "id": "hybrid-forge#HD-002",
+    "label": false,
+    "p": 0.4
+   },
+   {
+    "id": "hybrid-forge#HW-003",
+    "label": true,
+    "p": 0.15
+   },
+   {
+    "id": "hybrid-forge#HW-004",
+    "label": false,
+    "p": 0.25
+   },
+   {
+    "id": "hybrid-forge#HW-005",
+    "label": false,
+    "p": 0.3
+   },
+   {
+    "id": "hybrid-forge#US-001",
+    "label": true,
+    "p": 0.6
+   },
+   {
+    "id": "hybrid-forge#US-002",
+    "label": true,
+    "p": 0.6
+   },
+   {
+    "id": "hybrid-forge#TI-001",
+    "label": true,
+    "p": 0.35
+   },
+   {
+    "id": "hybrid-forge#TI-002",
+    "label": false,
+    "p": 0.25
+   },
+   {
+    "id": "hybrid-forge#RT-001",
+    "label": false,
+    "p": 0.15
+   },
+   {
+    "id": "hybrid-forge#RT-001",
+    "label": false,
+    "p": 0.15
+   },
+   {
+    "id": "hybrid-forge#RT-001",
+    "label": false,
+    "p": 0.3
+   },
+   {
+    "id": "hybrid-forge#RT-002",
+    "label": false,
+    "p": 0.25
+   },
+   {
+    "id": "image_forge_test#IMG-001",
+    "label": false,
+    "p": 0.2
+   },
+   {
+    "id": "new_forge_test#PN-001",
+    "label": false,
+    "p": 0.45
+   },
+   {
+    "id": "new_forge_test#PN-002",
+    "label": false,
+    "p": 0.55
+   },
+   {
+    "id": "new_forge_test#PN-003",
+    "label": false,
+    "p": 0.15
+   },
+   {
+    "id": "new_forge_test#PN-004",
+    "label": false,
+    "p": 0.35
+   },
+   {
+    "id": "new_forge_test#PN-005",
+    "label": false,
+    "p": 0.4
+   },
+   {
+    "id": "new_forge_test#PN-006",
+    "label": false,
+    "p": 0.15
+   },
+   {
+    "id": "new_forge_test#PN-007",
+    "label": false,
+    "p": 0.08
+   },
+   {
+    "id": "new_forge_test#BUG-001",
+    "label": false,
+    "p": 0.4
+   },
+   {
+    "id": "new_forge_test#BUG-002",
+    "label": false,
+    "p": 0.45
+   },
+   {
+    "id": "platformer-test#PT-001",
+    "label": true,
+    "p": 0.4
+   },
+   {
+    "id": "platformer-test#PT-002",
+    "label": true,
+    "p": 0.4
+   },
+   {
+    "id": "platformer-test#PT-003",
+    "label": false,
+    "p": 0.25
+   },
+   {
+    "id": "platformer-test#PT-004",
+    "label": false,
+    "p": 0.25
+   },
+   {
+    "id": "platformer-test#PT-005",
+    "label": false,
+    "p": 0.12
+   },
+   {
+    "id": "platformer-test#PT-006",
+    "label": false,
+    "p": 0.2
+   },
+   {
+    "id": "platformer-test#PT-007",
+    "label": true,
+    "p": 0.3
+   },
+   {
+    "id": "platformer-test#PT-008",
+    "label": false,
+    "p": 0.25
+   },
+   {
+    "id": "platformer-test#PT-009",
+    "label": false,
+    "p": 0.15
+   },
+   {
+    "id": "platformer-test#PT-010",
+    "label": false,
+    "p": 0.15
+   },
+   {
+    "id": "platformer-test#PT-011",
+    "label": false,
+    "p": 0.2
+   },
+   {
+    "id": "platformer-test#PT-012",
+    "label": false,
+    "p": 0.12
+   },
+   {
+    "id": "platformer-test#PT-013",
+    "label": false,
+    "p": 0.12
+   },
+   {
+    "id": "platformer-test#PT-014",
+    "label": true,
+    "p": 0.15
+   },
+   {
+    "id": "platformer-test#PT-015",
+    "label": true,
+    "p": 0.15
+   },
+   {
+    "id": "platformer-test#BUG-001",
+    "label": false,
+    "p": 0.3
+   },
+   {
+    "id": "sheet_forge_test#SHT-002",
+    "label": true,
+    "p": 0.35
+   },
+   {
+    "id": "testdir#TT-001",
+    "label": false,
+    "p": 0.25
+   },
+   {
+    "id": "testdir#TT-001",
+    "label": false,
+    "p": 0.12
+   },
+   {
+    "id": "testdir#TT-001",
+    "label": false,
+    "p": 0.4
+   },
+   {
+    "id": "testdir#TT-002",
+    "label": false,
+    "p": 0.3
+   },
+   {
+    "id": "testdir#TT-003",
+    "label": false,
+    "p": 0.2
+   },
+   {
+    "id": "testdir#TT-004",
+    "label": false,
+    "p": 0.25
+   },
+   {
+    "id": "testdir#TT-005",
+    "label": false,
+    "p": 0.4
+   },
+   {
+    "id": "testdir#TT-006",
+    "label": false,
+    "p": 0.45
+   },
+   {
+    "id": "testdir#TT-001",
+    "label": false,
+    "p": 0.4
+   },
+   {
+    "id": "testdir#TT-001",
+    "label": false,
+    "p": 0.35
+   },
+   {
+    "id": "testdir#TT-001",
+    "label": true,
+    "p": 0.4
+   },
+   {
+    "id": "testdir#TT-002",
+    "label": false,
+    "p": 0.35
+   },
+   {
+    "id": "testdir#TT-001",
+    "label": false,
+    "p": 0.25
+   },
+   {
+    "id": "testdir#TT-002",
+    "label": false,
+    "p": 0.2
+   },
+   {
+    "id": "testdir#TT-003",
+    "label": false,
+    "p": 0.12
+   },
+   {
+    "id": "testdir#TT-004",
+    "label": false,
+    "p": 0.25
+   },
+   {
+    "id": "testdir#TT-005",
+    "label": false,
+    "p": 0.1
+   },
+   {
+    "id": "testdir#TT-006",
+    "label": false,
+    "p": 0.15
+   },
+   {
+    "id": "testdir#TT-001",
+    "label": true,
+    "p": 0.4
+   },
+   {
+    "id": "testdir#TT-002",
+    "label": true,
+    "p": 0.35
+   },
+   {
+    "id": "testdir#TT-003",
+    "label": true,
+    "p": 0.2
+   },
+   {
+    "id": "testdir#TT-004",
+    "label": true,
+    "p": 0.3
+   },
+   {
+    "id": "testdir#TT-005",
+    "label": true,
+    "p": 0.45
+   },
+   {
+    "id": "testdir#TT-006",
+    "label": false,
+    "p": 0.5
+   },
+   {
+    "id": "tictactoe_forge_test#TTT-1",
+    "label": true,
+    "p": 0.6
+   },
+   {
+    "id": "tictactoe_forge_test#TTT-2",
+    "label": false,
+    "p": 0.45
+   },
+   {
+    "id": "tictactoe_forge_test#TTT-3",
+    "label": true,
+    "p": 0.65
+   },
+   {
+    "id": "tictactoe_forge_test#ART-1",
+    "label": true,
+    "p": 0.3
+   },
+   {
+    "id": "tictactoe_forge_test#ART-2",
+    "label": false,
+    "p": 0.2
+   },
+   {
+    "id": "tictactoe_forge_test#ART-3",
+    "label": true,
+    "p": 0.3
+   },
+   {
+    "id": "tictactoe_forge_test#ART-4",
+    "label": false,
+    "p": 0.25
+   },
+   {
+    "id": "tictactoe_forge_test#ART-5",
+    "label": false,
+    "p": 0.1
+   },
+   {
+    "id": "tictactoe_forge_test#TTT-5",
+    "label": false,
+    "p": 0.6
+   },
+   {
+    "id": "tictactoe_forge_test#TTT-6",
+    "label": false,
+    "p": 0.4
+   },
+   {
+    "id": "tictactoe_forge_test#DOC-1",
+    "label": true,
+    "p": 0.5
+   },
+   {
+    "id": "tile_forge_test#ART-001",
+    "label": false,
+    "p": 0.35
+   },
+   {
+    "id": "tile_forge_test#ART-002",
+    "label": false,
+    "p": 0.25
+   },
+   {
+    "id": "tile_forge_test#ART-003",
+    "label": false,
+    "p": 0.4
+   }
+  ]
+ }
+}

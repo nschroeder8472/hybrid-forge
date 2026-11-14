@@ -1084,15 +1084,29 @@ def pinned_values(criterion: str) -> list[str]:
     mention `16.25` — and on the run that found this, the ticket was blocked
     for it. A value stated before its call is not collected either, which
     misses a real weakening rather than inventing one.
+
+    A value the criterion *negates* is not collected either. "with O playing
+    `bestMove` ... from `newGame()`, no finished game has `winner: "X"`" pins
+    nothing: an honest test asserts the opposite of that span, and reading it
+    as the expected value blocked a correct ticket twice (tictactoe host-mode
+    run, 2026-11-02, TTT-2).
     """
     values: list[str] = []
-    spans = [span.strip() for span in _CODE_SPAN.findall(criterion or "")]
-    for index, span in enumerate(spans[:-1]):
-        following = spans[index + 1]
+    text = criterion or ""
+    matches = list(_CODE_SPAN.finditer(text))
+    for current, after in zip(matches, matches[1:]):
+        span, following = current.group(1).strip(), after.group(1).strip()
+        between = text[current.end():after.start()]
+        if _NEGATION.search(between):
+            continue
         if _CALL_SPAN.match(span) and not _CALL_SPAN.match(following):
             if following not in values:
                 values.append(following)
     return values
+
+
+# Words that turn the span after them into what must NOT happen.
+_NEGATION = re.compile(r"\b(?:no|not|never|none|without|neither|nor)\b|n't\b", re.IGNORECASE)
 
 
 def calls_named(criterion: str) -> list[str]:

@@ -9,6 +9,20 @@ The point is not to replace Claude with a local model. It is to spend expensive
 reasoning tokens on the parts that need reasoning, and let a cheaper model
 absorb the token-heavy bulk generation for the cost of electricity.
 
+## Tools for Claude
+
+`forge mcp` serves three tools to Claude (or any MCP client), through the
+`forge` plugin: **mold** renders art candidates with a local image model,
+finished and measured, on one contact sheet for Claude to choose from;
+**gauge** measures images; **anvil** runs the project's checks with failures
+attributed against a baseline. `forge tool <name> '<json>'` is the same from a
+shell.
+
+They are what survived benchmarking: an earlier design that had Claude
+delegate work to cheaper models cost about 3x Opus alone for the same result.
+[docs/VERDICT.md](docs/VERDICT.md) has the numbers, and `bench/` the harness
+that produced them.
+
 ## Measured throughput
 
 Four runs against one repository, on two local models sharing a single 32 GB
@@ -311,6 +325,8 @@ forge prune                 # delete the artifact trees of old runs
 forge pause | resume | stop # applied after the current step, never mid-patch
 forge ui                    # dashboard without running the loop
 forge ui --host IP --port N # bind it elsewhere, this run only (no auth!)
+forge mcp                   # serve anvil, gauge and mold over MCP (stdio)
+forge tool [name] [json]    # call one of them from a shell, print JSON
 ```
 
 `advise`, `release` and `discharge` are the return channel: a run that parks a

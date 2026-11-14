@@ -2270,6 +2270,11 @@ def cmd_release(args: argparse.Namespace) -> int:
     store.set_route(run_id, ticket, routes.DELEGATE)
     if ticket.status == TICKET_WITHHELD:
         store.reset_tickets(run_id, ticket_ids=[ticket.ticket_id])
+        # A run that finished holding this ticket is not in `forge go`'s queue
+        # until it is reopened, as `forge retry` reopens one.
+        from .api import _reopen_run
+
+        _reopen_run(store, run_id, f"{ticket.ticket_id} released")
 
     store.log(
         run_id,
@@ -2693,6 +2698,59 @@ def cmd_ui(args: argparse.Namespace) -> int:
 # ----------------------------------------------------------------------
 
 
+def cmd_mcp(args: argparse.Namespace) -> int:
+    from .mcp import server as mcp_server
+
+    return mcp_server.main(args.root)
+
+
+def cmd_tool(args: argparse.Namespace) -> int:
+    """The MCP tool surface from a shell, for a host without MCP or a person.
+
+    Same table, same handlers, same JSON. Exit status 1 when the tool refused.
+    """
+    from .mcp.server import call_tool
+    from .mcp.server import by_name, kit
+
+    BY_NAME = by_name()
+    TOOLS = kit()
+
+    if not args.name:
+        for tool in TOOLS:
+            print(f"{tool.name:<16} {tool.description.split('. ')[0]}.")
+        return 0
+    if args.name not in BY_NAME:
+        sys.exit(f"error: no tool {args.name!r} (have: {', '.join(BY_NAME)})")
+    # Read as UTF-8 whatever the console code page says. A Windows shell hands
+    # argv over in the ANSI code page, which turns an em dash in a spec into
+    # U+FFFD for good: pass anything non-ASCII through `-` (stdin) or `@file`.
+    if args.arguments == "-":
+        raw = sys.stdin.buffer.read().decode("utf-8")
+    elif args.arguments.startswith("@"):
+        raw = Path(args.arguments[1:]).read_text(encoding="utf-8")
+    else:
+        raw = args.arguments
+    if "�" in raw:
+        sys.exit(
+            "error: the arguments contain U+FFFD, a character lost in transit. "
+            "Pass them as @file or on stdin with -, which are read as UTF-8."
+        )
+    try:
+        arguments = json.loads(raw or "{}")
+    except ValueError as exc:
+        sys.exit(f"error: arguments are not JSON: {exc}")
+    if not isinstance(arguments, dict):
+        sys.exit("error: arguments must be a JSON object")
+    result = call_tool(Path(args.root).resolve(), args.name, arguments)
+    if result["isError"]:
+        print(result["content"][0]["text"], file=sys.stderr)
+        return 1
+    text = json.dumps(result["structuredContent"], indent=1, ensure_ascii=False)
+    sys.stdout.buffer.write(text.encode("utf-8") + b"\n")
+    sys.stdout.flush()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="forge", description=__doc__)
     # Asked from the machine the run is on, which is the machine whose build is
@@ -3074,6 +3132,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="port for this invocation only (default: ui.port from config)",
     )
     p.set_defaults(func=cmd_ui)
+
+    p = sub.add_parser(
+        "mcp",
+        help="serve the smith's tools (anvil, gauge, mold) over MCP (stdio)",
+    )
+    p.set_defaults(func=cmd_mcp)
+
+    p = sub.add_parser(
+        "tool",
+        help="call one of the smith's tools and print its JSON, from a shell",
+    )
+    p.add_argument("name", nargs="?", default="", help="tool name; omit to list them")
+    p.add_argument(
+        "arguments",
+        nargs="?",
+        default="{}",
+        help="the tool's arguments as a JSON object; - reads them from stdin and "
+        "@path from a file, both as UTF-8",
+    )
+    p.set_defaults(func=cmd_tool)
 
     return parser
 

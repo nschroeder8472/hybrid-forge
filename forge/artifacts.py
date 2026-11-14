@@ -63,6 +63,9 @@ _GITIGNORE_LINES = (
     # nothing in anyone else's clone.
     "servers.json",
     "logs/",
+    # The smith's scratch: mold's candidate batches and gauge's sheets.
+    "mold/",
+    "gauge/",
 )
 
 # The same entries as one file body, for `forge init` to write on a fresh

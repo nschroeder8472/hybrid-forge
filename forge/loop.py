@@ -6292,6 +6292,11 @@ class Orchestrator:
             )
             if refused is not None:
                 return refused
+            # A render is this ticket's apply, and quarantine reverts what the
+            # applies wrote. Left out, a ticket that stalled on review left its
+            # last render in the tree (tic-tac-toe run, 2026-11-02, ART-5).
+            if touched is not None:
+                touched.update(written)
             wrote_nothing, scope_note = False, ""
         else:
             # --- BUILD ---------------------------------------------------
@@ -6745,6 +6750,7 @@ class Orchestrator:
                             # previous one running forever.
                             test_path=test_path,
                             test_command=self.config.command_for("test", test_path),
+                            lint_command=self.config.command_for("lint", test_path),
                             example_test=example,
                             # The executor already gets this. Without it here, a
                             # tester that wrote one wrong assertion rewrites the

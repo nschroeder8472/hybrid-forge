@@ -1,0 +1,143 @@
+{
+ "12": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "flux2_dev_fp8mixed.safetensors",
+   "weight_dtype": "default"
+  }
+ },
+ "101": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "12",
+    0
+   ],
+   "lora_name": "Flux_2-Turbo-LoRA_comfyui.safetensors",
+   "strength_model": 1.0
+  }
+ },
+ "38": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "mistral_3_small_flux2_bf16.safetensors",
+   "type": "flux2",
+   "device": "default"
+  }
+ },
+ "10": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "full_encoder_small_decoder.safetensors"
+  }
+ },
+ "6": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "38",
+    0
+   ],
+   "text": "placeholder"
+  }
+ },
+ "26": {
+  "class_type": "FluxGuidance",
+  "inputs": {
+   "conditioning": [
+    "6",
+    0
+   ],
+   "guidance": 4.0
+  }
+ },
+ "47": {
+  "class_type": "EmptyFlux2LatentImage",
+  "inputs": {
+   "width": 1024,
+   "height": 1024,
+   "batch_size": 1
+  }
+ },
+ "48": {
+  "class_type": "Flux2Scheduler",
+  "inputs": {
+   "steps": 8,
+   "width": 1024,
+   "height": 1024
+  }
+ },
+ "25": {
+  "class_type": "RandomNoise",
+  "inputs": {
+   "noise_seed": 0
+  }
+ },
+ "16": {
+  "class_type": "KSamplerSelect",
+  "inputs": {
+   "sampler_name": "euler"
+  }
+ },
+ "22": {
+  "class_type": "BasicGuider",
+  "inputs": {
+   "model": [
+    "101",
+    0
+   ],
+   "conditioning": [
+    "26",
+    0
+   ]
+  }
+ },
+ "13": {
+  "class_type": "SamplerCustomAdvanced",
+  "inputs": {
+   "noise": [
+    "25",
+    0
+   ],
+   "guider": [
+    "22",
+    0
+   ],
+   "sampler": [
+    "16",
+    0
+   ],
+   "sigmas": [
+    "48",
+    0
+   ],
+   "latent_image": [
+    "47",
+    0
+   ]
+  }
+ },
+ "8": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "13",
+    0
+   ],
+   "vae": [
+    "10",
+    0
+   ]
+  }
+ },
+ "9": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "8",
+    0
+   ],
+   "filename_prefix": "forge_flux2"
+  }
+ }
+}

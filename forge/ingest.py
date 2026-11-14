@@ -721,6 +721,22 @@ def undeclared_order(root: Path, tickets: list[Ticket]) -> str:
     )
 
 
+# A criterion that hedges instead of asserting. Not an error — a prompt.
+VAGUE = re.compile(
+    r"\b(gracefully|properly|correctly|as expected|appropriate(?:ly)?|"
+    r"reasonable|sensible|works|handles?)\b",
+    re.IGNORECASE,
+)
+
+# A criterion about the project's own commands rather than about its code.
+HARNESS_CRITERION = re.compile(
+    r"\b(?:npm|npx|yarn|pnpm|bun|cargo|go|make|just|uv|poetry|pip|python|pytest|"
+    r"tox|dotnet|gradle|gradlew|mvn|swift|mix|composer|deno)\b"
+    r"[^.]{0,140}?\bexits?\b[^.]{0,40}?\b0\b",
+    re.IGNORECASE,
+)
+
+
 def parse_plan(text: str) -> list[Ticket]:
     """Parse a document that already contains tickets.
 

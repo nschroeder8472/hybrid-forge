@@ -1,0 +1,212 @@
+<title>Tic-Tac-Toe Blind Rating</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:opsz,wght@9..144,600&display=swap">
+<style>
+/* Layout: one judgement at a time — a stepper card over a quiet slate-tinted page. */
+:root {
+  --bg: #f3f4f2; --panel: #ffffff; --fg: #1d2321; --muted: #5d6763;
+  --line: #d6dbd8; --accent: #2f7a6f; --accent-ink: #ffffff; --pick: #e8f3f0;
+  --display: "Fraunces", Georgia, serif;
+  --body: "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #171b1a; --panel: #212726; --fg: #e8ece9; --muted: #9aa5a1;
+  --line: #34403d; --accent: #5cc2b2; --accent-ink: #0f1514; --pick: #1f3531; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #171b1a; --panel: #212726; --fg: #e8ece9; --muted: #9aa5a1;
+  --line: #34403d; --accent: #5cc2b2; --accent-ink: #0f1514; --pick: #1f3531; color-scheme: dark }
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font: 16px/1.5 var(--body);
+  padding-block: 24px 48px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+main { max-width: 1120px; margin: 0 auto; display: grid; gap: 20px; }
+h1 { font: 600 clamp(1.6rem, 3vw, 2.2rem)/1.15 var(--display); margin: 0; text-wrap: balance; }
+.lede { color: var(--muted); margin: 0; max-width: 65ch; }
+.bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.track { flex: 1; min-width: 160px; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+.fill { height: 100%; background: var(--accent); width: 0; transition: width .25s; }
+.count { font-variant-numeric: tabular-nums; color: var(--muted); font-size: .9rem; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; display: grid; gap: 16px; }
+.eyebrow { text-transform: uppercase; letter-spacing: .08em; font-size: .75rem; color: var(--muted); margin: 0; }
+.question { font-size: 1.15rem; font-weight: 700; margin: 0; }
+.choices { display: grid; gap: 16px; }
+.choices.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.choices.five { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+@media (max-width: 640px) { .choices.two { grid-template-columns: 1fr; } }
+.option { all: unset; cursor: pointer; display: grid; gap: 8px; justify-items: center;
+  border: 2px solid var(--line); border-radius: 10px; padding: 10px; background: var(--bg); min-width: 0; }
+.option img { max-width: 100%; height: auto; display: block; border-radius: 6px; }
+.option .label { font-size: .85rem; color: var(--muted); }
+.option:hover { border-color: var(--accent); }
+.option:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.option[aria-pressed="true"] { border-color: var(--accent); background: var(--pick); }
+.option[aria-pressed="true"] .label { color: var(--fg); font-weight: 700; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; justify-content: space-between; align-items: center; }
+button.plain { font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid var(--line);
+  background: transparent; color: var(--fg); cursor: pointer; }
+button.plain:hover { border-color: var(--accent); }
+button.plain:disabled { opacity: .4; cursor: default; }
+button.plain:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.status { font-size: .9rem; color: var(--muted); }
+.done { text-align: center; padding: 32px 20px; }
+.done h2 { font: 600 1.6rem/1.2 var(--display); margin: 0 0 8px; }
+textarea { width: 100%; min-height: 120px; font: .85rem/1.4 ui-monospace, Consolas, monospace;
+  background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+.keys { color: var(--muted); font-size: .85rem; }
+@media (prefers-reduced-motion: reduce) { .fill { transition: none; } }
+</style>
+
+<main>
+  <header style="display:grid;gap:8px">
+    <h1>Tic-Tac-Toe Blind Rating</h1>
+    <p class="lede">Five builds of the same chalkboard tic-tac-toe game. Pick the one you prefer in each round.
+      Letters are random, and change between sections, so nothing here tells you which build is which.</p>
+  </header>
+  <div class="bar"><div class="track"><div class="fill" id="fill"></div></div>
+    <span class="count" id="count"></span></div>
+  <section class="card" id="stage" aria-live="polite"></section>
+  <div class="row">
+    <button class="plain" id="back" type="button">Back</button>
+    <span class="status" id="status">Choices save as you go.</span>
+    <span class="keys" id="keys"></span>
+  </div>
+</main>
+
+<script>
+const DATA = __DATA__;
+const steps = [
+  ...DATA.pairs.map((p, i) => ({ kind: "pair", id: p.id, n: i + 1, of: DATA.pairs.length, p })),
+  ...DATA.picks.map((q) => ({ kind: "pick", id: q.id, q })),
+];
+const QUESTIONS = {
+  x: "Which X do you like best?",
+  o: "Which O do you like best?",
+  board: "Which board do you like best?",
+};
+const answers = {};
+let at = 0;
+let db = null;
+
+const stage = document.getElementById("stage");
+const statusEl = document.getElementById("status");
+
+function option(code, img, label, chosen, onPick) {
+  const b = document.createElement("button");
+  b.className = "option"; b.type = "button";
+  b.setAttribute("aria-pressed", chosen ? "true" : "false");
+  const i = document.createElement("img"); i.src = img; i.alt = label; i.loading = "eager";
+  const l = document.createElement("span"); l.className = "label"; l.textContent = label;
+  b.append(i, l); b.addEventListener("click", onPick);
+  return b;
+}
+
+function render() {
+  const total = steps.length;
+  const answered = Object.keys(answers).length;
+  document.getElementById("fill").style.width = `${(answered / total) * 100}%`;
+  document.getElementById("count").textContent = `${answered} of ${total} answered`;
+  document.getElementById("back").disabled = at === 0;
+  stage.replaceChildren();
+
+  if (at >= total) {
+    const box = document.createElement("div"); box.className = "done";
+    const h = document.createElement("h2"); h.textContent = "Done, thank you";
+    const p = document.createElement("p");
+    p.textContent = db
+      ? "All your choices are saved. Tell Claude you have finished."
+      : "This view could not save, so copy the text below and paste it to Claude.";
+    box.append(h, p);
+    if (!db) {
+      const t = document.createElement("textarea"); t.id = "export"; t.readOnly = true;
+      t.value = JSON.stringify(answers);
+      const c = document.createElement("button"); c.className = "plain"; c.type = "button";
+      c.textContent = "Copy results";
+      c.addEventListener("click", async () => {
+        try { await navigator.clipboard.writeText(t.value); c.textContent = "Copied"; }
+        catch { t.select(); c.textContent = "Selected; press Ctrl+C"; }
+      });
+      box.append(t, c);
+    }
+    stage.append(box);
+    document.getElementById("keys").textContent = "";
+    return;
+  }
+
+  const s = steps[at];
+  const eyebrow = document.createElement("p"); eyebrow.className = "eyebrow";
+  const q = document.createElement("p"); q.className = "question";
+  const grid = document.createElement("div");
+  if (s.kind === "pair") {
+    eyebrow.textContent = `Whole game · round ${s.n} of ${s.of}`;
+    q.textContent = "Which game would you rather play?";
+    grid.className = "choices two";
+    const mine = answers[s.id]?.choice;
+    grid.append(
+      option(s.p.left.code, s.p.left.img, `Build ${s.p.left.code}`, mine === s.p.left.code,
+             () => choose(s, s.p.left.code)),
+      option(s.p.right.code, s.p.right.img, `Build ${s.p.right.code}`, mine === s.p.right.code,
+             () => choose(s, s.p.right.code)),
+    );
+    const tie = document.createElement("button"); tie.className = "plain"; tie.type = "button";
+    tie.textContent = mine === "tie" ? "No preference (chosen)" : "No preference";
+    tie.addEventListener("click", () => choose(s, "tie"));
+    stage.append(eyebrow, q, grid, tie);
+    document.getElementById("keys").textContent = "Keys: ← left, → right, ↓ no preference";
+  } else {
+    eyebrow.textContent = "The pieces · pick one of five";
+    q.textContent = QUESTIONS[s.id];
+    grid.className = "choices five";
+    const mine = answers[s.id]?.choice;
+    for (const item of s.q.items) {
+      grid.append(option(item.code, item.img, `Build ${item.code}`, mine === item.code,
+                         () => choose(s, item.code)));
+    }
+    stage.append(eyebrow, q, grid);
+    document.getElementById("keys").textContent = "";
+  }
+}
+
+async function choose(step, choice) {
+  const record = { choice, at: Date.now() };
+  if (step.kind === "pair") { record.left = step.p.left.code; record.right = step.p.right.code; }
+  else { record.shown = step.q.items.map((i) => i.code); }
+  answers[step.id] = record;
+  at += 1;
+  render();
+  if (!db) return;
+  statusEl.textContent = "Saving…";
+  try {
+    await db.doc(`ratings/${step.id}`).set(record);
+    statusEl.textContent = "Saved.";
+  } catch (e) {
+    statusEl.textContent = "Could not save that choice; it is kept on this page.";
+  }
+}
+
+document.getElementById("back").addEventListener("click", () => { if (at > 0) { at -= 1; render(); } });
+document.addEventListener("keydown", (e) => {
+  const s = steps[at];
+  if (!s || s.kind !== "pair") return;
+  if (e.key === "ArrowLeft") choose(s, s.p.left.code);
+  if (e.key === "ArrowRight") choose(s, s.p.right.code);
+  if (e.key === "ArrowDown") choose(s, "tie");
+});
+
+render();
+
+(async () => {
+  try {
+    db = await claude.use("db");
+  } catch { db = null; }
+  if (!db) { statusEl.textContent = "Not connected: you can still rate, and copy the results at the end."; return; }
+  statusEl.textContent = "Choices save as you go.";
+  try {
+    const snap = await db.collection("ratings").get();
+    for (const doc of snap.docs ?? []) answers[doc.id] = doc.data();
+    while (at < steps.length && answers[steps[at].id]) at += 1;
+    render();
+  } catch { /* fresh start */ }
+})();
+</script>

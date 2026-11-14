@@ -5,6 +5,12 @@
   },
   "plugins": [
     {
+      "name": "forge",
+      "displayName": "Forge",
+      "source": "./plugins/forge",
+      "description": "The smith's tools: render and choose art with a local image model (mold), measure images (gauge), and attribute check failures (anvil)."
+    },
+    {
       "name": "forge-setup",
       "displayName": "Forge Setup",
       "source": "./plugins/forge-setup",
@@ -14,7 +20,7 @@
       "name": "forge-spec",
       "displayName": "Forge Spec",
       "source": "./plugins/forge-spec",
-      "description": "Design a specification the loop can execute verbatim — ticket-shaped, criteria written by you, parsed by `forge ingest` without a planner model touching it."
+      "description": "Design a specification the loop can execute verbatim â€” ticket-shaped, criteria written by you, parsed by `forge ingest` without a planner model touching it."
     }
   ]
 }
